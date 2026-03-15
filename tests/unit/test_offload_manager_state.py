@@ -1,0 +1,764 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for OffloadManager state machine and lifecycle.
+
+This test suite validates the OffloadManager's state machine logic by mocking the
+TensorManager and trap calls. It verifies:
+
+1. State Transitions: Proper transitions through WARMUP -> PROFILE -> INFERENCE states
+2. Iteration Counting: Correct tracking of iterations in each state
+3. Automatic State Tracking: Via ManagedModelWrapper (new) or forward hooks (old)
+4. Configuration: Different warmup and profile iteration counts
+5. Pattern Matching: Multiple module patterns for offloading
+
+Key behaviors tested:
+- State transitions occur AFTER completing N iterations (on the N+1th forward pass)
+- Iteration counters reset to 0 when transitioning to a new state
+- Automatic state transitions work without manual update_state() calls
+- NoOpTensorManager is used when enabled=False
+
+Test Compatibility:
+- Most tests work with both old (hooks) and new (wrapper) implementations
+- test_automatic_transitions_with_changing_model_objects specifically tests the
+  bug that exists in the old version where hooks don't work when model objects
+  change during state transitions
+
+Example flow with warmup_iters=2, profile_iters=3:
+  Forward 0: WARMUP (count 0 -> 1)
+  Forward 1: WARMUP (count 1 -> 2)
+  Forward 2: WARMUP -> PROFILE transition (count reset to 0)
+  Forward 3: PROFILE (count 0 -> 1)
+  Forward 4: PROFILE (count 1 -> 2)
+  Forward 5: PROFILE (count 2 -> 3)
+  Forward 6: PROFILE -> INFERENCE transition (count reset to 0)
+  Forward 7+: INFERENCE (no counting)
+"""
+
+from unittest.mock import MagicMock, patch
+
+import pytest
+import torch
+
+from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadModelProxy, OffloadState
+
+
+# Simple model for testing
+class SubmoduleL2(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class SubmoduleL1(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.submodule_l2 = SubmoduleL2()
+        self.submodule_l3 = SubmoduleL2()
+
+    def forward(self, x):
+        for _i in range(5):
+            x = self.submodule_l2(x)
+        return self.submodule_l3(x)
+
+
+class SimpleModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.submodule_l1 = SubmoduleL1()
+        self.submodule_l2 = SubmoduleL2()
+        self.module_list = torch.nn.ModuleList([SubmoduleL2() for _ in range(5)])
+
+    def forward(self, x):
+        x = self.submodule_l1(x)
+        x = self.submodule_l2(x)
+        for module in self.module_list:
+            x = module(x)
+        return x
+
+
+class MockTrap:
+    """Mock trap context manager for testing."""
+
+    def __init__(self, name):
+        self.name = name
+        self.entered = False
+        self.exited = False
+
+    def __enter__(self):
+        self.entered = True
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exited = True
+        return False
+
+
+class DelegatingWrapper(torch.nn.Module):
+    """A wrapper that delegates to another model without registering it as a child.
+
+    This simulates the pattern where forward hooks fail:
+    - The wrapper's forward immediately calls another module
+    - That other module is not a registered child (accessed via external reference)
+    - PyTorch hooks don't fire because of this delegation pattern
+    """
+
+    def __init__(self, target_model):
+        super().__init__()
+        # Store model reference but DON'T register as child
+        self._target = target_model
+
+    def forward(self, x):
+        # Direct delegation to external model - hooks won't fire here
+        return self._target(x)
+
+
+class TestMaxGpuMemResolution:
+    """Tests that _initialize_tensor_manager resolves max_gpu_mem_fraction → bytes."""
+
+    def test_fraction_resolved_to_bytes_via_device_properties(self):
+        """max_gpu_mem_fraction is multiplied by total GPU memory."""
+        config = OffloadConfig(max_gpu_mem_fraction=0.8)
+        om = OffloadManager("test_fraction_resolved")
+        om.set_config(config)
+
+        fake_props = MagicMock()
+        fake_props.total_memory = 40 * 1024**3  # 40 GB
+
+        with (
+            patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props),
+            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
+            patch("flextensor.tensor_manager.TensorManager"),
+        ):
+            om._initialize_tensor_manager()
+
+        mock_strategy.assert_called_once()
+        _, kwargs = mock_strategy.call_args
+        assert kwargs["max_gpu_mem_bytes"] == int(0.8 * 40 * 1024**3)
+
+    def test_fraction_none_passes_none_to_strategy(self):
+        """max_gpu_mem_fraction=None (latency mode) passes None to strategy, no GPU query."""
+        config = OffloadConfig(max_gpu_mem_fraction=None)
+        om = OffloadManager("test_fraction_none")
+        om.set_config(config)
+
+        # Shadow autouse fixture to verify no GPU query happens
+        with (
+            patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props,
+            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
+            patch("flextensor.tensor_manager.TensorManager"),
+        ):
+            om._initialize_tensor_manager()
+
+        mock_props.assert_not_called()
+        _, kwargs = mock_strategy.call_args
+        assert kwargs["max_gpu_mem_bytes"] is None
+
+    def test_deprecated_bytes_used_directly(self):
+        """Deprecated max_gpu_mem_bytes path: bytes passed directly, no GPU query."""
+        with pytest.warns(DeprecationWarning):
+            config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
+        om = OffloadManager("test_deprecated_bytes")
+        om.set_config(config)
+
+        # Shadow the autouse fixture's patch with a fresh mock so we can assert
+        # get_device_properties is not called at all on the deprecated bytes path.
+        with (
+            patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props,
+            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
+            patch("flextensor.tensor_manager.TensorManager"),
+        ):
+            om._initialize_tensor_manager()
+
+        mock_props.assert_not_called()  # no GPU query for deprecated path
+        _, kwargs = mock_strategy.call_args
+        assert kwargs["max_gpu_mem_bytes"] == 20 * 1024**3
+
+    def test_fraction_uses_correct_gpu_device(self):
+        """get_device_properties is called with the configured gpu_device index."""
+        config = OffloadConfig(gpu_device=1, max_gpu_mem_fraction=0.5)
+        om = OffloadManager("test_fraction_gpu_device")
+        om.set_config(config)
+
+        fake_props = MagicMock()
+        fake_props.total_memory = 80 * 1024**3  # 80 GB
+
+        with (
+            patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props) as mock_props,
+            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
+            patch("flextensor.tensor_manager.TensorManager"),
+        ):
+            om._initialize_tensor_manager()
+
+        mock_props.assert_called_once_with(1)
+        _, kwargs = mock_strategy.call_args
+        assert kwargs["max_gpu_mem_bytes"] == int(0.5 * 80 * 1024**3)
+
+
+class TestOffloadManagerStateMachine:
+    """Test cases for OffloadManager state machine logic."""
+
+    def setup_method(self) -> None:
+        """Setup test fixtures."""
+        self.model = SimpleModel()
+        self.model.cpu()
+        self.model.eval()
+
+        # Create test input
+        self.x = torch.randn(4, 10)
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_state_transitions_warmup_to_profile_to_inference(
+        self,
+        mock_strategy_cls,
+        mock_tensor_manager_cls,
+    ):
+        """Test state transitions from NOT_INITIALIZED -> WARMUP -> PROFILE -> INFERENCE."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+
+        # Mock trap to track calls
+        trap_calls = []
+
+        def mock_trap(name):
+            trap = MockTrap(name)
+            trap_calls.append(trap)
+            return trap
+
+        mock_tensor_manager.trap = mock_trap
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.initialize_profile.return_value = self.model
+        mock_tensor_manager.initialize_inference.return_value = self.model
+
+        # Configure offload manager with specific iteration counts
+        warmup_iters = 2
+        profile_iters = 7
+
+        om = OffloadManager("test")
+        config = OffloadConfig(
+            enabled=True,
+            warmup_iters=warmup_iters,
+            profile_iters=profile_iters,
+        )
+
+        # Offload the model
+        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        model = om.offload(self.model, config=config)
+
+        # Verify initial state
+        assert om._current_state == OffloadState.WARMUP
+        assert om._iteration_count == 0
+
+        # Run warmup iterations - wrapper automatically calls update_state()
+        for _ in range(warmup_iters):
+            with torch.no_grad():
+                _ = model(self.x)  # Wrapper automatically calls update_state()
+
+        # Should have transitioned to PROFILE after warmup_iters iterations
+        assert om._current_state == OffloadState.PROFILE
+        assert om._iteration_count == 0  # Counter resets on transition
+
+        # Verify transition to profile was called
+        mock_tensor_manager.initialize_profile.assert_called_once()
+
+        # Run profile iterations
+        for _ in range(profile_iters):
+            with torch.no_grad():
+                _ = model(self.x)  # Wrapper automatically calls update_state()
+
+        # Should have transitioned to INFERENCE after profile_iters iterations
+        assert om._current_state == OffloadState.INFERENCE
+        assert om._iteration_count == 0  # Counter resets on transition
+
+        # Verify transition to inference was called
+        mock_tensor_manager.initialize_inference.assert_called_once()
+
+        # Run inference iterations (should stay in INFERENCE state)
+        for _i in range(5):
+            with torch.no_grad():
+                _ = model(self.x)  # Wrapper automatically calls update_state()
+            assert om._current_state == OffloadState.INFERENCE
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_automatic_state_transitions_via_forward(
+        self,
+        mock_strategy_cls,
+        mock_tensor_manager_cls,
+    ):
+        """Test that state transitions happen automatically during forward passes.
+
+        This test verifies that calling the model's forward method triggers
+        automatic state transitions without requiring manual update_state() calls.
+
+        Note: This test works with both implementations:
+        - Old version: Uses forward hooks (works on simple models, may fail on complex delegation)
+        - New version: Uses ManagedModelWrapper (works reliably in all cases)
+        """
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.initialize_profile.return_value = self.model
+        mock_tensor_manager.initialize_inference.return_value = self.model
+
+        # Configure with minimal iterations
+        warmup_iters = 1
+        profile_iters = 1
+
+        om = OffloadManager("test")
+        config = OffloadConfig(
+            enabled=True,
+            warmup_iters=warmup_iters,
+            profile_iters=profile_iters,
+        )
+
+        # Offload the model
+        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        model = om.offload(self.model, config=config)
+
+        # Verify model is a torch.nn.Module (could be original or wrapper)
+        assert isinstance(model, torch.nn.Module)
+
+        # Initial state should be WARMUP
+        assert om._current_state == OffloadState.WARMUP
+        assert om._iteration_count == 0
+
+        # Run warmup iterations to trigger transition
+        # State transitions should happen automatically during forward passes
+        for _ in range(warmup_iters):
+            with torch.no_grad():
+                _ = model(self.x)
+
+        # Should have transitioned to PROFILE
+        assert om._current_state == OffloadState.PROFILE
+        assert om._iteration_count == 0
+
+        # Run profile iterations to trigger transition
+        for _ in range(profile_iters):
+            with torch.no_grad():
+                _ = model(self.x)
+
+        # Should now be in INFERENCE
+        assert om._current_state == OffloadState.INFERENCE
+        assert om._iteration_count == 0
+
+        # Verify all transition methods were called
+        mock_tensor_manager.initialize_warmup.assert_called_once()
+        mock_tensor_manager.initialize_profile.assert_called_once()
+        mock_tensor_manager.initialize_inference.assert_called_once()
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_automatic_transitions_with_changing_model_objects(
+        self,
+        mock_strategy_cls,
+        mock_tensor_manager_cls,
+    ):
+        """Test automatic state transitions when model objects change during transitions.
+
+        This test simulates the real failure scenario:
+        - initialize_warmup() returns model object A
+        - Hook is registered on model A
+        - initialize_profile() returns model object B (different instance)
+        - Hook on model A doesn't fire when calling model B
+        - User is calling model B but hook is stuck on model A
+
+        Expected behavior:
+        - Old version (hooks): FAILS - hook on model A, but calling model B
+        - New version (wrapper): PASSES - wrapper delegates to current model
+        """
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+
+        # Create THREE DIFFERENT model instances (as happens in real code)
+        warmup_model = SimpleModel()
+        profile_model = SimpleModel()  # Different instance!
+        inference_model = SimpleModel()  # Different instance!
+
+        # Each transition returns a DIFFERENT model object
+        mock_tensor_manager.initialize_warmup.return_value = warmup_model
+        mock_tensor_manager.initialize_profile.return_value = profile_model
+        mock_tensor_manager.initialize_inference.return_value = inference_model
+
+        # Configure with minimal iterations
+        warmup_iters = 1
+        profile_iters = 1
+
+        om = OffloadManager("test_changing_models")
+        config = OffloadConfig(
+            offload_on=True,
+            warmup_iters=warmup_iters,
+            profile_iters=profile_iters,
+        )
+
+        # Offload - KEY DIFFERENCE:
+        # Old version: returns self.model (original), but hook is on warmup_model!
+        # New version: returns wrapper that tracks om._model
+        _original_model_id = id(self.model)
+        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        returned_model = om.offload(self.model, config=config)
+
+        # OLD VERSION BUG: returned_model is original, but hook is on warmup_model
+        # This causes hooks to never fire because user calls returned_model
+        # NEW VERSION FIX: returned_model is wrapper that always calls om._model
+
+        # Initial state should be WARMUP
+        assert om._current_state == OffloadState.WARMUP
+        assert om._iteration_count == 0
+
+        # Run warmup iterations to trigger transition
+        # After transition, om._model becomes profile_model
+        # Old version: still calling warmup_model (hook fires)
+        # New version: wrapper calls om._model (profile_model)
+        for _ in range(warmup_iters):
+            with torch.no_grad():
+                _ = returned_model(self.x)
+
+        # Should have transitioned to PROFILE
+        # Old version: This PASSES because hook is still on warmup_model
+        # But in REAL usage, user would call the internal model which changes!
+        assert om._current_state == OffloadState.PROFILE
+        assert om._iteration_count == 0
+
+        # Run profile iterations to trigger transition
+        # After transition, om._model becomes inference_model
+        # Old version: still calling warmup_model (hook still fires)
+        # New version: wrapper calls om._model (inference_model)
+        for _ in range(profile_iters):
+            with torch.no_grad():
+                _ = returned_model(self.x)
+
+        # Should now be in INFERENCE
+        assert om._current_state == OffloadState.INFERENCE
+        assert om._iteration_count == 0
+
+        # Verify all transition methods were called
+        mock_tensor_manager.initialize_warmup.assert_called_once()
+        mock_tensor_manager.initialize_profile.assert_called_once()
+        mock_tensor_manager.initialize_inference.assert_called_once()
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_iteration_count_tracking(self, mock_strategy_cls, mock_tensor_manager_cls):
+        """Test that iteration counts are tracked correctly during state transitions."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.initialize_profile.return_value = self.model
+        mock_tensor_manager.initialize_inference.return_value = self.model
+
+        warmup_iters = 3
+        profile_iters = 5
+
+        om = OffloadManager("test")
+        config = OffloadConfig(
+            enabled=True,
+            warmup_iters=warmup_iters,
+            profile_iters=profile_iters,
+            module_patterns=["submoduleL1.submoduleL2"],
+        )
+        model = om.offload(self.model, config=config)
+
+        # Track iteration count during warmup
+        for _ in range(warmup_iters):
+            with torch.no_grad():
+                _ = model(self.x)  # Wrapper automatically calls update_state()
+
+        # Should have transitioned to PROFILE
+        assert om._current_state == OffloadState.PROFILE
+        assert om._iteration_count == 0
+
+        # Track iteration count during profile
+        for _ in range(profile_iters):
+            with torch.no_grad():
+                _ = model(self.x)  # Wrapper automatically calls update_state()
+
+        # Should have transitioned to INFERENCE
+        assert om._current_state == OffloadState.INFERENCE
+        assert om._iteration_count == 0
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_custom_warmup_and_profile_iterations(
+        self,
+        mock_strategy_cls,
+        mock_tensor_manager_cls,
+    ):
+        """Test with custom warmup and profile iteration counts."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.initialize_profile.return_value = self.model
+        mock_tensor_manager.initialize_inference.return_value = self.model
+
+        # Test different configurations
+        test_cases = [
+            (1, 1),
+            (2, 7),
+            (5, 10),
+            (10, 5),
+        ]
+
+        for warmup_iters, profile_iters in test_cases:
+            om = OffloadManager(f"test_{warmup_iters}_{profile_iters}")
+            config = OffloadConfig(
+                enabled=True,
+                warmup_iters=warmup_iters,
+                profile_iters=profile_iters,
+                module_patterns=["submoduleL1.submoduleL2"],
+            )
+            model = om.offload(self.model, config=config)
+
+            # Run warmup iterations to trigger transition
+            for _ in range(warmup_iters):
+                with torch.no_grad():
+                    _ = model(self.x)  # Wrapper automatically calls update_state()
+
+            # Should have transitioned to PROFILE
+            assert om._current_state == OffloadState.PROFILE
+
+            # Run profile iterations to trigger transition
+            for _ in range(profile_iters):
+                with torch.no_grad():
+                    _ = model(self.x)  # Wrapper automatically calls update_state()
+
+            # Should have transitioned to INFERENCE
+            assert om._current_state == OffloadState.INFERENCE
+
+            # Verify initialize methods were called
+            mock_tensor_manager.initialize_warmup.assert_called()
+            mock_tensor_manager.initialize_profile.assert_called()
+            mock_tensor_manager.initialize_inference.assert_called()
+
+            # Reset mocks for next test case
+            mock_tensor_manager.reset_mock()
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_offload_block_returns_trap(self, mock_strategy_cls, mock_tensor_manager_cls):
+        """Test that offload_block returns the correct trap object."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+
+        mock_trap = MockTrap("test_trap")
+        mock_tensor_manager.trap.return_value = mock_trap
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+
+        om = OffloadManager("test")
+        config = OffloadConfig(enabled=True, module_patterns=["submoduleL1.submoduleL2"])
+        om.offload(self.model, config=config)
+
+        # Get trap from offload_block
+        trap = om.offload_block("test_block")
+
+        # Verify it's the mock trap
+        assert trap is mock_trap
+        mock_tensor_manager.trap.assert_called_with("test_block")
+
+        # Test context manager usage
+        with trap:
+            assert trap.entered is True
+        assert trap.exited is True
+
+    @patch("flextensor.offload_manager.NoOpTensorManager")
+    def test_offload_disabled_uses_noop_manager(self, mock_noop_manager_cls):
+        """Test that when enabled=False, NoOpTensorManager is used."""
+        # Setup mock
+        mock_noop_manager = MagicMock()
+        mock_noop_manager_cls.return_value = mock_noop_manager
+        mock_noop_manager.trap = lambda name: MockTrap(name)
+        mock_noop_manager.initialize_warmup.return_value = self.model
+        mock_noop_manager.initialize_profile.return_value = self.model
+        mock_noop_manager.initialize_inference.return_value = self.model
+
+        om = OffloadManager("test")
+        config = OffloadConfig(enabled=False, module_patterns=["submoduleL1.submoduleL2"])
+        model = om.offload(self.model, config=config)
+
+        # Verify NoOpTensorManager was created
+        mock_noop_manager_cls.assert_called_once()
+
+        # Run some iterations - should not transition states normally
+        for _i in range(5):
+            with torch.no_grad():
+                _ = model(self.x)
+
+        # Should still be in warmup or have transitioned minimally
+        # (NoOp manager doesn't do real state management)
+        assert om._tensor_manager is mock_noop_manager
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_multiple_offload_patterns(self, mock_strategy_cls, mock_tensor_manager_cls):
+        """Test offloading multiple module patterns."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+
+        om = OffloadManager("test")
+
+        # Offload multiple patterns via config
+        patterns = [
+            "submoduleL1.submoduleL2",
+            "submoduleL1.submoduleL3",
+            "submoduleL2",
+            "module_list.*",
+        ]
+        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, module_patterns=patterns)
+        om.offload(self.model, config=config)
+
+        # Count how many modules were patched
+        patched_module_count = 0
+        for _name, module in self.model.named_modules():
+            if hasattr(module, "_ft_original_forward_func"):
+                patched_module_count += 1
+
+        # Should have patched the matching modules
+        assert patched_module_count > 0
+
+    def test_model_none_forward_raises_runtime_error(self):
+        """Test that calling proxy.forward() explicitly with None model raises RuntimeError."""
+        om = OffloadManager("test_none_forward")
+        # Create a dummy model for the proxy (but offload_manager.model will be None)
+        dummy_model = SimpleModel()
+        proxy = OffloadModelProxy(dummy_model, om)
+
+        # Model is None because offload() was never called
+        assert om.model is None
+
+        # Calling forward() explicitly should raise RuntimeError
+        with pytest.raises(RuntimeError, match="Model not initialized"):
+            proxy.forward(self.x)
+
+    def test_model_none_getattr_raises_attribute_error(self):
+        """Test that proxy delegates to ObjectWrapper when offload_manager.model is None."""
+        om = OffloadManager("test_none_getattr")
+        # Create a dummy model for the proxy (but offload_manager.model will be None)
+        dummy_model = SimpleModel()
+        proxy = OffloadModelProxy(dummy_model, om)
+
+        # Model is None because offload() was never called
+        assert om.model is None
+
+        # Attribute access works via ObjectWrapper (delegates to dummy_model)
+        assert hasattr(proxy, "submodule_l1")
+
+        # But calling forward explicitly should raise RuntimeError
+        with pytest.raises(RuntimeError, match="Model not initialized"):
+            proxy.forward(self.x)
+
+    def test_model_none_after_release(self):
+        """Test that model becomes None after release() and raises appropriate errors."""
+        # Setup mocks
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.release_memory = MagicMock()
+
+        om = OffloadManager("test_release")
+        om._tensor_manager = mock_tensor_manager
+        om._model = self.model
+
+        # Create proxy with the model
+        proxy = OffloadModelProxy(self.model, om)
+
+        # Model should work before release
+        assert om.model is not None
+
+        # Release the manager
+        om.release()
+
+        # Model should be None after release
+        assert om.model is None
+
+        # Calling forward explicitly should raise RuntimeError
+        with pytest.raises(RuntimeError, match="Model not initialized"):
+            proxy.forward(self.x)
+
+    def test_offload_uses_default_wildcard_pattern(self):
+        """Test that offload uses default ['*'] pattern when not specified in config."""
+        om = OffloadManager("test")
+        config = OffloadConfig(enabled=True)
+
+        # Verify default pattern is ["*"]
+        assert config.module_patterns == ["*"]
+
+        # Offload without specifying patterns - should use default
+        model = om.offload(self.model, config=config)
+
+        # Verify model was wrapped
+        assert isinstance(model, OffloadModelProxy)
+        assert om._current_state == OffloadState.WARMUP
+
+    def test_offload_with_custom_patterns_in_config(self):
+        """Test that offload uses custom patterns from config."""
+        om = OffloadManager("test")
+        config = OffloadConfig(
+            enabled=True,
+            module_patterns=["submoduleL1", "submoduleL2"],
+        )
+
+        model = om.offload(self.model, config=config)
+
+        # Verify model was wrapped
+        assert isinstance(model, OffloadModelProxy)
+        assert om._current_state == OffloadState.WARMUP
+
+
+class TestOffloadManagerConfig:
+    """Test cases for OffloadConfig and configuration management."""
+
+    def test_config_all_warmup_iters_property(self):
+        """Test that all_warmup_iters property returns sum of warmup and profile iters."""
+        config = OffloadConfig(warmup_iters=3, profile_iters=7)
+        assert config.all_warmup_iters == 10  # 3 + 7
+
+        config = OffloadConfig(warmup_iters=1, profile_iters=10)
+        assert config.all_warmup_iters == 11  # 1 + 10
+
+        config = OffloadConfig(warmup_iters=5, profile_iters=5)
+        assert config.all_warmup_iters == 10  # 5 + 5
+
+    def test_config_defaults(self):
+        """Test default configuration values."""
+        config = OffloadConfig()
+
+        assert config.enabled is True
+        assert config.gpu_device == 0
+        assert config.warmup_iters == 1
+        assert config.profile_iters == 10
+        assert config.pinned_memory is True
+        assert config.shm_enabled is False
+        assert config.enable_direct_mode is True
+        assert config.release_tensors is True
+
+    def test_config_custom_values(self):
+        """Test custom configuration values."""
+        config = OffloadConfig(
+            enabled=False,
+            gpu_device=1,
+            warmup_iters=5,
+            profile_iters=15,
+        )
+
+        assert config.enabled is False
+        assert config.gpu_device == 1
+        assert config.warmup_iters == 5
+        assert config.profile_iters == 15
+        assert config.all_warmup_iters == 20  # 5 + 15

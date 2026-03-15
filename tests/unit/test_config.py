@@ -1,0 +1,1279 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for OffloadConfig and environment variable loading.
+
+This test suite validates:
+1. OffloadConfig class behavior (defaults, validation, properties)
+2. Environment variable loading with type conversion
+3. File-based configuration loading (INI, JSON, YAML)
+4. Edge cases (case sensitivity, invalid values, etc.)
+"""
+
+import os
+import warnings
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from flextensor.config import (
+    OffloadConfig,
+    _get_field_types,
+    _parse_bool,
+    _parse_none,
+    load_config,
+    load_config_from_env,
+    load_config_from_file,
+)
+from flextensor.strategy import GreedyStrategy, KnapsackStrategy, NthLayerStrategy
+
+
+class TestOffloadConfig:
+    """Test OffloadConfig class behavior."""
+
+    def test_default_values(self):
+        """Test that default values are set correctly."""
+        config = OffloadConfig()
+        assert config.gpu_device == 0
+        assert config.pinned_memory is True
+        assert config.shm_enabled is False
+        assert config.warmup_iters == 1
+        assert config.profile_iters == 10
+        assert config.knapsack_scale == 1.0
+        assert config.transfer_mode == "allocation_block_transfer"
+        assert config.enable_direct_mode is True
+        assert config.release_tensors is True
+        assert config.rearrange_transfers is False
+        assert config.compute_transfer_gap == 1
+        assert config.num_blocks == 4
+        assert config.profile_storage_dir is None
+        assert config.profile_read_only is False
+        assert config.load_strategy is None
+        assert config.enable_tracing is False
+        assert config.min_blocks == 4
+        assert config.max_gpu_mem_fraction == 0.9
+        with pytest.warns(DeprecationWarning):
+            assert config.max_gpu_mem_bytes is None
+
+    def test_max_gpu_mem_fraction_default(self):
+        """Default max_gpu_mem_fraction is 0.9."""
+        config = OffloadConfig()
+        assert config.max_gpu_mem_fraction == 0.9
+
+    def test_max_gpu_mem_fraction_none_latency_mode(self):
+        """Setting max_gpu_mem_fraction=None enables latency mode."""
+        config = OffloadConfig(max_gpu_mem_fraction=None)
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_fraction_custom(self):
+        """Custom fraction is accepted."""
+        config = OffloadConfig(max_gpu_mem_fraction=0.75)
+        assert config.max_gpu_mem_fraction == 0.75
+
+    def test_max_gpu_mem_fraction_boundary_values(self):
+        """Boundary values: just above 0 and exactly 1.0 are valid."""
+        config_low = OffloadConfig(max_gpu_mem_fraction=0.01)
+        config_high = OffloadConfig(max_gpu_mem_fraction=1.0)
+        assert config_low.max_gpu_mem_fraction == 0.01
+        assert config_high.max_gpu_mem_fraction == 1.0
+
+    def test_max_gpu_mem_fraction_zero_invalid(self):
+        """max_gpu_mem_fraction=0.0 is rejected (gt=0.0 constraint)."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(max_gpu_mem_fraction=0.0)
+
+    def test_max_gpu_mem_fraction_above_one_invalid(self):
+        """max_gpu_mem_fraction > 1.0 is rejected."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(max_gpu_mem_fraction=1.1)
+
+    def test_max_gpu_mem_bytes_deprecated_emits_warning(self):
+        """Setting max_gpu_mem_bytes emits DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
+            config = OffloadConfig(max_gpu_mem_bytes=10 * 1024**3)
+            assert config.max_gpu_mem_bytes == 10 * 1024**3
+        assert config.max_gpu_mem_fraction is None  # default suppressed
+
+    def test_max_gpu_mem_bytes_and_fraction_both_set_raises(self):
+        """Setting both fields raises ValueError."""
+        with pytest.raises(ValidationError, match="Cannot set both"):
+            OffloadConfig(max_gpu_mem_bytes=10 * 1024**3, max_gpu_mem_fraction=0.8)
+
+    def test_custom_values(self):
+        """Test setting custom values."""
+        config = OffloadConfig(
+            gpu_device=2,
+            pinned_memory=False,
+            warmup_iters=5,
+            profile_iters=20,
+            knapsack_scale=2.0,
+            transfer_mode="custom_mode",
+            enable_direct_mode=False,
+            release_tensors=False,
+            rearrange_transfers=True,
+            compute_transfer_gap=2,
+            num_blocks=8,
+            enable_tracing=True,
+        )
+        assert config.gpu_device == 2
+        assert config.pinned_memory is False
+        assert config.warmup_iters == 5
+        assert config.profile_iters == 20
+        assert config.knapsack_scale == 2.0
+        assert config.transfer_mode == "custom_mode"
+        assert config.enable_direct_mode is False
+        assert config.release_tensors is False
+        assert config.rearrange_transfers is True
+        assert config.compute_transfer_gap == 2
+        assert config.num_blocks == 8
+        assert config.enable_tracing is True
+
+    def test_gpu_device_validation_negative(self):
+        """Test that negative gpu_device raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(gpu_device=-1)
+
+    def test_warmup_iters_validation_negative(self):
+        """Test that negative warmup_iters raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(warmup_iters=-1)
+
+    def test_profile_iters_validation_negative(self):
+        """Test that negative profile_iters raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(profile_iters=-1)
+
+    def test_knapsack_scale_validation_zero(self):
+        """Test that zero knapsack_scale raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(knapsack_scale=0.0)
+
+    def test_knapsack_scale_validation_negative(self):
+        """Test that negative knapsack_scale raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(knapsack_scale=-1.0)
+
+    def test_num_blocks_validation_zero(self):
+        """Test that zero num_blocks raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(num_blocks=0)
+
+    def test_num_blocks_validation_negative(self):
+        """Test that negative num_blocks raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(num_blocks=-1)
+
+    def test_min_blocks_custom(self):
+        """Test setting custom min_blocks value."""
+        config = OffloadConfig(min_blocks=3)
+        assert config.min_blocks == 3
+
+    def test_min_blocks_validation_below_minimum(self):
+        """Test that min_blocks < 2 raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(min_blocks=1)
+
+    def test_min_blocks_validation_at_minimum(self):
+        """Test that min_blocks=2 is accepted."""
+        config = OffloadConfig(min_blocks=2)
+        assert config.min_blocks == 2
+
+    def test_max_gpu_mem_bytes_custom(self):
+        """Test setting custom max_gpu_mem_bytes value."""
+        with pytest.warns(DeprecationWarning):
+            config = OffloadConfig(max_gpu_mem_bytes=48 * 1024**3)
+            assert config.max_gpu_mem_bytes == 48 * 1024**3
+
+    def test_max_gpu_mem_bytes_zero(self):
+        """Test that max_gpu_mem_bytes=0 is accepted."""
+        with pytest.warns(DeprecationWarning):
+            config = OffloadConfig(max_gpu_mem_bytes=0)
+            assert config.max_gpu_mem_bytes == 0
+
+    def test_max_gpu_mem_bytes_validation_negative(self):
+        """Test that negative max_gpu_mem_bytes raises validation error."""
+        with pytest.raises(ValidationError), pytest.warns(DeprecationWarning):
+            OffloadConfig(max_gpu_mem_bytes=-1)
+
+    def test_compute_transfer_gap_validation_negative(self):
+        """Test that negative compute_transfer_gap raises validation error."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(compute_transfer_gap=-1)
+
+    def test_all_warmup_iters_property(self):
+        """Test all_warmup_iters property calculation."""
+        config = OffloadConfig(warmup_iters=3, profile_iters=7)
+        assert config.all_warmup_iters == 10
+
+    def test_all_warmup_iters_property_default(self):
+        """Test all_warmup_iters property with default values."""
+        config = OffloadConfig()
+        assert config.all_warmup_iters == 11  # 1 + 10
+
+    def test_knapsack_strategy_assignment(self):
+        """Test assigning KnapsackStrategy to load_strategy."""
+        strategy = KnapsackStrategy(scale=1.5, cyclic=True, group_size=2)
+        config = OffloadConfig(load_strategy=strategy)
+        assert config.load_strategy is strategy
+        assert isinstance(config.load_strategy, KnapsackStrategy)
+
+    def test_greedy_strategy_assignment(self):
+        """Test assigning GreedyStrategy to load_strategy."""
+        strategy = GreedyStrategy(threshold_mb=0.2)
+        config = OffloadConfig(load_strategy=strategy)
+        assert config.load_strategy is strategy
+        assert isinstance(config.load_strategy, GreedyStrategy)
+
+    def test_nth_layer_strategy_assignment(self):
+        """Test assigning NthLayerStrategy to load_strategy."""
+        strategy = NthLayerStrategy(nth_layer=2, threshold_mb=0.2)
+        config = OffloadConfig(load_strategy=strategy)
+        assert config.load_strategy is strategy
+        assert isinstance(config.load_strategy, NthLayerStrategy)
+
+    def test_edge_values_warmup_iters_zero(self):
+        """Test warmup_iters at boundary value 0."""
+        config = OffloadConfig(warmup_iters=0)
+        assert config.warmup_iters == 0
+
+    def test_edge_values_profile_iters_zero(self):
+        """Test profile_iters at boundary value 0."""
+        config = OffloadConfig(profile_iters=0)
+        assert config.profile_iters == 0
+
+    def test_edge_values_compute_transfer_gap_zero(self):
+        """Test compute_transfer_gap at boundary value 0."""
+        config = OffloadConfig(compute_transfer_gap=0)
+        assert config.compute_transfer_gap == 0
+
+    def test_module_patterns_default(self):
+        """Test module_patterns default value is ['*']."""
+        config = OffloadConfig()
+        assert config.module_patterns == ["*"]
+
+    def test_module_patterns_custom(self):
+        """Test setting custom module_patterns."""
+        config = OffloadConfig(module_patterns=["layers.*", "head"])
+        assert config.module_patterns == ["layers.*", "head"]
+
+    def test_module_patterns_empty_list(self):
+        """Test that empty module_patterns list is allowed."""
+        config = OffloadConfig(module_patterns=[])
+        assert config.module_patterns == []
+
+    def test_json_schema_has_field_descriptions(self):
+        """All OffloadConfig fields must have descriptions in JSON Schema."""
+        schema = OffloadConfig.model_json_schema()
+        properties = schema["properties"]
+        missing = [name for name, prop in properties.items() if "description" not in prop]
+        assert missing == [], (
+            f"Fields missing 'description' in JSON Schema: {missing}. "
+            "Each field must have an attribute docstring and model_config must have "
+            "use_attribute_docstrings=True."
+        )
+
+
+class TestParseBool:
+    """Test _parse_bool helper function."""
+
+    def test_parse_true_lowercase(self):
+        """Test parsing 'true' (lowercase)."""
+        assert _parse_bool("true") is True
+
+    def test_parse_true_uppercase(self):
+        """Test parsing 'TRUE' (uppercase)."""
+        assert _parse_bool("TRUE") is True
+
+    def test_parse_true_mixed_case(self):
+        """Test parsing 'True' (mixed case)."""
+        assert _parse_bool("True") is True
+
+    def test_parse_one(self):
+        """Test parsing '1'."""
+        assert _parse_bool("1") is True
+
+    def test_parse_yes_lowercase(self):
+        """Test parsing 'yes' (lowercase)."""
+        assert _parse_bool("yes") is True
+
+    def test_parse_yes_uppercase(self):
+        """Test parsing 'YES' (uppercase)."""
+        assert _parse_bool("YES") is True
+
+    def test_parse_yes_mixed_case(self):
+        """Test parsing 'Yes' (mixed case)."""
+        assert _parse_bool("Yes") is True
+
+    def test_parse_y(self):
+        """Test parsing 'y'."""
+        assert _parse_bool("y") is True
+
+    def test_parse_on(self):
+        """Test parsing 'on'."""
+        assert _parse_bool("on") is True
+
+    def test_parse_false_lowercase(self):
+        """Test parsing 'false' (lowercase)."""
+        assert _parse_bool("false") is False
+
+    def test_parse_false_uppercase(self):
+        """Test parsing 'FALSE' (uppercase)."""
+        assert _parse_bool("FALSE") is False
+
+    def test_parse_false_mixed_case(self):
+        """Test parsing 'False' (mixed case)."""
+        assert _parse_bool("False") is False
+
+    def test_parse_zero(self):
+        """Test parsing '0'."""
+        assert _parse_bool("0") is False
+
+    def test_parse_no_lowercase(self):
+        """Test parsing 'no' (lowercase)."""
+        assert _parse_bool("no") is False
+
+    def test_parse_no_uppercase(self):
+        """Test parsing 'NO' (uppercase)."""
+        assert _parse_bool("NO") is False
+
+    def test_parse_no_mixed_case(self):
+        """Test parsing 'No' (mixed case)."""
+        assert _parse_bool("No") is False
+
+    def test_parse_n(self):
+        """Test parsing 'n'."""
+        assert _parse_bool("n") is False
+
+    def test_parse_off(self):
+        """Test parsing 'off'."""
+        assert _parse_bool("off") is False
+
+    def test_parse_invalid_value(self):
+        """Test parsing invalid value raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot parse 'invalid' as boolean"):
+            _parse_bool("invalid")
+
+    def test_parse_empty_string(self):
+        """Test parsing empty string raises ValueError."""
+        with pytest.raises(ValueError):
+            _parse_bool("")
+
+
+class TestParseNone:
+    """Test _parse_none helper function."""
+
+    def test_parse_none_lowercase(self):
+        """Test parsing 'none' (lowercase)."""
+        assert _parse_none("none") is None
+
+    def test_parse_none_uppercase(self):
+        """Test parsing 'NONE' (uppercase)."""
+        assert _parse_none("NONE") is None
+
+    def test_parse_none_mixed_case(self):
+        """Test parsing 'None' (mixed case)."""
+        assert _parse_none("None") is None
+
+    def test_parse_null_lowercase(self):
+        """Test parsing 'null' (lowercase)."""
+        assert _parse_none("null") is None
+
+    def test_parse_null_uppercase(self):
+        """Test parsing 'NULL' (uppercase)."""
+        assert _parse_none("NULL") is None
+
+    def test_parse_null_mixed_case(self):
+        """Test parsing 'Null' (mixed case)."""
+        assert _parse_none("Null") is None
+
+    def test_parse_invalid_value(self):
+        """Test parsing invalid value raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot parse 'invalid' as None"):
+            _parse_none("invalid")
+
+
+class TestLoadConfigFromEnv:
+    """Test load_config_from_env function."""
+
+    def setup_method(self):
+        """Clear relevant environment variables before each test."""
+        # Save original environment
+        self.original_env = os.environ.copy()
+
+    def teardown_method(self):
+        """Restore original environment after each test."""
+        # Restore original environment
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    def test_load_with_no_env_vars(self):
+        """Test loading config with no environment variables uses defaults."""
+        config = load_config_from_env()
+        assert config.gpu_device == 0
+        assert config.warmup_iters == 1
+        assert config.profile_iters == 10
+
+    def test_enabled_default_false(self):
+        """Test that enabled defaults to False when loading from env."""
+        config = load_config_from_env()
+        assert config.enabled is False
+
+    def test_enabled_explicitly_set_true(self):
+        """Test that enabled can be explicitly set to True via env var."""
+        os.environ["FT_ENABLED"] = "1"
+        config = load_config_from_env()
+        assert config.enabled is True
+
+    def test_enabled_explicitly_set_false(self):
+        """Test that enabled can be explicitly set to False via env var."""
+        os.environ["FT_ENABLED"] = "0"
+        config = load_config_from_env()
+        assert config.enabled is False
+
+    def test_enabled_override_with_kwargs(self):
+        """Test that enabled can be overridden with kwargs."""
+        config = load_config_from_env(enabled=True)
+        assert config.enabled is True
+
+    def test_load_int_field(self):
+        """Test loading integer field from environment."""
+        os.environ["FT_GPU_DEVICE"] = "2"
+        config = load_config_from_env()
+        assert config.gpu_device == 2
+
+    def test_load_bool_field_true(self):
+        """Test loading boolean field (True) from environment."""
+        os.environ["FT_ENABLE_TRACING"] = "true"
+        config = load_config_from_env()
+        assert config.enable_tracing is True
+
+    def test_load_bool_field_false(self):
+        """Test loading boolean field (False) from environment."""
+        os.environ["FT_PINNED_MEMORY"] = "false"
+        config = load_config_from_env()
+        assert config.pinned_memory is False
+
+    def test_load_bool_field_case_insensitive(self):
+        """Test loading boolean field with different cases."""
+        os.environ["FT_ENABLE_TRACING"] = "TRUE"
+        config = load_config_from_env()
+        assert config.enable_tracing is True
+
+        os.environ["FT_ENABLE_TRACING"] = "False"
+        config = load_config_from_env()
+        assert config.enable_tracing is False
+
+    def test_load_float_field(self):
+        """Test loading float field from environment."""
+        os.environ["FT_KNAPSACK_SCALE"] = "2.5"
+        config = load_config_from_env()
+        assert config.knapsack_scale == 2.5
+
+    def test_load_string_field(self):
+        """Test loading string field from environment."""
+        os.environ["FT_TRANSFER_MODE"] = "custom_transfer"
+        config = load_config_from_env()
+        assert config.transfer_mode == "custom_transfer"
+
+    def test_load_multiple_fields(self):
+        """Test loading multiple fields from environment."""
+        os.environ["FT_GPU_DEVICE"] = "1"
+        os.environ["FT_WARMUP_ITERS"] = "5"
+        os.environ["FT_PROFILE_ITERS"] = "15"
+        os.environ["FT_ENABLE_TRACING"] = "true"
+
+        config = load_config_from_env()
+        assert config.gpu_device == 1
+        assert config.warmup_iters == 5
+        assert config.profile_iters == 15
+        assert config.enable_tracing is True
+
+    def test_load_with_custom_prefix(self):
+        """Test loading config with custom prefix."""
+        os.environ["CUSTOM_GPU_DEVICE"] = "3"
+        os.environ["CUSTOM_WARMUP_ITERS"] = "7"
+
+        config = load_config_from_env(prefix="CUSTOM_")
+        assert config.gpu_device == 3
+        assert config.warmup_iters == 7
+
+    def test_load_partial_config(self):
+        """Test loading config with only some environment variables set."""
+        os.environ["FT_GPU_DEVICE"] = "2"
+        # Other fields should use defaults
+        config = load_config_from_env()
+        assert config.gpu_device == 2
+        assert config.warmup_iters == 1  # default
+        assert config.profile_iters == 10  # default
+
+    def test_kwargs_override_env_vars(self):
+        """Test that kwargs override environment variables."""
+        os.environ["FT_GPU_DEVICE"] = "1"
+        os.environ["FT_WARMUP_ITERS"] = "5"
+
+        config = load_config_from_env(gpu_device=2, warmup_iters=10)
+        assert config.gpu_device == 2  # kwargs override
+        assert config.warmup_iters == 10  # kwargs override
+
+    def test_invalid_int_raises_error(self):
+        """Test that invalid integer value raises error."""
+        os.environ["FT_GPU_DEVICE"] = "not_an_int"
+
+        with pytest.raises(ValueError, match="Failed to convert FT_GPU_DEVICE"):
+            load_config_from_env()
+
+    def test_invalid_float_raises_error(self):
+        """Test that invalid float value raises error."""
+        os.environ["FT_KNAPSACK_SCALE"] = "not_a_float"
+
+        with pytest.raises(ValueError, match="Failed to convert FT_KNAPSACK_SCALE"):
+            load_config_from_env()
+
+    def test_invalid_bool_raises_error(self):
+        """Test that invalid boolean value raises error."""
+        os.environ["FT_ENABLE_TRACING"] = "not_a_bool"
+
+        with pytest.raises(ValueError, match="Failed to convert FT_ENABLE_TRACING"):
+            load_config_from_env()
+
+    def test_validation_error_propagates(self):
+        """Test that pydantic validation errors are raised."""
+        os.environ["FT_GPU_DEVICE"] = "-1"  # Invalid: must be >= 0
+
+        with pytest.raises(ValidationError):
+            load_config_from_env()
+
+    def test_all_bool_fields(self):
+        """Test loading all boolean fields from environment."""
+        os.environ["FT_PINNED_MEMORY"] = "false"
+        os.environ["FT_ENABLE_DIRECT_MODE"] = "false"
+        os.environ["FT_RELEASE_TENSORS"] = "false"
+        os.environ["FT_REARRANGE_TRANSFERS"] = "true"
+        os.environ["FT_ENABLE_TRACING"] = "true"
+
+        config = load_config_from_env()
+        assert config.pinned_memory is False
+        assert config.enable_direct_mode is False
+        assert config.release_tensors is False
+        assert config.rearrange_transfers is True
+        assert config.enable_tracing is True
+
+    def test_min_blocks_from_env(self):
+        """Test loading min_blocks from FT_MIN_BLOCKS env var."""
+        os.environ["FT_MIN_BLOCKS"] = "3"
+        config = load_config_from_env()
+        assert config.min_blocks == 3
+
+    def test_max_gpu_mem_bytes_from_env(self):
+        """Test loading max_gpu_mem_bytes from FT_MAX_GPU_MEM_BYTES env var."""
+        os.environ["FT_MAX_GPU_MEM_BYTES"] = str(48 * 1024**3)
+        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
+            config = load_config_from_env()
+            assert config.max_gpu_mem_bytes == 48 * 1024**3
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_bytes_none_from_env(self):
+        """Test setting max_gpu_mem_bytes to None via FT_MAX_GPU_MEM_BYTES=none."""
+        os.environ["FT_MAX_GPU_MEM_BYTES"] = "none"
+        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
+            config = load_config_from_env()
+            assert config.max_gpu_mem_bytes is None
+
+    def test_max_gpu_mem_fraction_from_env(self):
+        """Test loading max_gpu_mem_fraction from FT_MAX_GPU_MEM_FRACTION env var."""
+        os.environ["FT_MAX_GPU_MEM_FRACTION"] = "0.75"
+        config = load_config_from_env()
+        assert config.max_gpu_mem_fraction == 0.75
+
+    def test_max_gpu_mem_fraction_none_from_env(self):
+        """Test setting max_gpu_mem_fraction to None via FT_MAX_GPU_MEM_FRACTION=none."""
+        os.environ["FT_MAX_GPU_MEM_FRACTION"] = "none"
+        config = load_config_from_env()
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_bytes_and_fraction_env_both_set_raises(self):
+        """Setting both FT_MAX_GPU_MEM_BYTES and FT_MAX_GPU_MEM_FRACTION raises."""
+        os.environ["FT_MAX_GPU_MEM_BYTES"] = str(20 * 1024**3)
+        os.environ["FT_MAX_GPU_MEM_FRACTION"] = "0.8"
+        with pytest.raises(ValidationError, match="Cannot set both"):
+            load_config_from_env()
+
+    def test_all_int_fields(self):
+        """Test loading all integer fields from environment."""
+        os.environ["FT_GPU_DEVICE"] = "3"
+        os.environ["FT_WARMUP_ITERS"] = "8"
+        os.environ["FT_PROFILE_ITERS"] = "25"
+        os.environ["FT_COMPUTE_TRANSFER_GAP"] = "5"
+        os.environ["FT_NUM_BLOCKS"] = "10"
+        os.environ["FT_MIN_BLOCKS"] = "3"
+
+        config = load_config_from_env()
+        assert config.gpu_device == 3
+        assert config.warmup_iters == 8
+        assert config.profile_iters == 25
+        assert config.compute_transfer_gap == 5
+        assert config.num_blocks == 10
+        assert config.min_blocks == 3
+
+    def test_all_float_fields(self):
+        """Test loading all float fields from environment."""
+        os.environ["FT_KNAPSACK_SCALE"] = "2.5"
+
+        config = load_config_from_env()
+        assert config.knapsack_scale == 2.5
+
+    def test_bool_variations_yes_no(self):
+        """Test boolean parsing with 'yes' and 'no'."""
+        os.environ["FT_ENABLE_TRACING"] = "yes"
+        config = load_config_from_env()
+        assert config.enable_tracing is True
+
+        os.environ["FT_ENABLE_TRACING"] = "no"
+        config = load_config_from_env()
+        assert config.enable_tracing is False
+
+    def test_bool_variations_one_zero(self):
+        """Test boolean parsing with '1' and '0'."""
+        os.environ["FT_ENABLE_TRACING"] = "1"
+        config = load_config_from_env()
+        assert config.enable_tracing is True
+
+        os.environ["FT_ENABLE_TRACING"] = "0"
+        config = load_config_from_env()
+        assert config.enable_tracing is False
+
+    def test_load_strategy_field_skipped(self):
+        """Test that load_strategy field is skipped (complex type)."""
+        # load_strategy is a complex type that can't be set via env vars
+        os.environ["FT_LOAD_STRATEGY"] = "something"
+        config = load_config_from_env()
+        # Should ignore the env var and use default (None)
+        assert config.load_strategy is None
+
+    def test_mixed_env_and_kwargs_with_validation(self):
+        """Test mixed environment and kwargs with validation."""
+        os.environ["FT_GPU_DEVICE"] = "1"
+
+        config = load_config_from_env(warmup_iters=20, enable_tracing=True)
+        assert config.gpu_device == 1  # from env
+        assert config.warmup_iters == 20  # from kwargs
+        assert config.enable_tracing is True  # from kwargs
+
+    def test_module_patterns_from_env(self):
+        """Test loading module_patterns from FT_MODULE_PATTERNS env var."""
+        os.environ["FT_MODULE_PATTERNS"] = "layers.*,head"
+        config = load_config_from_env()
+        assert config.module_patterns == ["layers.*", "head"]
+
+    def test_module_patterns_from_env_with_spaces(self):
+        """Test loading module_patterns with spaces in env var."""
+        os.environ["FT_MODULE_PATTERNS"] = "layers.*, head , model.norm"
+        config = load_config_from_env()
+        assert config.module_patterns == ["layers.*", "head", "model.norm"]
+
+    def test_module_patterns_from_env_single(self):
+        """Test loading single module pattern from env var."""
+        os.environ["FT_MODULE_PATTERNS"] = "model.*"
+        config = load_config_from_env()
+        assert config.module_patterns == ["model.*"]
+
+    def test_module_patterns_from_env_wildcard(self):
+        """Test loading wildcard module pattern from env var."""
+        os.environ["FT_MODULE_PATTERNS"] = "*"
+        config = load_config_from_env()
+        assert config.module_patterns == ["*"]
+
+    def test_module_patterns_kwargs_override_env(self):
+        """Test that kwargs override env var for module_patterns."""
+        os.environ["FT_MODULE_PATTERNS"] = "layers.*"
+        config = load_config_from_env(module_patterns=["custom.*"])
+        assert config.module_patterns == ["custom.*"]
+
+
+class TestLoadConfigFromFile:
+    """Test load_config_from_file function."""
+
+    def setup_method(self):
+        """Clear relevant environment variables before each test."""
+        self.original_env = os.environ.copy()
+
+    def teardown_method(self):
+        """Restore original environment after each test."""
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    def test_load_ini_file(self, tmp_path):
+        """Test loading config from INI file."""
+        config_file = tmp_path / "test.conf"
+        config_file.write_text("""[flextensor]
+enabled = true
+gpu_device = 2
+warmup_iters = 5
+enable_tracing = true
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 2
+        assert config.warmup_iters == 5
+        assert config.enable_tracing is True
+
+    def test_load_ini_file_with_ini_extension(self, tmp_path):
+        """Test loading config from .ini file."""
+        config_file = tmp_path / "test.ini"
+        config_file.write_text("""[flextensor]
+enabled = true
+gpu_device = 3
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 3
+
+    def test_load_json_file(self, tmp_path):
+        """Test loading config from JSON file."""
+        config_file = tmp_path / "test.json"
+        config_file.write_text("""{
+    "enabled": true,
+    "gpu_device": 4,
+    "warmup_iters": 8,
+    "enable_tracing": false
+}""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 4
+        assert config.warmup_iters == 8
+        assert config.enable_tracing is False
+
+    def test_load_yaml_file(self, tmp_path):
+        """Test loading config from YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 5
+warmup_iters: 10
+enable_tracing: true
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 5
+        assert config.warmup_iters == 10
+        assert config.enable_tracing is True
+
+    def test_load_yml_file(self, tmp_path):
+        """Test loading config from .yml file."""
+        config_file = tmp_path / "test.yml"
+        config_file.write_text("""enabled: false
+gpu_device: 6
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is False
+        assert config.gpu_device == 6
+
+    def test_load_from_env_var(self, tmp_path):
+        """Test loading config from FT_CONFIG_FILE env var."""
+        config_file = tmp_path / "env_test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 7
+""")
+        os.environ["FT_CONFIG_FILE"] = str(config_file)
+        config = load_config_from_file()
+        assert config.enabled is True
+        assert config.gpu_device == 7
+
+    def test_load_from_custom_env_var(self, tmp_path):
+        """Test loading config from custom env var."""
+        config_file = tmp_path / "custom_env.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 8
+""")
+        os.environ["MY_CONFIG_FILE"] = str(config_file)
+        config = load_config_from_file(env_var="MY_CONFIG_FILE")
+        assert config.enabled is True
+        assert config.gpu_device == 8
+
+    def test_kwargs_override_file_values(self, tmp_path):
+        """Test that kwargs override file values."""
+        config_file = tmp_path / "override.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 1
+warmup_iters: 5
+""")
+        config = load_config_from_file(config_file, gpu_device=10, warmup_iters=20)
+        assert config.enabled is True  # from file
+        assert config.gpu_device == 10  # from kwargs
+        assert config.warmup_iters == 20  # from kwargs
+
+    def test_file_not_found(self):
+        """Test that FileNotFoundError is raised for missing file."""
+        with pytest.raises(FileNotFoundError, match="Config file not found"):
+            load_config_from_file("/nonexistent/path/config.yaml")
+
+    def test_no_config_specified(self):
+        """Test that FileNotFoundError is raised when no config specified."""
+        with pytest.raises(FileNotFoundError, match="No config file specified"):
+            load_config_from_file()
+
+    def test_unsupported_format(self, tmp_path):
+        """Test that ValueError is raised for unsupported format."""
+        config_file = tmp_path / "test.txt"
+        config_file.write_text("some content")
+        with pytest.raises(ValueError, match="Unsupported config file format"):
+            load_config_from_file(config_file)
+
+    def test_ini_missing_section(self, tmp_path):
+        """Test that ValueError is raised for INI file without [flextensor] section."""
+        config_file = tmp_path / "bad.conf"
+        config_file.write_text("""[other_section]
+gpu_device = 1
+""")
+        with pytest.raises(ValueError, match="must contain"):
+            load_config_from_file(config_file)
+
+    def test_partial_config_file(self, tmp_path):
+        """Test loading file with only some fields uses defaults for rest."""
+        config_file = tmp_path / "partial.yaml"
+        config_file.write_text("""gpu_device: 3
+""")
+        config = load_config_from_file(config_file)
+        assert config.gpu_device == 3
+        assert config.warmup_iters == 1  # default
+        assert config.enabled is True  # default (not False like env loading)
+
+    def test_json_with_string_values(self, tmp_path):
+        """Test loading JSON with string values that need conversion."""
+        config_file = tmp_path / "string_vals.json"
+        config_file.write_text("""{
+    "enabled": "true",
+    "gpu_device": "5",
+    "knapsack_scale": "1.5"
+}""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 5
+        assert config.knapsack_scale == 1.5
+
+    def test_yaml_with_string_values(self, tmp_path):
+        """Test loading YAML with string values that need conversion."""
+        config_file = tmp_path / "string_vals.yaml"
+        config_file.write_text("""enabled: "yes"
+gpu_device: "6"
+knapsack_scale: "1.5"
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 6
+        assert config.knapsack_scale == 1.5
+
+    def test_empty_yaml_file(self, tmp_path):
+        """Test loading empty YAML file uses all defaults."""
+        config_file = tmp_path / "empty.yaml"
+        config_file.write_text("")
+        config = load_config_from_file(config_file)
+        assert config.gpu_device == 0  # default
+        assert config.enabled is True  # default
+
+    def test_path_object(self, tmp_path):
+        """Test that Path object works as config_path."""
+        config_file = tmp_path / "path_test.yaml"
+        config_file.write_text("""gpu_device: 9
+""")
+        config = load_config_from_file(Path(config_file))
+        assert config.gpu_device == 9
+
+    def test_string_path(self, tmp_path):
+        """Test that string path works as config_path."""
+        config_file = tmp_path / "string_test.yaml"
+        config_file.write_text("""gpu_device: 11
+""")
+        config = load_config_from_file(str(config_file))
+        assert config.gpu_device == 11
+
+    def test_all_fields_ini(self, tmp_path):
+        """Test loading all supported fields from INI file."""
+        config_file = tmp_path / "all_fields.conf"
+        config_file.write_text("""[flextensor]
+enabled = true
+gpu_device = 1
+pinned_memory = false
+warmup_iters = 3
+profile_iters = 15
+knapsack_scale = 2.0
+transfer_mode = custom_mode
+enable_direct_mode = false
+release_tensors = false
+rearrange_transfers = true
+compute_transfer_gap = 2
+num_blocks = 8
+enable_tracing = true
+""")
+        config = load_config_from_file(config_file)
+        assert config.enabled is True
+        assert config.gpu_device == 1
+        assert config.pinned_memory is False
+        assert config.warmup_iters == 3
+        assert config.profile_iters == 15
+        assert config.knapsack_scale == 2.0
+        assert config.transfer_mode == "custom_mode"
+        assert config.enable_direct_mode is False
+        assert config.release_tensors is False
+        assert config.rearrange_transfers is True
+        assert config.compute_transfer_gap == 2
+        assert config.num_blocks == 8
+        assert config.enable_tracing is True
+
+    def test_validation_error_from_file(self, tmp_path):
+        """Test that pydantic validation errors are raised for invalid values in file."""
+        config_file = tmp_path / "invalid.yaml"
+        config_file.write_text("""gpu_device: -1
+""")
+        with pytest.raises(ValidationError):
+            load_config_from_file(config_file)
+
+    def test_min_blocks_from_yaml_file(self, tmp_path):
+        """Test loading min_blocks from YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""min_blocks: 3
+""")
+        config = load_config_from_file(config_file)
+        assert config.min_blocks == 3
+
+    def test_max_gpu_mem_bytes_from_yaml_file(self, tmp_path):
+        """Test loading max_gpu_mem_bytes from YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""max_gpu_mem_bytes: 51539607552
+""")
+        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
+            config = load_config_from_file(config_file)
+            assert config.max_gpu_mem_bytes == 48 * 1024**3
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_bytes_null_from_yaml_file(self, tmp_path):
+        """Test that max_gpu_mem_bytes defaults to None when absent from YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""gpu_device: 0
+""")
+        config = load_config_from_file(config_file)
+        with pytest.warns(DeprecationWarning):
+            assert config.max_gpu_mem_bytes is None
+
+    def test_min_blocks_and_max_gpu_mem_bytes_from_json_file(self, tmp_path):
+        """Test loading min_blocks and max_gpu_mem_bytes from JSON file."""
+        config_file = tmp_path / "test.json"
+        config_file.write_text("""{
+    "min_blocks": 2,
+    "max_gpu_mem_bytes": 85899345920
+}""")
+        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
+            config = load_config_from_file(config_file)
+            assert config.max_gpu_mem_bytes == 80 * 1024**3
+        assert config.min_blocks == 2
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_fraction_from_yaml_file(self, tmp_path):
+        """Test loading max_gpu_mem_fraction from YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("max_gpu_mem_fraction: 0.8\n")
+        config = load_config_from_file(config_file)
+        assert config.max_gpu_mem_fraction == 0.8
+
+    def test_max_gpu_mem_fraction_none_from_yaml_file(self, tmp_path):
+        """Test that max_gpu_mem_fraction: null in YAML file results in None."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("max_gpu_mem_fraction: null\n")
+        config = load_config_from_file(config_file)
+        assert config.max_gpu_mem_fraction is None
+
+    def test_max_gpu_mem_fraction_default_when_absent_from_yaml(self, tmp_path):
+        """Test that max_gpu_mem_fraction defaults to 0.9 when not in YAML file."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("gpu_device: 0\n")
+        config = load_config_from_file(config_file)
+        assert config.max_gpu_mem_fraction == 0.9
+
+    def test_max_gpu_mem_fraction_from_json_file(self, tmp_path):
+        """Test loading max_gpu_mem_fraction from JSON file."""
+        config_file = tmp_path / "test.json"
+        config_file.write_text('{"max_gpu_mem_fraction": 0.6}')
+        config = load_config_from_file(config_file)
+        assert config.max_gpu_mem_fraction == 0.6
+
+    def test_module_patterns_from_yaml_file(self, tmp_path):
+        """Test loading module_patterns from YAML file."""
+        config_file = tmp_path / "patterns.yaml"
+        config_file.write_text("""module_patterns:
+  - "layers.*"
+  - "head"
+  - "norm"
+""")
+        config = load_config_from_file(config_file)
+        assert config.module_patterns == ["layers.*", "head", "norm"]
+
+    def test_module_patterns_from_json_file(self, tmp_path):
+        """Test loading module_patterns from JSON file."""
+        config_file = tmp_path / "patterns.json"
+        config_file.write_text("""{
+    "module_patterns": ["model.*", "lm_head"]
+}""")
+        config = load_config_from_file(config_file)
+        assert config.module_patterns == ["model.*", "lm_head"]
+
+    def test_module_patterns_default_when_not_in_file(self, tmp_path):
+        """Test that module_patterns uses default when not in config file."""
+        config_file = tmp_path / "no_patterns.yaml"
+        config_file.write_text("""gpu_device: 1
+""")
+        config = load_config_from_file(config_file)
+        assert config.module_patterns == ["*"]  # default
+
+
+class TestGetFieldTypes:
+    """Test _get_field_types helper function."""
+
+    def test_returns_dict(self):
+        """Test that _get_field_types returns a dictionary."""
+        field_types = _get_field_types()
+        assert isinstance(field_types, dict)
+
+    def test_contains_all_fields(self):
+        """Test that all OffloadConfig fields are present."""
+        field_types = _get_field_types()
+        for field_name in OffloadConfig.model_fields:
+            assert field_name in field_types
+
+    def test_bool_fields(self):
+        """Test that boolean fields are correctly identified."""
+        field_types = _get_field_types()
+        assert field_types["enabled"] is bool
+        assert field_types["pinned_memory"] is bool
+        assert field_types["enable_tracing"] is bool
+
+    def test_int_fields(self):
+        """Test that integer fields are correctly identified."""
+        field_types = _get_field_types()
+        assert field_types["gpu_device"] is int
+        assert field_types["warmup_iters"] is int
+        assert field_types["num_blocks"] is int
+        assert field_types["min_blocks"] is int
+
+    def test_optional_int_fields(self):
+        """Test that optional int fields (int | None) are correctly identified as int."""
+        field_types = _get_field_types()
+        assert field_types["max_gpu_mem_bytes"] is int
+
+    def test_float_fields(self):
+        """Test that float fields are correctly identified."""
+        field_types = _get_field_types()
+        assert field_types["knapsack_scale"] is float
+        assert field_types["max_gpu_mem_fraction"] is float
+
+    def test_str_fields(self):
+        """Test that string fields are correctly identified."""
+        field_types = _get_field_types()
+        assert field_types["transfer_mode"] is str
+
+    def test_complex_fields(self):
+        """Test that complex fields (like strategies) are marked as object."""
+        field_types = _get_field_types()
+        assert field_types["load_strategy"] is object
+
+
+class TestLoadConfig:
+    """Test unified load_config function with file + env + kwargs precedence."""
+
+    def setup_method(self):
+        """Clear relevant environment variables before each test."""
+        self.original_env = os.environ.copy()
+
+    def teardown_method(self):
+        """Restore original environment after each test."""
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    def test_env_only_no_file(self):
+        """Test loading from env only when no file is specified."""
+        os.environ["FT_GPU_DEVICE"] = "5"
+        config = load_config()
+        assert config.gpu_device == 5
+        assert config.enabled is False  # default when env-only
+
+    def test_env_only_enabled_default_false(self):
+        """Test that enabled defaults to False when loading from env only."""
+        config = load_config()
+        assert config.enabled is False
+
+    def test_env_override_file(self, tmp_path):
+        """Test that env vars override file values."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 1
+warmup_iters: 5
+""")
+        os.environ["FT_GPU_DEVICE"] = "10"
+
+        config = load_config(config_path=config_file)
+        assert config.enabled is True  # from file
+        assert config.gpu_device == 10  # from env (overrides file)
+        assert config.warmup_iters == 5  # from file
+
+    def test_kwargs_override_env_and_file(self, tmp_path):
+        """Test that kwargs override both env and file values."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 1
+warmup_iters: 5
+""")
+        os.environ["FT_GPU_DEVICE"] = "10"
+        os.environ["FT_WARMUP_ITERS"] = "15"
+
+        config = load_config(config_path=config_file, gpu_device=20, warmup_iters=25)
+        assert config.enabled is True  # from file
+        assert config.gpu_device == 20  # from kwargs (overrides env and file)
+        assert config.warmup_iters == 25  # from kwargs (overrides env and file)
+
+    def test_file_with_use_env_false(self, tmp_path):
+        """Test file loading without env override when use_env=False."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 1
+""")
+        os.environ["FT_GPU_DEVICE"] = "10"
+
+        config = load_config(config_path=config_file, use_env=False)
+        assert config.enabled is True  # from file
+        assert config.gpu_device == 1  # from file (env not used)
+
+    def test_file_from_env_var(self, tmp_path):
+        """Test loading file path from FT_CONFIG_FILE env var."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 7
+""")
+        os.environ["FT_CONFIG_FILE"] = str(config_file)
+
+        config = load_config()
+        assert config.enabled is True
+        assert config.gpu_device == 7
+
+    def test_file_from_env_var_with_env_override(self, tmp_path):
+        """Test file from env var with additional env overrides."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: true
+gpu_device: 1
+warmup_iters: 5
+""")
+        os.environ["FT_CONFIG_FILE"] = str(config_file)
+        os.environ["FT_GPU_DEVICE"] = "10"
+
+        config = load_config()
+        assert config.enabled is True  # from file
+        assert config.gpu_device == 10  # from env (overrides file)
+        assert config.warmup_iters == 5  # from file
+
+    def test_custom_env_prefix(self, tmp_path):
+        """Test using custom env prefix."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""gpu_device: 1
+""")
+        os.environ["CUSTOM_GPU_DEVICE"] = "20"
+
+        config = load_config(config_path=config_file, env_prefix="CUSTOM_")
+        assert config.gpu_device == 20
+
+    def test_file_not_found(self):
+        """Test FileNotFoundError for missing file."""
+        with pytest.raises(FileNotFoundError, match="Config file not found"):
+            load_config(config_path="/nonexistent/path.yaml")
+
+    def test_file_not_found_from_env_var(self, tmp_path):
+        """Test FileNotFoundError when FT_CONFIG_FILE points to missing file."""
+        os.environ["FT_CONFIG_FILE"] = "/nonexistent/path.yaml"
+        with pytest.raises(FileNotFoundError, match="Config file not found"):
+            load_config()
+
+    def test_full_precedence_chain(self, tmp_path):
+        """Test full precedence: file < env < kwargs."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: false
+gpu_device: 1
+warmup_iters: 5
+profile_iters: 10
+""")
+        os.environ["FT_GPU_DEVICE"] = "2"
+        os.environ["FT_WARMUP_ITERS"] = "10"
+        os.environ["FT_PROFILE_ITERS"] = "20"
+
+        config = load_config(
+            config_path=config_file,
+            warmup_iters=15,
+            profile_iters=25,
+        )
+
+        # enabled: from file (not overridden)
+        assert config.enabled is False
+        # gpu_device: from env (overrides file)
+        assert config.gpu_device == 2
+        # warmup_iters: from kwargs (overrides env and file)
+        assert config.warmup_iters == 15
+        # profile_iters: from kwargs (overrides env and file)
+        assert config.profile_iters == 25
+
+    def test_enabled_from_env_overrides_file(self, tmp_path):
+        """Test that FT_ENABLED from env overrides file value."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("""enabled: false
+""")
+        os.environ["FT_ENABLED"] = "1"
+
+        config = load_config(config_path=config_file)
+        assert config.enabled is True  # from env (overrides file)
+
+
+class TestShmConfigFields:
+    """Test new SHM config fields on OffloadConfig."""
+
+    def test_shm_config_fields_exist(self):
+        """New SHM config fields have correct defaults."""
+        config = OffloadConfig()
+        assert config.shm_enabled is False
+        assert config.shm_namespace is None
+        assert config.shm_wait_timeout == 0.0
+
+    def test_shm_enabled_replaces_use_shared_memory(self):
+        """shm_enabled is the canonical field; use_shared_memory is deprecated alias."""
+        config = OffloadConfig(shm_enabled=True)
+        assert config.shm_enabled is True
+        # Backward compat: use_shared_memory still readable (access warns, that's expected)
+        with pytest.warns(DeprecationWarning):
+            assert config.use_shared_memory is True
+
+    def test_use_shared_memory_sets_shm_enabled(self):
+        """Deprecated use_shared_memory sets shm_enabled."""
+        with pytest.warns(DeprecationWarning):
+            config = OffloadConfig(use_shared_memory=True)
+        assert config.shm_enabled is True
+
+    def test_use_shared_memory_warns_on_construction(self):
+        """Passing use_shared_memory emits DeprecationWarning at construction time."""
+        with pytest.warns(DeprecationWarning, match="use_shared_memory"):
+            OffloadConfig(use_shared_memory=True)
+
+    def test_use_shared_memory_warns_on_access(self):
+        """Reading use_shared_memory on an instance emits DeprecationWarning."""
+        config = OffloadConfig(shm_enabled=True)
+        with pytest.warns(DeprecationWarning, match="use_shared_memory"):
+            _ = config.use_shared_memory
+
+    def test_shm_enabled_construction_no_warning(self):
+        """Constructing with shm_enabled (the new field) emits no deprecation warning."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            OffloadConfig(shm_enabled=True)  # must not raise
+
+    def test_shm_env_vars_loaded(self, monkeypatch):
+        """FT_SHM_* env vars populate config fields."""
+        monkeypatch.setenv("FT_SHM_ENABLED", "1")
+        monkeypatch.setenv("FT_SHM_NAMESPACE", "my_model")
+        monkeypatch.setenv("FT_SHM_WAIT_TIMEOUT", "300")
+        config = load_config_from_env()
+        assert config.shm_enabled is True
+        assert config.shm_namespace == "my_model"
+        assert config.shm_wait_timeout == 300.0

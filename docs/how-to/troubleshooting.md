@@ -1,0 +1,493 @@
+<!--
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+-->
+# How to Troubleshoot FlexTensor
+
+This guide provides practical solutions to common problems you may encounter when using FlexTensor. Each section focuses on a specific troubleshooting scenario with step-by-step instructions to diagnose and resolve issues.
+
+**When to use this guide**: You're experiencing unexpected behavior, errors, or need to inspect FlexTensor's internal operations for debugging.
+
+## Prerequisites
+
+- FlexTensor installed
+- A model configured for offloading
+- Basic familiarity with FlexTensor's configuration (see [Quick Start](../quick-start.md))
+
+---
+
+## Debug Component Initialization
+
+**Problem**: You need to understand what configuration values FlexTensor is using internally, verify that components are initialized correctly, or debug unexpected behavior during offloading setup.
+
+**Solution**: Use FlexTensor's instrumentation system to capture all initialization arguments and configuration values used by internal components.
+
+### When to Use This Approach
+
+Use instrumentation debugging when:
+- Component initialization fails with unclear error messages
+- You suspect configuration values aren't being applied correctly
+- You need to verify which strategy or loader is being used
+- You're reporting a bug and need detailed diagnostic information
+
+### Steps
+
+#### 1. Enable Instrumentation in Your Config
+
+Set `enable_instrumentation=True` in your `OffloadConfig`:
+
+```python
+from flextensor import OffloadConfig, offload
+
+config = OffloadConfig(
+    enable_instrumentation=True,
+    module_patterns=["layers.*"],
+    # ... your other settings
+)
+
+model = offload(model, config=config)
+```
+
+**Alternative: Use environment variables**
+
+You can also enable instrumentation via environment variables without modifying code:
+
+```bash
+export FT_ENABLE_INSTRUMENTATION=1
+export FT_INSTRUMENTATION_OUTPUT_DIR=/tmp/my_debug_output  # optional
+```
+
+Then load the config from environment:
+
+```python
+from flextensor import load_config, offload
+
+config = load_config()  # reads FT_* environment variables
+model = offload(model, config=config)
+```
+
+#### 2. Run Your Model Through Warmup and Profiling
+
+Execute your model for the configured number of warmup and profile iterations:
+
+```python
+for _ in range(config.warmup_iters + config.profile_iters):
+    output = model(input_data)
+```
+
+When FlexTensor transitions to inference state, it automatically dumps the instrumentation data.
+
+#### 3. Locate the Output File
+
+The instrumentation data is written to the `instrumentation_output_dir` directory (default: `.flextensor/instrumentation`). The file structure is:
+
+```
+.flextensor/
+└── instrumentation/
+    └── 20251209_143052/
+        └──── components.20251209_143052_pid12345.json
+```
+
+Each run creates a timestamped subdirectory with the JSON file inside.
+
+#### 4. Interpret the Captured Data
+
+The JSON file contains:
+
+```json
+{
+  "timestamp": "2025-12-09T14:30:52.123456",
+  "flextensor_version": "0.1.0",
+  "host_memory": {
+    "host_memory_total": 270122237952,
+    "host_memory_used": 13204619264,
+    "host_memory_available": 256917618688,
+    "swap_total": 8589934592,
+    "swap_used": 107374182,
+    "swap_free": 8482560410
+  },
+  "components": [
+    {
+      "class_name": "KnapsackStrategy",
+      "module_path": "flextensor.strategy.KnapsackStrategy",
+      "init_timestamp": "2025-12-09T14:30:50.100000",
+      "args": {
+        "scale": 1.0,
+        "cyclic": false,
+        "group_size": 1,
+        "threshold_mb": 0.1
+      }
+    },
+    {
+      "class_name": "TensorManager",
+      "module_path": "flextensor.tensor_manager.TensorManager",
+      "init_timestamp": "2025-12-09T14:30:50.200000",
+      "args": {
+        "device_gpu": "cuda:0",
+        "pinned_memory": true,
+        "loader_type": "allocation_block_transfer",
+        "release_tensors": true,
+        "direct_mode": true
+      }
+    }
+  ],
+  "memory_transfer_stats": {
+    "1024": 0.015,
+    "4096": 0.023,
+    "1048576": 0.187
+  }
+}
+```
+
+Each component record includes:
+- `class_name`: The component class
+- `module_path`: Full module path
+- `init_timestamp`: When the component was initialized
+- `args`: All initialization arguments with their values
+
+The `host_memory` object captures a point-in-time snapshot of host physical memory (`host_memory_*`) and swap space (`swap_*`) at the time the dump is written. All values are in bytes. Divide by `1024 ** 3` to convert to GiB.
+
+The `memory_transfer_stats` object maps tensor sizes (bytes) to GPU↔CPU transfer times (ms), as measured during profiling. This key is present when the dump is written at inference transition (the automatic path); it may be absent in manual dumps.
+
+### Advanced Options
+
+#### Manual Dump
+
+To dump instrumentation data at any point (not just at inference transition):
+
+```python
+from flextensor.instrumentation import dump_instrumentation
+
+dump_instrumentation("/path/to/dir")
+```
+
+#### Custom Output Directory
+
+Change the output location via config:
+
+```python
+config = OffloadConfig(
+    enable_instrumentation=True,
+    instrumentation_output_dir="/tmp/my_debug_output",
+)
+```
+
+#### Disable Instrumentation
+
+For production, ensure instrumentation is disabled (the default):
+
+```python
+config = OffloadConfig(
+    enable_instrumentation=False,  # default
+)
+```
+
+Or simply omit the `enable_instrumentation` parameter.
+
+---
+
+## Resolve Out-of-Memory Errors
+
+**Problem**: CUDA out-of-memory errors during warmup, profiling, or inference.
+
+### Step 1: Narrow the module patterns
+
+If `module_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, narrow the scope. For example, when using the vLLM worker with a LLaMA-style model, these patterns target each transformer layer and special modules while leaving the rest unaffected:
+
+```python
+config = OffloadConfig(
+    module_patterns=[
+        "model.embed_tokens",
+        "model.layers.*",
+        "model.norm",
+        "lm_head",
+    ],
+)
+```
+
+For models with a different structure, use `model.named_modules()` to inspect module names and adapt the patterns accordingly.
+
+### Step 2: Reduce the number of transfer blocks
+
+Fewer pre-allocated GPU blocks reduces peak memory during block-based transfer:
+
+```python
+config = OffloadConfig(
+    transfer_mode="allocation_block_transfer",
+    num_blocks=2,   # Reduce from the default of 4
+)
+```
+
+If memory errors persist after these steps, check that no other processes are holding GPU memory:
+
+```bash
+nvidia-smi
+```
+
+---
+
+## Fix CUDA Device Mismatch Errors
+
+**Problem**: A runtime error such as `RuntimeError: Expected all tensors to be on the same device` during inference.
+
+This typically occurs when FlexTensor offloads a tensor but a custom kernel (for example, a Triton or CUDA kernel) accesses a related metadata tensor that was not discovered during warmup.
+
+### Step 1: Verify tensor discovery is enabled
+
+```python
+config = OffloadConfig(
+    enable_untraced_tensor_discovery=True,  # default
+    enable_module_tracker=True,             # default
+)
+```
+
+Both options are enabled by default. If you disabled them, re-enable them.
+
+### Step 2: Use the `offload()` API with forward patching
+
+Auto trap discovery (the most reliable strategy) only activates when you use `flextensor.offload()` with explicit `module_patterns`:
+
+```python
+config = OffloadConfig(module_patterns=["layers.*"])
+model = flextensor.offload(model, config=config)
+```
+
+Using manual `offload_block` context managers without forward patching relies on Module Tracker or Prefix Matching, which may miss tensors with unconventional naming.
+
+### Step 3: Debug with instrumentation
+
+Enable debug instrumentation to capture component initialization details and verify the tensor-to-layer mapping:
+
+```python
+config = OffloadConfig(
+    enable_instrumentation=True,
+    module_patterns=["layers.*"],
+)
+model = offload(model, config=config)
+```
+
+See [Debug Component Initialization](#debug-component-initialization) for how to interpret the output.
+
+For a detailed explanation of how tensor discovery works, see [Tensor Discovery](../explanation/tensor-discovery.md).
+
+---
+
+## Diagnose High Performance Overhead
+
+**Problem**: Model inference is slower than expected. FlexTensor targets less than 5% latency overhead over a baseline without offloading.
+
+### Step 1: Check that inference state has been reached
+
+Warmup and profile iterations are intentionally slower—overhead measurements are only meaningful after all warmup and profile iterations complete:
+
+```python
+config = OffloadConfig(warmup_iters=1, profile_iters=10)
+model = flextensor.offload(model, config=config)
+
+# First warmup_iters + profile_iters iterations are measurement phases
+for i, batch in enumerate(dataloader):
+    output = model(batch)
+    if i == config.warmup_iters + config.profile_iters:
+        print("Inference state reached — timing is now production overhead")
+```
+
+### Step 2: Increase profile iterations for noisy environments
+
+On shared or cloud GPUs, thermal throttling and multi-tenancy can cause noisy timing data. Increase `profile_iters` for a more accurate strategy:
+
+```python
+config = OffloadConfig(profile_iters=20)  # default: 10
+```
+
+### Step 3: Tune transfer mode and block count
+
+The `allocation_block_transfer` mode with more blocks can reduce stalls by overlapping transfers with computation:
+
+```python
+config = OffloadConfig(
+    transfer_mode="allocation_block_transfer",
+    num_blocks=8,                  # More blocks = more parallelism
+    rearrange_transfers=True,      # Schedule transfers earlier
+    compute_transfer_gap=2,        # Initiate transfer 2 layers ahead
+)
+```
+
+---
+
+## Fix Unexpected Behavior After Modifying a Patched Model
+
+**Problem**: You added, removed, or replaced a module in your model after calling `offload()`, and the new module is not being offloaded, or you observe incorrect behavior such as device mismatch errors or missing tensor coverage.
+
+### Why This Happens
+
+When you call `flextensor.offload(model, config=config)`, FlexTensor patches the `forward` methods of matched modules and builds a tensor-to-layer map during warmup. This map is fixed at the end of the warmup state. Any module added to the model after `offload()` is called is not part of that map and will not be offloaded.
+
+```python
+# BAD: new layer is not covered by offloading
+config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+model = flextensor.offload(model, config=config)
+model.layers.append(NewLayer())  # NewLayer will not be offloaded
+```
+
+### Solution: Release and Re-apply Offloading
+
+Call `release()` on the offload manager to remove all patches and clear the tensor map, modify the model, then call `offload()` again:
+
+```python
+import flextensor
+
+config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+
+# GOOD: patch after all modifications are done
+model.layers.append(NewLayer())
+model = flextensor.offload(model, config=config)
+```
+
+If you have already called `offload()` and need to modify the model afterward:
+
+```python
+import flextensor
+
+config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+model = flextensor.offload(model, config=config)
+
+# Later: modify the model
+om = flextensor.get_offload_manager()
+om.release()                          # Remove all patches and tensor map
+model.layers.append(NewLayer())
+model = flextensor.offload(model, config=config)  # Re-apply
+```
+
+### Prevention
+
+The safest approach is to finalize your model architecture before calling `offload()`. Apply all `append`, `insert`, `pop`, or attribute assignments to the model before patching it.
+
+---
+
+## Fix Cross-Thread Manager Access Errors
+
+**Problem**: A `RuntimeError` with a message like `OffloadManager 'default' belongs to thread 12345, but accessed from thread 67890`, or silent data corruption when using FlexTensor from multiple threads.
+
+!!! danger "FlexTensor is not thread-safe"
+    The entire offloading lifecycle — setup, warmup, profiling, **and inference** — must run on a single thread per manager. FlexTensor's internal state (tensor maps, CUDA streams, memory blocks, profiling counters) is not protected against concurrent access. Using a patched model from multiple threads in parallel can cause silent data corruption, CUDA errors, or incorrect inference results even if no `RuntimeError` is raised.
+
+The `get_offload_manager()` thread-ownership guard catches the most common mistake (calling the API from the wrong thread), but it does **not** protect against running forward passes on a patched model concurrently.
+
+### Step 1: Identify the conflicting access
+
+The error message includes both thread IDs. Check your code for places where `get_offload_manager()` (or the convenience functions `offload()`, `init()`, `set_config()`, etc.) is called from a background thread, callback, or worker that differs from the thread that originally created the manager. Also check for forward passes on the patched model from multiple threads.
+
+### Step 2: Use a separate name, model, and thread per manager
+
+If you need parallel offloading, each thread must have its own manager **and its own model instance**:
+
+```python
+import threading
+import flextensor
+
+def worker(thread_name: str, model):
+    config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+    model = flextensor.offload(model, config=config, name=thread_name)
+    for batch in dataloader:
+        output = model(batch)  # Safe: single thread owns this manager + model
+
+t1 = threading.Thread(target=worker, args=("worker-1", build_model()))
+t2 = threading.Thread(target=worker, args=("worker-2", build_model()))
+t1.start()
+t2.start()
+```
+
+### Step 3: Restructure to single-thread access
+
+If threads must share a single model, perform all FlexTensor operations (offloading, warmup, profiling, and inference) on one thread and dispatch results to other threads afterward. Do not run forward passes on a patched model from multiple threads concurrently.
+
+---
+
+## Collect GPU Memory Snapshots in vLLM
+
+**Problem**: You need a record of GPU memory state at each vLLM worker lifecycle point (after device initialization, model load, KV cache allocation, and warmup) to understand memory pressure, verify headroom, or compare baseline versus offloading deployments.
+
+**Solution**: Use one of the snapshot worker classes, which capture `MemorySnapshot` readings at each lifecycle stage and write them to a JSON file.
+
+### Choose the Right Worker Class
+
+| Scenario | Worker class |
+|----------|--------------|
+| Standard vLLM, no offloading | `SnapshotWorker` |
+| vLLM with FlexTensor offloading | `FlexTensorSnapshotWorker` |
+
+Both classes collect snapshots at the same lifecycle points: after `init_device`, `load_model`, `determine_available_memory`, `initialize_from_config` (KV cache), and `compile_or_warm_up_model`.
+
+### Steps
+
+#### 1. Set the output directory
+
+Snapshots are only written to disk when `FT_VLLM_SNAPSHOT_OUTPUT_DIR` is set. If the variable is unset or empty, snapshots are collected in memory but discarded when the process exits.
+
+```bash
+export FT_VLLM_SNAPSHOT_OUTPUT_DIR=/tmp/gpu_snapshots
+```
+
+#### 2. Start vLLM with the snapshot worker
+
+For a standard vLLM deployment (no FlexTensor offloading):
+
+```bash
+vllm serve <model> \
+    --worker-cls flextensor.contrib.vllm.snapshot.SnapshotWorker
+```
+
+For a FlexTensor offloading deployment:
+
+```bash
+FT_ENABLED=1 vllm serve <model> \
+    --worker-cls flextensor.contrib.vllm.snapshot.FlexTensorSnapshotWorker
+```
+
+#### 3. Inspect the output
+
+After the final warmup step, each worker rank writes a JSON file to `FT_VLLM_SNAPSHOT_OUTPUT_DIR`:
+
+```text
+/tmp/gpu_snapshots/
+└── gpu_snapshots_rank0_device0_20260303_120000.json
+```
+
+The file contains metadata about the worker and a list of snapshot entries, one per lifecycle label:
+
+```json
+{
+  "worker_type": "FlexTensorSnapshotWorker",
+  "model": "meta-llama/Llama-3.1-8B",
+  "rank": 0,
+  "local_rank": 0,
+  "device": "cuda:0",
+  "snapshots": [
+    {
+      "label": "after_init_device",
+      "gpu_memory": {
+        "free_memory": 79285829632,
+        "cuda_memory": 1073741824,
+        "torch_memory": 536870912,
+        "non_torch_memory": 536870912,
+        "total_memory": 85899345920,
+        "torch_peak": 536870912,
+        "timestamp": 1741003201.123456
+      },
+      "host_memory": {
+        "host_memory_total": 270122237952,
+        "host_memory_used": 13204619264,
+        "host_memory_available": 256917618688,
+        "swap_total": 8589934592,
+        "swap_used": 107374182,
+        "swap_free": 8482560410
+      }
+    }
+  ]
+}
+```
+
+All fields in `gpu_memory` and `host_memory` are in bytes. Divide by `1024 ** 3` to convert to GiB.
+
+!!! note "Multi-rank deployments"
+    In tensor-parallel deployments, each rank writes its own file. The filename includes `rank` and `device` to distinguish them.
