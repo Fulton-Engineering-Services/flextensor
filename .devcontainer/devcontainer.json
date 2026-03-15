@@ -1,0 +1,81 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/ubuntu
+{
+	"name": "Ubuntu",
+	"build": {
+		"dockerfile": "Dockerfile"
+	},
+	// Features to add to the dev container. More info: https://containers.dev/features.
+	"features": {
+		"ghcr.io/devcontainers/features/common-utils:2": {
+			"installZsh": true,
+			"configureZshAsDefaultShell": true,
+			"installOhMyZsh": true,
+			"upgradePackages": false,
+			"username": "${localEnv:USER}"
+		},
+		"ghcr.io/devcontainers/features/node:1": {},
+		// Mounts /var/run/docker.sock to allow Docker commands inside the container.
+		// Required for launching inference servers (vLLM, Triton) for debugging,
+		// benchmarking, and integration tests. See Security Model in README.md.
+		"ghcr.io/devcontainers/features/docker-outside-of-docker:1": {}
+	},
+	"runArgs": [
+		// Required for debuggers (gdb, strace, py-spy) and GPU profiling tools.
+		"--cap-add=SYS_PTRACE",
+		// Required by bubblewrap (Claude Code sandbox) for user namespace creation.
+		"--cap-add=SYS_ADMIN",
+		// Enables CUDA IPC for PyTorch and NCCL shared memory across GPU processes.
+		"--ipc=host",
+		// Exposes all NVIDIA GPUs to the container for CUDA workloads and GPU-accelerated tests.
+		"--gpus=all",
+		// bubblewrap requires clone/unshare syscalls that the default Docker seccomp
+		// profile blocks. Must be unconfined for the Claude Code sandbox to function.
+		"--security-opt=seccomp=unconfined",
+		// bubblewrap requires namespace operations that AppArmor blocks by default.
+		// Must be unconfined for the Claude Code sandbox to function.
+		"--security-opt=apparmor=unconfined"
+	],
+	"mounts": [
+		"source=${localEnv:HOME}/.zsh_history,target=/home/${localEnv:USER}/.zsh_history,type=bind,consistency=cached",
+		"source=${localEnv:HOME}/.ssh,target=/home/${localEnv:USER}/.ssh,type=bind,consistency=cached"
+	],
+	"workspaceFolder": "${localWorkspaceFolder}",
+	"remoteEnv": {},
+	"containerEnv": {
+		"LOCAL_WORKSPACE_FOLDER": "${localWorkspaceFolder}"
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"GitHub.vscode-pull-request-github",
+				"charliermarsh.ruff",
+				"ms-azuretools.vscode-docker",
+				"ms-python.python",
+				"ms-vscode.makefile-tools",
+				"pomdtr.excalidraw-editor",
+				"redhat.vscode-yaml",
+				"coderabbit.coderabbit-vscode"
+			],
+			"settings": {
+				"terminal.integrated.defaultProfile.linux": "zsh",
+				"terminal.integrated.profiles.linux": {
+					"zsh": {
+						"path": "/usr/bin/zsh"
+					}
+				},
+				"terminal.integrated.profiles.osx": {
+					"zsh": {
+						"path": "/usr/bin/zsh"
+					}
+				}
+			}
+		}
+	},
+	"postCreateCommand": "bash .devcontainer/post-create.sh",
+	"remoteUser": "${localEnv:USER}",
+	"containerUser": "${localEnv:USER}",
+	"updateRemoteUserUID": true
+}

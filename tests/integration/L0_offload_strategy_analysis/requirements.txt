@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Integration test requirements for L0_offload_strategy_analysis
+# These are in addition to the flextensor[test] dependencies
+# No additional requirements needed - uses standard flextensor and pytest

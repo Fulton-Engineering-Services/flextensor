@@ -1,0 +1,9 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Integration test requirements for L0_benchmark_models
+# These are in addition to the flextensor[test] dependencies
+
+torch~=2.5
+transformers~=4.54
+psutil~=7.0
+torchao>=0.8,<0.14  # in 0.14 change with safetensors functions; transofrmers have no proper depenendcy declaration for it yet

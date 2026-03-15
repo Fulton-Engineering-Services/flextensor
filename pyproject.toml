@@ -1,0 +1,175 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+[build-system]
+requires = ["setuptools>=64", "wheel", "setuptools-git-versioning>=2.0,<3",]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flextensor"
+dynamic = ["version"]
+description = "FlexTensor: Tensor offloading and management library"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.10"
+keywords = ["tensor", "offloading", "machine learning", "pytorch", "memory management"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "beartype~=0.21",
+    "numpy>=1.20.0",
+    "psutil>=5.9.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0",
+    # Pytorch 2.5+ required for torch.Event
+    "torch>=2.5",
+    "scipy>=1.9.0",
+    "proxytypes3>=1.0.1",
+    "posix-ipc~=1.3.0",
+    "shared-memory-dict~=0.7.2",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.10",
+]
+docs = [
+    "mkdocs~=1.6",
+    "mkdocs-material~=9.7",
+    "mike~=2.1",
+    "mkdocstrings[python]>=0.27",
+]
+dev = [
+    "build",
+    "pre-commit",
+    "flextensor[test]",
+]
+all = [
+    "flextensor[test,dev,docs]",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools-git-versioning]
+enabled = true
+dev_template = "{tag}.post{ccount}+g{full_sha}"
+dirty_template = "{tag}.post{ccount}+g{full_sha}+dirty"
+
+[tool.setuptools.package-data]
+flextensor = ["py.typed"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+disallow_untyped_decorators = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "gpu_mem_24g: Test requires 24GB GPU memory",
+    "gpu_mem_40g: Test requires 40GB GPU memory",
+    "gpu_mem_48g: Test requires 48GB GPU memory",
+    "gpu_mem_80g: Test requires 80GB GPU memory",
+    "gpu_mem_96g: Test requires 96GB GPU memory",
+]
+filterwarnings = [
+    # Fail on beartype decorator warnings - these indicate type hint issues
+    "error::beartype.roar.BeartypeClawDecorWarning",
+]
+
+[tool.coverage.run]
+source = ["flextensor"]
+omit = ["tests/integration/*"]
+
+[tool.coverage.report]
+fail_under = 60
+
+[tool.uv]
+managed = true
+
+[tool.ruff]
+preview = true
+target-version = "py310"
+line-length = 120
+indent-width = 4
+
+
+[tool.ruff.lint]
+select = [
+    "A",   # flake8-builtins
+    "B",   # flake8-bugbear
+    "C",   # flake8-comprehensions
+    "C4",  # flake8-comprehensions
+    "C90", # mccabe
+    "CPY", # flake8-copyright
+    "E",   # pycodestyle errors
+    "ERA", # eradicate
+    "F",   # pyflakes
+    "G",   # flake8-logging-format
+    "I",   # isort
+    "N",   # pep8-naming
+    "NPY", # NumPy-specific rules
+    "PD",  # pandas-vet
+    "PGH", # pygrep-hooks
+    "PIE", # flake8-pie
+    "PTH", # flake8-use-pathlib
+    "RSE", # flake8-raise
+    "RUF", # Ruff-specific rules
+    "S",   # flake8-bandit
+    "SIM", # flake8-simplify
+    "SLF", # flake8-self
+    "T10", # flake8-debugger
+    "T20", # flake8-print
+    "TCH", # flake8-type-checking
+    "UP",  # pyupgrade
+    "W",   # pycodestyle warnings
+]
+
+ignore = []
+fixable = ["ALL"]
+unfixable = []
+
+# Allow unused variables when underscore-prefixed
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # Ignore unused imports in __init__.py files that are used for exporting the public API
+"tests/**/*.py" = [
+    "BLE001",  # broad Exception allowed for transient OS/IPC failures
+    "RUF100",  # do not remove "unused" noqa (e.g. BLE001) so intent comments stay
+    "S101",    # assertion security warning
+    "SLF001",  # private member access
+    "T201",    # print statements
+]
