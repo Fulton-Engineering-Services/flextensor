@@ -1,0 +1,1565 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Tensor offloading and management library for PyTorch">
+      
+      
+      
+        <link rel="canonical" href="https://ai-dynamo.github.io/flextensor/latest/adr/0003-custom-type-handlers-for-tensor-processor/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.5">
+    
+    
+      
+        <title>0003 custom type handlers for tensor processor - FlexTensor Documentation</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/_mkdocstrings.css">
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="black" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#adr-0003-custom-type-handlers-for-tensorprocessor" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="FlexTensor Documentation" class="md-header__button md-logo" aria-label="FlexTensor Documentation" data-md-component="logo">
+      
+  <img src="../../assets/logo.png" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            FlexTensor Documentation
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              0003 custom type handlers for tensor processor
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+    
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ai-dynamo/flextensor" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    flextensor
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../.." class="md-tabs__link">
+          
+  
+  
+    
+  
+  Get Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../explanation/configuration/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Understand
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../how-to/troubleshooting/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Guides
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../../api/" class="md-tabs__link">
+          
+  
+  
+    
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="https://ai-dynamo.github.io/flextensor/dashboard/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Dashboard
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+<nav class="md-nav md-nav--primary md-nav--lifted" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="FlexTensor Documentation" class="md-nav__button md-logo" aria-label="FlexTensor Documentation" data-md-component="logo">
+      
+  <img src="../../assets/logo.png" alt="logo">
+
+    </a>
+    FlexTensor Documentation
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ai-dynamo/flextensor" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    flextensor
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_1" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../.." class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Get Started
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_1" id="__nav_1_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_1_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_1">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Get Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../quick-start/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Understand
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Understand
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/states/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internal States
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../explanation/tensor-discovery/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tensor Discovery
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Guides
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Guides
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/troubleshooting/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Troubleshooting
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../how-to/configure-for-common-scenarios/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configure for Common Scenarios
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+          
+        
+        <input class="md-nav__toggle md-toggle md-toggle--indeterminate" type="checkbox" id="__nav_4" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../api/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_4" id="__nav_4_label" tabindex="0">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/simplified/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Simplified API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/offload-manager/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    OffloadManager
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/strategies/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Strategies
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../api/advanced/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Advanced
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="https://ai-dynamo.github.io/flextensor/dashboard/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Dashboard
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#context" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Context
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#decision" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Decision
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Decision">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#core-abstractions" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Core abstractions
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#handler-priority-chain" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Handler priority chain
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#nnparameter-preservation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        nn.Parameter preservation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#registration-api" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Registration API
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#naming-rationale" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Naming rationale
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#alternatives-considered" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternatives Considered
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Alternatives Considered">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#alternative-1-override-_apply_on-in-subclasses" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternative 1: Override _apply_on() in subclasses
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alternative-2-functoolssingledispatch-based-dispatch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternative 2: functools.singledispatch based dispatch
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alternative-3-visitor-pattern" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternative 3: Visitor Pattern
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#alternative-4-type-handler-dispatch-selected" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Alternative 4: Type Handler Dispatch (Selected)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#consequences" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Consequences
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Consequences">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#positive" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Positive
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#negative" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Negative
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#intentional-behavioural-improvement-set-element-processing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Intentional behavioural improvement: set element processing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#neutral" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Neutral
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        References
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="References">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#internal-code-references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Internal Code References
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#external-references" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        External References
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+
+<!--
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+-->
+<h1 id="adr-0003-custom-type-handlers-for-tensorprocessor">ADR-0003: Custom Type Handlers for TensorProcessor<a class="headerlink" href="#adr-0003-custom-type-handlers-for-tensorprocessor" title="Permanent link">&para;</a></h1>
+<p><strong>Date</strong>: 2026-02-16</p>
+<p><strong>Status</strong>: Accepted</p>
+<h2 id="context">Context<a class="headerlink" href="#context" title="Permanent link">&para;</a></h2>
+<p><code>TensorProcessor</code> is the core mechanism for walking a PyTorch model's attribute tree and applying per-tensor transformations (pinning to memory, moving to GPU, benchmarking, etc.).  The base class's <code>_apply_on()</code> method previously contained a hardcoded cascade of <code>isinstance</code> checks to decide how each module attribute should be processed:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1"># Before (hardcoded in _apply_on)</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">attr_value</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">):</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>    <span class="n">updated_attr</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">process</span><span class="p">(</span><span class="n">attr_value</span><span class="p">)</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">attr_value</span><span class="p">,</span> <span class="nb">set</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">len</span><span class="p">(</span><span class="n">attr_value</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">:</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="n">updated_attr</span> <span class="o">=</span> <span class="nb">set</span><span class="p">()</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="k">for</span> <span class="n">value</span> <span class="ow">in</span> <span class="n">attr_value</span><span class="p">:</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>        <span class="n">updated_attr</span><span class="o">.</span><span class="n">add</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">process</span><span class="p">(</span><span class="n">value</span><span class="p">))</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">attr_value</span><span class="p">,</span> <span class="n">collections</span><span class="o">.</span><span class="n">OrderedDict</span><span class="p">):</span>
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="o">...</span>
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">attr_value</span><span class="p">,</span> <span class="nb">dict</span><span class="p">):</span>
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>    <span class="o">...</span>
+</span></code></pre></div>
+<p>This design has several problems:</p>
+<ol>
+<li>
+<p><strong>Not extensible for new attribute types</strong>: Real-world models (especially in vLLM, DeepSeek, and Megatron-LM) use custom data structures on modules — shared weight containers, exotic parameter wrappers, metadata objects holding tensors.  When <code>_apply_on()</code> encounters these, it silently skips the tensors inside them, leading to missed offloading, stale device placements, or crashes.</p>
+</li>
+<li>
+<p><strong>No way for users to intervene</strong>: The only extension point was subclassing <code>TensorProcessor</code> and overriding <code>_apply_on()</code> entirely — a fragile approach that forces users to duplicate the whole iteration and type-check logic and breaks whenever FlexTensor adds new built-in handling.</p>
+</li>
+<li>
+<p><strong><code>nn.Parameter</code> preservation was ad-hoc</strong>: Operations like <code>tensor.to(device)</code> and <code>tensor.pin_memory()</code> strip the <code>nn.Parameter</code> wrapper, returning a plain <code>torch.Tensor</code>.  Each subclass had to remember to re-wrap parameters manually.  Missing this caused silent bugs in id()-based tensor tracking (<code>tensors_map</code>, <code>traced_tensors</code>).</p>
+</li>
+<li>
+<p><strong>Hardcoded type checks are fragile</strong>: Adding support for a single new container type (e.g. <code>NamedTuple</code>, <code>dataclass</code>) required editing the base class — violating the Open/Closed Principle and risking regressions in all existing subclasses.</p>
+</li>
+</ol>
+<h2 id="decision">Decision<a class="headerlink" href="#decision" title="Permanent link">&para;</a></h2>
+<p>We will <strong>replace the hardcoded <code>isinstance</code> cascade in <code>_apply_on()</code> with a type handler dispatch system</strong>, allowing custom attribute types to be processed without modifying <code>TensorProcessor</code> internals.</p>
+<h3 id="core-abstractions">Core abstractions<a class="headerlink" href="#core-abstractions" title="Permanent link">&para;</a></h3>
+<ol>
+<li><strong><code>TypeHandler</code> Protocol</strong> — A lightweight interface with two methods:</li>
+<li><code>can_handle(value) -&gt; bool</code> — returns <code>True</code> if the handler should process this attribute value.</li>
+<li>
+<p><code>process_attribute(value, ctx) -&gt; Any</code> — processes the value, using <code>ctx</code> for tensor operations.</p>
+</li>
+<li>
+<p><strong><code>ProcessingContext</code></strong> — A context object passed to handlers that wraps the owning processor and exposes safe helper methods (<code>process()</code>, <code>process_and_preserve()</code>, <code>dispatch()</code>).  This prevents handlers from depending on processor internals while still giving them full access to tensor processing capabilities including <code>nn.Parameter</code> preservation.</p>
+</li>
+<li>
+<p><strong>Built-in type handlers</strong> — The three formerly-hardcoded cases are refactored into public handler classes (<code>TensorTypeHandler</code>, <code>SetTypeHandler</code>, <code>DictTypeHandler</code>) that sit at the end of the dispatch chain.</p>
+</li>
+</ol>
+<h3 id="handler-priority-chain">Handler priority chain<a class="headerlink" href="#handler-priority-chain" title="Permanent link">&para;</a></h3>
+<p>When <code>_apply_on()</code> processes a module attribute, handlers are checked in order:</p>
+<ol>
+<li><strong>Instance-level custom handlers</strong> (registered via <code>register_type_handler()</code> or the <code>type_handlers</code> constructor parameter)</li>
+<li><strong>Global handlers</strong> (registered via <code>TensorProcessor.register_global_type_handler()</code>)</li>
+<li><strong>Built-in handlers</strong> (tensor, set, dict)</li>
+</ol>
+<p>The first handler whose <code>can_handle()</code> returns <code>True</code> wins.  Within each tier, later registrations take higher priority (inserted at index 0).</p>
+<h3 id="nnparameter-preservation"><code>nn.Parameter</code> preservation<a class="headerlink" href="#nnparameter-preservation" title="Permanent link">&para;</a></h3>
+<p>A new <code>preserve_parameter_type()</code> function centralizes the logic to re-wrap <code>nn.Parameter</code> after processing.  Two modes are supported via the <code>force_update_nn_parameters</code> constructor flag:</p>
+<ul>
+<li><strong><code>False</code> (default)</strong>: Updates <code>Parameter.data</code> in-place, preserving object identity for id()-based tracking.</li>
+<li><strong><code>True</code></strong>: Creates a new <code>nn.Parameter</code>, used when building independent model copies (e.g. profile models) where identity should intentionally differ.</li>
+</ul>
+<p><code>ProcessingContext.process_and_preserve()</code> exposes this to handlers as a single convenient call.</p>
+<h3 id="registration-api">Registration API<a class="headerlink" href="#registration-api" title="Permanent link">&para;</a></h3>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Per-instance handler (highest priority)</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">processor</span> <span class="o">=</span> <span class="n">MoveToGPUTensorProcessor</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="n">processor</span><span class="o">.</span><span class="n">register_type_handler</span><span class="p">(</span><span class="n">MyHandler</span><span class="p">())</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="c1"># Or via constructor</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="n">processor</span> <span class="o">=</span> <span class="n">MoveToGPUTensorProcessor</span><span class="p">(</span><span class="n">device</span><span class="p">,</span> <span class="n">type_handlers</span><span class="o">=</span><span class="p">[</span><span class="n">MyHandler</span><span class="p">()])</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
+</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Global handler (applies to all processors)</span>
+</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="n">TensorProcessor</span><span class="o">.</span><span class="n">register_global_type_handler</span><span class="p">(</span><span class="n">MyHandler</span><span class="p">())</span>
+</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="n">TensorProcessor</span><span class="o">.</span><span class="n">clear_global_type_handlers</span><span class="p">()</span>  <span class="c1"># cleanup</span>
+</span></code></pre></div>
+<h3 id="naming-rationale">Naming rationale<a class="headerlink" href="#naming-rationale" title="Permanent link">&para;</a></h3>
+<p>We chose <strong>"Type Handler"</strong> over alternatives:</p>
+<ul>
+<li><strong>"Plugin"</strong>: Too generic; implies a broader extensibility architecture.  This is specifically about dispatching attribute processing by type.</li>
+<li><strong>"Custom Ops"</strong>: Strongly collides with PyTorch's <code>torch.ops</code> / custom operator concept.  Would be confusing for PyTorch users.</li>
+<li><strong>"Attribute Processor"</strong>: Collides with the existing <code>TensorProcessor</code> naming.</li>
+<li><strong>"Value Handler"</strong>: Less descriptive — "type" signals the dispatch-by-type pattern.</li>
+</ul>
+<p>"Type Handler" follows established patterns (Django form field handlers, marshmallow type serializers) and precisely describes what the abstraction does.</p>
+<h2 id="alternatives-considered">Alternatives Considered<a class="headerlink" href="#alternatives-considered" title="Permanent link">&para;</a></h2>
+<h3 id="alternative-1-override-_apply_on-in-subclasses">Alternative 1: Override <code>_apply_on()</code> in subclasses<a class="headerlink" href="#alternative-1-override-_apply_on-in-subclasses" title="Permanent link">&para;</a></h3>
+<p><strong>Approach</strong>: Each subclass that needs custom type handling overrides <code>_apply_on()</code> and adds its own <code>isinstance</code> checks alongside the base ones.</p>
+<p><strong>Pros</strong>:
+- No new abstractions needed
+- Standard inheritance pattern</p>
+<p><strong>Cons</strong>:
+- Forces duplicating the entire iteration and type-check logic in each subclass
+- Breaks whenever the base class adds new built-in type handling
+- No way for users to add handling without subclassing every processor they use
+- Violates Open/Closed Principle</p>
+<p><strong>Why rejected</strong>: Fragile and not user-extensible.  Users integrating custom model architectures (vLLM workers, DeepSeek inference) would need to subclass <em>every</em> processor variant.</p>
+<h3 id="alternative-2-functoolssingledispatch-based-dispatch">Alternative 2: <code>functools.singledispatch</code> based dispatch<a class="headerlink" href="#alternative-2-functoolssingledispatch-based-dispatch" title="Permanent link">&para;</a></h3>
+<p><strong>Approach</strong>: Use Python's <code>singledispatch</code> to register processing functions per type.</p>
+<p><strong>Pros</strong>:
+- Standard library mechanism
+- Familiar pattern for Pythonistas
+- Type-safe dispatch</p>
+<p><strong>Cons</strong>:
+- Dispatches on exact type, not on predicates — cannot handle "any object with attribute X" patterns
+- No support for priority ordering between handlers
+- Global mutable state (dispatch table) with no instance-level overrides
+- Awkward integration with <code>ProcessingContext</code> (no natural way to pass context)
+- Cannot handle duck-typed custom containers common in ML frameworks</p>
+<p><strong>Why rejected</strong>: ML model attributes frequently use duck-typing and custom wrappers where predicate-based dispatch (<code>can_handle()</code>) is more appropriate than exact-type dispatch.</p>
+<h3 id="alternative-3-visitor-pattern">Alternative 3: Visitor Pattern<a class="headerlink" href="#alternative-3-visitor-pattern" title="Permanent link">&para;</a></h3>
+<p><strong>Approach</strong>: Define a <code>TensorVisitor</code> with <code>visit_tensor()</code>, <code>visit_dict()</code>, <code>visit_set()</code>, etc. methods.</p>
+<p><strong>Pros</strong>:
+- Well-known design pattern
+- Clear separation of traversal and processing</p>
+<p><strong>Cons</strong>:
+- Requires a <code>visit_*</code> method for every type, defeating extensibility for unknown types
+- Adding a new type requires updating the visitor interface (same problem as hardcoded checks)
+- Overly formal for the simple dispatch needed here
+- No predicate-based matching for custom types</p>
+<p><strong>Why rejected</strong>: The Visitor pattern works well when the set of types is fixed and known.  Our problem is specifically that the set of types is <em>open</em> and determined by external model architectures.</p>
+<h3 id="alternative-4-type-handler-dispatch-selected">Alternative 4: Type Handler Dispatch (Selected)<a class="headerlink" href="#alternative-4-type-handler-dispatch-selected" title="Permanent link">&para;</a></h3>
+<p><strong>Approach</strong>: A <code>TypeHandler</code> protocol with <code>can_handle()</code> / <code>process_attribute()</code> methods, checked in priority order (instance → global → built-in).</p>
+<p><strong>Pros</strong>:
+- Open for extension without modifying base class (Open/Closed Principle)
+- Predicate-based dispatch handles duck-typed and custom types
+- Priority ordering gives users control over handler precedence
+- <code>ProcessingContext</code> provides safe, documented access to processor capabilities
+- Built-in handlers are just regular handlers, no special casing
+- <code>Protocol</code> class provides structural typing without requiring inheritance
+- Instance-level and global scopes cover both targeted and broad use cases</p>
+<p><strong>Cons</strong>:
+- New abstraction to learn (<code>TypeHandler</code>, <code>ProcessingContext</code>)
+- Linear scan of handlers per attribute (negligible for realistic handler counts)</p>
+<p><strong>Why selected</strong>: Best fit for the open-type problem.  Predicate dispatch is the right tool when the type set is unbounded.  The handler chain is simple to understand and extend.</p>
+<h2 id="consequences">Consequences<a class="headerlink" href="#consequences" title="Permanent link">&para;</a></h2>
+<h3 id="positive">Positive<a class="headerlink" href="#positive" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>User-extensible</strong>: Custom model architectures (vLLM shared weights, DeepSeek MoE containers, Megatron distributed parameters) can be handled without forking FlexTensor.</li>
+<li><strong>Cleaner <code>_apply_on()</code></strong>: The method body shrinks from a multi-branch <code>isinstance</code> cascade to a simple handler dispatch loop.</li>
+<li><strong>Centralised <code>nn.Parameter</code> preservation</strong>: <code>preserve_parameter_type()</code> and <code>ProcessingContext.process_and_preserve()</code> eliminate a class of bugs where parameter wrappers were silently stripped.</li>
+<li><strong>Testable in isolation</strong>: Each handler can be unit-tested independently via <code>ProcessingContext</code>.</li>
+<li><strong>Backward compatible</strong>: Existing <code>TensorProcessor</code> subclasses continue to work unchanged — they only override <code>process()</code>, not <code>_apply_on()</code>.</li>
+</ul>
+<h3 id="negative">Negative<a class="headerlink" href="#negative" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>New concepts to learn</strong>: Contributors need to understand <code>TypeHandler</code>, <code>ProcessingContext</code>, and the priority chain.  Mitigated by docstrings and the Protocol pattern being well-known in Python.</li>
+<li><strong>Global handler state</strong>: <code>_global_type_handlers</code> is mutable class-level state.  Tests must call <code>clear_global_type_handlers()</code> in teardown.  This is an accepted trade-off for the convenience of framework-wide handler registration.</li>
+</ul>
+<h3 id="intentional-behavioural-improvement-set-element-processing">Intentional behavioural improvement: set element processing<a class="headerlink" href="#intentional-behavioural-improvement-set-element-processing" title="Permanent link">&para;</a></h3>
+<p>The original hardcoded set handling called <code>self.process(value)</code> directly on each element — no handler dispatch, no <code>nn.Parameter</code> preservation.  The new built-in <code>SetTypeHandler</code> routes elements through <code>ctx.dispatch()</code>, which:</p>
+<ol>
+<li>Checks custom type handlers for each element (enabling recursive dispatch for exotic types nested inside sets).</li>
+<li>Falls back to <code>process_and_preserve()</code> for tensors, which applies <code>nn.Parameter</code> re-wrapping.</li>
+</ol>
+<p>This is an intentional improvement: the original omission of Parameter preservation in sets was an oversight, not a deliberate choice, and it was inconsistent with how dict values were handled.</p>
+<p><strong>Escape hatch</strong> — If the improved behaviour causes issues with a specific model, register <code>LegacySetTypeHandler</code> on the processor instance to restore the original <code>self.process()</code>-only semantics:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">flextensor.tensor_processors</span><span class="w"> </span><span class="kn">import</span> <span class="n">LegacySetTypeHandler</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="n">processor</span> <span class="o">=</span> <span class="n">MoveToGPUTensorProcessor</span><span class="p">(</span><span class="n">device</span><span class="p">)</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">processor</span><span class="o">.</span><span class="n">register_type_handler</span><span class="p">(</span><span class="n">LegacySetTypeHandler</span><span class="p">())</span>
+</span></code></pre></div>
+<h3 id="neutral">Neutral<a class="headerlink" href="#neutral" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Performance</strong>: The handler dispatch adds a linear scan per attribute.  With the typical 3 built-in + 0–2 custom handlers, this is negligible compared to tensor transfer times.</li>
+<li><strong><code>_apply_on()</code> complexity shifts</strong>: Instead of hardcoded branches, the complexity now lives in the handler chain assembly.  The total complexity is similar, just better organized.</li>
+</ul>
+<h2 id="references">References<a class="headerlink" href="#references" title="Permanent link">&para;</a></h2>
+<h3 id="internal-code-references">Internal Code References<a class="headerlink" href="#internal-code-references" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Type handler implementation: <a href="../../src/flextensor/tensor_processors.py"><code>flextensor/tensor_processors.py::TypeHandler</code></a></li>
+<li><code>ProcessingContext</code> implementation: <a href="../../src/flextensor/tensor_processors.py"><code>flextensor/tensor_processors.py::ProcessingContext</code></a></li>
+<li>Built-in handlers: <a href="../../src/flextensor/tensor_processors.py"><code>flextensor/tensor_processors.py::TensorTypeHandler</code>, <code>SetTypeHandler</code>, <code>DictTypeHandler</code></a></li>
+<li>Handler dispatch in <code>_apply_on()</code>: <a href="../../src/flextensor/tensor_processors.py"><code>flextensor/tensor_processors.py::TensorProcessor._apply_on</code></a></li>
+<li>Unit tests: <a href="../../tests/unit/test_tensor_processors.py"><code>tests/unit/test_tensor_processors.py::TestTypeHandlerSystem</code></a></li>
+</ul>
+<h3 id="external-references">External References<a class="headerlink" href="#external-references" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Python <code>Protocol</code> class documentation: https://docs.python.org/3/library/typing.html#typing.Protocol</li>
+<li>Chain of Responsibility pattern: https://refactoring.guru/design-patterns/chain-of-responsibility</li>
+<li>PyTorch <code>nn.Parameter</code> documentation: https://pytorch.org/docs/stable/generated/torch.nn.Parameter.html</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+        
+<div class="md-social">
+  
+    
+    
+    
+    
+      
+      
+    
+    <a href="https://github.com/ai-dynamo/flextensor" target="_blank" rel="noopener" title="github.com" class="md-social__link">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="m504 204.6-.7-1.8L433.6 21c-1.4-3.6-3.9-6.6-7.2-8.6-2.4-1.6-5.1-2.5-8-2.8s-5.7.1-8.4 1.1-5.1 2.7-7.1 4.8c-1.9 2.1-3.3 4.7-4.1 7.4l-47 144H161.3l-47.1-144c-.8-2.8-2.2-5.3-4.1-7.4-2-2.1-4.4-3.7-7.1-4.8-2.6-1-5.5-1.4-8.4-1.1s-5.6 1.2-8 2.8c-3.2 2-5.8 5.1-7.2 8.6L9.8 202.8l-.8 1.8c-10 26.2-11.3 55-3.5 82 7.7 26.9 24 50.7 46.4 67.6l.3.2.6.4 106 79.5c38.5 29.1 66.7 50.3 84.6 63.9 3.7 1.9 8.3 4.3 13 4.3s9.3-2.4 13-4.3c17.9-13.5 46.1-34.9 84.6-63.9l106.7-79.9.3-.3c22.4-16.9 38.7-40.6 45.6-67.5 8.6-27 7.4-55.8-2.6-82"/></svg>
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.tabs", "navigation.tabs.sticky", "navigation.top", "navigation.expand", "navigation.sections", "navigation.indexes", "content.code.copy", "content.code.annotate", "search.highlight", "search.suggest"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"default": "latest", "provider": "mike"}}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>

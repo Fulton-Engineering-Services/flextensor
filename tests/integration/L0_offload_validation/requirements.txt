@@ -1,7 +1,0 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: Apache-2.0
-# Integration test requirements for L0_offload_validation
-# These are in addition to the flextensor[test] dependencies
-
-torch~=2.5
-numpy~=2.0
