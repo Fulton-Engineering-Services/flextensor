@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import functools
+import logging
+import os
 import re
 import threading
 import types
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
     from flextensor.state_handler import TensorManagerState
 
+import psutil
 import torch
 from proxytypes3 import ObjectWrapper
 from torch import nn
@@ -24,6 +28,80 @@ from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
 from flextensor.utils import resolve_gpu_mem_bytes
+
+LOGGER = logging.getLogger(__name__)
+_GiB = 1 << 30
+
+
+def _log_diagnostic_snapshot(label: str, om: OffloadManager | None) -> None:
+    """Capture and log full diagnostic context. Called only on error path.
+
+    Every diagnostic collection is wrapped in its own try/except so that
+    capture failures never mask the original exception.
+
+    Args:
+        label: Human-readable context for the error (e.g. method name, forward block name).
+        om: The OffloadManager instance, or None if unavailable.
+    """
+    parts = [f"FlexTensor error in {label}"]
+
+    if om is not None:
+        parts.append(f"  state={om._current_state.value}")  # noqa: SLF001
+        parts.append(f"  iteration={om._iteration_count}")  # noqa: SLF001
+        parts.append(f"  manager={om.name!r}")
+
+    try:
+        for i in range(torch.cuda.device_count()):
+            alloc = torch.cuda.memory_allocated(i)
+            reserved = torch.cuda.memory_reserved(i)
+            total = torch.cuda.get_device_properties(i).total_memory
+            parts.append(
+                f"  gpu{i}: alloc={alloc / _GiB:.2f}GiB reserved={reserved / _GiB:.2f}GiB total={total / _GiB:.2f}GiB"
+            )
+    except Exception:
+        parts.append("  gpu: <unavailable>")
+
+    try:
+        vm = psutil.virtual_memory()
+        parts.append(
+            f"  host: used={vm.used / _GiB:.2f}GiB avail={vm.available / _GiB:.2f}GiB total={vm.total / _GiB:.2f}GiB"
+        )
+    except Exception:
+        parts.append("  host: <unavailable>")
+
+    parts.append(f"  pid={os.getpid()}")
+
+    LOGGER.error("\n".join(parts), exc_info=True)
+
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _error_boundary(func: _F) -> _F:
+    """Decorator that logs full diagnostics on unhandled exceptions.
+
+    Captures FlexTensor state, GPU/host memory, traceback, then re-raises.
+    Zero overhead on the happy path (CPython try/except is free when no
+    exception is raised).
+
+    Only for OffloadManager methods — ``self`` must be an OffloadManager.
+
+    Args:
+        func: The OffloadManager method to wrap.
+
+    Returns:
+        Wrapped method with identical signature.
+    """
+
+    @functools.wraps(func)
+    def wrapper(self: OffloadManager, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(self, *args, **kwargs)
+        except Exception:
+            _log_diagnostic_snapshot(func.__qualname__, self)
+            raise
+
+    return wrapper  # type: ignore[return-value]
 
 
 @runtime_checkable
@@ -397,9 +475,13 @@ class OffloadManager:
         offload_manager = self
 
         def patched_forward(self_module, *args, **kwargs):
-            with offload_manager.offload_block(offload_name):
-                # Call the unbound forward function with self_module explicitly
-                return original_forward_func(self_module, *args, **kwargs)
+            try:
+                with offload_manager.offload_block(offload_name):
+                    # Call the unbound forward function with self_module explicitly
+                    return original_forward_func(self_module, *args, **kwargs)
+            except Exception:
+                _log_diagnostic_snapshot(f"forward({offload_name})", offload_manager)
+                raise
 
         # Make patched_forward look like the original for introspection
         patched_forward = functools.wraps(original_forward_func)(patched_forward)
@@ -429,6 +511,7 @@ class OffloadManager:
             delattr(module, "_ft_original_forward_func")
             delattr(module, "_ft_offload_name")
 
+    @_error_boundary
     def _transition_to_warmup(self):
         """Transition to warmup state."""
 
@@ -446,6 +529,7 @@ class OffloadManager:
         self._current_state = OffloadState.WARMUP
         self._iteration_count = 0
 
+    @_error_boundary
     def _transition_to_profile(self):
         """Transition to profile state."""
         if self._tensor_manager is None:
@@ -461,6 +545,7 @@ class OffloadManager:
         self._current_state = OffloadState.PROFILE
         self._iteration_count = 0
 
+    @_error_boundary
     def _transition_to_inference(self):
         """Transition to inference state."""
         try:
@@ -568,6 +653,7 @@ class OffloadManager:
             )
         return self._tensor_manager.trap(name)
 
+    @_error_boundary
     def _initialize_from_shm(self, coordinator: _ShmCoordinatorLike, model: nn.Module) -> OffloadModelProxy:
         """Initialize as a follower from shared memory.
 

@@ -15,6 +15,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
+import psutil
 import tqdm
 from vllm.logger import init_logger
 from vllm.utils.mem_constants import GiB_bytes
@@ -176,6 +177,16 @@ class FlexTensorOffloadWorker(Worker):
             self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 
         LOGGER.info("FlexTensor: Switching to inference mode")
+        try:
+            vm = psutil.virtual_memory()
+            free_gib = vm.available / GiB_bytes
+            if free_gib < 2.0:
+                LOGGER.warning(
+                    "FlexTensor: Low host memory (%.1f GiB free) — inference transition may OOM",
+                    free_gib,
+                )
+        except Exception:  # noqa: S110
+            pass
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 
