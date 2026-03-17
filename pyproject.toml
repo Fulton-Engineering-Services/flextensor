@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 [build-system]
-requires = ["setuptools>=64", "wheel", "setuptools-git-versioning>=2.0,<3",]
+requires = ["setuptools>=64", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -63,10 +63,7 @@ all = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
-[tool.setuptools-git-versioning]
-enabled = true
-dev_template = "{tag}.post{ccount}+g{full_sha}"
-dirty_template = "{tag}.post{ccount}+g{full_sha}+dirty"
+[tool.setuptools_scm]
 
 [tool.setuptools.package-data]
 flextensor = ["py.typed"]

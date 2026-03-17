@@ -271,11 +271,18 @@ om.load_profile("/tmp/profiles/my_model", model=model)
 ## Running Unit Tests in Claude Code Sessions
 
 The sandbox creates stub files (`HEAD`) that can interfere with `setuptools-scm` version
-detection during editable installs. Use `SETUPTOOLS_SCM_PRETEND_VERSION` or the venv directly:
+detection during editable installs. Use `SETUPTOOLS_SCM_PRETEND_VERSION` to bypass git:
+
+```bash
+SETUPTOOLS_SCM_PRETEND_VERSION=0.4.0 UV_CACHE_DIR=$TMPDIR/.cache/uv uv run pytest tests/unit/ -v
+```
+
+Or use the venv directly (no version resolution needed):
 
 ```bash
 SETUPTOOLS_SCM_PRETEND_VERSION=0.4.0 uv pip install -e ".[test]"
 .venv/bin/python -m pytest tests/unit/ -v
 ```
 
+`uv` tries to write to `~/.cache/uv` which is outside the sandbox write allowlist. Setting `UV_CACHE_DIR=$TMPDIR/.cache/uv` redirects the cache to a writable path.
 <!-- MANUAL ADDITIONS END -->
