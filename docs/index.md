@@ -81,4 +81,10 @@ output = model(input_tensor)
 
 ## Performance
 
-FlexTensor targets less than 5% latency overhead compared to a baseline without offloading. See the [Dashboard](https://github.com/ai-dynamo/flextensor) for benchmark results.
+FlexTensor targets less than 5% latency overhead compared to a baseline without offloading, when the CPU-to-GPU interconnect bandwidth is sufficient to transfer offloaded weights within available compute time. Overhead increases when this condition is not met — for example, at low request concurrency with high offload ratios. See [Troubleshooting](how-to/troubleshooting.md#when-to-expect-higher-overhead) for details on when overhead may exceed this target.
+
+The <5% target assumes:
+
+- **Interconnect bandwidth matches workload** — the CPU-to-GPU bandwidth is sufficient to complete weight transfers within the compute time available to overlap them.
+- **Sufficient GPU memory for double-buffering** — the GPU can hold the weights currently being computed and the weights being transferred simultaneously, plus activations and KV-cache.
+- **Representative profiling** — the batch size used during profiling reflects the production workload. If profiling runs at large prefill size but production is dominated by single-token decode, the offloading strategy may be suboptimal.

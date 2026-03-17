@@ -274,7 +274,7 @@ For a detailed explanation of how tensor discovery works, see [Tensor Discovery]
 
 ## Diagnose High Performance Overhead
 
-**Problem**: Model inference is slower than expected. FlexTensor targets less than 5% latency overhead over a baseline without offloading.
+**Problem**: Model inference is slower than expected. FlexTensor targets less than 5% latency overhead over a baseline without offloading, under the assumptions described [below](#when-to-expect-higher-overhead).
 
 ### Step 1: Check that inference state has been reached
 
@@ -311,6 +311,22 @@ config = OffloadConfig(
     compute_transfer_gap=2,        # Initiate transfer 2 layers ahead
 )
 ```
+
+### When to expect higher overhead
+
+The <5% overhead target holds when the CPU-to-GPU interconnect bandwidth is sufficient to transfer offloaded weights within the available compute time. This condition may not hold when:
+
+- **Low concurrency / small batch decode**: At batch=1, per-layer compute can be very short (1–3 ms for typical LLMs), while transferring hundreds of MB of weights may take 15–25 ms depending on interconnect bandwidth. The transfer cannot be overlapped with such short compute.
+- **High offload ratio**: When a large fraction of model weights are offloaded (e.g., >40%), most layers require significant transfers. Even modest stalls per layer accumulate across dozens of layers.
+- **Profiling/production mismatch**: FlexTensor profiles at a specific batch size to measure per-layer compute time and plan transfers accordingly. If the production workload has a substantially different batch size (e.g., profiling at large prefill size but serving single-token decode at low concurrency), the transfer schedule may be planned for a compute window that does not exist at serving time.
+
+**How to check**: Enable `FT_ENABLE_DIAGNOSTICS=1` and examine the block assignment table in the log output. Compare the "Compute" column (per-layer compute time in ms) with the transfer sizes. If the time to transfer a layer's offloaded weights exceeds the preceding layer's compute time, expect overhead above 5%.
+
+**Mitigation**:
+
+- Increase request concurrency — larger decode batches increase per-layer compute, improving transfer overlap.
+- Reduce the offload ratio by increasing `max_gpu_mem_fraction` (if KV-cache budget allows).
+- Accept the latency tradeoff when serving a model that otherwise would not fit in GPU memory — FlexTensor enables serving, but the interconnect bandwidth constrains throughput.
 
 ---
 
