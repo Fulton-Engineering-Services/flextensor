@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import time
 
 import torch
 from torch.overrides import TorchFunctionMode
@@ -14,23 +13,26 @@ class Trap(TorchFunctionMode):
         self.tensors_ids = set()
         self.layer_statistics_collector = tensor_manager.layer_statistics_collector
         self.tensor_manager = tensor_manager
+        self.start_event = tensor_manager.trap_start_event
+        self.end_event = tensor_manager.trap_end_event
+        self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
+        self._nesting_guard.acquire(self.current_trace_id)
         self.tensor_layer_loader.enter(self.current_trace_id)
-        self.timer_start = time.time_ns()
+        self.start_event.record()
 
         return super().__enter__()
 
     def __exit__(self, _type, _value, _traceback):
-        _wait_time_start = time.time_ns()
-        torch.cuda.synchronize()
-        _wait_time_end = time.time_ns()
-        self.timer_end = time.time_ns()
-        duration_ms = (self.timer_end - self.timer_start) / 1e6
+        self.end_event.record()
+        self.end_event.synchronize()
+        duration_ms = self.start_event.elapsed_time(self.end_event)
 
         self.tensor_layer_loader.exit(self.current_trace_id)
 
         self.layer_statistics_collector.add_all(self.current_trace_id, self.tensors_ids, duration_ms)
+        self._nesting_guard.release()
 
         super().__exit__(_type, _value, _traceback)
 
@@ -71,23 +73,26 @@ class WarmupTrap(TorchFunctionMode):
         self.device_gpu = device_gpu
         self.tensors_ids = set()
         self.tensor_manager = tensor_manager
+        self.start_event = tensor_manager.trap_start_event
+        self.end_event = tensor_manager.trap_end_event
+        self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
-        self.timer_start = time.time_ns()
-        # Enter module tracker to associate modules with this trap
+        self._nesting_guard.acquire(self.current_trace_id)
+        self.start_event.record()
         if self.tensor_manager.module_tracker is not None:
             self.tensor_manager.module_tracker.enter_trap(self.current_trace_id)
         return super().__enter__()
 
     def __exit__(self, _type, _value, _traceback):
-        torch.cuda.synchronize()
-        self.timer_end = time.time_ns()
-        # Exit module tracker
+        self.end_event.record()
+        self.end_event.synchronize()
         if self.tensor_manager.module_tracker is not None:
             self.tensor_manager.module_tracker.exit_trap(self.current_trace_id)
 
-        duration_ms = (self.timer_end - self.timer_start) / 1e6
+        duration_ms = self.start_event.elapsed_time(self.end_event)
         self.tensor_manager.layer_statistics_collector.add_all(self.current_trace_id, self.tensors_ids, duration_ms)
+        self._nesting_guard.release()
         super().__exit__(_type, _value, _traceback)
 
     def _update_tensors_ids(self, args, kwargs):
@@ -182,23 +187,25 @@ class TrapDirect:
         self.tensor_layer_loader = tensor_manager.tensor_layer_loader
         self.tensors_ids = set()
         self.tensor_manager = tensor_manager
+        self.start_event = tensor_manager.trap_start_event
+        self.end_event = tensor_manager.trap_end_event
+        self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
+        self._nesting_guard.acquire(self.current_trace_id)
         self.tensor_layer_loader.enter(self.current_trace_id)
-        self.timer_start = time.time_ns()
+        self.start_event.record()
 
         return self
 
     def __exit__(self, _type, _value, _traceback):
-        _wait_time_start = time.time_ns()
-        torch.cuda.current_stream().synchronize()
-        _wait_time_end = time.time_ns()
-        self.timer_end = time.time_ns()
-        duration_ms = (self.timer_end - self.timer_start) / 1e6
+        self.end_event.record()
+        self.end_event.synchronize()
+        duration_ms = self.start_event.elapsed_time(self.end_event)
         self.tensor_manager.layer_statistics_collector.add_duration(self.current_trace_id, duration_ms)
 
         self.tensor_layer_loader.exit(self.current_trace_id)
-        torch.cuda.synchronize()
+        self._nesting_guard.release()
 
 
 class TrapInferDirect:

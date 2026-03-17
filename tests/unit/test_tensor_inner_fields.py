@@ -102,27 +102,29 @@ def test_tensor_inner_fields_moved_to_gpu():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
 def test_tensor_inner_fields_in_offload_block():
-    """Test that tensor inner fields work correctly within offload blocks."""
+    """Test that tensor inner fields work correctly with explicit offload blocks.
+
+    Uses manual offload_block() calls instead of automatic forward patching
+    to exercise the explicit block API path.
+    """
     # Create model
     model = ModelWithInnerFields()
     model = model.cpu()
 
-    # Configure FlexTensor
+    # Configure FlexTensor — use module_patterns=[] so offload() sets up the
+    # tensor manager but does NOT patch layer forwards (we wrap manually below).
     om = flextensor.get_offload_manager("test_inner_fields_block")
     config = flextensor.OffloadConfig(
         load_strategy=flextensor.NthLayerStrategy(nth_layer=1),
         warmup_iters=1,
         profile_iters=1,
+        module_patterns=[],
     )
 
-    # Offload model
-    config = config.model_copy(update={"module_patterns": ["layer1", "layer2"]})
     model = om.offload(model, config=config)
 
-    # Run warmup
     input_tensor = torch.randn(2, 64, device="cuda")
     for _ in range(config.warmup_iters + config.profile_iters):
-        # Explicitly use offload blocks
         with om.offload_block("layer1"):
             x = model.layer1(input_tensor)
         x = torch.relu(x)

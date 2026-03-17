@@ -1,31 +1,80 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import time
 
-import torch
+from __future__ import annotations
+
+from typing import Any
+
 from torch.overrides import TorchFunctionMode
 
 from flextensor.types import GPUMemoryUsage
 
 
+class TrapNestingGuard:
+    """Prevents nested trap entry on a shared pair of CUDA timing events.
+
+    Traps execute sequentially (one per layer in forward()). A second
+    ``acquire()`` before the matching ``release()`` would overwrite the
+    start-event timestamp and silently corrupt timing, so we fail fast.
+
+    One instance lives on ``TensorManager``; each trap calls
+    ``acquire(trace_id)`` / ``release()`` via that shared instance.
+    """
+
+    def __init__(self) -> None:
+        self._active = False
+
+    def acquire(self, trace_id: str) -> None:
+        """Mark a trap as active, or raise if one is already active.
+
+        Args:
+            trace_id: Name of the trap being entered (included in the error message).
+
+        Raises:
+            RuntimeError: If called while another trap is already active.
+        """
+        if self._active:
+            raise RuntimeError(
+                f"Nested traps are not supported: trap '{trace_id}' entered while another "
+                f"trap is active. Shared CUDA events would produce incorrect timing."
+            )
+        self._active = True
+
+    def release(self) -> None:
+        self._active = False
+
+
 class StatsTrap:
-    def __init__(self, tensor_manager, name):
+    """Context manager that measures layer execution time using shared CUDA events.
+
+    Used during direct-mode profiling to accumulate per-layer durations
+    on ``tensor_manager.traps_direct_stats``.
+
+    Args:
+        tensor_manager: The ``TensorManager`` instance owning the shared
+            CUDA events and duration accumulators.
+        name: Trace identifier for the layer being measured.
+    """
+
+    def __init__(self, tensor_manager: Any, name: str) -> None:
         self.tensor_manager = tensor_manager
         self.current_trace_id = name
+        self.start_event = tensor_manager.trap_start_event
+        self.end_event = tensor_manager.trap_end_event
+        self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
-        torch.cuda.synchronize()
-        self.timer_start = time.time_ns()
+        self._nesting_guard.acquire(self.current_trace_id)
+        self.start_event.record()
         return self
 
     def __exit__(self, _type, _value, _traceback):
-        _wait_time_start = time.time_ns()
-        torch.cuda.synchronize()
-        _wait_time_end = time.time_ns()
-        self.timer_end = time.time_ns()
-        duration_ms = (self.timer_end - self.timer_start) / 1e6
+        self.end_event.record()
+        self.end_event.synchronize()
+        duration_ms = self.start_event.elapsed_time(self.end_event)
         self.tensor_manager.traps_direct_duration_ms += duration_ms
         self.tensor_manager.traps_direct_stats[self.current_trace_id] = duration_ms
+        self._nesting_guard.release()
         return False
 
 

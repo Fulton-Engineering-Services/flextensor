@@ -17,6 +17,7 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
+from flextensor.helpers import TrapNestingGuard
 from flextensor.instrumentation import instrumentable
 from flextensor.layer_statistics_analyzer import LayerStatisticsAnalyzer
 from flextensor.loaders import (
@@ -343,6 +344,9 @@ class TensorManager:
         self._unmapped_tensors_bytes = 0
         self.module_tracker: ModuleTracker | None = None
         self.memory_transfer_stats: dict[int, float] | None = None
+        self.trap_start_event = torch.cuda.Event(enable_timing=True)
+        self.trap_end_event = torch.cuda.Event(enable_timing=True)
+        self.trap_nesting_guard = TrapNestingGuard()
 
     def build_parameters_mapping(self, model):
         self.tensor_id_to_name_map = {}

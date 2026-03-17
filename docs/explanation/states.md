@@ -103,7 +103,7 @@ The profile state measures how long each layer takes to execute *with* tensor lo
 
 1. **Statistics Initialization**: Layer statistics from warmup are processed
 2. **Tensor Layer Loader Setup**: A loader is configured with the tensor-to-layer mapping
-3. **Detailed Timing**: Each layer's execution time is measured with CUDA synchronization
+3. **Detailed Timing**: Each layer's execution time is measured using CUDA events (`start_event.record()` / `end_event.record()`)
 4. **Duration Collection**: Statistics are accumulated across multiple iterations for accuracy
 
 ### Internal Mechanics
@@ -123,15 +123,18 @@ The profile state uses either `Trap` (indirect mode) or `TrapDirect` (direct mod
 ```python
 # Internal flow during profile (simplified)
 with Trap(tensor_manager, layer_name, device_gpu):
+    # trap_nesting_guard.acquire() - prevent nested traps
     # tensor_layer_loader.enter() - preload tensors
-    timer_start = time.time_ns()
+    start_event.record()
 
     output = layer(input)
 
-    torch.cuda.synchronize()
-    timer_end = time.time_ns()
+    end_event.record()
+    end_event.synchronize()
+    duration_ms = start_event.elapsed_time(end_event)
     # tensor_layer_loader.exit() - cleanup
     # Duration recorded for layer
+    # trap_nesting_guard.release()
 ```
 
 ### Why It Matters
