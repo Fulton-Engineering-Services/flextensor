@@ -18,15 +18,12 @@ from .protocol import BlockStrategyData
 
 logger = logging.getLogger(__name__)
 
-NOTICE = 25
-logging.addLevelName(NOTICE, "NOTICE")
-
 _block_table_logger = logging.getLogger("flextensor.block_table")
 if not _block_table_logger.handlers:
     _handler = logging.StreamHandler()
     _handler.setFormatter(logging.Formatter("%(message)s"))
     _block_table_logger.addHandler(_handler)
-    _block_table_logger.setLevel(NOTICE)
+    _block_table_logger.setLevel(logging.INFO)
     _block_table_logger.propagate = False
 
 
@@ -493,7 +490,7 @@ def log_block_table(
         strategy_name: Name of the strategy for the table header.
     """
     table = format_block_table(layer_stats, strategy_map, block_data, strategy_name)
-    _block_table_logger.log(NOTICE, table)
+    _block_table_logger.info(table)
 
 
 def strategy_has_transfer_gaps(
