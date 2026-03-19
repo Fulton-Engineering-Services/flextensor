@@ -155,5 +155,4 @@ class TestBlockNameFn:
             block_name_fn=ns_fn,
         )
         name = ctrl._block_name_fn(0)
-        assert ns in name
-        assert str(os.getpid()) not in name
+        assert name == f"{ns}_w0"
