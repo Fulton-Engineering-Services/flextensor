@@ -24,71 +24,71 @@ class TestComputeShmNamespace:
     def test_deterministic_same_inputs(self):
         """Same inputs produce same namespace."""
         config = OffloadConfig(module_patterns=["layers.*"])
-        ns1 = compute_shm_namespace("/models/llama", config)
-        ns2 = compute_shm_namespace("/models/llama", config)
+        ns1 = compute_shm_namespace("/models/qwen", config)
+        ns2 = compute_shm_namespace("/models/qwen", config)
         assert ns1 == ns2
 
     def test_different_model_path_different_namespace(self):
         """Different model paths produce different namespaces."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama-7b", config)
-        ns2 = compute_shm_namespace("/models/llama-70b", config)
+        ns1 = compute_shm_namespace("/models/qwen-7b", config)
+        ns2 = compute_shm_namespace("/models/qwen-70b", config)
         assert ns1 != ns2
 
     def test_different_config_different_namespace(self):
         """Different config fields produce different namespaces."""
         c1 = OffloadConfig(module_patterns=["layers.*"])
         c2 = OffloadConfig(module_patterns=["attention.*"])
-        ns1 = compute_shm_namespace("/models/llama", c1)
-        ns2 = compute_shm_namespace("/models/llama", c2)
+        ns1 = compute_shm_namespace("/models/qwen", c1)
+        ns2 = compute_shm_namespace("/models/qwen", c2)
         assert ns1 != ns2
 
     def test_different_extra_keys_different_namespace(self):
         """Different vLLM config produces different namespace."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama", config, extra_keys={"quantization": "fp8"})
-        ns2 = compute_shm_namespace("/models/llama", config, extra_keys={"quantization": "awq"})
+        ns1 = compute_shm_namespace("/models/qwen", config, extra_keys={"quantization": "fp8"})
+        ns2 = compute_shm_namespace("/models/qwen", config, extra_keys={"quantization": "awq"})
         assert ns1 != ns2
 
     def test_extra_keys_none_vs_empty(self):
         """None and empty extra_keys produce same result."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama", config, extra_keys=None)
-        ns2 = compute_shm_namespace("/models/llama", config, extra_keys={})
+        ns1 = compute_shm_namespace("/models/qwen", config, extra_keys=None)
+        ns2 = compute_shm_namespace("/models/qwen", config, extra_keys={})
         assert ns1 == ns2
 
     def test_namespace_format(self):
         """Namespace starts with ft_ prefix and has 8 hex chars."""
         config = OffloadConfig()
-        ns = compute_shm_namespace("/models/llama", config)
+        ns = compute_shm_namespace("/models/qwen", config)
         assert ns.startswith("ft_")
         assert len(ns) == 3 + 8  # "ft_" + 8 hex chars
 
     def test_shm_namespace_override(self):
         """Explicit shm_namespace in config overrides computed value."""
         config = OffloadConfig(shm_namespace="my_custom_ns")
-        ns = compute_shm_namespace("/models/llama", config)
+        ns = compute_shm_namespace("/models/qwen", config)
         assert ns == "my_custom_ns"
 
     def test_different_manager_name_different_namespace(self):
         """Different manager names produce different namespaces."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama", config, manager_name="model_a")
-        ns2 = compute_shm_namespace("/models/llama", config, manager_name="model_b")
+        ns1 = compute_shm_namespace("/models/qwen", config, manager_name="model_a")
+        ns2 = compute_shm_namespace("/models/qwen", config, manager_name="model_b")
         assert ns1 != ns2
 
     def test_same_manager_name_deterministic(self):
         """Same manager name produces same namespace across calls."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama", config, manager_name="my_model")
-        ns2 = compute_shm_namespace("/models/llama", config, manager_name="my_model")
+        ns1 = compute_shm_namespace("/models/qwen", config, manager_name="my_model")
+        ns2 = compute_shm_namespace("/models/qwen", config, manager_name="my_model")
         assert ns1 == ns2
 
     def test_default_manager_name_matches_no_arg(self):
         """Omitting manager_name is equivalent to passing 'default'."""
         config = OffloadConfig()
-        ns1 = compute_shm_namespace("/models/llama", config)
-        ns2 = compute_shm_namespace("/models/llama", config, manager_name="default")
+        ns1 = compute_shm_namespace("/models/qwen", config)
+        ns2 = compute_shm_namespace("/models/qwen", config, manager_name="default")
         assert ns1 == ns2
 
     def test_protocol_version_is_integer(self):
@@ -106,10 +106,10 @@ class TestComputeShmNamespace:
         props_80g.total_memory = 80 * 1024**3
 
         with patch("flextensor.utils.torch.cuda.get_device_properties", return_value=props_40g):
-            ns_40g = compute_shm_namespace("/models/llama", config)
+            ns_40g = compute_shm_namespace("/models/qwen", config)
 
         with patch("flextensor.utils.torch.cuda.get_device_properties", return_value=props_80g):
-            ns_80g = compute_shm_namespace("/models/llama", config)
+            ns_80g = compute_shm_namespace("/models/qwen", config)
 
         assert ns_40g != ns_80g
 
@@ -120,8 +120,8 @@ class TestComputeShmNamespace:
         props.total_memory = 80 * 1024**3
 
         with patch("flextensor.utils.torch.cuda.get_device_properties", return_value=props):
-            ns1 = compute_shm_namespace("/models/llama", config)
-            ns2 = compute_shm_namespace("/models/llama", config)
+            ns1 = compute_shm_namespace("/models/qwen", config)
+            ns2 = compute_shm_namespace("/models/qwen", config)
 
         assert ns1 == ns2
 
@@ -131,7 +131,7 @@ class TestComputeShmNamespace:
             config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
 
         with patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props:
-            ns = compute_shm_namespace("/models/llama", config)
+            ns = compute_shm_namespace("/models/qwen", config)
 
         mock_props.assert_not_called()
         assert ns.startswith("ft_")
@@ -141,7 +141,7 @@ class TestComputeShmNamespace:
         config = OffloadConfig(max_gpu_mem_fraction=None)
 
         with patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props:
-            ns = compute_shm_namespace("/models/llama", config)
+            ns = compute_shm_namespace("/models/qwen", config)
 
         mock_props.assert_not_called()
         assert ns.startswith("ft_")

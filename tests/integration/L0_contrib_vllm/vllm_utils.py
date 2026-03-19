@@ -221,7 +221,7 @@ def start_vllm_server(
     """Start vLLM server in background with real-time log monitoring.
 
     Args:
-        model_name: Model identifier (e.g., "meta-llama/Llama-3.1-8B-Instruct")
+        model_name: Model identifier (e.g., "Qwen/Qwen2.5-7B-Instruct")
         offload_enabled: Whether to enable FlexTensor offloading
         port: Port to run server on
         additional_cli_args: Additional CLI arguments to pass to vllm serve

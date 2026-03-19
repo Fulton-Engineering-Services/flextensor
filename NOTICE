@@ -33,19 +33,14 @@ HuggingFace Models and Datasets
 -------------------------------
 
 The following models are downloaded from https://huggingface.co during
-integration tests and examples. Some models are gated and require
-acceptance of their respective licenses before access is granted.
+integration tests and examples.
 
   Model ID                              License               Used In
   ------------------------------------  --------------------  -------------------------
-  katuni4ka/tiny-random-deepseek-v3     Apache 2.0            Integration tests
   TinyLlama/TinyLlama_v1.1             Apache 2.0            Integration tests
   Qwen/Qwen3-0.6B                      Apache 2.0            Integration tests
-  meta-llama/Llama-3.1-8B-Instruct     Llama 3.1 License *   Integration tests
-  Qwen/Qwen2.5-72B-Instruct            Apache 2.0            Examples
-
-  * Gated model — requires accepting the license at
-    https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct before download.
+  Qwen/Qwen2.5-7B-Instruct             Apache 2.0            Integration tests
+  Qwen/Qwen2.5-72B-Instruct            Qwen License          Examples
 
 ================================================================================
 

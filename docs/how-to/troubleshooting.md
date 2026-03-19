@@ -192,7 +192,7 @@ Or simply omit the `enable_instrumentation` parameter.
 
 ### Step 1: Narrow the module patterns
 
-If `module_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, narrow the scope. For example, when using the vLLM worker with a LLaMA-style model, these patterns target each transformer layer and special modules while leaving the rest unaffected:
+If `module_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, narrow the scope. For example, when using the vLLM worker with a decoder-only model, these patterns target each transformer layer and special modules while leaving the rest unaffected:
 
 ```python
 config = OffloadConfig(
@@ -474,7 +474,7 @@ The file contains metadata about the worker and a list of snapshot entries, one 
 ```json
 {
   "worker_type": "FlexTensorSnapshotWorker",
-  "model": "meta-llama/Llama-3.1-8B",
+  "model": "Qwen/Qwen2.5-7B",
   "rank": 0,
   "local_rank": 0,
   "device": "cuda:0",

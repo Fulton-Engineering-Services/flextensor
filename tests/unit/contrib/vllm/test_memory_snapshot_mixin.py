@@ -44,7 +44,7 @@ def mixin_instance():
     instance.device = MagicMock()
     instance.device.__str__ = lambda self: "cuda:0"
     instance.vllm_config = MagicMock()
-    instance.vllm_config.model_config.model = "meta-llama/Llama-3.1-8B"
+    instance.vllm_config.model_config.model = "Qwen/Qwen2.5-7B"
     return instance
 
 
@@ -175,7 +175,7 @@ class TestDumpSnapshots:
         data = json.loads(json_files[0].read_text())
 
         assert data["worker_type"] == "MemorySnapshotMixin"
-        assert data["model"] == "meta-llama/Llama-3.1-8B"
+        assert data["model"] == "Qwen/Qwen2.5-7B"
         assert data["rank"] == 0
         assert data["local_rank"] == 0
         assert data["device"] == "cuda:0"

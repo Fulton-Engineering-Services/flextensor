@@ -36,7 +36,7 @@ class FakeBaseWorker:
         self.device = MagicMock()
         self.device.__str__ = lambda _: "cuda:0"
         self.vllm_config = MagicMock()
-        self.vllm_config.model_config.model = "meta-llama/Llama-3.1-8B"
+        self.vllm_config.model_config.model = "Qwen/Qwen2.5-7B"
 
     def init_device(self) -> None:
         pass

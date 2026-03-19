@@ -221,7 +221,7 @@ timeout "${TIMEOUT:-1800}" python -m pytest "$SCRIPT_DIR" "${PYTEST_ARGS[@]}"
 
 - **`module_patterns` in `OffloadConfig`**: Wildcard patterns (`*`, `?`) specify which modules to offload. Env override: `FT_MODULE_PATTERNS=layers.*,encoder.*`.
 
-- **`VLLM_DEFAULT_MODULE_PATTERNS` in `FlexTensorOffloadWorker`** (`contrib/vllm/worker.py`): When `OffloadConfig.module_patterns == ["*"]` (the global default), the vLLM worker substitutes LLaMA-style per-layer patterns (`model.embed_tokens`, `model.layers.*`, `model.norm`, `lm_head`, `logits_processor`) instead. This gives each transformer layer its own trap, enabling per-layer pipelining. Override via `FT_MODULE_PATTERNS` for non-standard model layouts.
+- **`VLLM_DEFAULT_MODULE_PATTERNS` in `FlexTensorOffloadWorker`** (`contrib/vllm/worker.py`): When `OffloadConfig.module_patterns == ["*"]` (the global default), the vLLM worker substitutes decoder-only per-layer patterns (`model.embed_tokens`, `model.layers.*`, `model.norm`, `lm_head`, `logits_processor`) instead. This gives each transformer layer its own trap, enabling per-layer pipelining. Override via `FT_MODULE_PATTERNS` for non-standard model layouts.
 
 - **GlobalStrategy optimizer**: Uses `scipy` (`differential_evolution` / `dual_annealing`).
 

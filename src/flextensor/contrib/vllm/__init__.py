@@ -8,7 +8,7 @@ then processes CUDA-only operations (FP8 quantization, MLA attention) on GPU
 layer-by-layer before returning the model on CPU for FlexTensor management.
 
 Usage:
-    FT_ENABLED=1 vllm serve meta-llama/Llama-3.1-8B \\
+    FT_ENABLED=1 vllm serve Qwen/Qwen2.5-7B \\
         --worker-cls flextensor.contrib.vllm.worker.FlexTensorOffloadWorker
 
 Components:

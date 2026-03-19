@@ -209,7 +209,7 @@ class TestContribVLLM:
         "model_name, cli_args",
         [
             (
-                "meta-llama/Llama-3.1-8B-Instruct",
+                "Qwen/Qwen2.5-7B-Instruct",
                 [],
             ),
         ],
@@ -319,7 +319,7 @@ class TestContribVLLM:
         "model_name, cli_args",
         [
             (
-                "meta-llama/Llama-3.1-8B-Instruct",
+                "Qwen/Qwen2.5-7B-Instruct",
                 [],
             ),
         ],
@@ -413,7 +413,7 @@ class TestContribVLLM:
         "model_name, cli_args",
         [
             (
-                "meta-llama/Llama-3.1-8B-Instruct",
+                "Qwen/Qwen2.5-7B-Instruct",
                 [],
             ),
         ],

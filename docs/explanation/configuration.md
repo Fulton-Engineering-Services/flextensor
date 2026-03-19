@@ -154,7 +154,7 @@ FT_MODULE_PATTERNS="layers.*,embed,head" python my_script.py
 ```
 
 !!! tip "vLLM worker default patterns"
-    The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_MODULE_PATTERNS` is set. They are designed for LLaMA-style model layouts as served by vLLM:
+    The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_MODULE_PATTERNS` is set. They are designed for decoder-only transformer layouts as served by vLLM:
 
     ```python
     config = OffloadConfig(

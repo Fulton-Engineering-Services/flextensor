@@ -54,7 +54,6 @@ class TestHuggingFaceModelBenchmarking:
     @pytest.mark.parametrize(
         "model_name",
         [
-            "katuni4ka/tiny-random-deepseek-v3",  # Smallest, fastest to download, MoE
             "TinyLlama/TinyLlama_v1.1",  # Small real model
             "Qwen/Qwen3-0.6B",  # Medium size
         ],
@@ -128,7 +127,7 @@ class TestHuggingFaceModelBenchmarking:
         Args:
             device_gpu: GPU device for testing
         """
-        model_name = "katuni4ka/tiny-random-deepseek-v3"
+        model_name = "Qwen/Qwen3-0.6B"
 
         torch.cuda.empty_cache()
         initial_gpu_memory = torch.cuda.memory_allocated(device_gpu)
@@ -151,6 +150,7 @@ class TestHuggingFaceModelBenchmarking:
         del model
         del outputs
         del input_ids
+        del tensor_manager
         torch.cuda.empty_cache()
 
         final_gpu_memory = torch.cuda.memory_allocated(device_gpu)

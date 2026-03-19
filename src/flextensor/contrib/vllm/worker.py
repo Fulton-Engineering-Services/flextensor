@@ -29,7 +29,7 @@ LOGGER = init_logger(__name__)
 
 _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"
 
-# Default module patterns for per-layer offloading in LLaMA-style models.
+# Default module patterns for per-layer offloading in decoder-only transformer models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to
 # overlap CPU→GPU transfers with GPU compute for subsequent layers.
 # Override via FT_MODULE_PATTERNS env var or OffloadConfig(module_patterns=[...]).
