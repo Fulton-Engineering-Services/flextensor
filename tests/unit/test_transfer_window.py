@@ -265,7 +265,6 @@ class TestGapAwareWindowIntegration:
 
         strategy_single = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=200 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -275,7 +274,6 @@ class TestGapAwareWindowIntegration:
 
         strategy_gap = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=200 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -299,7 +297,6 @@ class TestGapAwareWindowIntegration:
 
         strategy_single = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=100 * 1024 * 1024,
-            target_gpu_mem_bytes=50 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -310,7 +307,6 @@ class TestGapAwareWindowIntegration:
 
         strategy_gap = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=100 * 1024 * 1024,
-            target_gpu_mem_bytes=50 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,

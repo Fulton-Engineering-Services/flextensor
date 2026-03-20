@@ -339,17 +339,6 @@ class TestAdaptiveStrategy:
     def test_init_validation(self):
         with pytest.raises(ValueError, match="scale must be positive"):
             AdaptiveStrategy(scale=0.0)
-        with pytest.raises(ValueError, match=r"target_gpu_mem_bytes.*must be <="):
-            AdaptiveStrategy(max_gpu_mem_bytes=100, target_gpu_mem_bytes=200)
-
-    def test_target_defaults_to_max(self):
-        s = AdaptiveStrategy(max_gpu_mem_bytes=100)
-        assert s.target_gpu_mem_bytes == 100
-
-    def test_target_without_max_sets_max(self):
-        s = AdaptiveStrategy(target_gpu_mem_bytes=100)
-        assert s.max_gpu_mem_bytes == 100
-        assert s.target_gpu_mem_bytes == 100
 
     def test_compute_returns_result(self):
         """Smoke test: compute() runs all candidates and returns a StrategyResult."""

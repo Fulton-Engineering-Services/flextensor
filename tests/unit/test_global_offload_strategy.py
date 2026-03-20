@@ -778,15 +778,14 @@ class TestAdjustScaleForMemory:
         return layers
 
     def test_scale_increases_when_initial_exceeds_target(self):
-        """Binary search should raise scale so peak fits within target."""
+        """Binary search should raise scale so peak fits within max_gpu_mem_bytes."""
         layers = self._make_constrained_layers()
         target = 100 * 1024 * 1024
 
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=target,
+            max_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
         strategy.compute(layers)
@@ -809,7 +808,6 @@ class TestAdjustScaleForMemory:
             n_blocks=2,
             scale=1.0,
             max_gpu_mem_bytes=500 * 1024**2,
-            target_gpu_mem_bytes=500 * 1024**2,
             threshold_mb=0.1,
         )
         strategy.compute(layers)
@@ -824,8 +822,7 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=target,
+            max_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
 
@@ -844,7 +841,6 @@ class TestAdjustScaleForMemory:
             n_blocks=2,
             scale=1.0,
             max_gpu_mem_bytes=1,
-            target_gpu_mem_bytes=1,
             threshold_mb=0.1,
         )
 
@@ -858,13 +854,11 @@ class TestAdjustScaleForMemory:
     def test_scale_not_mutated_during_search(self):
         """self.scale should reflect the original value until compute() returns."""
         layers = self._make_constrained_layers()
-        target = 100 * 1024 * 1024
 
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
             max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
 
@@ -885,13 +879,11 @@ class TestAdjustScaleForMemory:
     def test_idempotent_compute(self):
         """Calling compute() twice should produce the same peak and strategy keys."""
         layers = self._make_constrained_layers()
-        target = 100 * 1024 * 1024
 
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
             max_gpu_mem_bytes=500 * 1024 * 1024,
-            target_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
 

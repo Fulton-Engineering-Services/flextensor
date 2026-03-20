@@ -58,7 +58,6 @@ def print_summary(strategy: GlobalTensorSelectionStrategy, layers: list[LayerSta
     print(f"  Layers: {len(layers)}")
     print(f"  Max blocks: {strategy.n_blocks}")
     print(f"  Max GPU memory: {strategy.max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
-    print(f"  Min GPU memory: {strategy.target_gpu_mem_bytes / 1024 / 1024:.0f} MB")
     print(f"  Scale bounds: [{strategy.scale}, {strategy.scale_ub}]")
 
     print("\n  Layer details:")
@@ -109,7 +108,6 @@ class TestGlobalTensorSelectionStrategyBasic:
             max_gpu_mem_bytes=1024 * 1024 * 1024,  # 1GB
         )
         assert strategy.max_gpu_mem_bytes == 1024 * 1024 * 1024
-        assert strategy.target_gpu_mem_bytes == 1024 * 1024 * 1024  # defaults to max_gpu_mem_bytes
         assert strategy.n_blocks == 4
         assert strategy.threshold_mb == 0.1
         assert strategy.scale == 1.0
@@ -119,7 +117,6 @@ class TestGlobalTensorSelectionStrategyBasic:
         """Test initialization with custom parameters."""
         strategy = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=2 * 1024 * 1024 * 1024,  # 2GB
-            target_gpu_mem_bytes=1 * 1024 * 1024 * 1024,  # 1GB
             n_blocks=3,
             threshold_mb=0.5,
             pop_size=30,
@@ -128,7 +125,6 @@ class TestGlobalTensorSelectionStrategyBasic:
             scale_ub=1.1,
         )
         assert strategy.max_gpu_mem_bytes == 2 * 1024 * 1024 * 1024
-        assert strategy.target_gpu_mem_bytes == 1 * 1024 * 1024 * 1024
         assert strategy.n_blocks == 3
         assert strategy.threshold_mb == 0.5
         assert strategy.scale == 0.9
@@ -163,7 +159,6 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
         # Large GPU budget: 200MB (plenty of headroom)
         strategy = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=200 * 1024 * 1024,  # 200MB
-            target_gpu_mem_bytes=150 * 1024 * 1024,  # Target: 150MB (75%)
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -203,7 +198,6 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
         # GPU budget: 200MB, target: 180MB (90%)
         strategy = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=200 * 1024 * 1024,
-            target_gpu_mem_bytes=180 * 1024 * 1024,  # 90% target
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -691,7 +685,6 @@ class TestGlobalTensorSelectionStrategyMemoryBounds:
         # GPU: min=150MB, max=200MB
         strategy = GlobalTensorSelectionStrategy(
             max_gpu_mem_bytes=200 * 1024 * 1024,
-            target_gpu_mem_bytes=150 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             pop_size=20,
             epoch=20,
@@ -717,11 +710,9 @@ class TestGlobalTensorSelectionStrategyMemoryBounds:
         results = {}
         for min_pct in [0.5, 0.8, 0.9]:
             max_mem = 200 * 1024 * 1024
-            min_mem = int(max_mem * min_pct)
 
             strategy = GlobalTensorSelectionStrategy(
                 max_gpu_mem_bytes=max_mem,
-                target_gpu_mem_bytes=min_mem,
                 n_blocks=3,  # Minimum 3 blocks for pipelining
                 pop_size=20,
                 epoch=15,

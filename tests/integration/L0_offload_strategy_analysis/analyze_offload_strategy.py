@@ -278,7 +278,6 @@ def run_global_strategy(
     memory_stats: dict[int, float],
     assignment_strategy: object | None = None,
     assignment_name: str = "",
-    target_gpu_mem_bytes: int | None = None,
 ) -> AnalysisResult:
     """Run GlobalOffloadStrategy and collect results."""
     with warnings.catch_warnings(record=True) as caught_warnings:
@@ -287,7 +286,6 @@ def run_global_strategy(
         strategy = GlobalOffloadStrategy(
             n_blocks=n_blocks,
             max_gpu_mem_bytes=max_gpu_mem_bytes,
-            target_gpu_mem_bytes=target_gpu_mem_bytes,
             threshold_mb=1.0,
             min_blocks=2,
             max_blocks=n_blocks,
@@ -332,7 +330,6 @@ def run_knapsack_strategy(
     n_blocks: int = 4,
     strategy_name: str = "Knapsack (per-layer)",
     max_gpu_mem_bytes: int | None = None,
-    target_gpu_mem_bytes: int | None = None,
 ) -> AnalysisResult:
     """Run original KnapsackStrategy and collect results.
 
@@ -346,7 +343,6 @@ def run_knapsack_strategy(
         scale=scale,
         n_blocks=n_blocks,
         max_gpu_mem_bytes=max_gpu_mem_bytes,
-        target_gpu_mem_bytes=target_gpu_mem_bytes,
     )
     t0 = time.perf_counter()
     compute_result = strategy.compute(layer_stats_list)
@@ -382,7 +378,6 @@ def run_knapsack_block_strategy(
     scale: float = 1.0,
     n_blocks: int = 4,
     max_gpu_mem_bytes: int | None = None,
-    target_gpu_mem_bytes: int | None = None,
 ) -> AnalysisResult:
     """Run KnapsackBlockStrategy with provided memory stats.
 
@@ -396,7 +391,6 @@ def run_knapsack_block_strategy(
         scale=scale,
         threshold_mb=1.0,
         max_gpu_mem_bytes=max_gpu_mem_bytes,
-        target_gpu_mem_bytes=target_gpu_mem_bytes,
         n_blocks=n_blocks,
     )
     t0 = time.perf_counter()
@@ -432,7 +426,6 @@ def run_tensor_selection(
     memory_stats: dict[int, float],
     n_blocks: int = 4,
     max_gpu_mem_bytes: int | None = None,
-    target_gpu_mem_bytes: int | None = None,
     assignment_strategy: object | None = None,
     assignment_name: str = "",
 ) -> AnalysisResult:
@@ -453,7 +446,6 @@ def run_tensor_selection(
     """
     strategy = GlobalTensorSelectionStrategy(
         max_gpu_mem_bytes=max_gpu_mem_bytes or (48 * 1024**3),
-        target_gpu_mem_bytes=target_gpu_mem_bytes,
         n_blocks=n_blocks,
         threshold_mb=1.0,
         pop_size=50,
@@ -502,7 +494,6 @@ def run_adaptive_strategy(
     scale: float = 1.0,
     n_blocks: int = 4,
     max_gpu_mem_bytes: int | None = None,
-    target_gpu_mem_bytes: int | None = None,
     extra_optimization: bool = False,
 ) -> AnalysisResult:
     """Run AdaptiveStrategy which evaluates all strategies and picks the best.
@@ -514,7 +505,6 @@ def run_adaptive_strategy(
         scale: Scale factor passed to all sub-strategies.
         n_blocks: Number of memory blocks.
         max_gpu_mem_bytes: Maximum GPU memory limit in bytes.
-        target_gpu_mem_bytes: Soft GPU memory target in bytes.
         extra_optimization: Include slower TensorSelection candidates.
     """
     strategy = AdaptiveStrategy(
@@ -523,7 +513,6 @@ def run_adaptive_strategy(
         threshold_mb=1.0,
         n_blocks=n_blocks,
         max_gpu_mem_bytes=max_gpu_mem_bytes,
-        target_gpu_mem_bytes=target_gpu_mem_bytes,
         extra_optimization=extra_optimization,
     )
     t0 = time.perf_counter()
@@ -945,13 +934,7 @@ def main() -> None:  # noqa: C901
         default=48.0,
         help="GPU memory limit in GB (default: 48.0)",
     )
-    parser.add_argument(
-        "--target-gpu-mem",
-        type=float,
-        default=None,
-        help="Target GPU memory in GB (soft target, default: same as --gpu-mem). "
-        "Optimizer aims for this peak memory; must be <= --gpu-mem.",
-    )
+
     parser.add_argument(
         "--diagnostics",
         action="store_true",
@@ -1026,12 +1009,9 @@ def main() -> None:  # noqa: C901
     print(f"Model size: {format_bytes(model_size_bytes)}")
     print(f"Total layers: {len(layer_stats_list)}")
     print(f"GPU memory limit: {args.gpu_mem} GB")
-    if args.target_gpu_mem is not None:
-        print(f"GPU memory target: {args.target_gpu_mem} GB")
     print(f"Number of blocks: {args.n_blocks}")
 
     max_gpu_mem_bytes = int(args.gpu_mem * 1024**3)
-    target_gpu_mem_bytes: int | None = int(args.target_gpu_mem * 1024**3) if args.target_gpu_mem is not None else None
 
     # Define which strategies to run
     if args.strategy == "recommended":
@@ -1073,7 +1053,6 @@ def main() -> None:  # noqa: C901
                 _m,
                 assignment_strategy=None,
                 assignment_name="Optimized",
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
             ),
             "global-strict": lambda _i=profile_interpolator, _m=scaled_stats: run_global_strategy(
                 layer_stats_list,
@@ -1083,7 +1062,6 @@ def main() -> None:  # noqa: C901
                 _m,
                 assignment_strategy=StrictRoundRobinAssignment(),
                 assignment_name="Strict",
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
             ),
             "knapsack": lambda _i=profile_interpolator: run_knapsack_strategy(
                 layer_stats_list,
@@ -1091,7 +1069,6 @@ def main() -> None:  # noqa: C901
                 scale=args.knapsack_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
             ),
             "knapsack-block": lambda _i=profile_interpolator, _m=scaled_stats: run_knapsack_block_strategy(
                 layer_stats_list,
@@ -1100,7 +1077,6 @@ def main() -> None:  # noqa: C901
                 scale=args.knapsack_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
             ),
             "tensor-select": lambda _i=profile_interpolator, _m=scaled_stats: run_tensor_selection(
                 layer_stats_list,
@@ -1108,7 +1084,6 @@ def main() -> None:  # noqa: C901
                 _m,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
                 assignment_strategy=None,
                 assignment_name="Optimized",
             ),
@@ -1118,7 +1093,6 @@ def main() -> None:  # noqa: C901
                 _m,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
                 assignment_strategy=StrictRoundRobinAssignment(),
                 assignment_name="Strict",
             ),
@@ -1129,7 +1103,6 @@ def main() -> None:  # noqa: C901
                 scale=args.knapsack_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
             ),
             "adaptive-extra": lambda _i=profile_interpolator, _m=scaled_stats: run_adaptive_strategy(
                 layer_stats_list,
@@ -1138,7 +1111,6 @@ def main() -> None:  # noqa: C901
                 scale=args.knapsack_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
-                target_gpu_mem_bytes=target_gpu_mem_bytes,
                 extra_optimization=True,
             ),
         }

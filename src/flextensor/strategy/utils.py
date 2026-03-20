@@ -35,34 +35,24 @@ if not _block_table_logger.handlers:
 def validate_memory_params(
     scale: float,
     max_gpu_mem_bytes: int | None,
-    target_gpu_mem_bytes: int | None,
 ) -> int | None:
-    """Validate and normalize memory parameters common to all strategies.
-
-    Checks that ``scale`` is positive and that ``target_gpu_mem_bytes`` does not
-    exceed ``max_gpu_mem_bytes``.  When ``target_gpu_mem_bytes`` is set but
-    ``max_gpu_mem_bytes`` is ``None``, the target is promoted to the hard limit.
+    """Validate memory parameters common to all strategies.
 
     Args:
         scale: Duration multiplier; must be positive.
         max_gpu_mem_bytes: Hard GPU memory limit in bytes, or ``None``.
-        target_gpu_mem_bytes: Soft GPU memory target in bytes, or ``None``.
 
     Returns:
-        Normalized ``max_gpu_mem_bytes`` (may differ from the input when
-        ``target_gpu_mem_bytes`` was used as a fallback).
+        The validated ``max_gpu_mem_bytes`` (unchanged).
 
     Raises:
-        ValueError: If ``scale <= 0`` or ``target_gpu_mem_bytes > max_gpu_mem_bytes``.
+        ValueError: If ``scale <= 0`` or ``max_gpu_mem_bytes`` is not ``None``
+            and not positive.
     """
     if scale <= 0:
         raise ValueError(f"scale must be positive, got {scale}")
-    if target_gpu_mem_bytes is not None and max_gpu_mem_bytes is None:
-        max_gpu_mem_bytes = target_gpu_mem_bytes
-    if target_gpu_mem_bytes is not None and max_gpu_mem_bytes is not None and target_gpu_mem_bytes > max_gpu_mem_bytes:
-        raise ValueError(
-            f"target_gpu_mem_bytes ({target_gpu_mem_bytes}) must be <= max_gpu_mem_bytes ({max_gpu_mem_bytes})"
-        )
+    if max_gpu_mem_bytes is not None and max_gpu_mem_bytes <= 0:
+        raise ValueError(f"max_gpu_mem_bytes must be positive when set, got {max_gpu_mem_bytes}")
     return max_gpu_mem_bytes
 
 

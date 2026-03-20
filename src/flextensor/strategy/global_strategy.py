@@ -50,7 +50,6 @@ class GlobalOffloadStrategy:
         self,
         n_blocks: int = 4,
         max_gpu_mem_bytes: int | None = None,
-        target_gpu_mem_bytes: int | None = None,
         scale: float = 1.0,
         threshold_mb: float = 0.1,
         min_blocks: int | None = None,
@@ -64,9 +63,6 @@ class GlobalOffloadStrategy:
             n_blocks: Number of reusable memory blocks (minimum 2 for pipelining).
             max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
                 When ``None``, latency mode — offload what fits in ``scale * duration``.
-            target_gpu_mem_bytes: Soft GPU memory target in bytes. If set without
-                ``max_gpu_mem_bytes``, the target is used as the hard limit.
-                Defaults to ``max_gpu_mem_bytes`` when ``None``.
             scale: Duration multiplier (baseline). Controls how much of the previous
                 layer's compute time is available for transfers. ``1.0`` = exact fit.
             threshold_mb: Minimum tensor size threshold in MB. Tensors smaller than
@@ -85,12 +81,11 @@ class GlobalOffloadStrategy:
             ValueError: If min_blocks > max_blocks.
             ValueError: If min_blocks < 2 or max_blocks > n_blocks.
             ValueError: If scale <= 0.
-            ValueError: If target_gpu_mem_bytes > max_gpu_mem_bytes.
         """
         if n_blocks < 2:
             msg = "n_blocks must be at least 2 for pipelined execution"
             raise ValueError(msg)
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes, target_gpu_mem_bytes)
+        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
 
         # Set defaults
         if min_blocks is None:
@@ -112,7 +107,6 @@ class GlobalOffloadStrategy:
         self.n_blocks = n_blocks
         self.scale = scale
         self.max_gpu_mem_bytes = max_gpu_mem_bytes
-        self.target_gpu_mem_bytes = target_gpu_mem_bytes if target_gpu_mem_bytes is not None else max_gpu_mem_bytes
         self.threshold_mb = threshold_mb
         self.min_blocks = min_blocks
         self.max_blocks = max_blocks
@@ -408,7 +402,7 @@ class GlobalOffloadStrategy:
         # When memory mode is active, suppress the "Cannot satisfy GPU memory
         # constraint" warning from the initial compute since we may auto-adjust
         # scale afterward.
-        target = self.target_gpu_mem_bytes
+        target = self.max_gpu_mem_bytes
         if target is not None:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning)
@@ -426,10 +420,10 @@ class GlobalOffloadStrategy:
         self,
         layer_stats: list[LayerStatistics],
         interpolator: MemoryTransferInterpolator,
-        target_gpu_mem_bytes: int,
+        memory_budget: int,
         max_attempts: int = 40,
     ) -> StrategyResult:
-        """Iteratively increase scale until peak GPU fits within the memory target.
+        """Iteratively increase scale until peak GPU fits within the memory budget.
 
         Uses binary search to find the lowest scale that meets the constraint,
         minimising latency overhead while satisfying the GPU memory budget.
@@ -441,7 +435,7 @@ class GlobalOffloadStrategy:
         Args:
             layer_stats: Layer statistics.
             interpolator: Memory transfer interpolator.
-            target_gpu_mem_bytes: Target peak GPU memory in bytes.
+            memory_budget: Target peak GPU memory in bytes.
             max_attempts: Maximum binary search iterations.
 
         Returns:
@@ -449,9 +443,9 @@ class GlobalOffloadStrategy:
         """
         original_scale = self.scale
 
-        # Estimate upper bound: total model size / target to get rough idea
+        # Estimate upper bound: total model size / budget to get rough idea
         total_model_size = sum(sum(t.size_bytes for t in layer.tensors) for layer in layer_stats)
-        needed_ratio = total_model_size / target_gpu_mem_bytes if target_gpu_mem_bytes > 0 else 100.0
+        needed_ratio = total_model_size / memory_budget if memory_budget > 0 else 100.0
         high_scale = max(original_scale * needed_ratio * 2, original_scale * 100)
         low_scale = original_scale
 
@@ -471,7 +465,7 @@ class GlobalOffloadStrategy:
                 warnings.filterwarnings("ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning)
                 result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded)
 
-            if self.optimal_peak_memory <= target_gpu_mem_bytes:
+            if self.optimal_peak_memory <= memory_budget:
                 best_result = result
                 best_peak = self.optimal_peak_memory
                 high_scale = mid_scale
@@ -501,7 +495,7 @@ class GlobalOffloadStrategy:
             if final_scale > original_scale:
                 warnings.warn(
                     f"Original scale ({original_scale}) is insufficient to meet GPU memory target "
-                    f"({target_gpu_mem_bytes / 1024**3:.2f} GB). "
+                    f"({memory_budget / 1024**3:.2f} GB). "
                     f"Adjusted scale to {final_scale:.4f}.",
                     stacklevel=3,
                 )
@@ -521,8 +515,8 @@ class GlobalOffloadStrategy:
         warnings.warn(
             f"Cannot satisfy GPU memory constraint: "
             f"minimum required = {best_peak / 1024 / 1024:.1f}MB (determined by tensor sizes), "
-            f"budget = {target_gpu_mem_bytes / 1024 / 1024:.1f}MB, "
-            f"excess = {(best_peak - target_gpu_mem_bytes) / 1024 / 1024:.1f}MB. "
+            f"budget = {memory_budget / 1024 / 1024:.1f}MB, "
+            f"excess = {(best_peak - memory_budget) / 1024 / 1024:.1f}MB. "
             f"Consider increasing max_gpu_mem_bytes or reducing tensor sizes.",
             UserWarning,
             stacklevel=3,
@@ -586,7 +580,7 @@ class GlobalTensorSelectionStrategy:
     - Hard: Transfer time for layer N <= (layer N-1's compute time) * scale
 
     Objective (maximize):
-    - GPU utilization in target range [target_gpu_mem, max_gpu_mem]
+    - GPU utilization relative to max_gpu_mem (when set)
     - Offload ratio (secondary)
     - Prefer lower scale (less latency overhead)
 
@@ -607,7 +601,6 @@ class GlobalTensorSelectionStrategy:
     def __init__(
         self,
         max_gpu_mem_bytes: int | None = None,
-        target_gpu_mem_bytes: int | None = None,
         scale: float = 1.0,
         scale_ub: float | None = None,
         n_blocks: int = 4,
@@ -630,10 +623,6 @@ class GlobalTensorSelectionStrategy:
             max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
                 When ``None``, the memory constraint is disabled and the optimizer
                 only respects the transfer time constraint (latency mode).
-            target_gpu_mem_bytes: Soft GPU memory target in bytes. The optimizer
-                aims for this peak memory to avoid over-offloading. If set without
-                ``max_gpu_mem_bytes``, the target is used as the hard limit.
-                When ``None``, defaults to ``max_gpu_mem_bytes``.
             scale: Duration multiplier (baseline / lower bound for the optimizer).
                 ``0.9`` = 10% safety margin, ``1.0`` = exact fit (default).
             scale_ub: Upper bound for scale the optimizer may explore.
@@ -667,9 +656,8 @@ class GlobalTensorSelectionStrategy:
                 Default: SingleLayerWindow (previous layer's duration only).
                 Use GapAwareWindow to exploit empty layers for larger transfer budgets.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes, target_gpu_mem_bytes)
+        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
         self.max_gpu_mem_bytes = max_gpu_mem_bytes
-        self.target_gpu_mem_bytes = target_gpu_mem_bytes if target_gpu_mem_bytes is not None else max_gpu_mem_bytes
         # For backward compatibility and internal use, keep scale_lb
         self.scale_lb = scale
         # Resolve scale_ub default based on mode
@@ -833,7 +821,6 @@ class GlobalTensorSelectionStrategy:
 
         # Capture variables for closure
         max_gpu_mem = self.max_gpu_mem_bytes
-        target_gpu_mem = self.target_gpu_mem_bytes
         n_blocks = self.n_blocks
         scale_lb = self.scale_lb
         scale_ub = self.scale_ub
@@ -891,11 +878,6 @@ class GlobalTensorSelectionStrategy:
                 while j < num_layers and static_offload_sizes[j] == 0.0:
                     j += 1
                 next_real_transfer[i] = min(j, num_layers)
-
-        # GPU memory range for scoring
-        gpu_mem_range = (
-            float(max_gpu_mem - target_gpu_mem) if max_gpu_mem is not None and target_gpu_mem is not None else 0.0
-        )
 
         # No type annotations on inner function — avoids beartype overhead on ~5000 calls
         def objective(solution):  # noqa: C901
@@ -962,18 +944,8 @@ class GlobalTensorSelectionStrategy:
             if constraint_violated:
                 return 1000.0 * (required_scale / solution_scale)
 
-            # Score: prefer peak memory close to target_gpu_mem
-            # - Best score (1.0) at exactly target
-            # - Below target: proportional (rewards getting closer to target)
-            # - Above target: penalty (still valid but less desirable)
-            if target_gpu_mem is not None:
-                if peak_memory <= target_gpu_mem:
-                    gpu_score = (peak_memory / target_gpu_mem) if target_gpu_mem > 0 else 1.0
-                else:
-                    gpu_score = 1.0 - 0.5 * (peak_memory - target_gpu_mem) / gpu_mem_range if gpu_mem_range > 0 else 0.5
-            else:
-                # Latency mode (no memory target): score based on offload ratio only
-                gpu_score = 1.0
+            # Score: prefer peak memory close to max_gpu_mem (latency mode: offload ratio only)
+            gpu_score = (peak_memory / max_gpu_mem if max_gpu_mem > 0 else 1.0) if max_gpu_mem is not None else 1.0
 
             offload_ratio = total_offloaded / total_model_size if total_model_size > 0 else 0.0
             score = (gpu_score + offload_ratio * 0.5) / solution_scale

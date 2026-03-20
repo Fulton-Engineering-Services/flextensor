@@ -13,41 +13,33 @@ from flextensor.strategy.utils import EarlyStopCallback, validate_memory_params
 
 
 class TestValidateMemoryParams:
-    def test_valid_params_both_none(self):
-        result = validate_memory_params(1.0, None, None)
+    def test_returns_none_when_max_is_none(self):
+        result = validate_memory_params(1.0, None)
         assert result is None
 
-    def test_valid_params_max_only(self):
-        result = validate_memory_params(1.0, 1000, None)
+    def test_returns_max_when_set(self):
+        result = validate_memory_params(1.0, 1000)
         assert result == 1000
-
-    def test_valid_params_both_set_equal(self):
-        result = validate_memory_params(1.0, 1000, 1000)
-        assert result == 1000
-
-    def test_valid_params_target_below_max(self):
-        result = validate_memory_params(1.0, 1000, 500)
-        assert result == 1000
-
-    def test_target_promotes_to_max_when_max_is_none(self):
-        result = validate_memory_params(1.0, None, 500)
-        assert result == 500
 
     def test_scale_zero_raises(self):
         with pytest.raises(ValueError, match="scale must be positive"):
-            validate_memory_params(0.0, None, None)
+            validate_memory_params(0.0, None)
 
     def test_scale_negative_raises(self):
         with pytest.raises(ValueError, match="scale must be positive"):
-            validate_memory_params(-1.0, None, None)
-
-    def test_target_exceeds_max_raises(self):
-        with pytest.raises(ValueError, match=r"target_gpu_mem_bytes.*must be <="):
-            validate_memory_params(1.0, 500, 1000)
+            validate_memory_params(-1.0, None)
 
     def test_fractional_scale(self):
-        result = validate_memory_params(0.01, 1000, None)
+        result = validate_memory_params(0.01, 1000)
         assert result == 1000
+
+    def test_max_gpu_mem_bytes_zero_raises(self):
+        with pytest.raises(ValueError, match="max_gpu_mem_bytes must be positive"):
+            validate_memory_params(1.0, 0)
+
+    def test_max_gpu_mem_bytes_negative_raises(self):
+        with pytest.raises(ValueError, match="max_gpu_mem_bytes must be positive"):
+            validate_memory_params(1.0, -1)
 
 
 # ===========================================================================

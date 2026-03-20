@@ -75,7 +75,6 @@ class AdaptiveStrategy:
         min_blocks: int = 2,
         n_blocks: int = 4,
         max_gpu_mem_bytes: int | None = None,
-        target_gpu_mem_bytes: int | None = None,
         extra_optimization: bool = False,
     ):
         """Initialize AdaptiveStrategy.
@@ -93,13 +92,11 @@ class AdaptiveStrategy:
             n_blocks: Number of memory blocks.
             max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
                 When ``None``, latency mode — respect ``scale`` strictly.
-            target_gpu_mem_bytes: Soft GPU memory target in bytes. If set without
-                ``max_gpu_mem_bytes``, the target is used as the hard limit.
             extra_optimization: If True, include additional slower strategy candidates
                 (GlobalTensorSelectionStrategy) that may find better solutions at the
                 cost of significantly longer optimization time. Default is False.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes, target_gpu_mem_bytes)
+        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
         if min_blocks < 2:
             raise ValueError(f"min_blocks must be >= 2, got {min_blocks}")
         if min_blocks > n_blocks:
@@ -114,7 +111,6 @@ class AdaptiveStrategy:
         self.min_blocks = min_blocks
         self.max_gpu_mem_bytes = max_gpu_mem_bytes
         self.extra_optimization = extra_optimization
-        self.target_gpu_mem_bytes = target_gpu_mem_bytes if target_gpu_mem_bytes is not None else max_gpu_mem_bytes
 
         # Set after compute()
         self._selected_strategy_name: str | None = None
@@ -229,7 +225,6 @@ class AdaptiveStrategy:
         n_blocks = self.n_blocks
         min_blocks = self.min_blocks
         max_mem = self.max_gpu_mem_bytes
-        target_mem = self.target_gpu_mem_bytes
 
         candidates: list[tuple[str, Strategy]] = [
             (
@@ -240,7 +235,6 @@ class AdaptiveStrategy:
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
                     max_gpu_mem_bytes=max_mem,
-                    target_gpu_mem_bytes=target_mem,
                 ),
             ),
             (
@@ -250,7 +244,6 @@ class AdaptiveStrategy:
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
                     max_gpu_mem_bytes=max_mem,
-                    target_gpu_mem_bytes=target_mem,
                     assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=min_blocks, max_blocks=n_blocks),
                 ),
             ),
@@ -261,7 +254,6 @@ class AdaptiveStrategy:
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
                     max_gpu_mem_bytes=max_mem,
-                    target_gpu_mem_bytes=target_mem,
                     assignment_strategy=StrictRoundRobinAssignment(),
                 ),
             ),
@@ -276,7 +268,6 @@ class AdaptiveStrategy:
                         threshold_mb=threshold_mb,
                         n_blocks=n_blocks,
                         max_gpu_mem_bytes=max_mem,
-                        target_gpu_mem_bytes=target_mem,
                         pop_size=50,
                         epoch=100,
                         max_early_stop=50,
@@ -290,7 +281,6 @@ class AdaptiveStrategy:
                         threshold_mb=threshold_mb,
                         n_blocks=n_blocks,
                         max_gpu_mem_bytes=max_mem,
-                        target_gpu_mem_bytes=target_mem,
                         pop_size=50,
                         epoch=100,
                         max_early_stop=50,
@@ -312,7 +302,6 @@ class AdaptiveStrategy:
                     group_size=self.group_size,
                     threshold_mb=self.threshold_mb,
                     max_gpu_mem_bytes=self.max_gpu_mem_bytes,
-                    target_gpu_mem_bytes=self.target_gpu_mem_bytes,
                 ),
             ),
         ]
