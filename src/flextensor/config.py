@@ -113,7 +113,9 @@ class OffloadConfig(BaseModel):
     """Target maximum GPU memory as a fraction of total device memory (e.g. 0.9 = 90%).
 
     When set, the strategy switches to *memory mode* and keeps peak GPU usage within this
-    budget. When ``None``, the strategy operates in *latency mode* (no memory constraint).
+    budget. At runtime, the fractional budget is capped by actual available GPU memory so
+    the strategy never targets more than what is free. When ``None``, the strategy operates
+    in *latency mode* (no memory constraint).
     Defaults to 0.9. Can also be set via the ``FT_MAX_GPU_MEM_FRACTION`` env var.
     """
 

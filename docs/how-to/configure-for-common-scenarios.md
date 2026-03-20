@@ -36,7 +36,7 @@ Key choices:
 
 - `release_tensors=True` frees GPU memory after each layer executes, reducing peak usage.
 - `pinned_memory=True` uses page-locked CPU memory to accelerate transfers via Direct Memory Access (DMA).
-- `max_gpu_mem_fraction=0.8` switches the strategy to memory mode, keeping peak GPU usage within 80% of total device memory. Using a fraction rather than a byte count makes the config portable across GPU SKUs.
+- `max_gpu_mem_fraction=0.8` switches the strategy to memory mode, targeting at most 80% of total device memory (the effective budget may be lower if other consumers have already used GPU memory). Using a fraction rather than a byte count makes the config portable across GPU SKUs.
 - `min_blocks=2` lets the optimizer try fewer memory blocks, reducing GPU memory consumed by FlexTensor itself.
 
 ---

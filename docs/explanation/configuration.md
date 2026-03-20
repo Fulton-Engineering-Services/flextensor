@@ -207,7 +207,12 @@ config = OffloadConfig(pinned_memory=False)  # Lower CPU memory overhead
 
 `max_gpu_mem_fraction` controls how much of the GPU's total memory FlexTensor may use. It accepts a `float` in the range `(0.0, 1.0]`, where `0.9` means "use at most 90% of total device memory."
 
-When set to a fraction, the strategy operates in *memory mode* and keeps peak GPU usage within that budget. The fraction is resolved to an absolute byte count at runtime, so the same config works portably across GPU SKUs with different memory capacities.
+When set to a fraction, the strategy operates in *memory mode* and keeps peak GPU usage within that budget. The fraction is resolved to an absolute byte count at runtime and then **capped by actual available GPU memory**. If other consumers (CUDA context, KV cache, framework buffers) have already used some GPU memory, the effective budget will be lower than `total * fraction`. This ensures the strategy never targets more memory than is actually free. The same config works portably across GPU SKUs with different memory capacities.
+
+!!! note "Budget capping and minimum memory"
+    If the budget is capped, a warning is logged with the adjusted value. If available
+    GPU memory drops below 256 MiB, a `RuntimeError` is raised — see
+    [Troubleshooting](../how-to/troubleshooting.md#step-3-check-for-insufficient-free-gpu-memory-error).
 
 ```python
 config = OffloadConfig(

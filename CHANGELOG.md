@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wall-clock time included kernel-launch overhead and scheduler jitter; CUDA events record
   timestamps on the GPU timeline, giving accurate device-side compute duration for strategy
   decisions.
+- GPU memory budget (`max_gpu_mem_fraction`) is now capped by actual available GPU memory
+  at strategy compute time. Previously, `total * fraction` could exceed available memory
+  when CUDA context, KV cache, or framework buffers had already consumed GPU memory,
+  causing OOM. (#104)
 
 ## [0.1.0] — 2026-03-16
 

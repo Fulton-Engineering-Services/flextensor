@@ -68,6 +68,9 @@ from flextensor.types import GPUMemoryUsage
 
 logger = logging.getLogger(__name__)
 
+_GiB = 1 << 30
+_MIN_GPU_BUDGET_BYTES = 256 * 1024**2  # 256 MiB — floor for strategy budget
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -763,13 +766,50 @@ class TensorManager:
     def _resolve_gpu_budget(self) -> int | None:
         """Resolve GPU memory budget from fraction and current device state.
 
+        Caps the fractional budget by actual available GPU memory to prevent OOM
+        when CUDA context, KV cache, or framework buffers have already consumed memory.
+
+        Available memory is computed as ``free_cuda + (reserved - allocated)``.
+        The ``reserved - allocated`` term accounts for PyTorch allocator cache that
+        CUDA reports as used but is actually reusable (reserved >= allocated is a
+        PyTorch allocator invariant).
+
         Returns:
-            Budget in bytes, or None for latency mode (no constraint).
+            Budget in bytes (capped by available memory), or None for latency mode.
+
+        Raises:
+            RuntimeError: If available GPU memory < 256 MiB.
         """
         if self._max_gpu_mem_fraction is None:
             return None
-        _, total = torch.cuda.mem_get_info(self.device_gpu)
-        return int(total * self._max_gpu_mem_fraction)
+
+        free_cuda, total = torch.cuda.mem_get_info(self.device_gpu)
+        budget = int(total * self._max_gpu_mem_fraction)
+
+        reserved = torch.cuda.memory_reserved(self.device_gpu)
+        allocated = torch.cuda.memory_allocated(self.device_gpu)
+        available = free_cuda + (reserved - allocated)
+
+        if available < _MIN_GPU_BUDGET_BYTES:
+            raise RuntimeError(
+                f"Insufficient free GPU memory: {available / _GiB:.2f} GiB available "
+                f"(free={free_cuda / _GiB:.2f}, reserved={reserved / _GiB:.2f}, "
+                f"allocated={allocated / _GiB:.2f}), "
+                f"minimum required: {_MIN_GPU_BUDGET_BYTES / _GiB:.2f} GiB"
+            )
+
+        if budget > available:
+            logger.warning(
+                "Capping GPU memory budget from %.2f GiB to %.2f GiB "
+                "(available: %.2f GiB free_cuda + %.2f GiB allocator cache)",
+                budget / _GiB,
+                available / _GiB,
+                free_cuda / _GiB,
+                (reserved - allocated) / _GiB,
+            )
+            budget = available
+
+        return budget
 
     def prepare_infer_mode(self):
         """Prepare inference mode from fresh profiling data.

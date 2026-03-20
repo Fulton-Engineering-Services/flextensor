@@ -224,6 +224,33 @@ If memory errors persist after these steps, check that no other processes are ho
 nvidia-smi
 ```
 
+### Step 3: Check for "Insufficient free GPU memory" error
+
+If you see:
+
+```
+RuntimeError: Insufficient free GPU memory: X.XX GiB available
+(free=..., reserved=..., allocated=...), minimum required: 0.25 GiB
+```
+
+FlexTensor detected that the GPU has less than 256 MiB of usable memory at strategy
+compute time. This typically means other processes, the CUDA context, or a large KV cache
+have consumed nearly all GPU memory before FlexTensor's offloading strategy runs.
+
+**Diagnose:**
+
+```bash
+nvidia-smi  # Check what's using GPU memory
+```
+
+**Resolve:**
+
+- Free other GPU processes or reduce KV cache / batch size in the inference framework.
+- If running inside vLLM or TRT-LLM, lower their GPU memory reservation so FlexTensor
+  has enough room to compute a strategy.
+- Set `max_gpu_mem_fraction=None` to switch to latency mode, which skips the memory
+  budget entirely (offloads based on `knapsack_scale` only).
+
 ---
 
 ## Fix CUDA Device Mismatch Errors
