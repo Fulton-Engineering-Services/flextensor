@@ -49,7 +49,6 @@ class GlobalOffloadStrategy:
     def __init__(
         self,
         n_blocks: int = 4,
-        max_gpu_mem_bytes: int | None = None,
         scale: float = 1.0,
         threshold_mb: float = 0.1,
         min_blocks: int | None = None,
@@ -61,8 +60,6 @@ class GlobalOffloadStrategy:
 
         Args:
             n_blocks: Number of reusable memory blocks (minimum 2 for pipelining).
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, latency mode — offload what fits in ``scale * duration``.
             scale: Duration multiplier (baseline). Controls how much of the previous
                 layer's compute time is available for transfers. ``1.0`` = exact fit.
             threshold_mb: Minimum tensor size threshold in MB. Tensors smaller than
@@ -85,7 +82,7 @@ class GlobalOffloadStrategy:
         if n_blocks < 2:
             msg = "n_blocks must be at least 2 for pipelined execution"
             raise ValueError(msg)
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
+        validate_memory_params(scale)
 
         # Set defaults
         if min_blocks is None:
@@ -106,7 +103,6 @@ class GlobalOffloadStrategy:
 
         self.n_blocks = n_blocks
         self.scale = scale
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
         self.threshold_mb = threshold_mb
         self.min_blocks = min_blocks
         self.max_blocks = max_blocks
@@ -262,6 +258,7 @@ class GlobalOffloadStrategy:
         layer_data: list[tuple[str, list[TensorStatistics], float]],
         layer_stats: list[LayerStatistics],
         non_offloaded_memory: int,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """
         Compute strategy using an external assignment strategy.
@@ -273,6 +270,8 @@ class GlobalOffloadStrategy:
             layer_data: List of (label, tensors, duration) per layer.
             layer_stats: Original layer statistics.
             non_offloaded_memory: Memory of tensors not being offloaded.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, the memory constraint is not checked.
 
         Returns:
             StrategyResult containing strategy_map and block_data.
@@ -320,9 +319,9 @@ class GlobalOffloadStrategy:
         self.optimal_peak_memory = self.calculate_peak_memory_pipelined(block_sizes, non_offloaded_memory)
 
         # Validate against memory budget (only when hard limit is set)
-        if self.max_gpu_mem_bytes is not None and self.optimal_peak_memory > self.max_gpu_mem_bytes:
+        if max_gpu_mem_bytes is not None and self.optimal_peak_memory > max_gpu_mem_bytes:
             min_required_mb = self.optimal_peak_memory / 1024 / 1024
-            budget_mb = self.max_gpu_mem_bytes / 1024 / 1024
+            budget_mb = max_gpu_mem_bytes / 1024 / 1024
             excess_mb = min_required_mb - budget_mb
 
             warnings.warn(
@@ -356,6 +355,7 @@ class GlobalOffloadStrategy:
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """
         Compute offload strategy using pipelined block optimization.
@@ -368,6 +368,8 @@ class GlobalOffloadStrategy:
             layer_stats: List of layer statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
                 If provided, uses this data. Otherwise falls back to extraction from layer stats.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, latency mode — offload what fits in ``scale * duration``.
 
         Returns:
             StrategyResult containing strategy_map and block_data.
@@ -402,17 +404,23 @@ class GlobalOffloadStrategy:
         # When memory mode is active, suppress the "Cannot satisfy GPU memory
         # constraint" warning from the initial compute since we may auto-adjust
         # scale afterward.
-        target = self.max_gpu_mem_bytes
+        target = max_gpu_mem_bytes
         if target is not None:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning)
-                result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded_memory)
+                result = self._compute_with_assignment_strategy(
+                    layer_data, layer_stats, non_offloaded_memory, max_gpu_mem_bytes=max_gpu_mem_bytes
+                )
         else:
-            result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded_memory)
+            result = self._compute_with_assignment_strategy(
+                layer_data, layer_stats, non_offloaded_memory, max_gpu_mem_bytes=max_gpu_mem_bytes
+            )
 
         # Memory mode: auto-increase scale if peak memory exceeds target
         if target is not None and self.optimal_peak_memory > target:
-            result = self._adjust_scale_for_memory(layer_stats, memory_transfer_interpolator, target)
+            result = self._adjust_scale_for_memory(
+                layer_stats, memory_transfer_interpolator, target, max_gpu_mem_bytes=max_gpu_mem_bytes
+            )
 
         return result
 
@@ -422,6 +430,7 @@ class GlobalOffloadStrategy:
         interpolator: MemoryTransferInterpolator,
         memory_budget: int,
         max_attempts: int = 40,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """Iteratively increase scale until peak GPU fits within the memory budget.
 
@@ -437,6 +446,8 @@ class GlobalOffloadStrategy:
             interpolator: Memory transfer interpolator.
             memory_budget: Target peak GPU memory in bytes.
             max_attempts: Maximum binary search iterations.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes, threaded through
+                to ``_compute_with_assignment_strategy`` for constraint validation.
 
         Returns:
             StrategyResult with the adjusted strategy.
@@ -463,7 +474,9 @@ class GlobalOffloadStrategy:
             non_offloaded = self._calculate_non_offloaded_memory(layer_stats, offloaded_layer_data=layer_data)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning)
-                result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded)
+                result = self._compute_with_assignment_strategy(
+                    layer_data, layer_stats, non_offloaded, max_gpu_mem_bytes=max_gpu_mem_bytes
+                )
 
             if self.optimal_peak_memory <= memory_budget:
                 best_result = result
@@ -489,7 +502,9 @@ class GlobalOffloadStrategy:
                     warnings.filterwarnings(
                         "ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning
                     )
-                    best_result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded)
+                    best_result = self._compute_with_assignment_strategy(
+                        layer_data, layer_stats, non_offloaded, max_gpu_mem_bytes=max_gpu_mem_bytes
+                    )
 
             self.scale = final_scale
             if final_scale > original_scale:
@@ -507,7 +522,9 @@ class GlobalOffloadStrategy:
             non_offloaded = self._calculate_non_offloaded_memory(layer_stats, offloaded_layer_data=layer_data)
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=r"Cannot satisfy GPU memory constraint", category=UserWarning)
-                result = self._compute_with_assignment_strategy(layer_data, layer_stats, non_offloaded)
+                result = self._compute_with_assignment_strategy(
+                    layer_data, layer_stats, non_offloaded, max_gpu_mem_bytes=max_gpu_mem_bytes
+                )
         else:
             result = StrategyResult(strategy_map={}, block_data=None)
 
@@ -600,7 +617,6 @@ class GlobalTensorSelectionStrategy:
 
     def __init__(
         self,
-        max_gpu_mem_bytes: int | None = None,
         scale: float = 1.0,
         scale_ub: float | None = None,
         n_blocks: int = 4,
@@ -620,15 +636,13 @@ class GlobalTensorSelectionStrategy:
         Initialize GlobalTensorSelectionStrategy.
 
         Args:
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, the memory constraint is disabled and the optimizer
-                only respects the transfer time constraint (latency mode).
             scale: Duration multiplier (baseline / lower bound for the optimizer).
                 ``0.9`` = 10% safety margin, ``1.0`` = exact fit (default).
             scale_ub: Upper bound for scale the optimizer may explore.
-                When ``None`` (default), automatically determined by mode:
-                - Latency mode (``max_gpu_mem_bytes=None``): ``scale`` (no overhead)
-                - Memory mode (``max_gpu_mem_bytes`` set): ``100.0`` (wide search)
+                When ``None`` (default), defaults to ``scale`` (latency mode).
+                ``compute()`` automatically widens to ``100.0`` in memory mode
+                (``max_gpu_mem_bytes`` set) unless the caller explicitly set
+                ``scale_ub``.
                 When explicitly set, used as-is. Example: ``scale=0.9, scale_ub=1.0``
                 means transfers should fit within 90-100% of compute time.
             n_blocks: Number of memory blocks (max). Used if assignment_strategy is None.
@@ -656,17 +670,15 @@ class GlobalTensorSelectionStrategy:
                 Default: SingleLayerWindow (previous layer's duration only).
                 Use GapAwareWindow to exploit empty layers for larger transfer budgets.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
+        validate_memory_params(scale)
         # For backward compatibility and internal use, keep scale_lb
         self.scale_lb = scale
         # Resolve scale_ub default based on mode
         if scale_ub is not None:
             self.scale_ub = scale_ub
-        elif max_gpu_mem_bytes is not None:
-            self.scale_ub = 100.0  # Memory mode: wide search for optimal scale
         else:
-            self.scale_ub = scale  # Latency mode: strict, no overhead
+            self.scale_ub = scale  # Default to latency mode; compute() adjusts for memory mode
+        self._user_set_scale_ub = scale_ub is not None
         self.n_blocks = n_blocks
         self.min_blocks = min_blocks if min_blocks is not None else 2
         self.max_blocks = max_blocks if max_blocks is not None else n_blocks
@@ -704,9 +716,27 @@ class GlobalTensorSelectionStrategy:
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
-        """Run the core optimizer. See ``compute()`` for the public API."""
+        """Run the core optimizer.
+
+        Args:
+            layer_stats: List of layer statistics containing tensor info and durations.
+            memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
+                If provided, uses this data. Otherwise falls back to extraction from layer stats.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, the memory constraint is disabled and the optimizer
+                only respects the transfer time constraint (latency mode).
+
+        Returns:
+            StrategyResult containing strategy_map and block_data.
+        """
         from scipy.optimize import differential_evolution, dual_annealing
+
+        # Compute effective scale_ub locally (do NOT mutate self.scale_ub)
+        effective_scale_ub = self.scale_ub
+        if max_gpu_mem_bytes is not None and not self._user_set_scale_ub:
+            effective_scale_ub = 100.0
 
         # Handle empty layers - nothing to offload
         if not layer_stats:
@@ -820,10 +850,10 @@ class GlobalTensorSelectionStrategy:
         }
 
         # Capture variables for closure
-        max_gpu_mem = self.max_gpu_mem_bytes
+        max_gpu_mem = max_gpu_mem_bytes
         n_blocks = self.n_blocks
         scale_lb = self.scale_lb
-        scale_ub = self.scale_ub
+        scale_ub = effective_scale_ub
 
         # Compute layer sizes for assignment strategy.
         # Block sizing uses TRANSFER sizes: during layer i's execution, the data

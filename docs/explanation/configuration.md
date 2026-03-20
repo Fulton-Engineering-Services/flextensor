@@ -207,7 +207,7 @@ config = OffloadConfig(pinned_memory=False)  # Lower CPU memory overhead
 
 `max_gpu_mem_fraction` controls how much of the GPU's total memory FlexTensor may use. It accepts a `float` in the range `(0.0, 1.0]`, where `0.9` means "use at most 90% of total device memory."
 
-When set to a fraction, the strategy operates in *memory mode* and keeps peak GPU usage within that budget. The fraction is resolved to an absolute byte count at runtime via `torch.cuda.get_device_properties()`, so the same config works portably across GPU SKUs with different memory capacities.
+When set to a fraction, the strategy operates in *memory mode* and keeps peak GPU usage within that budget. The fraction is resolved to an absolute byte count at runtime, so the same config works portably across GPU SKUs with different memory capacities.
 
 ```python
 config = OffloadConfig(

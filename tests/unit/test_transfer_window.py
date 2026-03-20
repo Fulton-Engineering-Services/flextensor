@@ -263,8 +263,8 @@ class TestGapAwareWindowIntegration:
         ]
         mem_stats = _memory_stats()
 
+        budget = 500 * 1024 * 1024
         strategy_single = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -273,7 +273,6 @@ class TestGapAwareWindowIntegration:
         )
 
         strategy_gap = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -281,8 +280,8 @@ class TestGapAwareWindowIntegration:
             transfer_window=GapAwareWindow(),
         )
 
-        result_single = strategy_single.compute(layers, memory_stats=mem_stats)
-        result_gap = strategy_gap.compute(layers, memory_stats=mem_stats)
+        result_single = strategy_single.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=budget)
+        result_gap = strategy_gap.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=budget)
 
         # GapAwareWindow should offload at least as much as SingleLayerWindow
         offloaded_single = sum(sum(t.size_bytes for t in tensors) for tensors in result_single.strategy_map.values())
@@ -295,8 +294,8 @@ class TestGapAwareWindowIntegration:
         layers = [_layer(f"layer_{i}", [tensors_per_layer[i]], 100.0) for i in range(4)]
         mem_stats = _memory_stats()
 
+        budget = 100 * 1024 * 1024
         strategy_single = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -306,7 +305,6 @@ class TestGapAwareWindowIntegration:
         )
 
         strategy_gap = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             scale=1.0,
             n_blocks=2,
             threshold_mb=0.1,
@@ -315,8 +313,8 @@ class TestGapAwareWindowIntegration:
             transfer_window=GapAwareWindow(),
         )
 
-        result_single = strategy_single.compute(layers, memory_stats=mem_stats)
-        result_gap = strategy_gap.compute(layers, memory_stats=mem_stats)
+        result_single = strategy_single.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=budget)
+        result_gap = strategy_gap.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=budget)
 
         # With no gaps, both should produce the same strategy map keys
         assert set(result_single.strategy_map.keys()) == set(result_gap.strategy_map.keys())
@@ -350,7 +348,6 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
@@ -358,7 +355,7 @@ class TestGapAwareAutoDetection:
         )
         assert isinstance(strategy.transfer_window, SingleLayerWindow)
 
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
         # Should produce a valid result
         assert result.strategy_map is not None
 
@@ -369,14 +366,13 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
             seed=42,
         )
 
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
         assert result.strategy_map is not None
         # transfer_window on the strategy instance should still be SingleLayerWindow
         assert isinstance(strategy.transfer_window, SingleLayerWindow)
@@ -398,13 +394,12 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
             seed=42,
         )
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         assert result.block_data is not None
         assert result.block_data.label_to_block_id is not None
@@ -433,13 +428,12 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
             seed=42,
         )
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         assert result.strategy_map is not None
         assert result.block_data is not None
@@ -455,7 +449,6 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
@@ -463,7 +456,7 @@ class TestGapAwareAutoDetection:
             transfer_window=GapAwareWindow(),
         )
 
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
         assert result.strategy_map is not None
         # The explicit GapAwareWindow should still be the instance's transfer_window
         assert isinstance(strategy.transfer_window, GapAwareWindow)
@@ -481,13 +474,12 @@ class TestGapAwareAutoDetection:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
             seed=42,
         )
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
         assert result.strategy_map is not None
 
 
@@ -509,13 +501,12 @@ class TestGapAwareBlockSizing:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=10,
             seed=42,
         )
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         # Block sizes should be non-zero even with a gap,
         # because the gap slot is mapped to L3's offload
@@ -539,14 +530,13 @@ class TestGapAwareBlockSizing:
         mem_stats = _memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=2,
             threshold_mb=0.1,
             epoch=5,
             seed=42,
             scale=1.0,
         )
-        result = strategy.compute(layers, memory_stats=mem_stats)
+        result = strategy.compute(layers, memory_stats=mem_stats, max_gpu_mem_bytes=500 * 1024 * 1024)
         assert result.strategy_map is not None
         # Should offload some tensors
         total_offloaded = sum(len(ts) for ts in result.strategy_map.values())

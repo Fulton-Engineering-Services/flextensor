@@ -89,12 +89,16 @@ class Strategy(Protocol):
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """Compute offload strategy.
 
         Args:
             layer_stats: List of layer statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes. When set (memory mode),
+                the strategy must respect this constraint. When ``None`` (latency mode),
+                only ``scale`` governs offloading.
 
         Returns:
             StrategyResult containing strategy_map and optional block_data.

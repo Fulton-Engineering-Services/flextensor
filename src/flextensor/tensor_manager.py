@@ -271,6 +271,7 @@ class TensorManager:
         enable_untraced_tensor_discovery=True,
         enable_module_tracker=True,
         enable_diagnostics: bool = False,
+        max_gpu_mem_fraction: float | None = None,
     ):
         """
         Initialize TensorManager with configurable tensor loading strategy.
@@ -299,6 +300,9 @@ class TensorManager:
                 patching is not used (default: True)
             enable_diagnostics: Whether to log diagnostic information (layer duration statistics,
                 block assignment table) after strategy computation (default: False)
+            max_gpu_mem_fraction: Fraction of total GPU memory to use as budget, in (0.0, 1.0].
+                Resolved to bytes at compute time via :meth:`_resolve_gpu_budget`. If None,
+                no memory constraint is applied (latency mode). (default: None)
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
@@ -320,6 +324,7 @@ class TensorManager:
         self.enable_untraced_tensor_discovery = enable_untraced_tensor_discovery
         self.enable_module_tracker = enable_module_tracker
         self.enable_diagnostics = enable_diagnostics
+        self._max_gpu_mem_fraction = max_gpu_mem_fraction
 
         self.traps_duration_ms = 0
         self.model_ids = set()
@@ -755,6 +760,17 @@ class TensorManager:
         """
         return self.memory_transfer_stats
 
+    def _resolve_gpu_budget(self) -> int | None:
+        """Resolve GPU memory budget from fraction and current device state.
+
+        Returns:
+            Budget in bytes, or None for latency mode (no constraint).
+        """
+        if self._max_gpu_mem_fraction is None:
+            return None
+        _, total = torch.cuda.mem_get_info(self.device_gpu)
+        return int(total * self._max_gpu_mem_fraction)
+
     def prepare_infer_mode(self):
         """Prepare inference mode from fresh profiling data.
 
@@ -793,7 +809,8 @@ class TensorManager:
         if self.enable_diagnostics and memory_stats:
             logger.info("Memory transfer statistics:\n%s", format_memory_transfer_table(memory_stats))
 
-        result = self.tensor_manager_load_strategy.compute(self.stats, memory_stats)
+        max_gpu_mem_bytes = self._resolve_gpu_budget()
+        result = self.tensor_manager_load_strategy.compute(self.stats, memory_stats, max_gpu_mem_bytes)
         load_strategy = remove_layers_compound(result.strategy_map, self.stats, self.remove_layers_operations)
         self.traps_duration_ms = _compute_duration(self.stats)
         self.load_strategy = load_strategy

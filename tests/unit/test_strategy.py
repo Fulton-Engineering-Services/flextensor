@@ -461,7 +461,6 @@ class TestKnapsackStrategy:
         assert strategy.cyclic is True
         assert strategy.group_size == 1
         assert strategy.threshold_mb == 0.1
-        assert strategy.max_gpu_mem_bytes is None
 
     def test_init_custom_values(self):
         """Test initialization with custom values."""
@@ -470,14 +469,12 @@ class TestKnapsackStrategy:
             cyclic=False,
             group_size=2,
             threshold_mb=0.5,
-            max_gpu_mem_bytes=20 * 1024 * 1024 * 1024,
         )
 
         assert strategy.scale == 2.0
         assert strategy.cyclic is False
         assert strategy.group_size == 2
         assert strategy.threshold_mb == 0.5
-        assert strategy.max_gpu_mem_bytes == 20 * 1024 * 1024 * 1024
 
     def test_compute_empty_layer_stats(self):
         """Test compute with empty layer stats returns StrategyResult with empty strategy_map."""
@@ -497,12 +494,11 @@ class TestKnapsackStrategy:
 
         strategy = KnapsackStrategy(
             scale=0.001,  # Very low scale that will need adjustment
-            max_gpu_mem_bytes=50 * 1024 * 1024,  # 50MB limit (need to offload 150MB)
         )
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            strategy.compute([layer1, layer2])
+            strategy.compute([layer1, layer2], max_gpu_mem_bytes=50 * 1024 * 1024)  # 50MB limit
 
         scale_warnings = [x for x in w if "insufficient" in str(x.message)]
         assert scale_warnings, (
@@ -520,7 +516,6 @@ class TestKnapsackBlockStrategy:
         assert strategy.scale == 1.0
         assert strategy.group_size == 1
         assert strategy.threshold_mb == 0.1
-        assert strategy.max_gpu_mem_bytes is None
 
     def test_init_custom_values(self):
         """Test initialization with custom values."""
@@ -528,13 +523,11 @@ class TestKnapsackBlockStrategy:
             scale=2.0,
             group_size=2,
             threshold_mb=0.5,
-            max_gpu_mem_bytes=20 * 1024 * 1024 * 1024,
         )
 
         assert strategy.scale == 2.0
         assert strategy.group_size == 2
         assert strategy.threshold_mb == 0.5
-        assert strategy.max_gpu_mem_bytes == 20 * 1024 * 1024 * 1024
 
 
 class TestAdaptiveKnapsackStrategy:
@@ -594,7 +587,6 @@ class TestAdaptiveKnapsackStrategy:
             cyclic=False,
             group_size=3,
             threshold_mb=0.25,
-            max_gpu_mem_bytes=16 * 1024 * 1024 * 1024,
         )
 
         assert strategy.scale == 2.5
@@ -602,7 +594,6 @@ class TestAdaptiveKnapsackStrategy:
         assert strategy.cyclic is False
         assert strategy.group_size == 3
         assert strategy.threshold_mb == 0.25
-        assert strategy.max_gpu_mem_bytes == 16 * 1024 * 1024 * 1024
 
 
 class TestComputePeakMemoryFromStrategy:

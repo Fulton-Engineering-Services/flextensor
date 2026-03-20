@@ -123,19 +123,21 @@ class GreedyStrategy:
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """Compute greedy offload strategy.
 
         Args:
             layer_stats: List of layer statistics.
             memory_stats: Unused, accepted for interface consistency.
+            max_gpu_mem_bytes: Unused, accepted for interface consistency.
 
         Returns:
             StrategyResult containing strategy_map and optional block_data.
         """
         if not layer_stats:
             return StrategyResult(strategy_map={}, block_data=None)
-        _ = memory_stats  # Unused, but accepted for interface consistency
+        _ = memory_stats, max_gpu_mem_bytes  # Unused, but accepted for interface consistency
         strategy_map = _compute_offload_tensors_greedy(layer_stats, self.threshold_mb)
         block_data = _build_block_data(strategy_map, layer_stats, self.n_blocks)
         return StrategyResult(strategy_map=strategy_map, block_data=block_data)
@@ -160,19 +162,21 @@ class NthLayerStrategy:
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """Compute Nth layer offload strategy.
 
         Args:
             layer_stats: List of layer statistics.
             memory_stats: Unused, accepted for interface consistency.
+            max_gpu_mem_bytes: Unused, accepted for interface consistency.
 
         Returns:
             StrategyResult containing strategy_map and optional block_data.
         """
         if not layer_stats:
             return StrategyResult(strategy_map={}, block_data=None)
-        _ = memory_stats  # Unused, but accepted for interface consistency
+        _ = memory_stats, max_gpu_mem_bytes  # Unused, but accepted for interface consistency
         strategy_map = _compute_offload_tensors_nth_layer(layer_stats, self.nth_layer, self.threshold_mb)
         block_data = _build_block_data(strategy_map, layer_stats, self.n_blocks)
         return StrategyResult(strategy_map=strategy_map, block_data=block_data)

@@ -117,85 +117,75 @@ class DelegatingWrapper(torch.nn.Module):
 
 
 class TestMaxGpuMemResolution:
-    """Tests that _initialize_tensor_manager resolves max_gpu_mem_fraction → bytes."""
+    """Tests that _initialize_tensor_manager passes max_gpu_mem_fraction to TensorManager.
 
-    def test_fraction_resolved_to_bytes_via_device_properties(self):
-        """max_gpu_mem_fraction is multiplied by total GPU memory."""
+    Budget resolution (fraction → bytes) now happens inside TensorManager._resolve_gpu_budget()
+    at compute time, not at strategy construction time. These tests verify the fraction
+    is forwarded correctly to TensorManager.
+    """
+
+    def test_fraction_passed_to_tensor_manager(self):
+        """max_gpu_mem_fraction is forwarded to TensorManager."""
         config = OffloadConfig(max_gpu_mem_fraction=0.8)
         om = OffloadManager("test_fraction_resolved")
         om.set_config(config)
 
-        fake_props = MagicMock()
-        fake_props.total_memory = 40 * 1024**3  # 40 GB
-
         with (
-            patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props),
-            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
-            patch("flextensor.tensor_manager.TensorManager"),
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
         ):
             om._initialize_tensor_manager()
 
-        mock_strategy.assert_called_once()
-        _, kwargs = mock_strategy.call_args
-        assert kwargs["max_gpu_mem_bytes"] == int(0.8 * 40 * 1024**3)
+        mock_tm.assert_called_once()
+        _, kwargs = mock_tm.call_args
+        assert kwargs["max_gpu_mem_fraction"] == 0.8
 
-    def test_fraction_none_passes_none_to_strategy(self):
-        """max_gpu_mem_fraction=None (latency mode) passes None to strategy, no GPU query."""
+    def test_fraction_none_passed_to_tensor_manager(self):
+        """max_gpu_mem_fraction=None (latency mode) is forwarded to TensorManager."""
         config = OffloadConfig(max_gpu_mem_fraction=None)
         om = OffloadManager("test_fraction_none")
         om.set_config(config)
 
-        # Shadow autouse fixture to verify no GPU query happens
         with (
-            patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props,
-            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
-            patch("flextensor.tensor_manager.TensorManager"),
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
         ):
             om._initialize_tensor_manager()
 
-        mock_props.assert_not_called()
-        _, kwargs = mock_strategy.call_args
-        assert kwargs["max_gpu_mem_bytes"] is None
+        _, kwargs = mock_tm.call_args
+        assert kwargs["max_gpu_mem_fraction"] is None
 
-    def test_deprecated_bytes_used_directly(self):
-        """Deprecated max_gpu_mem_bytes path: bytes passed directly, no GPU query."""
+    def test_deprecated_bytes_converted_to_fraction(self):
+        """Deprecated max_gpu_mem_bytes path: config syncs to max_gpu_mem_fraction."""
         with pytest.warns(DeprecationWarning):
             config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
         om = OffloadManager("test_deprecated_bytes")
         om.set_config(config)
 
-        # Shadow the autouse fixture's patch with a fresh mock so we can assert
-        # get_device_properties is not called at all on the deprecated bytes path.
         with (
-            patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props,
-            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
-            patch("flextensor.tensor_manager.TensorManager"),
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
         ):
             om._initialize_tensor_manager()
 
-        mock_props.assert_not_called()  # no GPU query for deprecated path
-        _, kwargs = mock_strategy.call_args
-        assert kwargs["max_gpu_mem_bytes"] == 20 * 1024**3
+        _, kwargs = mock_tm.call_args
+        # The deprecated bytes path syncs to max_gpu_mem_fraction via model_validator
+        assert "max_gpu_mem_fraction" in kwargs
 
     def test_fraction_uses_correct_gpu_device(self):
-        """get_device_properties is called with the configured gpu_device index."""
+        """gpu_device index is forwarded to TensorManager."""
         config = OffloadConfig(gpu_device=1, max_gpu_mem_fraction=0.5)
         om = OffloadManager("test_fraction_gpu_device")
         om.set_config(config)
 
-        fake_props = MagicMock()
-        fake_props.total_memory = 80 * 1024**3  # 80 GB
-
         with (
-            patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props) as mock_props,
-            patch("flextensor.offload_manager.AdaptiveStrategy") as mock_strategy,
-            patch("flextensor.tensor_manager.TensorManager"),
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
         ):
             om._initialize_tensor_manager()
 
-        mock_props.assert_called_once_with(1)
-        _, kwargs = mock_strategy.call_args
-        assert kwargs["max_gpu_mem_bytes"] == int(0.5 * 80 * 1024**3)
+        _, kwargs = mock_tm.call_args
+        assert kwargs["max_gpu_mem_fraction"] == 0.5
 
 
 class TestOffloadManagerStateMachine:

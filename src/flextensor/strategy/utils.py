@@ -32,28 +32,17 @@ if not _block_table_logger.handlers:
 # =============================================================================
 
 
-def validate_memory_params(
-    scale: float,
-    max_gpu_mem_bytes: int | None,
-) -> int | None:
+def validate_memory_params(scale: float) -> None:
     """Validate memory parameters common to all strategies.
 
     Args:
         scale: Duration multiplier; must be positive.
-        max_gpu_mem_bytes: Hard GPU memory limit in bytes, or ``None``.
-
-    Returns:
-        The validated ``max_gpu_mem_bytes`` (unchanged).
 
     Raises:
-        ValueError: If ``scale <= 0`` or ``max_gpu_mem_bytes`` is not ``None``
-            and not positive.
+        ValueError: If ``scale <= 0``.
     """
     if scale <= 0:
         raise ValueError(f"scale must be positive, got {scale}")
-    if max_gpu_mem_bytes is not None and max_gpu_mem_bytes <= 0:
-        raise ValueError(f"max_gpu_mem_bytes must be positive when set, got {max_gpu_mem_bytes}")
-    return max_gpu_mem_bytes
 
 
 class EarlyStopCallback:

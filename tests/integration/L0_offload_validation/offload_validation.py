@@ -432,18 +432,18 @@ class TensorManagerFactory:
         # Initialize tensor manager strategy based on strategy_type
         strategy_type = getattr(config, "strategy_type", "knapsack")
         n_blocks = getattr(config, "n_blocks", 4)
-        max_gpu_mem_bytes = int(getattr(config, "max_gpu_mem_gb", 48.0) * 1024**3)
+        max_gpu_mem_gb = getattr(config, "max_gpu_mem_gb", 48.0)
+        _, total_gpu_mem = torch.cuda.mem_get_info(device_gpu)
+        max_gpu_mem_fraction = min((max_gpu_mem_gb * 1024**3) / total_gpu_mem, 1.0)
 
         if strategy_type == "global_offload":
             tensor_manager_load_strategy = GlobalOffloadStrategy(
                 n_blocks=n_blocks,
-                max_gpu_mem_bytes=max_gpu_mem_bytes,
                 threshold_mb=1.0,
             )
         elif strategy_type == "global_tensor_selection":
             tensor_manager_load_strategy = GlobalTensorSelectionStrategy(
                 n_blocks=n_blocks,
-                max_gpu_mem_bytes=max_gpu_mem_bytes,
                 threshold_mb=1.0,
                 pop_size=30,
                 epoch=50,
@@ -455,13 +455,11 @@ class TensorManagerFactory:
                 scale=config.knapsack_scale,
                 loader_type=config.transfer_mode,
                 n_blocks=n_blocks,
-                max_gpu_mem_bytes=max_gpu_mem_bytes,
             )
         elif strategy_type == "knapsack_block":
             tensor_manager_load_strategy = KnapsackBlockStrategy(
                 scale=config.knapsack_scale,
                 threshold_mb=1.0,
-                max_gpu_mem_bytes=max_gpu_mem_bytes,
                 n_blocks=n_blocks,
             )
         elif config.model_type == "basic":
@@ -488,6 +486,7 @@ class TensorManagerFactory:
             "rearrange_transfers": config.rearrange_transfers,
             "min_compute_transfer_gap": config.compute_transfer_gap,
             "loader_type": config.transfer_mode,
+            "max_gpu_mem_fraction": max_gpu_mem_fraction,
         }
 
         if use_trace_tensor is not None:

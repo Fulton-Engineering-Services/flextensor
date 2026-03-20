@@ -285,14 +285,15 @@ def run_global_strategy(
 
         strategy = GlobalOffloadStrategy(
             n_blocks=n_blocks,
-            max_gpu_mem_bytes=max_gpu_mem_bytes,
             threshold_mb=1.0,
             min_blocks=2,
             max_blocks=n_blocks,
             assignment_strategy=assignment_strategy,
         )
         t0 = time.perf_counter()
-        compute_result = strategy.compute(layer_stats_list, memory_stats=memory_stats)
+        compute_result = strategy.compute(
+            layer_stats_list, memory_stats=memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes
+        )
         optimization_time = time.perf_counter() - t0
         strategy_map = compute_result.strategy_map
 
@@ -342,10 +343,9 @@ def run_knapsack_strategy(
     strategy = KnapsackStrategy(
         scale=scale,
         n_blocks=n_blocks,
-        max_gpu_mem_bytes=max_gpu_mem_bytes,
     )
     t0 = time.perf_counter()
-    compute_result = strategy.compute(layer_stats_list)
+    compute_result = strategy.compute(layer_stats_list, max_gpu_mem_bytes=max_gpu_mem_bytes)
     optimization_time = time.perf_counter() - t0
     strategy_map = compute_result.strategy_map
     block_data = compute_result.block_data
@@ -390,11 +390,10 @@ def run_knapsack_block_strategy(
     strategy = KnapsackBlockStrategy(
         scale=scale,
         threshold_mb=1.0,
-        max_gpu_mem_bytes=max_gpu_mem_bytes,
         n_blocks=n_blocks,
     )
     t0 = time.perf_counter()
-    compute_result = strategy.compute(layer_stats_list, memory_stats)
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
     optimization_time = time.perf_counter() - t0
     strategy_map = compute_result.strategy_map
     block_data = compute_result.block_data
@@ -445,7 +444,6 @@ def run_tensor_selection(
         assignment_name: Name of assignment strategy for display.
     """
     strategy = GlobalTensorSelectionStrategy(
-        max_gpu_mem_bytes=max_gpu_mem_bytes or (48 * 1024**3),
         n_blocks=n_blocks,
         threshold_mb=1.0,
         pop_size=50,
@@ -455,7 +453,9 @@ def run_tensor_selection(
         assignment_strategy=assignment_strategy,
     )
     t0 = time.perf_counter()
-    compute_result = strategy.compute(layer_stats_list, memory_stats)
+    compute_result = strategy.compute(
+        layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes or (48 * 1024**3)
+    )
     optimization_time = time.perf_counter() - t0
     strategy_map = compute_result.strategy_map
     block_data = compute_result.block_data
@@ -512,11 +512,10 @@ def run_adaptive_strategy(
         loader_type="allocation_block_transfer",
         threshold_mb=1.0,
         n_blocks=n_blocks,
-        max_gpu_mem_bytes=max_gpu_mem_bytes,
         extra_optimization=extra_optimization,
     )
     t0 = time.perf_counter()
-    compute_result = strategy.compute(layer_stats_list, memory_stats)
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
     optimization_time = time.perf_counter() - t0
     strategy_map = compute_result.strategy_map
     block_data = compute_result.block_data

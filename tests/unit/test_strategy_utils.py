@@ -13,33 +13,21 @@ from flextensor.strategy.utils import EarlyStopCallback, validate_memory_params
 
 
 class TestValidateMemoryParams:
-    def test_returns_none_when_max_is_none(self):
-        result = validate_memory_params(1.0, None)
+    def test_valid_scale_returns_none(self):
+        result = validate_memory_params(1.0)
         assert result is None
-
-    def test_returns_max_when_set(self):
-        result = validate_memory_params(1.0, 1000)
-        assert result == 1000
 
     def test_scale_zero_raises(self):
         with pytest.raises(ValueError, match="scale must be positive"):
-            validate_memory_params(0.0, None)
+            validate_memory_params(0.0)
 
     def test_scale_negative_raises(self):
         with pytest.raises(ValueError, match="scale must be positive"):
-            validate_memory_params(-1.0, None)
+            validate_memory_params(-1.0)
 
     def test_fractional_scale(self):
-        result = validate_memory_params(0.01, 1000)
-        assert result == 1000
-
-    def test_max_gpu_mem_bytes_zero_raises(self):
-        with pytest.raises(ValueError, match="max_gpu_mem_bytes must be positive"):
-            validate_memory_params(1.0, 0)
-
-    def test_max_gpu_mem_bytes_negative_raises(self):
-        with pytest.raises(ValueError, match="max_gpu_mem_bytes must be positive"):
-            validate_memory_params(1.0, -1)
+        result = validate_memory_params(0.01)
+        assert result is None
 
 
 # ===========================================================================

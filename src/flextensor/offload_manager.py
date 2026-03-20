@@ -27,7 +27,6 @@ from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
-from flextensor.utils import resolve_gpu_mem_bytes
 
 LOGGER = logging.getLogger(__name__)
 _GiB = 1 << 30
@@ -375,14 +374,11 @@ class OffloadManager:
         if self.config.load_strategy is not None:
             tensor_manager_load_strategy = self.config.load_strategy
         else:
-            max_gpu_mem_bytes = resolve_gpu_mem_bytes(self.config, context="resolving strategy memory budget")
-
             tensor_manager_load_strategy = AdaptiveStrategy(
                 scale=self.config.knapsack_scale,
                 loader_type=self.config.transfer_mode,
                 n_blocks=self.config.num_blocks,
                 min_blocks=self.config.min_blocks,
-                max_gpu_mem_bytes=max_gpu_mem_bytes,
             )
 
         if not self.config.enabled:
@@ -408,6 +404,7 @@ class OffloadManager:
                 enable_module_tracker=self.config.enable_module_tracker,
                 use_shm=self.config.shm_enabled,
                 enable_diagnostics=self.config.enable_diagnostics,
+                max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,
             )
 
     def _transfer_hooks(self, old_model: nn.Module | None, new_model: nn.Module):  # noqa: C901

@@ -53,12 +53,8 @@ class AdaptiveStrategy:
     strategy's name is available via :attr:`selected_strategy_name`.
 
     Example:
-        >>> strategy = AdaptiveStrategy(
-        ...     scale=1.0,
-        ...     max_gpu_mem_bytes=50 * 1024**3,
-        ...     n_blocks=4,
-        ... )
-        >>> result = strategy.compute(layer_stats, memory_stats)
+        >>> strategy = AdaptiveStrategy(scale=1.0, n_blocks=4)
+        >>> result = strategy.compute(layer_stats, memory_stats, max_gpu_mem_bytes=50 * 1024**3)
         >>> print(strategy.selected_strategy_name)
         'KnapsackBlock'
     """
@@ -74,7 +70,6 @@ class AdaptiveStrategy:
         threshold_mb: float = 0.1,
         min_blocks: int = 2,
         n_blocks: int = 4,
-        max_gpu_mem_bytes: int | None = None,
         extra_optimization: bool = False,
     ):
         """Initialize AdaptiveStrategy.
@@ -90,13 +85,11 @@ class AdaptiveStrategy:
             min_blocks: Minimum number of blocks for OptimizedRoundRobinAssignment
                 search range. Does not affect Strict or Knapsack candidates.
             n_blocks: Number of memory blocks.
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, latency mode — respect ``scale`` strictly.
             extra_optimization: If True, include additional slower strategy candidates
                 (GlobalTensorSelectionStrategy) that may find better solutions at the
                 cost of significantly longer optimization time. Default is False.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
+        validate_memory_params(scale)
         if min_blocks < 2:
             raise ValueError(f"min_blocks must be >= 2, got {min_blocks}")
         if min_blocks > n_blocks:
@@ -109,7 +102,6 @@ class AdaptiveStrategy:
         self.threshold_mb = threshold_mb
         self.n_blocks = n_blocks
         self.min_blocks = min_blocks
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
         self.extra_optimization = extra_optimization
 
         # Set after compute()
@@ -124,12 +116,15 @@ class AdaptiveStrategy:
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """Run all strategy candidates and return the best result.
 
         Args:
             layer_stats: List of layer statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, latency mode — respect ``scale`` strictly.
 
         Returns:
             :class:`StrategyResult` from the best-scoring candidate.
@@ -144,7 +139,7 @@ class AdaptiveStrategy:
         for name, strategy in candidates:
             t0 = time.perf_counter()
             try:
-                result = strategy.compute(layer_stats, memory_stats)
+                result = strategy.compute(layer_stats, memory_stats, max_gpu_mem_bytes)
             except StrategyComputeError:
                 logger.warning("Strategy %s failed, skipping", name, exc_info=True)
                 continue
@@ -155,7 +150,7 @@ class AdaptiveStrategy:
                 layer_stats,
                 strategy_name=name,
                 interpolator=interpolator,
-                max_gpu_mem_bytes=self.max_gpu_mem_bytes,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
             )
             all_scores.append(score)
 
@@ -224,7 +219,6 @@ class AdaptiveStrategy:
         threshold_mb = self.threshold_mb
         n_blocks = self.n_blocks
         min_blocks = self.min_blocks
-        max_mem = self.max_gpu_mem_bytes
 
         candidates: list[tuple[str, Strategy]] = [
             (
@@ -234,7 +228,6 @@ class AdaptiveStrategy:
                     group_size=self.group_size,
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
-                    max_gpu_mem_bytes=max_mem,
                 ),
             ),
             (
@@ -243,7 +236,6 @@ class AdaptiveStrategy:
                     scale=scale,
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
-                    max_gpu_mem_bytes=max_mem,
                     assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=min_blocks, max_blocks=n_blocks),
                 ),
             ),
@@ -253,7 +245,6 @@ class AdaptiveStrategy:
                     scale=scale,
                     threshold_mb=threshold_mb,
                     n_blocks=n_blocks,
-                    max_gpu_mem_bytes=max_mem,
                     assignment_strategy=StrictRoundRobinAssignment(),
                 ),
             ),
@@ -267,7 +258,6 @@ class AdaptiveStrategy:
                         scale=scale,
                         threshold_mb=threshold_mb,
                         n_blocks=n_blocks,
-                        max_gpu_mem_bytes=max_mem,
                         pop_size=50,
                         epoch=100,
                         max_early_stop=50,
@@ -280,7 +270,6 @@ class AdaptiveStrategy:
                         scale=scale,
                         threshold_mb=threshold_mb,
                         n_blocks=n_blocks,
-                        max_gpu_mem_bytes=max_mem,
                         pop_size=50,
                         epoch=100,
                         max_early_stop=50,
@@ -301,7 +290,6 @@ class AdaptiveStrategy:
                     cyclic=self.cyclic,
                     group_size=self.group_size,
                     threshold_mb=self.threshold_mb,
-                    max_gpu_mem_bytes=self.max_gpu_mem_bytes,
                 ),
             ),
         ]

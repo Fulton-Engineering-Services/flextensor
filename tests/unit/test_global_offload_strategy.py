@@ -33,7 +33,12 @@ def create_layer(label: str, tensors: list[TensorStatistics], duration_ms: float
     )
 
 
-def print_summary(strategy: GlobalOffloadStrategy, layers: list[LayerStatistics], test_name: str) -> None:
+def print_summary(
+    strategy: GlobalOffloadStrategy,
+    layers: list[LayerStatistics],
+    test_name: str,
+    max_gpu_mem_bytes: int | None = None,
+) -> None:
     """Print a detailed summary of the optimization results."""
     print(f"\n{'=' * 70}")
     print(f"TEST: {test_name}")
@@ -43,7 +48,8 @@ def print_summary(strategy: GlobalOffloadStrategy, layers: list[LayerStatistics]
     print("\nINPUT:")
     print(f"  Layers: {len(layers)}")
     print(f"  Blocks: {strategy.n_blocks}")
-    print(f"  Memory budget: {strategy.max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
+    if max_gpu_mem_bytes is not None:
+        print(f"  Memory budget: {max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
 
     print("\n  Layer details:")
     for layer in layers:
@@ -66,8 +72,9 @@ def print_summary(strategy: GlobalOffloadStrategy, layers: list[LayerStatistics]
     print(f"    Total blocks: {total_blocks / 1024 / 1024:.2f} MB")
     print(f"    Non-offloaded: {strategy.optimal_non_offloaded_memory / 1024 / 1024:.4f} MB")
     print(f"    Peak memory: {strategy.optimal_peak_memory / 1024 / 1024:.2f} MB")
-    print(f"    Budget: {strategy.max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
-    print(f"    Within budget: {strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes}")
+    if max_gpu_mem_bytes is not None:
+        print(f"    Budget: {max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
+        print(f"    Within budget: {strategy.optimal_peak_memory <= max_gpu_mem_bytes}")
 
     # Pipeline check
     print("\n  Pipeline Constraint:")
@@ -92,18 +99,15 @@ class TestGlobalOffloadStrategyBasic:
         with pytest.raises(ValueError, match="n_blocks must be at least 2"):
             GlobalOffloadStrategy(
                 n_blocks=1,
-                max_gpu_mem_bytes=100 * 1024 * 1024,
             )
 
     def test_initialization_with_valid_params(self):
         """Test successful initialization with valid parameters."""
         strategy = GlobalOffloadStrategy(
             n_blocks=3,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.5,
         )
         assert strategy.n_blocks == 3
-        assert strategy.max_gpu_mem_bytes == 200 * 1024 * 1024
         assert strategy.threshold_mb == 0.5
 
 
@@ -119,21 +123,21 @@ class TestGlobalOffloadStrategyFeasible:
             create_layer("layer_3", [create_tensor(4, 30, 3.0)], 4.0),
         ]
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Simple 4 Layers with 2 Blocks")
+        print_summary(strategy, layers, "Simple 4 Layers with 2 Blocks", max_gpu_mem_bytes=budget)
 
         # Verify results
         # Pipelined: transfers happen during previous layer's compute, so N-1 entries for N layers
         assert len(result.strategy_map) == 3, "Should have N-1 transfers for N layers (pipelined)"
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes, "Should be within budget"
+        assert strategy.optimal_peak_memory <= budget, "Should be within budget"
 
         # Verify pipeline constraint (no consecutive same blocks)
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -160,19 +164,19 @@ class TestGlobalOffloadStrategyFeasible:
             create_layer("layer_5", [create_tensor(6, 30, 3.0)], 5.0),
         ]
 
+        budget = 150 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=3,
-            max_gpu_mem_bytes=150 * 1024 * 1024,
             threshold_mb=0.1,
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "6 Layers with 3 Blocks")
+        print_summary(strategy, layers, "6 Layers with 3 Blocks", max_gpu_mem_bytes=budget)
 
         # Verify results
         assert len(result.strategy_map) == 5  # N-1 for pipelined transfers
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
         # Verify pipeline constraint
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -193,20 +197,20 @@ class TestGlobalOffloadStrategyFeasible:
         ]
 
         # Use OptimizedRoundRobinAssignment for reliable pipeline constraint satisfaction
+        budget = 200 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=4),
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "8 Layers with 4 Blocks")
+        print_summary(strategy, layers, "8 Layers with 4 Blocks", max_gpu_mem_bytes=budget)
 
         # Verify results
         assert len(result.strategy_map) == 7  # N-1 for pipelined transfers
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
         # Verify pipeline constraint (no consecutive same blocks)
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -254,19 +258,19 @@ class TestGlobalOffloadStrategyFeasible:
             ),
         ]
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Layers with Multiple Tensors")
+        print_summary(strategy, layers, "Layers with Multiple Tensors", max_gpu_mem_bytes=budget)
 
         assert len(result.strategy_map) == 3  # N-1 for pipelined transfers
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
     def test_with_non_offloaded_tensors(self):
         """Test with small tensors that stay on GPU (below threshold)."""
@@ -305,20 +309,20 @@ class TestGlobalOffloadStrategyFeasible:
             ),
         ]
 
+        budget = 150 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=150 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        _result = strategy.compute(layers)
+        _result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Layers with Non-Offloaded Tensors")
+        print_summary(strategy, layers, "Layers with Non-Offloaded Tensors", max_gpu_mem_bytes=budget)
 
         # Verify non-offloaded memory is accounted for
         assert strategy.optimal_non_offloaded_memory > 0, "Should have non-offloaded memory"
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
         # Peak memory should include both blocks and non-offloaded
         total_blocks = sum(strategy.optimal_block_sizes)
@@ -343,28 +347,27 @@ class TestGlobalOffloadStrategyConstraints:
             create_layer("layer_3", [create_tensor(4, 30, 3.0)], 5.0),
         ]
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=2,
         )
 
-        _result = strategy.compute(layers)
+        _result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Tight Memory Budget")
+        print_summary(strategy, layers, "Tight Memory Budget", max_gpu_mem_bytes=budget)
 
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
     def test_empty_layers_returns_empty(self):
         """Test that empty layer list returns empty strategy."""
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        result = strategy.compute([])
+        result = strategy.compute([], max_gpu_mem_bytes=100 * 1024 * 1024)
         assert result.strategy_map == {}
 
     def test_first_layer_never_offloaded(self):
@@ -379,10 +382,9 @@ class TestGlobalOffloadStrategyConstraints:
 
         strategy = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
         )
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=200 * 1024 * 1024)
 
         first_layer_ids = {t.tensor_id for t in layers[0].tensors}
         all_offloaded_ids = {t.tensor_id for tensors in result.strategy_map.values() for t in tensors}
@@ -397,12 +399,11 @@ class TestGlobalOffloadStrategyConstraints:
 
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             threshold_mb=0.1,  # All tensors below this
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=100 * 1024 * 1024)
         assert result.strategy_map == {}, "Should return empty when all tensors below threshold"
 
 
@@ -422,35 +423,34 @@ class TestGlobalOffloadStrategyBlockRange:
             create_layer("layer_7", [create_tensor(8, 20, 2.0)], 4.0),
         ]
 
+        budget = 200 * 1024 * 1024
         # Default: optimizer chooses optimal block count (min_blocks=2, max_blocks=4)
         strategy_auto = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=4),
         )
-        _result_auto = strategy_auto.compute(layers)
+        _result_auto = strategy_auto.compute(layers, max_gpu_mem_bytes=budget)
         blocks_used_auto = len(set(strategy_auto.optimal_layer_to_block.values()))
 
-        print_summary(strategy_auto, layers, "8 Layers 4 Blocks - AUTO (find optimal)")
+        print_summary(strategy_auto, layers, "8 Layers 4 Blocks - AUTO (find optimal)", max_gpu_mem_bytes=budget)
         print(f"  Blocks used (auto): {blocks_used_auto} out of 4")
 
         # Force all 4 blocks: min_blocks=max_blocks=n_blocks
         strategy_force = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=4, max_blocks=4),
         )
-        _result_force = strategy_force.compute(layers)
+        _result_force = strategy_force.compute(layers, max_gpu_mem_bytes=budget)
         blocks_used_force = len(set(strategy_force.optimal_layer_to_block.values()))
 
-        print_summary(strategy_force, layers, "8 Layers 4 Blocks - FORCED (use all)")
+        print_summary(strategy_force, layers, "8 Layers 4 Blocks - FORCED (use all)", max_gpu_mem_bytes=budget)
         print(f"  Blocks used (forced): {blocks_used_force} out of 4")
 
         # Verify constraints
-        assert strategy_auto.optimal_peak_memory <= strategy_auto.max_gpu_mem_bytes
-        assert strategy_force.optimal_peak_memory <= strategy_force.max_gpu_mem_bytes
+        assert strategy_auto.optimal_peak_memory <= budget
+        assert strategy_force.optimal_peak_memory <= budget
 
         # When forced, should use all 4 blocks (if enough layers)
         assert blocks_used_force == 4, f"Expected 4 blocks used, got {blocks_used_force}"
@@ -474,23 +474,23 @@ class TestGlobalOffloadStrategyBlockRange:
             create_layer("layer_2", [create_tensor(3, 30, 3.0)], 5.0),
         ]
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=4,  # Request all 4, but only 3 layers available
             max_blocks=4,
         )
 
-        _result = strategy.compute(layers)
+        _result = strategy.compute(layers, max_gpu_mem_bytes=budget)
         blocks_used = len(set(strategy.optimal_layer_to_block.values()))
 
-        print_summary(strategy, layers, "3 Layers 4 Blocks - MIN=4 (not enough layers)")
+        print_summary(strategy, layers, "3 Layers 4 Blocks - MIN=4 (not enough layers)", max_gpu_mem_bytes=budget)
         print(f"  Blocks used: {blocks_used} (max possible with 3 layers)")
 
         # With only 3 layers, can use at most 3 blocks (due to pipeline constraint)
         assert blocks_used <= 3, "Cannot use more blocks than layers"
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
     def test_round_robin_mode(self):
         """Test round-robin block assignment mode with min_blocks=max_blocks=n_blocks."""
@@ -505,9 +505,9 @@ class TestGlobalOffloadStrategyBlockRange:
             create_layer("layer_7", [create_tensor(8, 30, 3.0)], 5.0),
         ]
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(
                 min_blocks=4,  # Force using all 4 blocks
@@ -516,9 +516,11 @@ class TestGlobalOffloadStrategyBlockRange:
             ),
         )
 
-        _result = strategy.compute(layers)
+        _result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "8 Layers 4 Blocks - ROUND ROBIN (forced, dist_weight=1.0)")
+        print_summary(
+            strategy, layers, "8 Layers 4 Blocks - ROUND ROBIN (forced, dist_weight=1.0)", max_gpu_mem_bytes=budget
+        )
 
         # Verify all 4 blocks are used
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -558,18 +560,20 @@ class TestGlobalOffloadStrategyBlockRange:
             create_layer("layer_7", [create_tensor(8, 45, 4.5)], 5.0),  # 45 MB
         ]
 
+        budget = 300 * 1024 * 1024
         # Test MEMORY OPTIMIZED mode (distribution_weight=0.0)
         strategy_mem = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=300 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(
                 distribution_weight=0.0,  # Minimize memory only
             ),
         )
-        strategy_mem.compute(layers)
+        strategy_mem.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy_mem, layers, "Variable Sizes - MEMORY OPTIMIZED (dist_weight=0.0)")
+        print_summary(
+            strategy_mem, layers, "Variable Sizes - MEMORY OPTIMIZED (dist_weight=0.0)", max_gpu_mem_bytes=budget
+        )
 
         blocks_used_mem = len([s for s in strategy_mem.optimal_block_sizes if s > 0])
         total_mem_mem = sum(strategy_mem.optimal_block_sizes) / 1024 / 1024
@@ -584,7 +588,6 @@ class TestGlobalOffloadStrategyBlockRange:
         # Test DISTRIBUTION OPTIMIZED mode (distribution_weight=1.0, force 4 blocks)
         strategy_dist = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=300 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(
                 min_blocks=4,  # Force using all 4 blocks
@@ -592,9 +595,11 @@ class TestGlobalOffloadStrategyBlockRange:
                 distribution_weight=1.0,  # Prefer cyclic distribution
             ),
         )
-        strategy_dist.compute(layers)
+        strategy_dist.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy_dist, layers, "Variable Sizes - DISTRIBUTION OPTIMIZED (dist_weight=1.0)")
+        print_summary(
+            strategy_dist, layers, "Variable Sizes - DISTRIBUTION OPTIMIZED (dist_weight=1.0)", max_gpu_mem_bytes=budget
+        )
 
         blocks_used_dist = len([s for s in strategy_dist.optimal_block_sizes if s > 0])
         total_mem_dist = sum(strategy_dist.optimal_block_sizes) / 1024 / 1024
@@ -628,34 +633,33 @@ class TestGlobalOffloadStrategyBlockRange:
         ]
 
         # Test with range [3, 4]
+        budget = 300 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=4,
-            max_gpu_mem_bytes=300 * 1024 * 1024,
             threshold_mb=0.1,
             assignment_strategy=OptimizedRoundRobinAssignment(
                 min_blocks=3,  # At least 3 blocks
                 max_blocks=4,
             ),  # At most 4 blocks
         )
-        strategy.compute(layers)
+        strategy.compute(layers, max_gpu_mem_bytes=budget)
 
         blocks_used = len([s for s in strategy.optimal_block_sizes if s > 0])
         total_mem = sum(strategy.optimal_block_sizes) / 1024 / 1024
 
-        print_summary(strategy, layers, "6 Layers - min_blocks=3, max_blocks=4")
+        print_summary(strategy, layers, "6 Layers - min_blocks=3, max_blocks=4", max_gpu_mem_bytes=budget)
         print(f"  Blocks used: {blocks_used}")
         print(f"  Total memory: {total_mem:.0f} MB")
 
         # Should use either 3 or 4 blocks (within range)
         assert 3 <= blocks_used <= 4, f"Expected 3-4 blocks, got {blocks_used}"
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
     def test_validation_min_greater_than_max(self):
         """Test that min_blocks > max_blocks raises ValueError."""
         with pytest.raises(ValueError, match=r"min_blocks.*cannot exceed.*max_blocks"):
             GlobalOffloadStrategy(
                 n_blocks=4,
-                max_gpu_mem_bytes=200 * 1024 * 1024,
                 min_blocks=4,
                 max_blocks=2,  # Invalid: max < min
             )
@@ -665,7 +669,6 @@ class TestGlobalOffloadStrategyBlockRange:
         with pytest.raises(ValueError, match="min_blocks must be at least 2"):
             GlobalOffloadStrategy(
                 n_blocks=4,
-                max_gpu_mem_bytes=200 * 1024 * 1024,
                 min_blocks=1,  # Invalid: < 2
             )
 
@@ -674,7 +677,6 @@ class TestGlobalOffloadStrategyBlockRange:
         with pytest.raises(ValueError, match=r"max_blocks.*cannot exceed.*n_blocks"):
             GlobalOffloadStrategy(
                 n_blocks=4,
-                max_gpu_mem_bytes=200 * 1024 * 1024,
                 max_blocks=5,  # Invalid: > n_blocks
             )
 
@@ -692,19 +694,19 @@ class TestGlobalOffloadStrategyTransferCapacity:
             create_layer("layer_3", [create_tensor(4, 20, 2.0)], 3.0),
         ]
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             threshold_mb=0.1,
             min_blocks=2,  # Explicitly test 2-block scenario
         )
 
-        result = strategy.compute(layers)
+        result = strategy.compute(layers, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Transfer Within Capacity")
+        print_summary(strategy, layers, "Transfer Within Capacity", max_gpu_mem_bytes=budget)
 
         # Verify all constraints satisfied
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
         assert len(result.strategy_map) == 3  # N-1 for pipelined transfers
 
 
@@ -723,26 +725,26 @@ class TestGlobalOffloadStrategyMemoryConstraint:
             create_layer("layer_3", [create_tensor(4, 90, 9.0)], 10.0),
         ]
 
+        budget = 100 * 1024 * 1024  # Budget too small (need ~180MB)
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
 
             strategy = GlobalOffloadStrategy(
                 n_blocks=2,
-                max_gpu_mem_bytes=100 * 1024 * 1024,  # Budget too small (need ~180MB)
                 threshold_mb=0.1,
                 min_blocks=2,  # Explicitly test 2-block scenario
                 assignment_strategy=StrictRoundRobinAssignment(),
             )
-            strategy.compute(layers)
+            strategy.compute(layers, max_gpu_mem_bytes=budget)
 
             memory_warnings = [x for x in w if "memory constraint" in str(x.message).lower()]
 
-        print_summary(strategy, layers, "Memory Constraint Warning")
+        print_summary(strategy, layers, "Memory Constraint Warning", max_gpu_mem_bytes=budget)
         print(f"  Peak memory: {strategy.optimal_peak_memory / 1024 / 1024:.0f} MB")
-        print(f"  Budget: {strategy.max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
+        print(f"  Budget: {budget / 1024 / 1024:.0f} MB")
         print(f"  Memory warnings: {len(memory_warnings)}")
 
-        assert strategy.optimal_peak_memory > strategy.max_gpu_mem_bytes, "Memory should exceed budget"
+        assert strategy.optimal_peak_memory > budget, "Memory should exceed budget"
         assert len(memory_warnings) == 1, "Should have memory constraint warning"
         assert "tensor sizes" in str(memory_warnings[0].message).lower()
 
@@ -785,10 +787,9 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
-        strategy.compute(layers)
+        strategy.compute(layers, max_gpu_mem_bytes=target)
 
         assert strategy.scale > 1.0, "Scale should have been increased by the binary search"
         assert strategy.optimal_peak_memory <= target, "Peak should be within target"
@@ -807,10 +808,9 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=500 * 1024**2,
             threshold_mb=0.1,
         )
-        strategy.compute(layers)
+        strategy.compute(layers, max_gpu_mem_bytes=500 * 1024**2)
 
         assert strategy.scale == pytest.approx(1.0), "Scale should remain 1.0 when target is already met"
 
@@ -822,13 +822,12 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=target,
             threshold_mb=0.1,
         )
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            strategy.compute(layers)
+            strategy.compute(layers, max_gpu_mem_bytes=target)
             scale_warnings = [x for x in w if "insufficient to meet GPU memory target" in str(x.message)]
 
         assert len(scale_warnings) >= 1
@@ -840,13 +839,12 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=1,
             threshold_mb=0.1,
         )
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            strategy.compute(layers)
+            strategy.compute(layers, max_gpu_mem_bytes=1)
             constraint_warnings = [x for x in w if "Cannot satisfy GPU memory constraint" in str(x.message)]
 
         assert len(constraint_warnings) >= 1
@@ -858,7 +856,6 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             threshold_mb=0.1,
         )
 
@@ -870,7 +867,7 @@ class TestAdjustScaleForMemory:
             return original_collect(*args, **kwargs)
 
         strategy._collect_layer_tensors = spy_collect  # type: ignore[method-assign]
-        strategy.compute(layers)
+        strategy.compute(layers, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         pre_final = observed_self_scale[:-1]
         if pre_final:
@@ -883,17 +880,16 @@ class TestAdjustScaleForMemory:
         strategy = GlobalOffloadStrategy(
             n_blocks=2,
             scale=1.0,
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             threshold_mb=0.1,
         )
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            result1 = strategy.compute(layers)
+            result1 = strategy.compute(layers, max_gpu_mem_bytes=500 * 1024 * 1024)
             peak1 = strategy.optimal_peak_memory
             keys1 = set(result1.strategy_map.keys())
 
-            result2 = strategy.compute(layers)
+            result2 = strategy.compute(layers, max_gpu_mem_bytes=500 * 1024 * 1024)
             peak2 = strategy.optimal_peak_memory
             keys2 = set(result2.strategy_map.keys())
 

@@ -761,7 +761,6 @@ class KnapsackStrategy:
         cyclic: bool = True,
         group_size: int = 1,
         threshold_mb: float = 0.1,
-        max_gpu_mem_bytes: int | None = None,
         n_blocks: int = 4,
     ):
         """
@@ -775,23 +774,21 @@ class KnapsackStrategy:
             cyclic: Whether to apply cyclic strategy extension.
             group_size: Number of layers to merge into groups.
             threshold_mb: Minimum tensor size threshold in MB.
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, latency mode — respect ``scale`` strictly.
             n_blocks: Number of blocks for block-based loaders. Set to 0 to skip
                 block data computation.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
+        validate_memory_params(scale)
         self.threshold_mb = threshold_mb
         self.scale = scale
         self.cyclic = cyclic
         self.group_size = group_size
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
         self.n_blocks = n_blocks
 
     def compute(  # noqa: C901
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """
         Compute offload strategy using knapsack optimization.
@@ -800,6 +797,8 @@ class KnapsackStrategy:
             layer_stats: List of layer statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
                 If not provided, extracts from layer stats.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, latency mode — respect ``scale`` strictly.
 
         Returns:
             StrategyResult containing strategy_map and optional block_data.
@@ -815,18 +814,18 @@ class KnapsackStrategy:
 
         # Determine effective scale - either use provided scale or compute optimal
         effective_scale = self.scale
-        if self.max_gpu_mem_bytes is not None and memory_transfers:
+        if max_gpu_mem_bytes is not None and memory_transfers:
             memory_transfer_interpolator = MemoryTransferInterpolator(memory_transfers)
             effective_scale, _, _ = _compute_optimal_scale(
                 layer_stats=new_layer_stats,
                 memory_transfer_interpolator=memory_transfer_interpolator,
-                max_gpu_mem_bytes=self.max_gpu_mem_bytes,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
                 initial_scale=self.scale,
             )
             if effective_scale > self.scale:
                 warnings.warn(
                     f"Original scale ({self.scale}) is insufficient to meet GPU memory target "
-                    f"({self.max_gpu_mem_bytes / 1024**3:.2f} GB). "
+                    f"({max_gpu_mem_bytes / 1024**3:.2f} GB). "
                     f"Adjusted scale to {effective_scale:.4f}.",
                     stacklevel=2,
                 )
@@ -840,8 +839,8 @@ class KnapsackStrategy:
         # Post-validation: block pre-allocation overhead may push peak above
         # the hard limit. Adjust scale to meet max_gpu_mem_bytes (hard limit).
         # The soft target is already handled by _compute_optimal_scale above.
-        if self.max_gpu_mem_bytes is not None and block_data is not None:
-            limit = self.max_gpu_mem_bytes
+        if max_gpu_mem_bytes is not None and block_data is not None:
+            limit = max_gpu_mem_bytes
             peak_gpu = _estimate_peak_gpu_block(strategy_map, new_layer_stats, block_data)
             if peak_gpu > limit:
                 best_peak = peak_gpu
@@ -893,7 +892,6 @@ class KnapsackBlockStrategy:
         scale: float = 1.0,
         group_size: int = 1,
         threshold_mb: float = 0.1,
-        max_gpu_mem_bytes: int | None = None,
         n_blocks: int = 4,
     ):
         """
@@ -906,21 +904,19 @@ class KnapsackBlockStrategy:
                 to meet the memory constraint.
             group_size: Number of layers to merge into groups.
             threshold_mb: Minimum tensor size threshold in MB.
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, latency mode — respect ``scale`` strictly.
             n_blocks: Number of blocks for block-based loaders.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
+        validate_memory_params(scale)
         self.threshold_mb = threshold_mb
         self.scale = scale
         self.group_size = group_size
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
         self.n_blocks = n_blocks
 
     def compute(
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """
         Compute offload strategy using block-based knapsack optimization.
@@ -930,6 +926,8 @@ class KnapsackBlockStrategy:
             memory_stats: Dict mapping tensor size (bytes) to transfer time (ms).
                 Should be provided by TensorManager via live GPU benchmarking.
                 If not provided, falls back to extracting from layer stats.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, latency mode — respect ``scale`` strictly.
 
         Returns:
             StrategyResult containing strategy_map and block_data.
@@ -945,18 +943,18 @@ class KnapsackBlockStrategy:
 
         # Determine effective scale - either use provided scale or compute optimal
         effective_scale = self.scale
-        if self.max_gpu_mem_bytes is not None and memory_transfers:
+        if max_gpu_mem_bytes is not None and memory_transfers:
             memory_transfer_interpolator = MemoryTransferInterpolator(memory_transfers)
             effective_scale, _, _ = _compute_optimal_scale(
                 layer_stats=new_layer_stats,
                 memory_transfer_interpolator=memory_transfer_interpolator,
-                max_gpu_mem_bytes=self.max_gpu_mem_bytes,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
                 initial_scale=self.scale,
             )
             if effective_scale > self.scale:
                 warnings.warn(
                     f"Original scale ({self.scale}) is insufficient to meet GPU memory target "
-                    f"({self.max_gpu_mem_bytes / 1024**3:.2f} GB). "
+                    f"({max_gpu_mem_bytes / 1024**3:.2f} GB). "
                     f"Adjusted scale to {effective_scale:.4f}.",
                     stacklevel=2,
                 )
@@ -970,9 +968,14 @@ class KnapsackBlockStrategy:
         # Post-validation: _compute_optimal_scale doesn't account for block
         # pre-allocation overhead. Check actual peak GPU and increase scale to
         # offload more aggressively if the hard limit is violated.
-        if self.max_gpu_mem_bytes is not None and block_data is not None:
+        if max_gpu_mem_bytes is not None and block_data is not None:
             strategy_map, block_data = self._adjust_scale_for_block_overhead(
-                strategy_map, block_data, new_layer_stats, memory_transfers, effective_scale
+                strategy_map,
+                block_data,
+                new_layer_stats,
+                memory_transfers,
+                effective_scale,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
             )
 
         return StrategyResult(strategy_map=strategy_map, block_data=block_data)
@@ -985,6 +988,7 @@ class KnapsackBlockStrategy:
         memory_transfers: dict[int, float],
         initial_scale: float,
         max_attempts: int = 10,
+        max_gpu_mem_bytes: int | None = None,
     ) -> tuple[dict[str, list[TensorStatistics]], BlockStrategyData | None]:
         """Iteratively increase scale until actual peak GPU fits within memory limit.
 
@@ -1001,13 +1005,14 @@ class KnapsackBlockStrategy:
             memory_transfers: Memory transfer benchmarks.
             initial_scale: Starting scale value.
             max_attempts: Maximum correction iterations.
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
 
         Returns:
             Tuple of (adjusted_strategy_map, adjusted_block_data).
         """
-        if self.max_gpu_mem_bytes is None:
+        if max_gpu_mem_bytes is None:
             raise RuntimeError("_adjust_scale_for_block_overhead requires max_gpu_mem_bytes to be set")
-        limit = self.max_gpu_mem_bytes
+        limit = max_gpu_mem_bytes
 
         peak_gpu = _estimate_peak_gpu_block(strategy_map, layer_stats, block_data)
         if peak_gpu <= limit:
@@ -1068,7 +1073,6 @@ class AdaptiveKnapsackStrategy:
         cyclic: bool = True,
         group_size: int = 1,
         threshold_mb: float = 0.1,
-        max_gpu_mem_bytes: int | None = None,
     ):
         """
         Initialize AdaptiveKnapsackStrategy.
@@ -1082,16 +1086,13 @@ class AdaptiveKnapsackStrategy:
             cyclic: Whether to apply cyclic strategy extension.
             group_size: Number of layers to merge into groups.
             threshold_mb: Minimum tensor size threshold in MB.
-            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
-                When ``None``, latency mode — respect ``scale`` strictly.
         """
-        max_gpu_mem_bytes = validate_memory_params(scale, max_gpu_mem_bytes)
+        validate_memory_params(scale)
         self.scale = scale
         self.loader_type = loader_type
         self.cyclic = cyclic
         self.group_size = group_size
         self.threshold_mb = threshold_mb
-        self.max_gpu_mem_bytes = max_gpu_mem_bytes
 
     def _create_strategy(self) -> KnapsackStrategy | KnapsackBlockStrategy:
         """Create the appropriate strategy instance based on loader_type."""
@@ -1100,7 +1101,6 @@ class AdaptiveKnapsackStrategy:
                 scale=self.scale,
                 group_size=self.group_size,
                 threshold_mb=self.threshold_mb,
-                max_gpu_mem_bytes=self.max_gpu_mem_bytes,
             )
         else:
             return KnapsackStrategy(
@@ -1108,13 +1108,13 @@ class AdaptiveKnapsackStrategy:
                 cyclic=self.cyclic,
                 group_size=self.group_size,
                 threshold_mb=self.threshold_mb,
-                max_gpu_mem_bytes=self.max_gpu_mem_bytes,
             )
 
     def compute(
         self,
         layer_stats: list[LayerStatistics],
         memory_stats: dict[int, float] | None = None,
+        max_gpu_mem_bytes: int | None = None,
     ) -> StrategyResult:
         """
         Compute offload strategy using the appropriate strategy implementation.
@@ -1122,9 +1122,11 @@ class AdaptiveKnapsackStrategy:
         Args:
             layer_stats: List of layer statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
+            max_gpu_mem_bytes: Hard GPU memory limit in bytes (never exceed).
+                When ``None``, latency mode — respect ``scale`` strictly.
 
         Returns:
             StrategyResult containing strategy_map and block_data.
         """
         strategy_impl = self._create_strategy()
-        return strategy_impl.compute(layer_stats, memory_stats)
+        return strategy_impl.compute(layer_stats, memory_stats, max_gpu_mem_bytes)

@@ -47,7 +47,12 @@ def create_memory_stats() -> dict[int, float]:
     }
 
 
-def print_summary(strategy: GlobalTensorSelectionStrategy, layers: list[LayerStatistics], test_name: str) -> None:
+def print_summary(
+    strategy: GlobalTensorSelectionStrategy,
+    layers: list[LayerStatistics],
+    test_name: str,
+    max_gpu_mem_bytes: int | None = None,
+) -> None:
     """Print a detailed summary of the optimization results."""
     print(f"\n{'=' * 70}")
     print(f"TEST: {test_name}")
@@ -57,7 +62,8 @@ def print_summary(strategy: GlobalTensorSelectionStrategy, layers: list[LayerSta
     print("\nINPUT:")
     print(f"  Layers: {len(layers)}")
     print(f"  Max blocks: {strategy.n_blocks}")
-    print(f"  Max GPU memory: {strategy.max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
+    if max_gpu_mem_bytes is not None:
+        print(f"  Max GPU memory: {max_gpu_mem_bytes / 1024 / 1024:.0f} MB")
     print(f"  Scale bounds: [{strategy.scale}, {strategy.scale_ub}]")
 
     print("\n  Layer details:")
@@ -88,11 +94,12 @@ def print_summary(strategy: GlobalTensorSelectionStrategy, layers: list[LayerSta
             print(f"    {label} -> Block {block_idx} ({block_size / 1024 / 1024:.0f}MB)")
 
         blocks_used = len(set(optimal_assignments.values()))
-        utilization = optimal_peak / strategy.max_gpu_mem_bytes * 100 if strategy.max_gpu_mem_bytes > 0 else 0
+        utilization = optimal_peak / max_gpu_mem_bytes * 100 if max_gpu_mem_bytes and max_gpu_mem_bytes > 0 else 0
         print("\n  Summary:")
         print(f"    Blocks used: {blocks_used}")
         print(f"    GPU utilization: {utilization:.1f}%")
-        print(f"    Within budget: {optimal_peak <= strategy.max_gpu_mem_bytes}")
+        if max_gpu_mem_bytes is not None:
+            print(f"    Within budget: {optimal_peak <= max_gpu_mem_bytes}")
     else:
         print("\n  No tensors offloaded (all below threshold or empty)")
 
@@ -104,19 +111,14 @@ class TestGlobalTensorSelectionStrategyBasic:
 
     def test_initialization_with_defaults(self):
         """Test successful initialization with default parameters."""
-        strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=1024 * 1024 * 1024,  # 1GB
-        )
-        assert strategy.max_gpu_mem_bytes == 1024 * 1024 * 1024
+        strategy = GlobalTensorSelectionStrategy()
         assert strategy.n_blocks == 4
         assert strategy.threshold_mb == 0.1
         assert strategy.scale == 1.0
-        assert strategy.scale_ub == 100.0  # memory mode: wide search by default
 
     def test_initialization_with_custom_params(self):
         """Test initialization with custom parameters."""
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=2 * 1024 * 1024 * 1024,  # 2GB
             n_blocks=3,
             threshold_mb=0.5,
             pop_size=30,
@@ -124,7 +126,6 @@ class TestGlobalTensorSelectionStrategyBasic:
             scale=0.9,
             scale_ub=1.1,
         )
-        assert strategy.max_gpu_mem_bytes == 2 * 1024 * 1024 * 1024
         assert strategy.n_blocks == 3
         assert strategy.threshold_mb == 0.5
         assert strategy.scale == 0.9
@@ -132,12 +133,10 @@ class TestGlobalTensorSelectionStrategyBasic:
 
     def test_empty_layers_returns_empty(self):
         """Test that empty layer list returns empty strategy."""
-        strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=1024 * 1024 * 1024,
-        )
+        strategy = GlobalTensorSelectionStrategy()
         memory_stats = create_memory_stats()
 
-        result = strategy.compute([], memory_stats)
+        result = strategy.compute([], memory_stats, max_gpu_mem_bytes=1024 * 1024 * 1024)
 
         assert result.strategy_map == {}
 
@@ -157,8 +156,8 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
 
         # Total model size: 120MB
         # Large GPU budget: 200MB (plenty of headroom)
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,  # 200MB
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -168,17 +167,17 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
             scale_ub=1.0,
         )
 
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Abundant Memory - Maximize GPU Utilization")
+        print_summary(strategy, layers, "Abundant Memory - Maximize GPU Utilization", max_gpu_mem_bytes=budget)
 
         # Verify results
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes, "Should be within budget"
+        assert strategy.optimal_peak_memory <= budget, "Should be within budget"
         # Optimizer may choose to offload fewer layers to maximize GPU utilization
         assert len(result.strategy_map) >= 0, "Should return valid strategy map"
 
         # GPU utilization should be within budget
-        utilization = strategy.optimal_peak_memory / strategy.max_gpu_mem_bytes
+        utilization = strategy.optimal_peak_memory / budget
         print(f"  GPU utilization: {utilization * 100:.1f}%")
 
         # Scale should stay within bounds
@@ -196,8 +195,8 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
 
         # Model size: 160MB
         # GPU budget: 200MB, target: 180MB (90%)
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -207,11 +206,11 @@ class TestGlobalTensorSelectionStrategyEnoughMemory:
             scale_ub=1.0,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "High Utilization Target (90%)")
+        print_summary(strategy, layers, "High Utilization Target (90%)", max_gpu_mem_bytes=budget)
 
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
 
 class TestGlobalTensorSelectionStrategyLimitedMemory:
@@ -229,8 +228,8 @@ class TestGlobalTensorSelectionStrategyLimitedMemory:
 
         # Model size: 200MB
         # Tight GPU budget: 100MB (must offload ~100MB)
+        budget = 100 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,  # 100MB
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -240,9 +239,9 @@ class TestGlobalTensorSelectionStrategyLimitedMemory:
             scale_ub=1.2,  # Allow some scale flexibility
         )
 
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Tight Budget - Requires More Offload")
+        print_summary(strategy, layers, "Tight Budget - Requires More Offload", max_gpu_mem_bytes=budget)
 
         # Should offload tensors to fit within budget
         total_offload = sum(sum(t.size_bytes for t in ts) for ts in result.strategy_map.values())
@@ -267,8 +266,8 @@ class TestGlobalTensorSelectionStrategyLimitedMemory:
         memory_stats = create_memory_stats()
 
         # Budget forces some offloading
+        budget = 150 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=150 * 1024 * 1024,  # 150MB
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,
             pop_size=20,
@@ -278,9 +277,9 @@ class TestGlobalTensorSelectionStrategyLimitedMemory:
             scale_ub=3.0,  # Allow scale to increase
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Scale Adjusted for Transfer Constraint")
+        print_summary(strategy, layers, "Scale Adjusted for Transfer Constraint", max_gpu_mem_bytes=budget)
 
         # Scale should stay within bounds
         print(f"  Optimal scale: {strategy.optimal_scale:.2f}")
@@ -302,8 +301,8 @@ class TestGlobalTensorSelectionStrategyBlockCount:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,
             min_blocks=3,
             max_blocks=3,
@@ -311,9 +310,9 @@ class TestGlobalTensorSelectionStrategyBlockCount:
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "3 Blocks Configuration")
+        print_summary(strategy, layers, "3 Blocks Configuration", max_gpu_mem_bytes=budget)
 
         blocks_used = len(set(strategy.optimal_layer_to_block.values()))
         assert blocks_used <= 3, f"Should use at most 3 blocks, got {blocks_used}"
@@ -337,8 +336,8 @@ class TestGlobalTensorSelectionStrategyBlockCount:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 300 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=300 * 1024 * 1024,
             n_blocks=4,
             min_blocks=4,
             max_blocks=4,
@@ -346,9 +345,9 @@ class TestGlobalTensorSelectionStrategyBlockCount:
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "4 Blocks Configuration")
+        print_summary(strategy, layers, "4 Blocks Configuration", max_gpu_mem_bytes=budget)
 
         blocks_used = len(set(strategy.optimal_layer_to_block.values()))
         assert blocks_used <= 4, f"Should use at most 4 blocks, got {blocks_used}"
@@ -363,8 +362,8 @@ class TestGlobalTensorSelectionStrategyBlockCount:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 300 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=300 * 1024 * 1024,
             n_blocks=4,
             min_blocks=2,  # Let optimizer choose
             max_blocks=4,
@@ -372,9 +371,9 @@ class TestGlobalTensorSelectionStrategyBlockCount:
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Optimized Block Count (min=2, max=4)")
+        print_summary(strategy, layers, "Optimized Block Count (min=2, max=4)", max_gpu_mem_bytes=budget)
 
         blocks_used = len(set(strategy.optimal_layer_to_block.values()))
         assert 2 <= blocks_used <= 4, f"Should use 2-4 blocks, got {blocks_used}"
@@ -393,8 +392,8 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 150 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=150 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             scale=0.8,
             scale_ub=1.2,
@@ -402,9 +401,9 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
             epoch=20,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Scale Bounds [0.8, 1.2]")
+        print_summary(strategy, layers, "Scale Bounds [0.8, 1.2]", max_gpu_mem_bytes=budget)
 
         assert strategy.scale <= strategy.optimal_scale <= strategy.scale_ub, (
             f"Scale {strategy.optimal_scale} should be within [{strategy.scale}, {strategy.scale_ub}]"
@@ -420,8 +419,8 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             scale=1.0,
             scale_ub=1.0,  # Fixed scale
@@ -429,9 +428,9 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
             epoch=20,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Fixed Scale (1.0)")
+        print_summary(strategy, layers, "Fixed Scale (1.0)", max_gpu_mem_bytes=budget)
 
         assert strategy.optimal_scale == 1.0, f"Scale should be exactly 1.0, got {strategy.optimal_scale}"
 
@@ -446,8 +445,8 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
         memory_stats = create_memory_stats()
 
         # Scale 0.9 means transfers must fit in 90% of compute time (10% safety margin)
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             scale=0.9,
             scale_ub=0.95,  # Strict margin
@@ -455,9 +454,9 @@ class TestGlobalTensorSelectionStrategyScaleBounds:
             epoch=20,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Scale with Safety Margin [0.9, 0.95]")
+        print_summary(strategy, layers, "Scale with Safety Margin [0.9, 0.95]", max_gpu_mem_bytes=budget)
 
         assert 0.9 <= strategy.optimal_scale <= 0.95
 
@@ -475,17 +474,17 @@ class TestGlobalTensorSelectionStrategyAssignmentStrategies:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,
             assignment_strategy=StrictRoundRobinAssignment(),
             pop_size=20,
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "StrictRoundRobinAssignment")
+        print_summary(strategy, layers, "StrictRoundRobinAssignment", max_gpu_mem_bytes=budget)
 
         # Verify pipeline constraint
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -502,17 +501,17 @@ class TestGlobalTensorSelectionStrategyAssignmentStrategies:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=4,
             assignment_strategy=OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=4),
             pop_size=20,
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "OptimizedRoundRobinAssignment")
+        print_summary(strategy, layers, "OptimizedRoundRobinAssignment", max_gpu_mem_bytes=budget)
 
         # Verify pipeline constraint
         assignments = list(strategy.optimal_layer_to_block.values())
@@ -532,17 +531,17 @@ class TestGlobalTensorSelectionStrategyEdgeCases:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             threshold_mb=0.1,  # All tensors below this
             pop_size=20,
             epoch=10,
         )
 
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "All Tensors Below Threshold")
+        print_summary(strategy, layers, "All Tensors Below Threshold", max_gpu_mem_bytes=budget)
 
         # Should return empty or minimal strategy (nothing to offload)
         total_offload = sum(sum(t.size_bytes for t in ts) for ts in result.strategy_map.values())
@@ -559,13 +558,12 @@ class TestGlobalTensorSelectionStrategyEdgeCases:
         memory_stats = create_memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             n_blocks=3,
             threshold_mb=0.1,
             pop_size=15,
             epoch=10,
         )
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=100 * 1024 * 1024)
 
         first_layer_ids = {t.tensor_id for t in layers[0].tensors}
         all_offloaded_ids = {t.tensor_id for tensors in result.strategy_map.values() for t in tensors}
@@ -578,16 +576,16 @@ class TestGlobalTensorSelectionStrategyEdgeCases:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 100 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=100 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             pop_size=20,
             epoch=10,
         )
 
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Single Layer")
+        print_summary(strategy, layers, "Single Layer", max_gpu_mem_bytes=budget)
 
         # Single layer - no transfers possible (nothing to overlap with)
         assert len(result.strategy_map) <= 1
@@ -623,19 +621,19 @@ class TestGlobalTensorSelectionStrategyEdgeCases:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 210 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=210 * 1024 * 1024,
             n_blocks=3,
             threshold_mb=1.0,
             pop_size=20,
             epoch=15,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "Many Small Tensors Per Layer")
+        print_summary(strategy, layers, "Many Small Tensors Per Layer", max_gpu_mem_bytes=budget)
 
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
 
 class TestGlobalTensorSelectionStrategyOptimizers:
@@ -652,19 +650,19 @@ class TestGlobalTensorSelectionStrategyOptimizers:
         ]
         memory_stats = create_memory_stats()
 
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             optimizer=optimizer,
             pop_size=15,
             epoch=10,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, f"Optimizer: {optimizer}")
+        print_summary(strategy, layers, f"Optimizer: {optimizer}", max_gpu_mem_bytes=budget)
 
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
         assert strategy.scale <= strategy.optimal_scale <= strategy.scale_ub
 
 
@@ -683,19 +681,19 @@ class TestGlobalTensorSelectionStrategyMemoryBounds:
 
         # Model size: 160MB
         # GPU: min=150MB, max=200MB
+        budget = 200 * 1024 * 1024
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,  # Minimum 3 blocks for pipelining
             pop_size=20,
             epoch=20,
         )
 
-        _result = strategy.compute(layers, memory_stats)
+        _result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=budget)
 
-        print_summary(strategy, layers, "GPU Memory Range [150MB, 200MB]")
+        print_summary(strategy, layers, "GPU Memory Range [150MB, 200MB]", max_gpu_mem_bytes=budget)
 
         # Should be within max
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
     def test_different_utilization_targets(self):
         """Test different GPU utilization targets."""
@@ -712,13 +710,12 @@ class TestGlobalTensorSelectionStrategyMemoryBounds:
             max_mem = 200 * 1024 * 1024
 
             strategy = GlobalTensorSelectionStrategy(
-                max_gpu_mem_bytes=max_mem,
                 n_blocks=3,  # Minimum 3 blocks for pipelining
                 pop_size=20,
                 epoch=15,
             )
 
-            strategy.compute(layers, memory_stats)
+            strategy.compute(layers, memory_stats, max_gpu_mem_bytes=max_mem)
             utilization = strategy.optimal_peak_memory / max_mem * 100
             results[min_pct] = utilization
 
@@ -758,14 +755,13 @@ class TestBuildFixedOnlyResult:
         layers, mem = self._make_fitting_layers()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             scale=0.9,
             scale_ub=5.0,
             pop_size=10,
             epoch=5,
         )
-        strategy.compute(layers, mem)
+        strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         assert strategy.optimal_scale == pytest.approx(0.9), (
             f"optimal_scale should equal scale_lb (0.9), got {strategy.optimal_scale}"
@@ -776,12 +772,11 @@ class TestBuildFixedOnlyResult:
         layers, mem = self._make_fitting_layers()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        result = strategy.compute(layers, mem)
+        result = strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         assert "layer_0" in result.strategy_map, "layer_0 should transfer layer_1's tensors"
         assert "layer_1" in result.strategy_map, "layer_1 should transfer layer_2's tensors"
@@ -800,12 +795,11 @@ class TestBuildFixedOnlyResult:
         layers, mem = self._make_fitting_layers()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        result = strategy.compute(layers, mem)
+        result = strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         layer0_ids = {t.tensor_id for t in layers[0].tensors}
         for label, tensors in result.strategy_map.items():
@@ -823,12 +817,11 @@ class TestBuildFixedOnlyResult:
         mem = create_memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        result = strategy.compute(layers, mem)
+        result = strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         for label, block_idx in strategy.optimal_layer_to_block.items():
             if label not in result.strategy_map:
@@ -844,12 +837,11 @@ class TestBuildFixedOnlyResult:
         layers, mem = self._make_fitting_layers()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        strategy.compute(layers, mem)
+        strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         total_blocks = sum(strategy.optimal_block_sizes)
         assert strategy.optimal_peak_memory >= total_blocks, "Peak must include block memory"
@@ -860,12 +852,11 @@ class TestBuildFixedOnlyResult:
         layers, mem = self._make_fitting_layers()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        strategy.compute(layers, mem)
+        strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         for label, selections in strategy.optimal_tensor_selection.items():
             assert all(selections), f"All tensors in {label} should be selected (True)"
@@ -892,13 +883,12 @@ class TestBuildFixedOnlyResult:
         mem = create_memory_stats()
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             threshold_mb=0.1,
             pop_size=10,
             epoch=5,
         )
-        result = strategy.compute(layers, mem)
+        result = strategy.compute(layers, mem, max_gpu_mem_bytes=500 * 1024 * 1024)
 
         for tensors in result.strategy_map.values():
             for t in tensors:
@@ -907,16 +897,16 @@ class TestBuildFixedOnlyResult:
     def test_within_memory_budget(self):
         """Short-circuit result should respect memory budget."""
         layers, mem = self._make_fitting_layers()
+        budget = 500 * 1024 * 1024
 
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=500 * 1024 * 1024,
             n_blocks=3,
             pop_size=10,
             epoch=5,
         )
-        strategy.compute(layers, mem)
+        strategy.compute(layers, mem, max_gpu_mem_bytes=budget)
 
-        assert strategy.optimal_peak_memory <= strategy.max_gpu_mem_bytes
+        assert strategy.optimal_peak_memory <= budget
 
 
 class TestBlockAssignmentConsistency:
@@ -952,7 +942,6 @@ class TestBlockAssignmentConsistency:
 
         assignment_strategy = OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=3)
         strategy = GlobalTensorSelectionStrategy(
-            max_gpu_mem_bytes=200 * 1024 * 1024,
             n_blocks=3,
             assignment_strategy=assignment_strategy,
             threshold_mb=0.1,
@@ -963,7 +952,7 @@ class TestBlockAssignmentConsistency:
             seed=42,
         )
 
-        result = strategy.compute(layers, memory_stats)
+        result = strategy.compute(layers, memory_stats, max_gpu_mem_bytes=200 * 1024 * 1024)
 
         # Expected: assignment from full layer sizes (all N-1 slots, including gap)
         layer_sizes = [sum(t.size_bytes for t in layer.tensors) for layer in layers]

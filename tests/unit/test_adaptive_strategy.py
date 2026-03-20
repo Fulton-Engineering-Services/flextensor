@@ -346,10 +346,9 @@ class TestAdaptiveStrategy:
         strategy = AdaptiveStrategy(
             scale=1.0,
             loader_type="allocation_block_transfer",
-            max_gpu_mem_bytes=200 * 1024**2,
             n_blocks=4,
         )
-        result = strategy.compute(layers, mem_stats)
+        result = strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
         assert isinstance(result, StrategyResult)
         assert strategy.selected_strategy_name != ""
         assert len(strategy.all_scores) > 0
@@ -384,9 +383,8 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024**2,
         )
-        strategy.compute(layers, mem_stats)
+        strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
         assert len(strategy.all_scores) == 3
         names = {s.strategy_name for s in strategy.all_scores}
         assert "KnapsackBlock" in names
@@ -400,10 +398,9 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024**2,
             extra_optimization=True,
         )
-        strategy.compute(layers, mem_stats)
+        strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
         assert len(strategy.all_scores) == 5
         names = {s.strategy_name for s in strategy.all_scores}
         assert "KnapsackBlock" in names
@@ -419,11 +416,10 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=1,  # impossibly small
         )
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            strategy.compute(layers, mem_stats)
+            strategy.compute(layers, mem_stats, max_gpu_mem_bytes=1)  # impossibly small
             adaptive_warnings = [x for x in w if "AdaptiveStrategy" in str(x.message)]
             assert len(adaptive_warnings) >= 1
 
@@ -434,9 +430,8 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024**2,
         )
-        result = strategy.compute(layers, mem_stats)
+        result = strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
         assert result.block_data is not None
 
     def test_strategy_compute_error_is_caught(self, monkeypatch):
@@ -448,7 +443,6 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024**2,
         )
 
         def _failing_compute(self, *a, **kw):
@@ -456,7 +450,7 @@ class TestAdaptiveStrategy:
 
         monkeypatch.setattr(knapsack.KnapsackBlockStrategy, "compute", _failing_compute)
 
-        result = strategy.compute(layers, mem_stats)
+        result = strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
         assert isinstance(result, StrategyResult)
         assert strategy.selected_strategy_name != "KnapsackBlock"
 
@@ -469,7 +463,6 @@ class TestAdaptiveStrategy:
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
-            max_gpu_mem_bytes=200 * 1024**2,
         )
 
         def _buggy_compute(self, *a, **kw):
@@ -478,4 +471,4 @@ class TestAdaptiveStrategy:
         monkeypatch.setattr(knapsack.KnapsackBlockStrategy, "compute", _buggy_compute)
 
         with pytest.raises(TypeError, match="unexpected None"):
-            strategy.compute(layers, mem_stats)
+            strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
