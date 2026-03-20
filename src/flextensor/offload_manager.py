@@ -853,6 +853,33 @@ def load_profile(
     om.load_profile(profile_directory, model)
 
 
+def offload_from_profile(
+    model: nn.Module,
+    profile_directory: str,
+    config: OffloadConfig | None = None,
+    name: str = DEFAULT_MANAGER_NAME,
+) -> nn.Module:
+    """Initialize, load a saved profile, and offload the model in one step.
+
+    Convenience wrapper that combines :func:`init`, :func:`load_profile`, and
+    :func:`offload`.  The profile must be loaded *before* offloading so that
+    ``initialize_warmup`` sees the saved state and skips warmup/profiling,
+    going straight to inference mode.
+
+    Args:
+        model: PyTorch model to offload.
+        profile_directory: Directory containing the saved profile.
+        config: OffloadConfig to apply.
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+
+    Returns:
+        The offloaded model proxy, ready for inference.
+    """
+    init(config=config, name=name)
+    load_profile(profile_directory, model=model, name=name)
+    return offload(model, config=config, name=name)
+
+
 def offload_block(block_name: str, name: str = DEFAULT_MANAGER_NAME) -> Any:
     """Create offload block using the specified offload manager.
 

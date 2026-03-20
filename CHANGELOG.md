@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `offload_from_profile()` convenience API that combines `init`, `load_profile`, and `offload`
+  into a single call for loading a saved profile and going straight to inference.
+- Diffusers examples (`examples/diffusers/basic/` and `examples/diffusers/profile-reuse/`)
+  demonstrating FlexTensor offloading with the Wan2.2 text-to-video model, including profile
+  save/load workflow.
+
 ### Fixed
 
 - Profiling traps now use CUDA events instead of `time.time_ns()` for timing. Host-side

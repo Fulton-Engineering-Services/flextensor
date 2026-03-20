@@ -603,3 +603,98 @@ class TestModuleLevelProfileFunctions:
         load_profile(profile_dir)
 
         mock_om.load_profile.assert_called_once_with(profile_dir, None)
+
+
+class TestOffloadFromProfile:
+    """Test cases for the offload_from_profile convenience function."""
+
+    def setup_method(self):
+        """Setup test fixtures."""
+        self.model = SimpleModel()
+        self.model.cpu()
+        self.model.eval()
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_calls_init_load_profile_offload_in_order(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that offload_from_profile calls init, load_profile, and offload in correct order."""
+        from flextensor.offload_manager import offload_from_profile
+
+        mock_offload.return_value = self.model
+        config = OffloadConfig(module_patterns=["linear1"])
+        profile_dir = str(tmp_path / "profile")
+
+        call_order = []
+        mock_init.side_effect = lambda **kw: call_order.append("init")
+        mock_load.side_effect = lambda *a, **kw: call_order.append("load_profile")
+        mock_offload.side_effect = lambda *a, **kw: (call_order.append("offload"), self.model)[1]
+
+        offload_from_profile(self.model, profile_dir, config=config, name="test")
+
+        assert call_order == ["init", "load_profile", "offload"]
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_passes_correct_arguments(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that offload_from_profile passes the correct arguments to each function."""
+        from flextensor.offload_manager import offload_from_profile
+
+        mock_offload.return_value = self.model
+        config = OffloadConfig(module_patterns=["linear1"])
+        profile_dir = str(tmp_path / "profile")
+
+        offload_from_profile(self.model, profile_dir, config=config, name="mymodel")
+
+        mock_init.assert_called_once_with(config=config, name="mymodel")
+        mock_load.assert_called_once_with(profile_dir, model=self.model, name="mymodel")
+        mock_offload.assert_called_once_with(self.model, config=config, name="mymodel")
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_returns_offload_result(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that offload_from_profile returns the result from offload()."""
+        from flextensor.offload_manager import offload_from_profile
+
+        proxy_model = SimpleModel()
+        mock_offload.return_value = proxy_model
+        config = OffloadConfig(module_patterns=["linear1"])
+        profile_dir = str(tmp_path / "profile")
+
+        result = offload_from_profile(self.model, profile_dir, config=config, name="test")
+
+        assert result is proxy_model
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_uses_default_name(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that offload_from_profile uses DEFAULT_MANAGER_NAME when name is not provided."""
+        from flextensor.offload_manager import DEFAULT_MANAGER_NAME, offload_from_profile
+
+        mock_offload.return_value = self.model
+        profile_dir = str(tmp_path / "profile")
+
+        offload_from_profile(self.model, profile_dir)
+
+        mock_init.assert_called_once_with(config=None, name=DEFAULT_MANAGER_NAME)
+        mock_load.assert_called_once_with(profile_dir, model=self.model, name=DEFAULT_MANAGER_NAME)
+        mock_offload.assert_called_once_with(self.model, config=None, name=DEFAULT_MANAGER_NAME)
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_propagates_load_profile_error(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that errors from load_profile propagate without calling offload."""
+        from flextensor.offload_manager import offload_from_profile
+
+        mock_load.side_effect = FileNotFoundError("profile.json not found")
+        profile_dir = str(tmp_path / "nonexistent")
+
+        with pytest.raises(FileNotFoundError, match=r"profile\.json not found"):
+            offload_from_profile(self.model, profile_dir)
+
+        mock_init.assert_called_once()
+        mock_offload.assert_not_called()

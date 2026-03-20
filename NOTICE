@@ -41,6 +41,7 @@ integration tests and examples.
   Qwen/Qwen3-0.6B                      Apache 2.0            Integration tests
   Qwen/Qwen2.5-7B-Instruct             Apache 2.0            Integration tests
   Qwen/Qwen2.5-72B-Instruct            Qwen License          Examples
+  Wan-AI/Wan2.2-T2V-A14B-Diffusers     Apache 2.0            Examples
 
 ================================================================================
 

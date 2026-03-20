@@ -18,6 +18,7 @@ Module-level convenience functions — the recommended starting point for most u
 - [`offload_block()`](simplified.md#flextensor.offload_manager.offload_block) — Context manager for manual offloading control
 - [`get_gpu_memory_usage()`](simplified.md#flextensor.offload_manager.get_gpu_memory_usage) — Get GPU memory usage (inference mode only)
 - [`save_profile()` / `load_profile()`](simplified.md#flextensor.offload_manager.save_profile) — Profile persistence
+- [`offload_from_profile()`](simplified.md#flextensor.offload_manager.offload_from_profile) — Load a saved profile and offload in one step
 - [`release()`](simplified.md#flextensor.offload_manager.release) — Release resources and restore model
 - [`load_model_from_profile()`](simplified.md#flextensor.lazy_model_init.load_model_from_profile) — Load a model from a saved profile with optimized weight loading
 

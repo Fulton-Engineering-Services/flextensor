@@ -110,13 +110,15 @@ for _ in range(config.warmup_iters + config.profile_iters):
 om.save_profile("/tmp/profiles/my_model")
 
 # Later runs: load profile, skip warmup/profile
-om = flextensor.get_offload_manager()
-om.set_config(config)
-om.load_profile("/tmp/profiles/my_model", model=model)
+model = flextensor.offload_from_profile(
+    model,
+    "/tmp/profiles/my_model",
+    config=config,
+)
 ```
 
-!!! note "Profile read-only mode"
-    By default, `profile_read_only` is `False`, allowing both saving and loading of profiles. Set `profile_read_only=True` to prevent accidental overwrites in production.
+`offload_from_profile` combines `init`, `load_profile`, and `offload` into a single call —
+the model is ready for inference immediately with no warmup or profiling overhead.
 
 ## Verify It's Working
 
