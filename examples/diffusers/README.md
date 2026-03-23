@@ -8,7 +8,7 @@ These examples show how to run large [Diffusers](https://github.com/huggingface/
 
 | Example | Description |
 |---------|-------------|
-| [`basic/`](basic/) | Minimal single-script example showing how to integrate FlexTensor with a Diffusers pipeline. Profiles inline on every launch. |
+| [`quickstart/`](quickstart/) | Minimal single-script example showing how to integrate FlexTensor with a Diffusers pipeline. Profiles inline on every launch. |
 | [`profile-reuse/`](profile-reuse/) | Two-step workflow: profile once with `run_profile.py`, then generate videos with `run_infer.py` without re-profiling. |
 
-Start with **basic** to see how FlexTensor integrates with Diffusers. Move to **profile-reuse** when you want to avoid the profiling overhead on repeated runs.
+Start with **quickstart** to see how FlexTensor integrates with Diffusers. Move to **profile-reuse** when you want to avoid the profiling overhead on repeated runs.

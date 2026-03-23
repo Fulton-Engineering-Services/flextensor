@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 -->
-# vLLM Model Weight Offloading with FlexTensor
+# vLLM Model Weight Offloading with FlexTensor [Coming Soon]
 
 This example demonstrates how to use FlexTensor's tensor offloading with vLLM to run larger models with limited GPU memory.
 
