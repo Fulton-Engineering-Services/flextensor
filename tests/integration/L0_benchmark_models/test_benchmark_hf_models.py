@@ -3,6 +3,8 @@
 
 """Integration tests for HuggingFace model benchmarking with bermuda TensorManager."""
 
+import gc
+
 import psutil
 import pytest
 import torch
@@ -127,6 +129,7 @@ class TestHuggingFaceModelBenchmarking:
         """
         model_name = "Qwen/Qwen3-0.6B"
 
+        gc.collect()
         torch.cuda.empty_cache()
         initial_gpu_memory = torch.cuda.memory_allocated(device_gpu)
         initial_cpu_memory = psutil.Process().memory_info().rss
@@ -149,6 +152,7 @@ class TestHuggingFaceModelBenchmarking:
         del outputs
         del input_ids
         del tensor_manager
+        gc.collect()
         torch.cuda.empty_cache()
 
         final_gpu_memory = torch.cuda.memory_allocated(device_gpu)
