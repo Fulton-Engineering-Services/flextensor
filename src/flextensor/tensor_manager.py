@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 
-from flextensor.benchmark_tensor_mode import BenchmarkReplace, TensorBenchmarkMode
+from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, TensorBenchmarkMode
 from flextensor.collectors import (
     IterativeLayerStatisticsCollector,
     IterativeLayerStatisticsFilter,
@@ -258,54 +258,56 @@ class TensorManager:
     def __init__(
         self,
         device_gpu,
-        pinned_memory,
         tensor_manager_load_strategy,
-        release_tensors=True,
-        benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace,
-        direct_mode=True,
-        use_trace_tensor=False,
+        pinned_memory: bool = True,
         loader_type="allocation_block_transfer",
         remove_layers_operations=None,
-        rearrange_transfers=False,
-        min_compute_transfer_gap=1,
         blocks=4,
         move_top_level_buffers_to_gpu=True,
         use_shm=False,
-        enable_untraced_tensor_discovery=True,
-        enable_module_tracker=True,
         enable_diagnostics: bool = False,
         max_gpu_mem_fraction: float | None = None,
+        *,
+        _direct_mode: bool = True,
+        _use_trace_tensor: bool = False,
+        _rearrange_transfers: bool = False,
+        _compute_transfer_gap: int = 1,
+        _enable_untraced_tensor_discovery: bool = True,
     ):
         """
         Initialize TensorManager with configurable tensor loading strategy.
 
         Args:
             device_gpu: GPU device to use
-            pinned_memory: Whether to use pinned memory
             tensor_manager_load_strategy: Strategy for loading tensors
-            release_tensors: Whether to release tensors after use
-            benchmark_cls: Benchmark class to use
-            direct_mode: Whether to enable direct mode
-            use_trace_tensor: Whether to use trace tensor functionality
+            pinned_memory: Whether to use pinned (page-locked) memory for CPU tensors.
+                Required for non-blocking transfers on a separate CUDA stream so that
+                weight copies can overlap with GPU computation. Increases host memory
+                pressure since pinned pages cannot be swapped. (default: True)
             loader_type: Type of tensor loader to use. Options:
                 - "strategy": Uses TensorStrategyLoader
                 - "raw_block_transfer": Uses PreallocatedBatchTransferTensorLoader with RawBlockController
                 - "allocation_block_transfer": Uses PreallocatedBatchTransferTensorLoader with AllocationBlockController
             remove_layers_operations: List of operations to remove layers from the strategy map
-            rearrange_transfers: Whether to enable transfer rearrangement optimization (default: True)
-            min_compute_transfer_gap: Minimum gap between compute and transfer layers for optimization (default: 1)
             blocks: Number of blocks to use for the block transfer loaders (default: 4)
             move_top_level_buffers_to_gpu: Whether to move top-level model buffers to GPU
                 during warmup initialization (default: True)
-            enable_untraced_tensor_discovery: Whether to discover untraced tensors (e.g., FP8 weights
-                passed to Triton kernels) using discovery strategies (default: True)
-            enable_module_tracker: Whether to enable ModuleTracker for manual traps when forward
-                patching is not used (default: True)
             enable_diagnostics: Whether to log diagnostic information (layer duration statistics,
                 block assignment table) after strategy computation (default: False)
             max_gpu_mem_fraction: Fraction of total GPU memory to use as budget, in (0.0, 1.0].
                 Resolved to bytes at compute time via :meth:`_resolve_gpu_budget`. If None,
                 no memory constraint is applied (latency mode). (default: None)
+            _direct_mode: Internal debug flag — when False, uses TorchFunctionMode-based
+                traps instead of direct tensor replacement. Significant overhead; kept as
+                a debug fallback. Not part of the public API.
+            _use_trace_tensor: Internal debug flag — enables TraceTensor + BenchmarkReplace
+                for per-tensor transfer timing. Not part of the public API.
+            _rearrange_transfers: Internal — whether to enable transfer rearrangement.
+                Auto-enabled when permanent gap layers are detected. (default: False)
+            _compute_transfer_gap: Internal — minimum layer gap between a block's compute
+                and its next transfer during rearrangement. (default: 1)
+            _enable_untraced_tensor_discovery: Internal — whether to discover untraced
+                tensors (e.g., FP8 weights passed to Triton kernels). (default: True)
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
@@ -316,16 +318,15 @@ class TensorManager:
         self.tensor_layer_loader = None
         self.layer_statistics_collector = None
         self.tensor_manager_load_strategy = tensor_manager_load_strategy
-        self.release_tensors = release_tensors
+        self.release_tensors = True
         self.pinned_memory = pinned_memory
-        self._benchmark_cls = benchmark_cls
-        self.direct_enabled = direct_mode
+        self._benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace if _use_trace_tensor else NoOpBenchmark
+        self.direct_enabled = _direct_mode
         self.traced_tensors = set()
         self.transfer_stream_priority = 1
         self.blocks = blocks
         self.move_top_level_buffers_to_gpu = move_top_level_buffers_to_gpu
-        self.enable_untraced_tensor_discovery = enable_untraced_tensor_discovery
-        self.enable_module_tracker = enable_module_tracker
+        self.enable_untraced_tensor_discovery = _enable_untraced_tensor_discovery
         self.enable_diagnostics = enable_diagnostics
         self._max_gpu_mem_fraction = max_gpu_mem_fraction
 
@@ -335,15 +336,19 @@ class TensorManager:
 
         self.loader_type = loader_type
         self.remove_layers_operations = remove_layers_operations
-        self.rearrange_transfers = rearrange_transfers
-        self.min_compute_transfer_gap = min_compute_transfer_gap
-        self.use_trace_tensor = use_trace_tensor
-        if use_trace_tensor:
+        self.rearrange_transfers = _rearrange_transfers
+        self.min_compute_transfer_gap = _compute_transfer_gap
+        self.use_trace_tensor = _use_trace_tensor
+        if _use_trace_tensor:
             self.is_traced = self.is_traced_trace_tensor
 
-        if self.loader_type in ["allocation_block_transfer", "raw_block_transfer"] and not direct_mode:
-            msg = "Direct mode is required for allocation_block_transfer and raw_block_transfer"
-            raise Exception(msg)
+        if self.loader_type in ["allocation_block_transfer", "raw_block_transfer"] and not _direct_mode:
+            msg = (
+                f"_direct_mode=False is incompatible with loader_type={self.loader_type!r}. "
+                "Either remove the _direct_mode override or use loader_type='strategy'."
+            )
+            raise ValueError(msg)
+
         self.model = None
         self.tensor_id_to_name_map = {}
         self.tensor_manager_state = None
@@ -433,14 +438,9 @@ class TensorManager:
         self.layer_statistics_collector = IterativeLayerStatisticsCollector()
         self.trap_class = WarmupTrap
         self.tensor_layer_loader = None
-        # Initialize module tracker only for manual traps (no forward patching).
+        # Initialize module tracker for manual traps (no forward patching).
         # With forward patching, we can discover tensors directly via named_parameters().
-        if (
-            self.enable_module_tracker
-            and self.model is not None
-            and isinstance(self.model, torch.nn.Module)
-            and not has_offload_modules(self.model)
-        ):
+        if self.model is not None and isinstance(self.model, torch.nn.Module) and not has_offload_modules(self.model):
             self.module_tracker = ModuleTracker()
             self.module_tracker.register(self.model)
 

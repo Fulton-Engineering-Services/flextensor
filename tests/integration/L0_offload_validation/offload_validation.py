@@ -478,24 +478,21 @@ class TensorManagerFactory:
         remove_layers_operations = []
         use_trace_tensor = False if config.model_type != "basic" else None
 
-        # Create TensorManager with correct parameter order
         tensor_manager_kwargs = {
-            "release_tensors": config.release_tensors,
-            "direct_mode": config.enable_direct_mode,
             "remove_layers_operations": remove_layers_operations,
-            "rearrange_transfers": config.rearrange_transfers,
-            "min_compute_transfer_gap": config.compute_transfer_gap,
+            "_rearrange_transfers": config.rearrange_transfers,
+            "_compute_transfer_gap": config.compute_transfer_gap,
             "loader_type": config.transfer_mode,
             "max_gpu_mem_fraction": max_gpu_mem_fraction,
         }
 
         if use_trace_tensor is not None:
-            tensor_manager_kwargs["use_trace_tensor"] = use_trace_tensor
+            tensor_manager_kwargs["_use_trace_tensor"] = use_trace_tensor
 
         return TensorManager(
             device_gpu,
-            config.pinned_memory,
             tensor_manager_load_strategy,
+            pinned_memory=config.pinned_memory,
             **tensor_manager_kwargs,
         )
 
@@ -664,10 +661,8 @@ class CombinedTensorOffloadExperiment:
             print(f"  Batch size: {self.config.batch_size}")
             print(f"  Sequence length: {self.config.seq_len}")
         print(f"  Iterations: {self.config.iterations}")
-        print(f"  Release tensors: {self.config.release_tensors}")
         print(f"  Pinned memory: {self.config.pinned_memory}")
         print(f"  Data type: {self.config.tensor_dtype}")
-        print(f"  Direct mode: {self.config.enable_direct_mode}")
         print(f"  Rearrange transfers: {self.config.rearrange_transfers}")
         print(f"  Transfer mode: {self.config.transfer_mode}")
         print(f"  Baseline mode (GPU only): {self.config.baseline_mode}")
@@ -839,7 +834,6 @@ class OffloadManagerExperiment:
             knapsack_scale=self.config.knapsack_scale,
             num_blocks=self.config.n_blocks,
             pinned_memory=self.config.pinned_memory,
-            enable_direct_mode=self.config.enable_direct_mode,
         )
 
         manager_name = f"test_{uuid.uuid4().hex[:8]}"

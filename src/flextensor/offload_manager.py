@@ -21,7 +21,7 @@ import torch
 from proxytypes3 import ObjectWrapper
 from torch import nn
 
-from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, PreloadToDevice, TensorBenchmarkMode
+from flextensor.benchmark_tensor_mode import PreloadToDevice
 from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
@@ -386,22 +386,13 @@ class OffloadManager:
             # pyright: ignore[reportUnknownReturnType]
             self._tensor_manager = NoOpTensorManager(device_gpu, benchmark_cls=benchmark_cls)
         else:
-            benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace if self.config.enable_tracing else NoOpBenchmark
             self._tensor_manager = TensorManager(
                 device_gpu,
-                self.config.pinned_memory,
                 tensor_manager_load_strategy,
-                self.config.release_tensors,
-                benchmark_cls=benchmark_cls,
-                direct_mode=self.config.enable_direct_mode,
-                use_trace_tensor=self.config.enable_tracing,
+                pinned_memory=self.config.pinned_memory,
                 loader_type=self.config.transfer_mode,
-                min_compute_transfer_gap=self.config.compute_transfer_gap,
-                rearrange_transfers=self.config.rearrange_transfers,
                 blocks=self.config.num_blocks,
                 remove_layers_operations=[],
-                enable_untraced_tensor_discovery=self.config.enable_untraced_tensor_discovery,
-                enable_module_tracker=self.config.enable_module_tracker,
                 use_shm=self.config.shm_enabled,
                 enable_diagnostics=self.config.enable_diagnostics,
                 max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,

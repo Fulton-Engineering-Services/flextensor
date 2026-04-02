@@ -9,7 +9,6 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from flextensor import TensorManager
-from flextensor.benchmark_tensor_mode import BenchmarkReplace
 from flextensor.strategy import KnapsackStrategy
 
 
@@ -28,9 +27,8 @@ class TestHuggingFaceModelBenchmarking:
         strategy = KnapsackStrategy(scale=0.8)
         return TensorManager(
             device_gpu=device_gpu,
-            pinned_memory=True,
             tensor_manager_load_strategy=strategy,
-            benchmark_cls=BenchmarkReplace,
+            _use_trace_tensor=True,
         )
 
     def load_hf_model(self, model_name: str):

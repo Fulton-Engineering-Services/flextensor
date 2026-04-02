@@ -9,6 +9,7 @@ including support for loading configuration from environment variables and files
 
 import configparser
 import json
+import logging
 import os
 import types
 import warnings
@@ -17,9 +18,12 @@ from typing import Annotated, Any, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, Field, WithJsonSchema, model_validator
+from typing_extensions import Self
 from typing_extensions import deprecated as _deprecated
 
 from flextensor.strategy import Strategy
+
+logger = logging.getLogger(__name__)
 
 _USE_SHARED_MEMORY_MSG = "`use_shared_memory` is deprecated. Use `shm_enabled` instead. Will be removed in v0.5."
 _MAX_GPU_MEM_BYTES_MSG = (
@@ -27,6 +31,20 @@ _MAX_GPU_MEM_BYTES_MSG = (
 )
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
+
+_REMOVED_FIELDS: dict[str, tuple[str, str]] = {
+    "release_tensors": ("v0.1.1", "GPU tensors are now always released after layer execution."),
+    "enable_direct_mode": ("v0.1.1", "Direct mode is now always enabled."),
+    "enable_tracing": ("v0.1.1", "Use TensorManager(_use_trace_tensor=True) for tracing."),
+    "rearrange_transfers": ("v0.1.1", "Transfer rearrangement is now auto-enabled when gap layers are detected."),
+    "compute_transfer_gap": ("v0.1.1", "Use TensorManager(_compute_transfer_gap=N) to override."),
+    "enable_untraced_tensor_discovery": (
+        "v0.1.1",
+        "Untraced tensor discovery is now always enabled."
+        " Use TensorManager(_enable_untraced_tensor_discovery=False) to override.",
+    ),
+    "enable_module_tracker": ("v0.1.1", "ModuleTracker is now always enabled for manual traps."),
+}
 
 
 class OffloadConfig(BaseModel):
@@ -39,7 +57,7 @@ class OffloadConfig(BaseModel):
     """GPU device index to use."""
 
     pinned_memory: bool = Field(default=True)
-    """Whether to use pinned memory for CPU-to-GPU transfers."""
+    """Whether to use pinned (page-locked) memory for CPU tensors, enabling non-blocking GPU transfers."""
 
     use_shared_memory: Annotated[bool, _deprecated(_USE_SHARED_MEMORY_MSG)] = Field(
         default=False, deprecated=_USE_SHARED_MEMORY_MSG
@@ -80,32 +98,35 @@ class OffloadConfig(BaseModel):
     """Number of profiling iterations to collect statistics."""
 
     knapsack_scale: float = Field(default=1.0, gt=0.0)
-    """Knapsack algorithm scale factor."""
+    """Duration multiplier for transfer budget estimation in latency mode.
+
+    Values below 1.0 add a safety margin to absorb profiling measurement noise
+    (e.g., 0.95 = 5% margin). Only affects latency mode (``max_gpu_mem_fraction=None``);
+    in memory mode the strategy auto-scales to meet the GPU memory target.
+    """
 
     transfer_mode: str = Field(default="allocation_block_transfer")
-    """Transfer strategy name."""
+    """Tensor loading mode. Block transfer loaders (``allocation_block_transfer``,
+    ``raw_block_transfer``) do not support shared tensors between layers;
+    use ``strategy`` for models with shared weights."""
 
-    enable_direct_mode: bool = Field(default=True)
-    """Whether to use direct tensor access."""
+    num_blocks: int = Field(default=4, ge=2)
+    """Number of memory blocks for block transfer loaders.
 
-    release_tensors: bool = Field(default=True)
-    """Whether to release GPU memory after layer execution."""
-
-    rearrange_transfers: bool = Field(default=False)
-    """Whether to optimize transfer scheduling."""
-
-    compute_transfer_gap: int = Field(default=1, ge=0)
-    """Gap between compute and transfer layers for pipelining."""
-
-    num_blocks: int = Field(default=4, gt=0)
-    """Number of memory blocks for block transfer loaders."""
+    More blocks reserve more GPU memory but give the pipelining scheduler more
+    room to overlap transfers with compute. Fewer blocks (e.g., 2) reduce GPU
+    memory overhead and can work well for models whose layers have long compute
+    times (such as diffusers), since the transfer easily finishes within a
+    single layer's compute window.
+    """
 
     min_blocks: int = Field(default=4, ge=2)
     """Minimum number of blocks for assignment optimization search range.
 
-    Lower values give the optimizer more freedom and reduce GPU memory used by
-    FlexTensor's memory blocks, but may hurt pipelining throughput.
-    Must be >= 2 (pipelined execution requires at least two blocks).
+    The optimizer tries block counts from ``min_blocks`` to ``num_blocks`` and
+    picks the best. Lower values give more freedom and reduce GPU memory, but
+    may hurt pipelining throughput. Must be >= 2 (pipelined execution requires
+    at least two blocks).
     Can also be set via the ``FT_MIN_BLOCKS`` env var.
     """
 
@@ -138,9 +159,6 @@ class OffloadConfig(BaseModel):
     load_strategy: Annotated[Strategy, WithJsonSchema({"type": "object"})] | None = Field(default=None)
     """Override automatic strategy selection."""
 
-    enable_tracing: bool = Field(default=False)
-    """Whether to enable tensor tracing for debugging."""
-
     enable_instrumentation: bool = Field(default=False)
     """Whether to capture component init args for debugging."""
 
@@ -152,12 +170,6 @@ class OffloadConfig(BaseModel):
 
     Can also be set via the ``FT_MODULE_PATTERNS`` env var as a comma-separated list.
     """
-
-    enable_untraced_tensor_discovery: bool = Field(default=True)
-    """Whether to discover untraced tensors (e.g. FP8 weights passed to Triton kernels)."""
-
-    enable_module_tracker: bool = Field(default=True)
-    """Whether to enable ModuleTracker for manual traps when forward patching is not used."""
 
     enable_diagnostics: bool = Field(default=False)
     """Whether to log diagnostic information (layer duration statistics, block assignment table)
@@ -195,6 +207,23 @@ class OffloadConfig(BaseModel):
             elif "shm_enabled" in data and "use_shared_memory" not in data:
                 data["use_shared_memory"] = data["shm_enabled"]
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            for field, (version, msg) in _REMOVED_FIELDS.items():
+                if field in data:
+                    raise ValueError(
+                        f"'{field}' was removed in {version}. {msg} Remove '{field}' from your OffloadConfig() call."
+                    )
+        return data
+
+    @model_validator(mode="after")
+    def _validate_block_range(self) -> Self:
+        if self.num_blocks < self.min_blocks:
+            raise ValueError(f"num_blocks ({self.num_blocks}) must be >= min_blocks ({self.min_blocks})")
+        return self
 
     @property
     def all_warmup_iters(self) -> int:
@@ -344,6 +373,10 @@ def _load_ini_file(config_path: Path, field_types: dict[str, type]) -> dict[str,
                 continue
             config_dict[field_name] = _convert_env_value(value, field_type)
 
+    for field in _REMOVED_FIELDS:
+        if field in parser[section]:
+            config_dict[field] = parser[section][field]
+
     return config_dict
 
 
@@ -362,6 +395,10 @@ def _process_data_dict(data: dict[str, Any], field_types: dict[str, type]) -> di
     """
     config_dict: dict[str, Any] = {}
     for field_name in data:
+        if field_name in _REMOVED_FIELDS:
+            config_dict[field_name] = data[field_name]
+            continue
+
         # Skip complex types unless it's module_patterns (a list field we support)
         if field_name in field_types and field_types[field_name] is object and field_name != "module_patterns":
             continue
@@ -451,6 +488,17 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
         Dictionary of configuration values
     """
     config_dict: dict[str, Any] = {}
+
+    for field, (version, msg) in _REMOVED_FIELDS.items():
+        env_var_name = f"{env_prefix}{field.upper()}"
+        if os.environ.get(env_var_name) is not None:
+            logger.warning(
+                "Environment variable '%s' is ignored: '%s' was removed in %s. %s",
+                env_var_name,
+                field,
+                version,
+                msg,
+            )
 
     # Special handling for list field: module_patterns
     env_var_name = f"{env_prefix}MODULE_PATTERNS"

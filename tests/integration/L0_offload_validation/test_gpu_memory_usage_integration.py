@@ -59,9 +59,7 @@ class TestGPUMemoryUsageIntegration:
         strategy = KnapsackStrategy(scale=0.8)
         return TensorManager(
             device_gpu=device_gpu,
-            pinned_memory=True,
             tensor_manager_load_strategy=strategy,
-            direct_mode=True,
             loader_type=loader_type,
             blocks=4,
         )
@@ -212,9 +210,7 @@ class TestGPUMemoryUsageWithDictModel:
         strategy = KnapsackStrategy(scale=0.8)
         tensor_manager = TensorManager(
             device_gpu=device_gpu,
-            pinned_memory=True,
             tensor_manager_load_strategy=strategy,
-            direct_mode=True,
             loader_type="allocation_block_transfer",
             blocks=4,
         )

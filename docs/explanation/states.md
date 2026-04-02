@@ -87,7 +87,7 @@ At the end of the warmup state, FlexTensor has collected:
 
 **Model state after warmup**:
 - All model tensors reside on **CPU memory**
-- Tensors are **pinned** (if `pinned_memory=True`) for faster GPU transfers
+- For the strategy loader, tensors are **pinned** (if `pinned_memory=True`) at this stage; for block transfer loaders, pinned buffers are allocated later during inference setup
 - The model structure is unchanged—only tensor locations have moved
 - No GPU memory is permanently allocated yet (tensors were copied on-demand and released)
 

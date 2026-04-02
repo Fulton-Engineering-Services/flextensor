@@ -17,7 +17,6 @@ class TestGetMemoryTransferStats:
         strategy = KnapsackStrategy()
         return TensorManager(
             device_gpu="cuda:0",
-            pinned_memory=True,
             tensor_manager_load_strategy=strategy,
         )
 

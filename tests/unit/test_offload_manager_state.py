@@ -735,8 +735,6 @@ class TestOffloadManagerConfig:
         assert config.profile_iters == 10
         assert config.pinned_memory is True
         assert config.shm_enabled is False
-        assert config.enable_direct_mode is True
-        assert config.release_tensors is True
 
     def test_config_custom_values(self):
         """Test custom configuration values."""

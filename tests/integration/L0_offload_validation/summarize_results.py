@@ -240,9 +240,7 @@ def print_configurations(summaries: list[TestSummary]):  # noqa: C901
         "baseline_mode": False,
         "transfer_mode": "strategy",
         "pinned_memory": True,
-        "release_tensors": True,
         "knapsack_scale": 1.0,
-        "enable_direct_mode": True,
         "rearrange_transfers": False,
         "compute_transfer_gap": 1,
     }

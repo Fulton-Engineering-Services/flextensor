@@ -19,6 +19,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demonstrating FlexTensor offloading with the Wan2.2 text-to-video model, including profile
   save/load workflow.
 
+### Removed
+
+- **BREAKING**: Removed internal-only `OffloadConfig` fields that should not have been
+  user-facing: `release_tensors`, `enable_direct_mode`, `enable_tracing`,
+  `rearrange_transfers`, `compute_transfer_gap`, `enable_untraced_tensor_discovery`,
+  and `enable_module_tracker`.
+  `release_tensors` is now hardcoded to `True`. `rearrange_transfers` is hardcoded to
+  `False` (auto-enabled when gap layers are detected). `enable_module_tracker` is
+  hardcoded to `True`. The corresponding environment variables are no longer recognised.
+  `compute_transfer_gap` and `enable_untraced_tensor_discovery` remain available as
+  private debug parameters on `TensorManager` (`_compute_transfer_gap`,
+  `_enable_untraced_tensor_discovery`).
+
 ### Fixed
 
 - Profiling traps now use CUDA events instead of `time.time_ns()` for timing. Host-side

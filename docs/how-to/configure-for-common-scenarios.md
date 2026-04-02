@@ -22,8 +22,6 @@ Use this configuration when GPU memory is the primary constraint and you need to
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    release_tensors=True,       # Release GPU memory promptly
-    pinned_memory=True,         # Fast CPU-GPU transfers
     profile_iters=15,           # Accurate profiling
     max_gpu_mem_fraction=0.8,   # Use at most 80% of total GPU memory
     min_blocks=2,               # Fewer blocks to save GPU memory
@@ -34,8 +32,6 @@ model = offload(model, config=config)
 
 Key choices:
 
-- `release_tensors=True` frees GPU memory after each layer executes, reducing peak usage.
-- `pinned_memory=True` uses page-locked CPU memory to accelerate transfers via Direct Memory Access (DMA).
 - `max_gpu_mem_fraction=0.8` switches the strategy to memory mode, targeting at most 80% of total device memory (the effective budget may be lower if other consumers have already used GPU memory). Using a fraction rather than a byte count makes the config portable across GPU SKUs.
 - `min_blocks=2` lets the optimizer try fewer memory blocks, reducing GPU memory consumed by FlexTensor itself.
 
@@ -51,8 +47,6 @@ from flextensor import OffloadConfig, offload
 config = OffloadConfig(
     transfer_mode="allocation_block_transfer",
     num_blocks=8,               # More blocks for parallelism
-    enable_direct_mode=True,    # Lower overhead
-    rearrange_transfers=True,   # Optimize transfer scheduling
 )
 
 model = offload(model, config=config)
@@ -61,7 +55,7 @@ model = offload(model, config=config)
 Key choices:
 
 - `num_blocks=8` increases the number of pre-allocated GPU memory blocks, allowing more transfers to overlap with computation.
-- `rearrange_transfers=True` lets FlexTensor reorder transfer scheduling to better hide latency.
+- Transfer rearrangement is auto-enabled when gap layers are detected.
 
 ---
 

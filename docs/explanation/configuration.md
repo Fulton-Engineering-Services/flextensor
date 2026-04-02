@@ -186,21 +186,15 @@ When `enabled=False`, FlexTensor passes through to normal PyTorch execution with
 | `shm_enabled` | bool | `False` | Enable cross-process weight sharing via POSIX shared memory |
 | `shm_namespace` | str \| None | `None` | Base namespace for SHM blocks (auto-derived if None) |
 | `shm_wait_timeout` | float | `0.0` | Hard timeout (seconds) for followers waiting on creator |
-| `release_tensors` | bool | `True` | Release GPU tensors after layer execution |
 | `max_gpu_mem_fraction` | float \| None | `0.9` | GPU memory budget as a fraction of total device memory (e.g. `0.9` = 90%). `None` = latency mode (no constraint). |
 | `max_gpu_mem_bytes` | int \| None | `None` | Deprecated since v0.4 — use `max_gpu_mem_fraction` instead. Will be removed in v0.5. |
 
 #### Pinned Memory
 
-When `pinned_memory=True`, CPU tensors use page-locked memory, which enables:
-
-- Faster CPU↔GPU transfers (DMA — Direct Memory Access — without CPU involvement)
-- Overlapping computation with transfers
-
-The trade-off is increased CPU memory usage and allocation time. Disable for systems with limited CPU memory:
+Pinned (page-locked) memory is required for non-blocking CPU→GPU transfers on a separate CUDA stream. This lets FlexTensor overlap weight transfers with GPU computation, hiding offloading latency. The trade-off is higher host memory pressure (pinned pages cannot be swapped). Disable when host memory is scarce:
 
 ```python
-config = OffloadConfig(pinned_memory=False)  # Lower CPU memory overhead
+config = OffloadConfig(pinned_memory=False)
 ```
 
 #### GPU Memory Limit
@@ -315,7 +309,6 @@ config = OffloadConfig(warmup_iters=1, profile_iters=3)
 | `transfer_mode` | str | `"allocation_block_transfer"` | Tensor transfer strategy |
 | `num_blocks` | int | `4` | Number of memory blocks for block transfer |
 | `min_blocks` | int | `4` | Minimum blocks for assignment optimization |
-| `enable_direct_mode` | bool | `True` | Use direct tensor access (lower overhead) |
 
 FlexTensor supports different transfer strategies:
 
@@ -344,7 +337,7 @@ This option can also be set via the `FT_MIN_BLOCKS` environment variable.
 
 Gap layers are layers that contain no offloadable tensors. When a model has sequential gap layers between offloadable layers, the effective transfer window — the time available to pre-fetch the next layer's tensors — is larger than a single layer's execution time.
 
-`GapAwareWindow` exploits this by computing transfer windows that span gap layers, allowing FlexTensor to start pre-fetching earlier. `strategy_has_transfer_gaps()` detects whether a computed strategy contains such gaps. When gap layers are detected during inference setup, `rearrange_transfers` is automatically enabled to take advantage of the extended windows.
+`GapAwareWindow` exploits this by computing transfer windows that span gap layers, allowing FlexTensor to start pre-fetching earlier. `strategy_has_transfer_gaps()` detects whether a computed strategy contains such gaps. When gap layers are detected during inference setup, transfer rearrangement is automatically enabled to take advantage of the extended windows.
 
 ### Strategy Configuration
 
@@ -386,18 +379,6 @@ from flextensor import OffloadConfig, GreedyStrategy
 config = OffloadConfig(load_strategy=GreedyStrategy())
 ```
 
-### Advanced Transfer Options
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `rearrange_transfers` | bool | `False` | Optimize transfer scheduling |
-| `compute_transfer_gap` | int | `1` | Minimum gap between compute and transfer |
-
-These options control transfer scheduling optimizations:
-
-- **`rearrange_transfers`**: When enabled, FlexTensor may reorder tensor transfers to better overlap with computation. FlexTensor also auto-enables `rearrange_transfers` when it detects permanent gap layers (layers with no offloadable tensors) during inference setup. You may therefore observe this behavior even when you have not set the option explicitly.
-- **`compute_transfer_gap`**: Ensures transfers are initiated N layers before tensors are needed, hiding transfer latency
-
 ### Profile Storage
 
 | Option | Type | Default | Description |
@@ -432,47 +413,31 @@ Set `profile_read_only=True` to prevent accidental profile overwrites in product
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enable_tracing` | bool | `False` | Enable tensor access tracing |
 | `enable_instrumentation` | bool | `False` | Capture component initialization args |
 | `instrumentation_output_dir` | str | `".flextensor/instrumentation"` | Instrumentation output directory |
 | `enable_diagnostics` | bool | `False` | Log memory transfer statistics, layer duration statistics, and block assignment table after strategy computation |
 
 These options help diagnose offloading behavior:
 
-- **`enable_tracing`**: Records tensor access patterns during profiling.
 - **`enable_instrumentation`**: Captures the arguments passed to FlexTensor components at initialization time and writes them to `instrumentation_output_dir`. Useful for reproducing configuration state.
 - **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Layer Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Layer Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which module patterns were applied as traps. Useful for diagnosing per-layer pipelining setup and inspecting why specific tensors were assigned to specific pipeline blocks.
 
 The distinction between `enable_diagnostics` and `enable_instrumentation` is scope: `enable_diagnostics` reports strategy decisions (which tensors landed in which block and why); `enable_instrumentation` captures component initialization arguments (how each component was configured).
 
 ```python
-# Enable detailed tracing for debugging
-config = OffloadConfig(
-    enable_tracing=True,
-    enable_instrumentation=True,
-)
+# Enable instrumentation for debugging
+config = OffloadConfig(enable_instrumentation=True)
 
 # Inspect strategy decisions
 config = OffloadConfig(enable_diagnostics=True)
 ```
 
 !!! warning "Performance Impact"
-    Tracing and instrumentation add significant overhead. Use only for debugging, not production.
+    Instrumentation adds overhead. Use only for debugging, not production.
 
 ### Tensor Discovery
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `enable_untraced_tensor_discovery` | bool | `True` | Discover untraced tensors (e.g., FP8 weights passed to Triton kernels) |
-| `enable_module_tracker` | bool | `True` | Enable ModuleTracker for manual traps when forward patching is not used |
-
-Tensor discovery ensures that all tensors are properly tracked, even those accessed by custom kernels that bypass PyTorch's dispatch system (such as Triton kernels used in FP8 inference). In most cases, leave both options enabled.
-
-You might disable `enable_untraced_tensor_discovery` if:
-
-- Your model does not use FP8 or custom kernels
-- You are debugging and want to isolate issues
-- You have verified all tensors are traced normally
+Tensor discovery ensures that all tensors are properly tracked, even those accessed by custom kernels that bypass PyTorch's dispatch system (such as Triton kernels used in FP8 inference). Both untraced tensor discovery and ModuleTracker are always enabled.
 
 See [Tensor Discovery](tensor-discovery.md) for a detailed explanation of how the discovery mechanism works.
 
@@ -485,9 +450,9 @@ For ready-to-use starting configurations covering memory-constrained systems, pe
 | Category | Key Options | Typical Tuning |
 |----------|-------------|----------------|
 | **Core** | `enabled`, `gpu_device` | Set based on deployment |
-| **Memory** | `pinned_memory`, `release_tensors`, `max_gpu_mem_fraction`, `shm_enabled` | Balance memory vs. performance |
+| **Memory** | `pinned_memory`, `max_gpu_mem_fraction`, `shm_enabled` | Balance memory vs. performance |
 | **Profiling** | `warmup_iters`, `profile_iters` | More iters = more accurate |
 | **Transfer** | `transfer_mode`, `num_blocks`, `min_blocks` | Default works for most cases |
-| **Debug** | `enable_tracing` | Only when troubleshooting |
+| **Debug** | `enable_diagnostics`, `enable_instrumentation` | Only when troubleshooting |
 
 Start with defaults, measure performance, and tune based on your specific workload characteristics. The profiling system will adapt to your model's actual behavior, so explicit strategy configuration is rarely needed.

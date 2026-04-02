@@ -246,25 +246,7 @@ This ensures that when a weight tensor is offloaded, its scale and other metadat
 
 ## Configuration
 
-Tensor discovery is enabled by default but can be configured:
-
-```python
-from flextensor import OffloadConfig
-
-config = OffloadConfig(
-    enable_untraced_tensor_discovery=True,  # Master switch for discovery
-    enable_module_tracker=True,             # Enable Strategy 2 (ModuleTracker)
-)
-```
-
-### When to Disable
-
-You might disable tensor discovery if:
-- Your model doesn't use FP8 or custom kernels
-- You're debugging and want to isolate issues
-- You've verified all tensors are traced normally
-
-Disabling reduces overhead slightly but is rarely necessary.
+Both untraced tensor discovery and ModuleTracker are always enabled (hardcoded). No configuration is required. If you need to disable untraced tensor discovery for benchmarking or debugging, use the private `TensorManager` parameter `_enable_untraced_tensor_discovery`.
 
 ## Integration with FlexTensor States
 

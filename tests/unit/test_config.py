@@ -10,9 +10,11 @@ This test suite validates:
 4. Edge cases (case sensitivity, invalid values, etc.)
 """
 
+import logging
 import os
 import warnings
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from pydantic import ValidationError
@@ -42,15 +44,10 @@ class TestOffloadConfig:
         assert config.profile_iters == 10
         assert config.knapsack_scale == 1.0
         assert config.transfer_mode == "allocation_block_transfer"
-        assert config.enable_direct_mode is True
-        assert config.release_tensors is True
-        assert config.rearrange_transfers is False
-        assert config.compute_transfer_gap == 1
         assert config.num_blocks == 4
         assert config.profile_storage_dir is None
         assert config.profile_read_only is False
         assert config.load_strategy is None
-        assert config.enable_tracing is False
         assert config.min_blocks == 4
         assert config.max_gpu_mem_fraction == 0.9
         with pytest.warns(DeprecationWarning):
@@ -109,12 +106,7 @@ class TestOffloadConfig:
             profile_iters=20,
             knapsack_scale=2.0,
             transfer_mode="custom_mode",
-            enable_direct_mode=False,
-            release_tensors=False,
-            rearrange_transfers=True,
-            compute_transfer_gap=2,
             num_blocks=8,
-            enable_tracing=True,
         )
         assert config.gpu_device == 2
         assert config.pinned_memory is False
@@ -122,12 +114,7 @@ class TestOffloadConfig:
         assert config.profile_iters == 20
         assert config.knapsack_scale == 2.0
         assert config.transfer_mode == "custom_mode"
-        assert config.enable_direct_mode is False
-        assert config.release_tensors is False
-        assert config.rearrange_transfers is True
-        assert config.compute_transfer_gap == 2
         assert config.num_blocks == 8
-        assert config.enable_tracing is True
 
     def test_gpu_device_validation_negative(self):
         """Test that negative gpu_device raises validation error."""
@@ -154,6 +141,11 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError):
             OffloadConfig(knapsack_scale=-1.0)
 
+    def test_num_blocks_validation_one(self):
+        """Test that num_blocks=1 raises validation error (ge=2 constraint)."""
+        with pytest.raises(ValidationError):
+            OffloadConfig(num_blocks=1)
+
     def test_num_blocks_validation_zero(self):
         """Test that zero num_blocks raises validation error."""
         with pytest.raises(ValidationError):
@@ -179,6 +171,17 @@ class TestOffloadConfig:
         config = OffloadConfig(min_blocks=2)
         assert config.min_blocks == 2
 
+    def test_num_blocks_less_than_min_blocks_raises(self):
+        """Test that num_blocks < min_blocks raises validation error."""
+        with pytest.raises(ValidationError, match=r"num_blocks.*must be >= min_blocks"):
+            OffloadConfig(num_blocks=2, min_blocks=4)
+
+    def test_num_blocks_equal_min_blocks_accepted(self):
+        """Test that num_blocks == min_blocks is accepted."""
+        config = OffloadConfig(num_blocks=3, min_blocks=3)
+        assert config.num_blocks == 3
+        assert config.min_blocks == 3
+
     def test_max_gpu_mem_bytes_custom(self):
         """Test setting custom max_gpu_mem_bytes value."""
         with pytest.warns(DeprecationWarning):
@@ -195,11 +198,6 @@ class TestOffloadConfig:
         """Test that negative max_gpu_mem_bytes raises validation error."""
         with pytest.raises(ValidationError), pytest.warns(DeprecationWarning):
             OffloadConfig(max_gpu_mem_bytes=-1)
-
-    def test_compute_transfer_gap_validation_negative(self):
-        """Test that negative compute_transfer_gap raises validation error."""
-        with pytest.raises(ValidationError):
-            OffloadConfig(compute_transfer_gap=-1)
 
     def test_all_warmup_iters_property(self):
         """Test all_warmup_iters property calculation."""
@@ -241,11 +239,6 @@ class TestOffloadConfig:
         """Test profile_iters at boundary value 0."""
         config = OffloadConfig(profile_iters=0)
         assert config.profile_iters == 0
-
-    def test_edge_values_compute_transfer_gap_zero(self):
-        """Test compute_transfer_gap at boundary value 0."""
-        config = OffloadConfig(compute_transfer_gap=0)
-        assert config.compute_transfer_gap == 0
 
     def test_module_patterns_default(self):
         """Test module_patterns default value is ['*']."""
@@ -444,9 +437,9 @@ class TestLoadConfigFromEnv:
 
     def test_load_bool_field_true(self):
         """Test loading boolean field (True) from environment."""
-        os.environ["FT_ENABLE_TRACING"] = "true"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "true"
         config = load_config_from_env()
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
     def test_load_bool_field_false(self):
         """Test loading boolean field (False) from environment."""
@@ -456,13 +449,13 @@ class TestLoadConfigFromEnv:
 
     def test_load_bool_field_case_insensitive(self):
         """Test loading boolean field with different cases."""
-        os.environ["FT_ENABLE_TRACING"] = "TRUE"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "TRUE"
         config = load_config_from_env()
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
-        os.environ["FT_ENABLE_TRACING"] = "False"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "False"
         config = load_config_from_env()
-        assert config.enable_tracing is False
+        assert config.enable_diagnostics is False
 
     def test_load_float_field(self):
         """Test loading float field from environment."""
@@ -481,13 +474,13 @@ class TestLoadConfigFromEnv:
         os.environ["FT_GPU_DEVICE"] = "1"
         os.environ["FT_WARMUP_ITERS"] = "5"
         os.environ["FT_PROFILE_ITERS"] = "15"
-        os.environ["FT_ENABLE_TRACING"] = "true"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "true"
 
         config = load_config_from_env()
         assert config.gpu_device == 1
         assert config.warmup_iters == 5
         assert config.profile_iters == 15
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
     def test_load_with_custom_prefix(self):
         """Test loading config with custom prefix."""
@@ -532,9 +525,9 @@ class TestLoadConfigFromEnv:
 
     def test_invalid_bool_raises_error(self):
         """Test that invalid boolean value raises error."""
-        os.environ["FT_ENABLE_TRACING"] = "not_a_bool"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "not_a_bool"
 
-        with pytest.raises(ValueError, match="Failed to convert FT_ENABLE_TRACING"):
+        with pytest.raises(ValueError, match="Failed to convert FT_ENABLE_DIAGNOSTICS"):
             load_config_from_env()
 
     def test_validation_error_propagates(self):
@@ -547,17 +540,13 @@ class TestLoadConfigFromEnv:
     def test_all_bool_fields(self):
         """Test loading all boolean fields from environment."""
         os.environ["FT_PINNED_MEMORY"] = "false"
-        os.environ["FT_ENABLE_DIRECT_MODE"] = "false"
-        os.environ["FT_RELEASE_TENSORS"] = "false"
-        os.environ["FT_REARRANGE_TRANSFERS"] = "true"
-        os.environ["FT_ENABLE_TRACING"] = "true"
+        os.environ["FT_ENABLE_INSTRUMENTATION"] = "true"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "true"
 
         config = load_config_from_env()
         assert config.pinned_memory is False
-        assert config.enable_direct_mode is False
-        assert config.release_tensors is False
-        assert config.rearrange_transfers is True
-        assert config.enable_tracing is True
+        assert config.enable_instrumentation is True
+        assert config.enable_diagnostics is True
 
     def test_min_blocks_from_env(self):
         """Test loading min_blocks from FT_MIN_BLOCKS env var."""
@@ -604,7 +593,6 @@ class TestLoadConfigFromEnv:
         os.environ["FT_GPU_DEVICE"] = "3"
         os.environ["FT_WARMUP_ITERS"] = "8"
         os.environ["FT_PROFILE_ITERS"] = "25"
-        os.environ["FT_COMPUTE_TRANSFER_GAP"] = "5"
         os.environ["FT_NUM_BLOCKS"] = "10"
         os.environ["FT_MIN_BLOCKS"] = "3"
 
@@ -612,7 +600,6 @@ class TestLoadConfigFromEnv:
         assert config.gpu_device == 3
         assert config.warmup_iters == 8
         assert config.profile_iters == 25
-        assert config.compute_transfer_gap == 5
         assert config.num_blocks == 10
         assert config.min_blocks == 3
 
@@ -625,23 +612,23 @@ class TestLoadConfigFromEnv:
 
     def test_bool_variations_yes_no(self):
         """Test boolean parsing with 'yes' and 'no'."""
-        os.environ["FT_ENABLE_TRACING"] = "yes"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "yes"
         config = load_config_from_env()
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
-        os.environ["FT_ENABLE_TRACING"] = "no"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "no"
         config = load_config_from_env()
-        assert config.enable_tracing is False
+        assert config.enable_diagnostics is False
 
     def test_bool_variations_one_zero(self):
         """Test boolean parsing with '1' and '0'."""
-        os.environ["FT_ENABLE_TRACING"] = "1"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "1"
         config = load_config_from_env()
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
-        os.environ["FT_ENABLE_TRACING"] = "0"
+        os.environ["FT_ENABLE_DIAGNOSTICS"] = "0"
         config = load_config_from_env()
-        assert config.enable_tracing is False
+        assert config.enable_diagnostics is False
 
     def test_load_strategy_field_skipped(self):
         """Test that load_strategy field is skipped (complex type)."""
@@ -655,10 +642,10 @@ class TestLoadConfigFromEnv:
         """Test mixed environment and kwargs with validation."""
         os.environ["FT_GPU_DEVICE"] = "1"
 
-        config = load_config_from_env(warmup_iters=20, enable_tracing=True)
+        config = load_config_from_env(warmup_iters=20, enable_diagnostics=True)
         assert config.gpu_device == 1  # from env
         assert config.warmup_iters == 20  # from kwargs
-        assert config.enable_tracing is True  # from kwargs
+        assert config.enable_diagnostics is True  # from kwargs
 
     def test_module_patterns_from_env(self):
         """Test loading module_patterns from FT_MODULE_PATTERNS env var."""
@@ -710,13 +697,13 @@ class TestLoadConfigFromFile:
 enabled = true
 gpu_device = 2
 warmup_iters = 5
-enable_tracing = true
+enable_diagnostics = true
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 2
         assert config.warmup_iters == 5
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
     def test_load_ini_file_with_ini_extension(self, tmp_path):
         """Test loading config from .ini file."""
@@ -736,13 +723,13 @@ gpu_device = 3
     "enabled": true,
     "gpu_device": 4,
     "warmup_iters": 8,
-    "enable_tracing": false
+    "enable_diagnostics": false
 }""")
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 4
         assert config.warmup_iters == 8
-        assert config.enable_tracing is False
+        assert config.enable_diagnostics is False
 
     def test_load_yaml_file(self, tmp_path):
         """Test loading config from YAML file."""
@@ -750,13 +737,13 @@ gpu_device = 3
         config_file.write_text("""enabled: true
 gpu_device: 5
 warmup_iters: 10
-enable_tracing: true
+enable_diagnostics: true
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 5
         assert config.warmup_iters == 10
-        assert config.enable_tracing is True
+        assert config.enable_diagnostics is True
 
     def test_load_yml_file(self, tmp_path):
         """Test loading config from .yml file."""
@@ -898,12 +885,7 @@ warmup_iters = 3
 profile_iters = 15
 knapsack_scale = 2.0
 transfer_mode = custom_mode
-enable_direct_mode = false
-release_tensors = false
-rearrange_transfers = true
-compute_transfer_gap = 2
 num_blocks = 8
-enable_tracing = true
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
@@ -913,12 +895,7 @@ enable_tracing = true
         assert config.profile_iters == 15
         assert config.knapsack_scale == 2.0
         assert config.transfer_mode == "custom_mode"
-        assert config.enable_direct_mode is False
-        assert config.release_tensors is False
-        assert config.rearrange_transfers is True
-        assert config.compute_transfer_gap == 2
         assert config.num_blocks == 8
-        assert config.enable_tracing is True
 
     def test_validation_error_from_file(self, tmp_path):
         """Test that pydantic validation errors are raised for invalid values in file."""
@@ -1044,7 +1021,7 @@ class TestGetFieldTypes:
         field_types = _get_field_types()
         assert field_types["enabled"] is bool
         assert field_types["pinned_memory"] is bool
-        assert field_types["enable_tracing"] is bool
+        assert field_types["enable_instrumentation"] is bool
 
     def test_int_fields(self):
         """Test that integer fields are correctly identified."""
@@ -1277,3 +1254,55 @@ class TestShmConfigFields:
         assert config.shm_enabled is True
         assert config.shm_namespace == "my_model"
         assert config.shm_wait_timeout == 300.0
+
+
+class TestRemovedFieldsRejection:
+    """Verify that removed OffloadConfig fields are rejected with clear errors."""
+
+    _REMOVED: ClassVar[list[str]] = [
+        "release_tensors",
+        "enable_direct_mode",
+        "enable_tracing",
+        "rearrange_transfers",
+        "compute_transfer_gap",
+        "enable_untraced_tensor_discovery",
+        "enable_module_tracker",
+    ]
+
+    @pytest.mark.parametrize("field", _REMOVED)
+    def test_constructor_rejects_removed_field(self, field):
+        """Passing a removed field to OffloadConfig() raises ValueError."""
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+            OffloadConfig(**{field: False})
+
+    @pytest.mark.parametrize("field", _REMOVED)
+    def test_env_var_warns_for_removed_field(self, field, monkeypatch, caplog):
+        """Setting a removed FT_* env var logs a warning."""
+        env_var = f"FT_{field.upper()}"
+        monkeypatch.setenv(env_var, "false")
+        with caplog.at_level(logging.WARNING, logger="flextensor.config"):
+            load_config_from_env()
+        assert f"'{env_var}' is ignored" in caplog.text
+
+    @pytest.mark.parametrize("field", _REMOVED)
+    def test_ini_file_rejects_removed_field(self, field, tmp_path):
+        """Removed field in an INI config file raises ValueError."""
+        config_file = tmp_path / "test.conf"
+        config_file.write_text(f"[flextensor]\n{field} = false\n")
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+            load_config_from_file(config_file)
+
+    @pytest.mark.parametrize("field", _REMOVED)
+    def test_json_file_rejects_removed_field(self, field, tmp_path):
+        """Removed field in a JSON config file raises ValueError."""
+        import json
+
+        config_file = tmp_path / "test.json"
+        config_file.write_text(json.dumps({field: False}))
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+            load_config_from_file(config_file)
+
+    def test_pinned_memory_not_rejected(self):
+        """pinned_memory is still a valid field and must not be rejected."""
+        config = OffloadConfig(pinned_memory=False)
+        assert config.pinned_memory is False

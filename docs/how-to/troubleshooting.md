@@ -124,10 +124,23 @@ The JSON file contains:
       "init_timestamp": "2025-12-09T14:30:50.200000",
       "args": {
         "device_gpu": "cuda:0",
+        "tensor_manager_load_strategy": {
+          "_type": "AdaptiveStrategy",
+          "_module": "flextensor.strategy"
+        },
         "pinned_memory": true,
         "loader_type": "allocation_block_transfer",
-        "release_tensors": true,
-        "direct_mode": true
+        "remove_layers_operations": [],
+        "blocks": 4,
+        "move_top_level_buffers_to_gpu": true,
+        "use_shm": false,
+        "enable_diagnostics": false,
+        "max_gpu_mem_fraction": null,
+        "_direct_mode": true,
+        "_use_trace_tensor": false,
+        "_rearrange_transfers": false,
+        "_compute_transfer_gap": 1,
+        "_enable_untraced_tensor_discovery": true
       }
     }
   ],
@@ -143,7 +156,9 @@ Each component record includes:
 - `class_name`: The component class
 - `module_path`: Full module path
 - `init_timestamp`: When the component was initialized
-- `args`: All initialization arguments with their values
+- `args`: All initialization arguments **and their default values**. The decorator captures every parameter, including those not explicitly passed by the caller.
+
+> **Note:** Fields prefixed with `_` (e.g. `_direct_mode`, `_use_trace_tensor`) are internal debug parameters. Their presence in instrumentation output is expected. In normal operation they remain at their defaults (`true` and `false` respectively). The exact set of fields may vary across components and versions.
 
 The `host_memory` object captures a point-in-time snapshot of host physical memory (`host_memory_*`) and swap space (`swap_*`) at the time the dump is written. All values are in bytes. Divide by `1024 ** 3` to convert to GiB.
 
@@ -261,14 +276,7 @@ This typically occurs when FlexTensor offloads a tensor but a custom kernel (for
 
 ### Step 1: Verify tensor discovery is enabled
 
-```python
-config = OffloadConfig(
-    enable_untraced_tensor_discovery=True,  # default
-    enable_module_tracker=True,             # default
-)
-```
-
-Both options are enabled by default. If you disabled them, re-enable them.
+Both untraced tensor discovery and ModuleTracker are always enabled (hardcoded). No configuration is required.
 
 ### Step 2: Use the `offload()` API with forward patching
 
@@ -334,10 +342,10 @@ The `allocation_block_transfer` mode with more blocks can reduce stalls by overl
 config = OffloadConfig(
     transfer_mode="allocation_block_transfer",
     num_blocks=8,                  # More blocks = more parallelism
-    rearrange_transfers=True,      # Schedule transfers earlier
-    compute_transfer_gap=2,        # Initiate transfer 2 layers ahead
 )
 ```
+
+Transfer rearrangement is auto-enabled when gap layers are detected.
 
 ### When to expect higher overhead
 

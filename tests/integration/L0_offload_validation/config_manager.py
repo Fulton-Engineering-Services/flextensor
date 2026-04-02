@@ -85,10 +85,6 @@ class TestPreset(BaseModel):
         default=True,
         description="Whether to use pinned memory for transfers",
     )
-    release_tensors: bool = Field(
-        default=True,
-        description="Whether to release tensors after use",
-    )
     knapsack_scale: float = Field(
         default=1.0,
         description="Knapsack scale factor for tensor manager",
@@ -110,7 +106,6 @@ class TestPreset(BaseModel):
         description="Maximum GPU memory in GB for GlobalOffloadStrategy",
         gt=0.0,
     )
-    enable_direct_mode: bool = Field(default=True, description="Whether to enable direct mode")
 
     # Transfer optimization configuration
     rearrange_transfers: bool = Field(
@@ -186,10 +181,6 @@ class ExperimentConfig(BaseModel):
         default=True,
         description="Whether to use pinned memory for transfers",
     )
-    release_tensors: bool = Field(
-        default=True,
-        description="Whether to release tensors after use",
-    )
     knapsack_scale: float = Field(default=1.0, description="Knapsack scale factor for tensor manager", gt=0.0)
     strategy_type: Literal["knapsack", "knapsack_block", "global_offload", "global_tensor_selection", "adaptive"] = (
         Field(
@@ -211,7 +202,6 @@ class ExperimentConfig(BaseModel):
         default=torch.bfloat16,
         description="Data type for tensors",
     )
-    enable_direct_mode: bool = Field(default=True, description="Whether to enable direct mode")
 
     # Transfer optimization configuration
     rearrange_transfers: bool = Field(
@@ -269,12 +259,10 @@ class ExperimentConfig(BaseModel):
             num_experts_list=model.num_experts_list,
             # Test configuration
             pinned_memory=test.pinned_memory,
-            release_tensors=test.release_tensors,
             knapsack_scale=test.knapsack_scale,
             strategy_type=test.strategy_type,
             n_blocks=test.n_blocks,
             max_gpu_mem_gb=test.max_gpu_mem_gb,
-            enable_direct_mode=test.enable_direct_mode,
             rearrange_transfers=test.rearrange_transfers,
             compute_transfer_gap=test.compute_transfer_gap,
             transfer_mode=test.transfer_mode,
@@ -308,12 +296,10 @@ class ExperimentConfig(BaseModel):
             api_type=self.api_type,
             transfer_mode=self.transfer_mode,
             pinned_memory=self.pinned_memory,
-            release_tensors=self.release_tensors,
             knapsack_scale=self.knapsack_scale,
             strategy_type=self.strategy_type,
             n_blocks=self.n_blocks,
             max_gpu_mem_gb=self.max_gpu_mem_gb,
-            enable_direct_mode=self.enable_direct_mode,
             rearrange_transfers=self.rearrange_transfers,
             compute_transfer_gap=self.compute_transfer_gap,
             baseline_mode=self.baseline_mode,
@@ -507,13 +493,11 @@ class ConfigManager:
 
         tests["offload-raw"] = TestPreset(
             transfer_mode="raw_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
         tests["offload-raw-block-transfer"] = TestPreset(
             transfer_mode="raw_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -521,7 +505,6 @@ class ConfigManager:
 
         tests["offload-allocation-block-transfer"] = TestPreset(
             transfer_mode="allocation_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -529,13 +512,11 @@ class ConfigManager:
 
         tests["offload-batch"] = TestPreset(
             transfer_mode="strategy",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
         tests["offload-batch-transfer"] = TestPreset(
             transfer_mode="strategy",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -544,7 +525,6 @@ class ConfigManager:
         tests["memory-optimized"] = TestPreset(
             loader_type="strategy",
             scale=0.5,
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -695,7 +675,6 @@ class ConfigManager:
             iterations=5,
             tensor_shape=(8192, 4096),
             loader_type="raw_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -705,7 +684,6 @@ class ConfigManager:
             iterations=10,
             tensor_shape=(14336, 4096),
             loader_type="raw_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -717,7 +695,6 @@ class ConfigManager:
             inter_dim=8192,
             num_experts=4,
             loader_type="raw_block_transfer",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -729,7 +706,6 @@ class ConfigManager:
             iterations=5,
             tensor_shape=(8192, 4096),
             loader_type="strategy",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -741,7 +717,6 @@ class ConfigManager:
             inter_dim=8192,
             num_experts=4,
             loader_type="strategy",
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -779,7 +754,6 @@ class ConfigManager:
             tensor_shape=(14336, 4096),
             loader_type="strategy",
             scale=0.5,  # Reduce memory usage
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -792,7 +766,6 @@ class ConfigManager:
             num_experts=16,
             loader_type="strategy",
             scale=0.6,
-            pinned_memory=True,
             baseline_mode=False,
         )
 
@@ -1158,9 +1131,7 @@ class ConfigManager:
         if not test.baseline_mode:
             print(f"Transfer Mode:   {test.transfer_mode}")
             print(f"Pinned Memory:   {test.pinned_memory}")
-            print(f"Release Tensors: {test.release_tensors}")
             print(f"Knapsack Scale:  {test.knapsack_scale}")
-            print(f"Direct Mode:     {test.enable_direct_mode}")
             if test.rearrange_transfers:
                 print("Rearrange:       Yes")
                 print(f"Transfer Gap:    {test.compute_transfer_gap}")

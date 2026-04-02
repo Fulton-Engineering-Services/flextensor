@@ -24,7 +24,6 @@ class TestResolveGpuBudget:
         ):
             tm = TensorManager(
                 device_gpu="cpu",
-                pinned_memory=False,
                 tensor_manager_load_strategy=strategy,
                 max_gpu_mem_fraction=max_gpu_mem_fraction,
             )
@@ -68,7 +67,6 @@ class TestGpuBudgetCap:
         ):
             tm = TensorManager(
                 device_gpu="cpu",
-                pinned_memory=False,
                 tensor_manager_load_strategy=strategy,
                 max_gpu_mem_fraction=max_gpu_mem_fraction,
             )
