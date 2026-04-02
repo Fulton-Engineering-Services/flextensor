@@ -41,6 +41,7 @@ nav:
       - Configure for Common Scenarios: how-to/configure-for-common-scenarios.md
   - Reference:
       - Overview: api/index.md
+      - Glossary: api/glossary.md
       - Simplified API: api/simplified.md
       - OffloadManager: api/offload-manager.md
       - Configuration: api/configuration.md
@@ -112,7 +113,10 @@ markdown_extensions:
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
-  - pymdownx.snippets
+  - abbr
+  - pymdownx.snippets:
+      auto_append:
+        - docs/includes/abbreviations.md
   - pymdownx.tabbed:
       alternate_style: true
   - tables

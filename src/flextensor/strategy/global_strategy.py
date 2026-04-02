@@ -43,7 +43,7 @@ class GlobalOffloadStrategy:
 
     The strategy uses an AssignmentStrategy (default: OptimizedRoundRobinAssignment) to
     determine layer-to-block assignments, then calculates block sizes based on the
-    maximum tensor size assigned to each block.
+    maximum weight size assigned to each block.
     """
 
     def __init__(
@@ -62,7 +62,7 @@ class GlobalOffloadStrategy:
             n_blocks: Number of reusable memory blocks (minimum 2 for pipelining).
             scale: Duration multiplier (baseline). Controls how much of the previous
                 layer's compute time is available for transfers. ``1.0`` = exact fit.
-            threshold_mb: Minimum tensor size threshold in MB. Tensors smaller than
+            threshold_mb: Minimum weight size threshold in MB. Weights smaller than
                 this are kept on GPU and not offloaded.
             min_blocks: Minimum number of blocks to use (default: 2).
                 - 2 blocks: With alternating pattern (A,B,A,B,...)
@@ -578,18 +578,18 @@ class GlobalOffloadStrategy:
 
 class GlobalTensorSelectionStrategy:
     """
-    Tensor-level metaheuristic optimization strategy for GPU memory offloading.
+    Weight-level metaheuristic optimization strategy for GPU memory offloading.
 
-    This strategy optimizes the binary decision of whether to offload each tensor,
+    This strategy optimizes the binary decision of whether to offload each weight,
     maximizing GPU memory utilization while respecting memory limits and ensuring
     transfers fit within pipelined execution windows.
 
     Unlike GlobalOffloadStrategy which optimizes block sizes and layer assignments,
-    this strategy performs fine-grained tensor selection to find the optimal
-    subset of tensors to offload.
+    this strategy performs fine-grained weight selection to find the optimal
+    subset of weights to offload.
 
     Decision variables:
-    - Binary x[i] for each tensor: 1 = offload, 0 = keep on GPU
+    - Binary x[i] for each weight: 1 = offload, 0 = keep on GPU
     - Continuous scale: multiplier for compute time (transfer window)
 
     Constraints:

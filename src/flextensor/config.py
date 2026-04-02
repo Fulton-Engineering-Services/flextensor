@@ -172,8 +172,8 @@ class OffloadConfig(BaseModel):
     """
 
     enable_diagnostics: bool = Field(default=False)
-    """Whether to log diagnostic information (layer duration statistics, block assignment table)
-       after strategy computation
+    """Whether to log diagnostic information (per-trap duration statistics, block assignment table)
+       after strategy computation.
     """
 
     model_config = {"arbitrary_types_allowed": True, "use_attribute_docstrings": True}

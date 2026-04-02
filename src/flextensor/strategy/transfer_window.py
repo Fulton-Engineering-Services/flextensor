@@ -1,19 +1,22 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Transfer window calculators for pipelined tensor offloading.
+"""Transfer window calculators for pipelined weight offloading.
 
 This module provides strategies for computing the effective transfer window
-per layer in a pipelined offloading scheme.  The transfer window determines
-how much compute time is available for transferring a layer's tensors from
+per trap in a pipelined offloading scheme.  The transfer window determines
+how much compute time is available for transferring a trap's weights from
 CPU to GPU.
+
+Note: code identifiers use "layer" (e.g. ``layer_durations``) for historical
+reasons — a future refactor will rename them to "trap".
 
 Two implementations are provided:
 
-* :class:`SingleLayerWindow` - uses only the immediately preceding layer's
+* :class:`SingleLayerWindow` - uses only the immediately preceding trap's
   compute duration (conservative, original behaviour).
-* :class:`GapAwareWindow` - sums backward through consecutive layers that
-  have no competing transfer, exploiting "gap" layers (layers with no
-  offloaded tensors) to increase the effective transfer budget.
+* :class:`GapAwareWindow` - sums backward through consecutive traps that
+  have no competing transfer, exploiting "gap traps" (traps with no
+  offloaded weights) to increase the effective transfer budget.
 """
 
 from typing import Protocol, runtime_checkable
@@ -23,10 +26,10 @@ import numpy as np
 
 @runtime_checkable
 class TransferWindowCalculator(Protocol):
-    """Protocol for computing effective transfer windows per layer.
+    """Protocol for computing effective transfer windows per trap.
 
-    In the pipelined offload model, the transfer for layer *i* starts during
-    an earlier layer's compute.  How much earlier depends on the strategy:
+    In the pipelined offload model, the transfer for trap *i* starts during
+    an earlier trap's compute.  How much earlier depends on the strategy:
 
     * ``SingleLayerWindow`` assumes transfer happens during layer *i-1* only.
     * ``GapAwareWindow`` extends the window backward through consecutive

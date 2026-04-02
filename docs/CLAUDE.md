@@ -21,6 +21,10 @@
 - When renaming headings, grep for old anchors and update references
 - API cross-refs: `` [`OffloadConfig`][flextensor.OffloadConfig] ``
 
+## Terminology
+
+Follow `api/glossary.md` for canonical definitions. New terms must also be added to `includes/abbreviations.md` (hover tooltips).
+
 ## Audience
 
 Docs must be consumable by both humans and AI agents. Write clear, structured prose — avoid ambiguous references, implicit context, or visual-only formatting that agents cannot parse.

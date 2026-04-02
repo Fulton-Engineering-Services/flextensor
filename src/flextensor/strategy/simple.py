@@ -20,7 +20,7 @@ def _calculate_load_time(
     layer: LayerStatistics,
     threshold_mb: float = 0.1,
 ) -> tuple[float, list[TensorStatistics]]:
-    """Calculate total load time for tensors in a layer above threshold.
+    """Calculate total load time for weights in a layer above threshold.
 
     Args:
         layer: Layer statistics containing tensor information.
@@ -44,14 +44,14 @@ def _compute_offload_tensors_greedy(
 ) -> dict[str, list[TensorStatistics]]:
     """Compute offload strategy using greedy heuristic.
 
-    Offloads tensors when cumulative compute time exceeds their load time.
+    Offloads weights when cumulative compute time exceeds their load time.
 
     Args:
         layer_stats: List of layer statistics.
         threshold_mb: Minimum tensor size threshold in MB.
 
     Returns:
-        Strategy dict mapping layer labels to lists of tensors to offload.
+        Strategy dict mapping layer labels to lists of weights to offload.
     """
     strategy: dict[str, list[TensorStatistics]] = {}
     upload_layer = layer_stats[0]
@@ -78,10 +78,10 @@ def _compute_offload_tensors_nth_layer(
     Args:
         layer_stats: List of layer statistics.
         nth_layer: Interval between offloaded layers.
-        threshold_mb: Minimum tensor size threshold in MB.
+        threshold_mb: Minimum weight size threshold in MB.
 
     Returns:
-        Strategy dict mapping layer labels to lists of tensors to offload.
+        Strategy dict mapping layer labels to lists of weights to offload.
     """
     strategy: dict[str, list[TensorStatistics]] = {}
     upload_layer = layer_stats[0]

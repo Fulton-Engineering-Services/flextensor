@@ -24,13 +24,13 @@ def load_specific_keys(
 
     Args:
         file_path: Path to the safetensors file
-        keys: List of tensor keys to load
-        device: Target device for loaded tensors (default: "cpu")
+        keys: List of weight keys to load
+        device: Target device for loaded weights (default: "cpu")
         strict: If True, raise KeyError when any requested key is missing
             from the safetensors file. Default False for backward compatibility.
 
     Returns:
-        Dictionary mapping key names to loaded tensors
+        Dictionary mapping key names to loaded weights
 
     Raises:
         KeyError: If strict=True and any requested keys are not found in the file
@@ -504,14 +504,14 @@ def load_model_from_profile(
         model_kwargs: Keyword arguments for the model constructor
         buffer_device: Device for model buffers (default: uses tensor manager's device)
         diagnose: If True, run diagnostics on nested parameter tracking
-        strict: If True, raise KeyError when any tensor key from the profile
+        strict: If True, raise KeyError when any weight key from the profile
             is missing in the safetensors file. Default False.
 
     Returns:
         The loaded model in eval mode, ready for use with tensor_manager
 
     Raises:
-        KeyError: If strict=True and any profile tensor keys are missing from safetensors
+        KeyError: If strict=True and any profile weight keys are missing from safetensors
 
     Example:
         >>> from flextensor import TensorManager

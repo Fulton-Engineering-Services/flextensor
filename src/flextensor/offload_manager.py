@@ -207,7 +207,7 @@ class OffloadModelProxy(ObjectWrapper):
 class OffloadManager:
     """Simplified offload manager API.
 
-    Provides a high-level interface for tensor offloading with automatic
+    Provides a high-level interface for weight offloading with automatic
     state management, profiling, and module patching capabilities.
     """
 
@@ -301,7 +301,7 @@ class OffloadManager:
         self._tensor_manager.load_profile(resolved_dir, target_model)
 
     def benchmark_transfers(self):
-        """Benchmark tensor transfer speeds."""
+        """Benchmark weight transfer speeds."""
         if self._tensor_manager is None:
             return
         # TODO: Implement transfer benchmarking
@@ -586,7 +586,7 @@ class OffloadManager:
         """Offload modules in the model based on config patterns.
 
         Patches modules matching config.module_patterns to automatically manage
-        tensor transfers. Supports wildcards in module patterns.
+        weight transfers. Supports wildcards in module patterns.
 
         Args:
             model: PyTorch model to patch

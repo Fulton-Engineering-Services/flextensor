@@ -42,19 +42,19 @@ class BlockStrategyData:
     """
 
     label_to_size_map: dict[str, int]
-    """Maps layer label to total size of tensors to offload."""
+    """Maps trap label to total size of weights to offload."""
 
     allocation_ordered: dict[int, list[str]]
-    """Maps block_id to ordered list of layer labels assigned to it."""
+    """Maps block_id to ordered list of trap labels assigned to it."""
 
     block_sizes: dict[int, int] | list[int]
-    """Size of each block in bytes (max layer size per block)."""
+    """Size of each block in bytes (max trap size per block)."""
 
     label_to_block_id: dict[str, int]
-    """Maps layer label to assigned block index."""
+    """Maps trap label to assigned block index."""
 
     transfer_to_compute_map: dict[str, str]
-    """Maps transfer layer label to compute layer label for pipelining."""
+    """Maps transfer trap label to compute trap label for pipelining."""
 
 
 @dataclass
@@ -66,7 +66,7 @@ class StrategyResult:
     """
 
     strategy_map: dict[str, list[TensorStatistics]]
-    """Maps layer label to list of tensors to offload."""
+    """Maps trap label to list of weights to offload."""
 
     block_data: BlockStrategyData | None = None
     """Block allocation data. None if n_blocks=0 or not computed."""
@@ -94,7 +94,7 @@ class Strategy(Protocol):
         """Compute offload strategy.
 
         Args:
-            layer_stats: List of layer statistics containing tensor info and durations.
+            layer_stats: Per-trap statistics containing tensor info and durations.
             memory_stats: Optional dict mapping tensor size (bytes) to transfer time (ms).
             max_gpu_mem_bytes: Hard GPU memory limit in bytes. When set (memory mode),
                 the strategy must respect this constraint. When ``None`` (latency mode),

@@ -4,7 +4,7 @@
 -->
 # FlexTensor
 
-FlexTensor is a tensor offloading library for PyTorch that enables running large models on limited GPU memory by intelligently offloading tensors between GPU and CPU memory.
+FlexTensor is a tensor offloading library for PyTorch that enables running large models on limited GPU memory by intelligently offloading model weights between GPU and CPU memory.
 
 ## Features
 

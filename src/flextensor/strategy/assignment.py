@@ -1,9 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Layer-to-block assignment strategies for pipelined tensor offloading.
+"""Trap-to-block assignment strategies for pipelined weight offloading.
 
-This module provides strategies for assigning layers to memory blocks
+This module provides strategies for assigning traps to memory blocks
 in block-based offloading schemes.
+
+Note: code identifiers use "layer" (e.g. ``layer_sizes``) for historical
+reasons — a future refactor will rename them to "trap".
 """
 
 from typing import Protocol, runtime_checkable
@@ -15,7 +18,7 @@ from typing import Protocol, runtime_checkable
 
 @runtime_checkable
 class AssignmentStrategy(Protocol):
-    """Protocol for layer-to-block assignment strategies."""
+    """Protocol for trap-to-block assignment strategies."""
 
     def compute(self, layer_sizes: list[int], n_blocks: int) -> list[int]:
         """
@@ -35,9 +38,9 @@ class StrictRoundRobinAssignment:
     """
     Strict round-robin assignment.
 
-    Assigns layers to blocks using strict pattern: layer_i -> block (i % n_blocks).
+    Assigns traps to blocks using strict pattern: trap_i -> block (i % n_blocks).
     Always uses all available blocks in a fixed cyclic pattern (0,1,2,3,0,1,2,3,...).
-    Does not optimize for memory - all blocks sized to fit the largest layer.
+    Does not optimize for memory — all blocks sized to fit the largest trap.
     """
 
     def compute(self, layer_sizes: list[int], n_blocks: int) -> list[int]:

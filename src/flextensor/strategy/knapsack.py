@@ -578,7 +578,7 @@ def _has_tensor_conflicts(layer: LayerStatistics, existing_tensor_ids: set[int])
 
 
 def _calculate_total_offload_memory(tensors: list) -> float:
-    """Calculate total memory footprint of tensor list in MB."""
+    """Calculate total memory footprint of weight list in MB."""
     return float(sum(tensor.size_bytes for tensor in tensors) / 1024 / 1024)
 
 
@@ -764,7 +764,7 @@ class KnapsackStrategy:
         n_blocks: int = 4,
     ):
         """
-        Initialize KnapsackStrategy for tensor offloading.
+        Initialize KnapsackStrategy for weight offloading.
 
         Args:
             scale: Duration multiplier (baseline). ``0.9`` = 10% safety margin,
@@ -895,7 +895,7 @@ class KnapsackBlockStrategy:
         n_blocks: int = 4,
     ):
         """
-        Initialize KnapsackBlockStrategy for tensor offloading.
+        Initialize KnapsackBlockStrategy for weight offloading.
 
         Args:
             scale: Duration multiplier (baseline). ``0.9`` = 10% safety margin,

@@ -4,6 +4,10 @@
 -->
 # FlexTensor Source Guidelines
 
+## Terminology (Docstrings)
+
+Follow `docs/api/glossary.md` for canonical definitions (trap vs module vs layer, weight vs parameter vs tensor).
+
 ## Deprecation
 
 **Policy**: Deprecated in `vX.Y` → remove in `vX.(Y+1)` minimum. State removal version explicitly.

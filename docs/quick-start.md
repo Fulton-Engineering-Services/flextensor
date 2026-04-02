@@ -23,7 +23,7 @@ assert torch.cuda.is_available(), "CUDA required"
 
 ## How It Works
 
-FlexTensor manages tensor movement automatically through a short learning phase (warmup and profile) before switching to optimized inference. You don't manage these phases directly — FlexTensor handles them during the first few iterations.
+FlexTensor manages weight transfers automatically through a short learning phase (warmup and profile) before switching to optimized inference. You don't manage these phases directly — FlexTensor handles them during the first few iterations.
 
 For a deeper explanation of the warmup, profile, and inference states and the decisions made during each, see [Internal States](explanation/states.md).
 
@@ -39,7 +39,7 @@ model = YourModel()
 # Configure offloading
 config = OffloadConfig(
     gpu_device=0,              # GPU to use
-    warmup_iters=1,            # Iterations for tensor discovery
+    warmup_iters=1,            # Iterations for parameter discovery
     profile_iters=10,          # Iterations for timing measurement
     module_patterns=["layers.*"],  # Which modules to offload
 )

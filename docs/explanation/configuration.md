@@ -170,7 +170,7 @@ FT_MODULE_PATTERNS="layers.*,embed,head" python my_script.py
 
     These patterns give each transformer layer its own offload trap, enabling FlexTensor to overlap CPU→GPU transfers with GPU computation. For models with a different layout, inspect module names with `model.named_modules()` and set `FT_MODULE_PATTERNS` accordingly.
 
-The default `["*"]` matches all top-level child modules. It is a reasonable starting point for quick experimentation, but for transformer models in production, prefer specific patterns such as `model.layers.*`. With `["*"]`, every top-level child is wrapped in a single coarse trap, which prevents per-layer pipelining. With patterns like `model.layers.*`, each layer gets its own trap, and FlexTensor can overlap CPU→GPU transfers for layer N+1 while the GPU computes layer N.
+The default `["*"]` matches all top-level child modules. It is a reasonable starting point for quick experimentation, but for transformer models in production, prefer specific patterns such as `model.layers.*`. With `["*"]`, every top-level child is wrapped in a single coarse trap, which prevents per-trap pipelining. With patterns like `model.layers.*`, each matched module gets its own trap, and FlexTensor can overlap CPU→GPU transfers for trap N+1 while the GPU computes trap N.
 
 When `enabled=False`, FlexTensor passes through to normal PyTorch execution with no overhead. This is useful for:
 
@@ -182,7 +182,7 @@ When `enabled=False`, FlexTensor passes through to normal PyTorch execution with
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `pinned_memory` | bool | `True` | Use pinned memory for CPU tensors |
+| `pinned_memory` | bool | `True` | Use pinned memory for CPU-resident weights |
 | `shm_enabled` | bool | `False` | Enable cross-process weight sharing via POSIX shared memory |
 | `shm_namespace` | str \| None | `None` | Base namespace for SHM blocks (auto-derived if None) |
 | `shm_wait_timeout` | float | `0.0` | Hard timeout (seconds) for followers waiting on creator |
@@ -271,7 +271,7 @@ These options can also be set via `FT_SHM_ENABLED`, `FT_SHM_NAMESPACE`, and
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `warmup_iters` | int | `1` | Iterations to discover tensor-layer relationships |
+| `warmup_iters` | int | `1` | Iterations to discover parameter-to-trap mappings |
 | `profile_iters` | int | `10` | Iterations to measure execution timing |
 
 FlexTensor learns your model's behavior during initial iterations:
@@ -285,8 +285,8 @@ Remaining iterations: Optimized execution with learned strategy
 
 **`warmup_iters`**: Usually 1 is sufficient. Increase if your model has:
 
-- Dynamic control flow affecting tensor access patterns
-- Variable-length inputs that change which tensors are used
+- Dynamic control flow affecting parameter access patterns
+- Variable-length inputs that change which parameters are used
 
 **`profile_iters`**: More iterations = more accurate timing estimates. Consider:
 
@@ -306,7 +306,7 @@ config = OffloadConfig(warmup_iters=1, profile_iters=3)
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `transfer_mode` | str | `"allocation_block_transfer"` | Tensor transfer strategy |
+| `transfer_mode` | str | `"allocation_block_transfer"` | Weight transfer strategy |
 | `num_blocks` | int | `4` | Number of memory blocks for block transfer |
 | `min_blocks` | int | `4` | Minimum blocks for assignment optimization |
 
@@ -333,9 +333,9 @@ config = OffloadConfig(
 
 This option can also be set via the `FT_MIN_BLOCKS` environment variable.
 
-#### Gap Layers and Transfer Windows
+#### Gap Traps and Transfer Windows
 
-Gap layers are layers that contain no offloadable tensors. When a model has sequential gap layers between offloadable layers, the effective transfer window — the time available to pre-fetch the next layer's tensors — is larger than a single layer's execution time.
+Gap traps are traps whose modules contain no offloadable weights. When a model has sequential gap traps between offloadable traps, the effective transfer window — the time available to pre-fetch the next trap's weights — is larger than a single module's execution time.
 
 `GapAwareWindow` exploits this by computing transfer windows that span gap layers, allowing FlexTensor to start pre-fetching earlier. `strategy_has_transfer_gaps()` detects whether a computed strategy contains such gaps. When gap layers are detected during inference setup, transfer rearrangement is automatically enabled to take advantage of the extended windows.
 
@@ -415,12 +415,12 @@ Set `profile_read_only=True` to prevent accidental profile overwrites in product
 |--------|------|---------|-------------|
 | `enable_instrumentation` | bool | `False` | Capture component initialization args |
 | `instrumentation_output_dir` | str | `".flextensor/instrumentation"` | Instrumentation output directory |
-| `enable_diagnostics` | bool | `False` | Log memory transfer statistics, layer duration statistics, and block assignment table after strategy computation |
+| `enable_diagnostics` | bool | `False` | Log memory transfer statistics, per-trap duration statistics, and block assignment table after strategy computation |
 
 These options help diagnose offloading behavior:
 
 - **`enable_instrumentation`**: Captures the arguments passed to FlexTensor components at initialization time and writes them to `instrumentation_output_dir`. Useful for reproducing configuration state.
-- **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Layer Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Layer Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which module patterns were applied as traps. Useful for diagnosing per-layer pipelining setup and inspecting why specific tensors were assigned to specific pipeline blocks.
+- **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Trap Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Trap Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which module patterns were applied as traps. Useful for diagnosing per-trap pipelining setup and inspecting why specific weights were assigned to specific pipeline blocks.
 
 The distinction between `enable_diagnostics` and `enable_instrumentation` is scope: `enable_diagnostics` reports strategy decisions (which tensors landed in which block and why); `enable_instrumentation` captures component initialization arguments (how each component was configured).
 

@@ -12,12 +12,12 @@ FlexTensor uses an internal state machine with four states: **Not Initialized**,
 
 ### Why States?
 
-Tensor offloading presents a fundamental challenge: to efficiently move tensors between CPU and GPU, we need to know *which* tensors to offload and *when* to transfer them. Making poor decisions leads to either memory exhaustion (offloading too little) or performance degradation (offloading too much or at the wrong time).
+Tensor offloading presents a fundamental challenge: to efficiently move model weights between CPU and GPU, we need to know *which* parameters to offload and *when* to transfer them. Making poor decisions leads to either memory exhaustion (offloading too little) or performance degradation (offloading too much or at the wrong time).
 
 FlexTensor solves this by learning about your model's tensor usage patterns before optimizing:
 
-1. **Discovers** which tensors belong to which layers (Warmup state)
-2. **Measures** execution timing with tensor loading (Profile state)
+1. **Discovers** which parameters belong to which traps (Warmup state)
+2. **Measures** per-trap execution timing with weight loading (Profile state)
 3. **Applies** an optimized offloading strategy (Inference state)
 
 This learning process happens transparently during the first few iterations of model execution.
@@ -43,14 +43,14 @@ config = OffloadConfig(
 
 ### Purpose
 
-The warmup state identifies the relationship between layers and tensors. It answers the question: "Which tensors does each layer use?"
+The warmup state identifies the relationship between modules and their parameters. It answers the question: "Which parameters does each module use?"
 
 ### What Happens Internally
 
-1. **Model Preprocessing**: Tensors are moved to CPU and optionally pinned in memory for faster transfers
+1. **Model Preprocessing**: Parameters are moved to CPU and optionally pinned in memory for faster transfers
 2. **Tensor Tracking**: Each tensor operation is intercepted via `WarmupTrap`
-3. **On-Demand Transfer**: When a layer needs a tensor, it's copied to GPU, used, then released
-4. **Statistics Collection**: The system records which tensor IDs are accessed by each layer
+3. **On-Demand Transfer**: When a module needs a weight, it's copied to GPU, used, then released
+4. **Statistics Collection**: The system records which tensor IDs are accessed by each trap
 
 ### Internal Mechanics
 
@@ -58,9 +58,9 @@ During warmup, the `WarmupTrap` context manager:
 
 - Intercepts all PyTorch operations via `__torch_function__`
 - Tracks tensor IDs used in each operation
-- Copies tensors to GPU on-demand when needed for computation
-- Measures baseline layer execution time
-- Collects tensor-to-layer mapping data
+- Copies weights to GPU on-demand when needed for computation
+- Measures baseline module execution time
+- Collects parameter-to-trap mapping data
 
 ```python
 # Internal flow during warmup (simplified)
@@ -73,7 +73,7 @@ with WarmupTrap(tensor_manager, layer_name, device_gpu):
 
 ### Why It Matters
 
-Without warmup, we wouldn't know which tensors to preload for each layer. This mapping is essential for the profile state to measure realistic transfer overhead.
+Without warmup, we wouldn't know which weights to preload for each trap. This mapping is essential for the profile state to measure realistic transfer overhead.
 
 ### Outputs and Model State
 
@@ -82,14 +82,14 @@ At the end of the warmup state, FlexTensor has collected:
 | Output | Description |
 |--------|-------------|
 | `tensors_map` | Dictionary mapping tensor IDs to CPU tensor references |
-| `layer_statistics_collector` | Contains tensor-to-layer mappings and baseline timing per layer |
+| `layer_statistics_collector` | Contains parameter-to-trap mappings and baseline timing per trap |
 | `model_ids` | Set of all tensor IDs belonging to the model |
 
 **Model state after warmup**:
 - All model tensors reside on **CPU memory**
 - For the strategy loader, tensors are **pinned** (if `pinned_memory=True`) at this stage; for block transfer loaders, pinned buffers are allocated later during inference setup
 - The model structure is unchanged—only tensor locations have moved
-- No GPU memory is permanently allocated yet (tensors were copied on-demand and released)
+- No GPU memory is permanently allocated yet (weights were copied on-demand and released)
 
 This CPU-resident model with collected statistics is the foundation for the profile state.
 
@@ -97,13 +97,13 @@ This CPU-resident model with collected statistics is the foundation for the prof
 
 ### Purpose
 
-The profile state measures how long each layer takes to execute *with* tensor loading overhead included. It answers: "How much time does each layer need, including tensor transfers?"
+The profile state measures how long each trap takes to execute *with* weight loading overhead included. It answers: "How much time does each module need, including weight transfers?"
 
 ### What Happens Internally
 
-1. **Statistics Initialization**: Layer statistics from warmup are processed
-2. **Tensor Layer Loader Setup**: A loader is configured with the tensor-to-layer mapping
-3. **Detailed Timing**: Each layer's execution time is measured using CUDA events (`start_event.record()` / `end_event.record()`)
+1. **Statistics Initialization**: Per-trap statistics from warmup are processed
+2. **Weight Loader Setup**: A loader is configured with the parameter-to-trap mapping
+3. **Detailed Timing**: Each trap's execution time is measured using CUDA events (`start_event.record()` / `end_event.record()`)
 4. **Duration Collection**: Statistics are accumulated across multiple iterations for accuracy
 
 ### Internal Mechanics
@@ -141,7 +141,7 @@ with Trap(tensor_manager, layer_name, device_gpu):
 
 Profile data enables the offloading strategy (e.g., Knapsack, Greedy, Adaptive, Global) to make informed decisions about:
 
-- Which tensors to keep on GPU vs. offload to CPU
+- Which parameters to keep on GPU vs. offload to CPU
 - When to initiate transfers to hide latency
 - How to batch transfers for efficiency
 
@@ -151,14 +151,14 @@ At the end of the profile state, FlexTensor has collected:
 
 | Output | Description |
 |--------|-------------|
-| `layer_stats` | Filtered layer statistics with tensor IDs and accumulated timing data |
+| `layer_stats` | Filtered per-trap statistics with tensor IDs and accumulated timing data |
 | `tensor_statistics_map` | Per-tensor statistics (size, transfer time estimates) |
-| `tensor_layer_loader` | Configured loader with tensor-to-layer mapping |
+| `tensor_layer_loader` | Configured loader with parameter-to-trap mapping |
 
 **Model state after profile**:
 - Model tensors still reside on **CPU memory**
 - In direct mode: model may have been copied with shared tensor references for profiling
-- `layer_statistics_collector` contains averaged timing across all profile iterations
+- `layer_statistics_collector` contains averaged per-trap timing across all profile iterations
 - System is ready to compute the optimal offloading strategy
 
 The collected timing data is the input for strategy computation in the inference state.
@@ -171,7 +171,7 @@ The inference state applies the computed offloading strategy for production exec
 
 ### What Happens Internally
 
-1. **Strategy Computation**: The load strategy (e.g., Knapsack) determines which tensors to load at each layer
+1. **Strategy Computation**: The load strategy (e.g., Knapsack) determines which weights to load at each trap
 2. **Release Strategy**: Complementary strategy determines when to release GPU memory
 3. **Tensor Loader Selection**: The appropriate loader is configured based on `transfer_mode`
 4. **Model Finalization**: The model is patched with optimized tensor access patterns
@@ -182,7 +182,7 @@ The inference state uses `TrapInfer` or `TrapInferDirect`:
 
 **Key Differences from Profile**:
 - No timing collection (removes measurement overhead)
-- Tensor loading follows the precomputed schedule
+- Weight loading follows the precomputed schedule
 - Memory is released according to the release strategy
 - Optimized for throughput rather than data collection
 
@@ -200,7 +200,7 @@ FlexTensor supports different transfer strategies internally:
 
 The inference state is where the performance gains are realized. By using the learned statistics and optimized strategies, FlexTensor achieves:
 
-- Minimal GPU memory usage (tensors offloaded to CPU when not needed)
+- Minimal GPU memory usage (weights offloaded to CPU when not needed)
 - Low latency overhead (transfers scheduled to overlap with computation)
 - Consistent performance (deterministic based on learned patterns)
 
@@ -210,20 +210,20 @@ At the end of state transition to inference, FlexTensor has computed:
 
 | Output | Description |
 |--------|-------------|
-| `load_strategy` | Per-layer decisions on which tensors to load to GPU |
-| `release_strategy` | Per-layer decisions on which tensors to release from GPU |
+| `load_strategy` | Per-trap decisions on which weights to load to GPU |
+| `release_strategy` | Per-trap decisions on which weights to release from GPU |
 | `tensor_layer_loader` | Production-optimized loader (e.g., `TensorStrategyLoader` or block-based) |
-| `stats` | Computed layer statistics with sizes and timing |
+| `stats` | Computed per-trap statistics with sizes and timing |
 
 **Model state in inference**:
 - Model is **finalized** via `prepare_final_model()` with optimized tensor access
-- Tensors are loaded to GPU **on-demand** per the computed schedule
+- Weights are loaded to GPU **on-demand** per the computed schedule
 - GPU memory is **dynamically allocated and released** according to the release strategy
 - The model reference in tensor manager is cleared (`self.model = None`) as it's no longer needed for profiling
 
 **Runtime behavior**:
-- Tensors are preloaded to GPU before each layer executes (`tensor_layer_loader.enter()`)
-- After layer execution, tensors may be released based on the release strategy (`tensor_layer_loader.exit()`)
+- Weights are preloaded to GPU before each module executes (`tensor_layer_loader.enter()`)
+- After module execution, weights may be released based on the release strategy (`tensor_layer_loader.exit()`)
 - No timing collection overhead—optimized for production throughput
 
 This is the steady-state for all subsequent model executions.
@@ -294,11 +294,11 @@ Understanding the state machine explains some behaviors that might otherwise see
 
 **Profile iteration count affects strategy quality.** The profile state accumulates timing statistics across `profile_iters` iterations. Too few iterations can produce inaccurate estimates, especially on systems with thermal throttling or when sharing the GPU with other processes. If you observe variable inference performance, increasing `profile_iters` gives the strategy more data to work with.
 
-**Tensor-to-layer mapping is fixed after warmup.** The warmup state builds a complete map of which tensors belong to which layers. Any module added to the model after `offload()` is called will not be part of this map and will not be offloaded. The system does not re-run warmup when the model changes.
+**Parameter-to-trap mapping is fixed after warmup.** The warmup state builds a complete map of which parameters belong to which traps. Any module added to the model after `offload()` is called will not be part of this map and will not be offloaded. The system does not re-run warmup when the model changes.
 
 **State transitions are irreversible within a run.** Once FlexTensor enters inference state, it does not return to warmup or profile. To re-profile (for example, after changing the model), call `release()` and then `offload()` again.
 
-**Profile persistence can skip warmup and profile.** By saving the offloading profile after the first run (using `save_profile()`), subsequent runs can load the saved state (using `load_profile()`) and skip the warmup and profile phases entirely. The loaded state contains the tensor-to-layer mappings, timing statistics, and computed strategy, allowing the system to proceed directly to inference-ready configuration. See `OffloadConfig.profile_storage_dir` for configuration.
+**Profile persistence can skip warmup and profile.** By saving the offloading profile after the first run (using `save_profile()`), subsequent runs can load the saved state (using `load_profile()`) and skip the warmup and profile phases entirely. The loaded state contains the parameter-to-trap mappings, timing statistics, and computed strategy, allowing the system to proceed directly to inference-ready configuration. See `OffloadConfig.profile_storage_dir` for configuration.
 
 For practical guidance on avoiding mistakes related to these behaviors, see [Troubleshooting](../how-to/troubleshooting.md).
 
@@ -306,8 +306,8 @@ For practical guidance on avoiding mistakes related to these behaviors, see [Tro
 
 | State | Purpose | Internal Trap Class | Key Output |
 |-------|---------|---------------------|------------|
-| Warmup | Discover tensor-layer relationships | `WarmupTrap` | Tensor ID mapping |
-| Profile | Measure execution timing | `Trap` / `TrapDirect` | Layer statistics |
+| Warmup | Discover parameter-to-trap relationships | `WarmupTrap` | Parameter ID mapping |
+| Profile | Measure per-trap execution timing | `Trap` / `TrapDirect` | Per-trap statistics |
 | Inference | Apply optimized strategy | `TrapInfer` / `TrapInferDirect` | Production execution |
 
-This state machine approach enables FlexTensor to intelligently offload tensors without requiring manual configuration. By learning from your model's actual behavior, it achieves near-optimal memory efficiency with minimal performance overhead -- all transparently managed as an internal implementation detail.
+This state machine approach enables FlexTensor to intelligently offload model weights without requiring manual configuration. By learning from your model's actual behavior, it achieves near-optimal memory efficiency with minimal performance overhead -- all transparently managed as an internal implementation detail.

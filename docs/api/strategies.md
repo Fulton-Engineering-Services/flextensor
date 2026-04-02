@@ -4,7 +4,7 @@
 -->
 # Strategies
 
-Offloading strategies determine which tensors to move from GPU to CPU memory.
+Offloading strategies determine which model weights to move from GPU to CPU memory.
 Pass a strategy instance to [`OffloadConfig(load_strategy=...)`](configuration.md#flextensor.config.OffloadConfig).
 
 ## Strategy Protocol
