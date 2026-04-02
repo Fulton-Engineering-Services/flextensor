@@ -206,7 +206,7 @@ When set to a fraction, the strategy operates in *memory mode* and keeps peak GP
 !!! note "Budget capping and minimum memory"
     If the budget is capped, a warning is logged with the adjusted value. If available
     GPU memory drops below 256 MiB, a `RuntimeError` is raised — see
-    [Troubleshooting](../how-to/troubleshooting.md#step-3-check-for-insufficient-free-gpu-memory-error).
+    [Troubleshooting](../how-to/troubleshooting.md#step-4-check-for-insufficient-free-gpu-memory-error).
 
 ```python
 config = OffloadConfig(

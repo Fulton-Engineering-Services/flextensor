@@ -201,13 +201,30 @@ Or simply omit the `enable_instrumentation` parameter.
 
 ---
 
-## Resolve Out-of-Memory Errors
+## Resolve GPU Out-of-Memory Errors
 
-**Problem**: CUDA out-of-memory errors during warmup, profiling, or inference.
+**Problem**: `torch.cuda.OutOfMemoryError` or `CUDA out of memory` during warmup, profiling, or inference.
 
-### Step 1: Narrow the module patterns
+### Why this happens
 
-If `module_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, narrow the scope. For example, when using the vLLM worker with a decoder-only model, these patterns target each transformer layer and special modules while leaving the rest unaffected:
+FlexTensor pre-allocates GPU memory blocks sized to the largest trapped module's weights. With `module_patterns=["*"]`, container modules (e.g., the top-level `model` or a `Sequential`) are also trapped — their traps see all child weights, inflating block sizes.
+
+### Step 1: Check for competing GPU processes
+
+Verify that no other processes are holding GPU memory:
+
+```bash
+nvidia-smi
+```
+
+If another process is consuming significant memory, stop it or move your workload to a free device.
+
+!!! note
+    Setting `max_gpu_mem_fraction` does not fully eliminate this risk. The budget is capped to available memory at the time the strategy is computed, but a competing process can allocate GPU memory between that query and the actual block allocations, causing an OOM.
+
+### Step 2: Narrow the module patterns
+
+If `module_patterns=["*"]`, narrow the scope to target individual layers. For example, with a decoder-only model in vLLM:
 
 ```python
 config = OffloadConfig(
@@ -220,11 +237,13 @@ config = OffloadConfig(
 )
 ```
 
-For models with a different structure, use `model.named_modules()` to inspect module names and adapt the patterns accordingly.
+**Why this helps:** Offloaded layers are distributed across `num_blocks` GPU memory blocks, each sized to the largest layer assigned to it. With `["*"]`, container modules become the "largest layer" and inflate every memory block to the full model's size. Per-layer patterns remove the containers, so memory blocks are sized to individual layers.
 
-### Step 2: Reduce the number of transfer blocks
+For other architectures, use `model.named_modules()` to find the right pattern names.
 
-Fewer pre-allocated GPU blocks reduces peak memory during block-based transfer:
+### Step 3: Reduce the number of memory blocks
+
+Step 2 reduces each memory block's *size*; this step reduces the *count*. Fewer memory blocks means less total GPU memory reserved:
 
 ```python
 config = OffloadConfig(
@@ -233,13 +252,7 @@ config = OffloadConfig(
 )
 ```
 
-If memory errors persist after these steps, check that no other processes are holding GPU memory:
-
-```bash
-nvidia-smi
-```
-
-### Step 3: Check for "Insufficient free GPU memory" error
+### Step 4: Check for "Insufficient free GPU memory" error
 
 If you see:
 
@@ -248,24 +261,64 @@ RuntimeError: Insufficient free GPU memory: X.XX GiB available
 (free=..., reserved=..., allocated=...), minimum required: 0.25 GiB
 ```
 
-FlexTensor detected that the GPU has less than 256 MiB of usable memory at strategy
-compute time. This typically means other processes, the CUDA context, or a large KV cache
-have consumed nearly all GPU memory before FlexTensor's offloading strategy runs.
-
-**Diagnose:**
-
-```bash
-nvidia-smi  # Check what's using GPU memory
-```
+The GPU has less than 256 MiB free when the strategy runs — typically consumed by other processes, the CUDA context, or a large KV cache.
 
 **Resolve:**
 
-- Free other GPU processes or reduce KV cache / batch size in the inference framework.
-- If running inside vLLM or TRT-LLM, lower their GPU memory reservation so FlexTensor
-  has enough room to compute a strategy.
-- Set `max_gpu_mem_fraction=None` to switch to latency mode, which skips the memory
-  budget entirely (offloads based on `knapsack_scale` only).
+- Free other GPU processes or reduce KV cache / batch size.
+- In vLLM or TRT-LLM, lower GPU memory reservation so FlexTensor has room.
+- Set `max_gpu_mem_fraction=None` to switch to latency mode — this bypasses the memory budget check, but if the GPU genuinely has no free memory, block allocations will still fail with a CUDA OOM.
 
+---
+
+## Resolve Host Out-of-Memory Errors
+
+**Problem**: Python `MemoryError`, the Linux OOM killer terminating the process (`Killed`), or severe swap thrashing during warmup or profiling.
+
+### Why this happens
+
+FlexTensor copies offloaded weights into pinned (page-locked) CPU memory, which cannot be swapped — it consumes physical RAM exclusively. With `module_patterns=["*"]`, every discovered weight is pinned, which can exhaust host RAM on large models.
+
+Since `pin_memory()` copies data, the original and pinned weights coexist briefly — peak host memory is roughly model size plus one layer's worth of weights. PyTorch may also round pinned allocations to the next power of two ([pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)).
+
+### Step 1: Check host memory pressure
+
+```bash
+free -h              # available memory and swap
+dmesg | grep -i oom  # check for OOM killer
+```
+
+You can also inspect the `host_memory` object in FlexTensor's [instrumentation output](#debug-component-initialization) for a memory snapshot at inference transition.
+
+### Step 2: Narrow the module patterns
+
+Narrow `module_patterns` from `["*"]` to target specific layers:
+
+```python
+config = OffloadConfig(
+    module_patterns=[
+        "model.embed_tokens",
+        "model.layers.*",
+        "model.norm",
+        "lm_head",
+    ],
+)
+```
+
+**Why this helps:** Fewer trapped modules means fewer weights pinned in host RAM.
+
+### Step 3: Disable pinned memory as a last resort
+
+If host memory is still exhausted after narrowing patterns, disable pinned memory:
+
+```python
+config = OffloadConfig(
+    pinned_memory=False,
+)
+```
+
+!!! warning "Performance trade-off"
+    Unpinned memory can be swapped (preventing OOM) but disables asynchronous DMA, making CPU↔GPU transfers slower.
 ---
 
 ## Fix CUDA Device Mismatch Errors
