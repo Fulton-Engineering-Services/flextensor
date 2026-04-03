@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for CUDA event timing in Trap, WarmupTrap, TrapDirect, and StatsTrap."""
+"""Unit tests for CUDA event timing in Trap, WarmupTrap, and TrapDirect."""
 
 from typing import ClassVar
 from unittest.mock import Mock, call
@@ -9,7 +9,7 @@ from unittest.mock import Mock, call
 import pytest
 import torch
 
-from flextensor.helpers import StatsTrap, TrapNestingGuard
+from flextensor.helpers import TrapNestingGuard
 from flextensor.tensor_manager import TensorManager
 from flextensor.trap_tensor_mode import Trap, TrapDirect, WarmupTrap
 
@@ -199,48 +199,6 @@ class TestTrapDirectTiming:
         tm.tensor_layer_loader.exit.assert_called_once_with("layer.0")
 
 
-class TestStatsTrapTiming:
-    """Test CUDA event timing in StatsTrap (helpers.py)."""
-
-    def test_events_from_tensor_manager(self):
-        tm = _make_mock_tensor_manager(use_spec=True)
-        tm.traps_direct_duration_ms = 0.0
-        tm.traps_direct_stats = {}
-        trap = StatsTrap(tm, "layer.0")
-
-        assert trap.start_event is tm.trap_start_event
-        assert trap.end_event is tm.trap_end_event
-
-    def test_record_and_sync_ordering(self):
-        tm = _make_mock_tensor_manager(elapsed_time_ms=2.0, use_spec=True)
-        tm.traps_direct_duration_ms = 0.0
-        tm.traps_direct_stats = {}
-
-        call_order = []
-        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
-        tm.trap_end_event.record.side_effect = lambda: call_order.append("end.record")
-        tm.trap_end_event.synchronize.side_effect = lambda: call_order.append("end.synchronize")
-        tm.trap_start_event.elapsed_time.side_effect = lambda e: (call_order.append("elapsed_time"), 2.0)[1]
-
-        trap = StatsTrap(tm, "layer.0")
-        trap.__enter__()
-        trap.__exit__(None, None, None)
-
-        assert call_order == ["start.record", "end.record", "end.synchronize", "elapsed_time"]
-
-    def test_duration_accumulates(self):
-        tm = _make_mock_tensor_manager(elapsed_time_ms=3.5, use_spec=True)
-        tm.traps_direct_duration_ms = 10.0
-        tm.traps_direct_stats = {}
-
-        trap = StatsTrap(tm, "mlp.1")
-        trap.__enter__()
-        trap.__exit__(None, None, None)
-
-        assert tm.traps_direct_duration_ms == 13.5
-        assert tm.traps_direct_stats["mlp.1"] == 3.5
-
-
 class TestMultiLayerTraps:
     """Simulate sequential trap usage across multiple layers, verifying event reuse and per-layer duration."""
 
@@ -288,23 +246,6 @@ class TestMultiLayerTraps:
         ]
         tm.layer_statistics_collector.add_all.assert_has_calls(expected_calls)
 
-    def test_stats_trap_multi_layer_accumulates(self):
-        tm = _make_mock_tensor_manager(use_spec=True)
-        tm.traps_direct_duration_ms = 0.0
-        tm.traps_direct_stats = {}
-
-        durations = iter(self.LAYER_DURATIONS)
-        tm.trap_start_event.elapsed_time.side_effect = lambda _e: next(durations)
-
-        for name in self.LAYER_NAMES:
-            trap = StatsTrap(tm, name)
-            trap.__enter__()
-            trap.__exit__(None, None, None)
-
-        assert tm.traps_direct_duration_ms == pytest.approx(sum(self.LAYER_DURATIONS))
-        for name, dur in zip(self.LAYER_NAMES, self.LAYER_DURATIONS, strict=False):
-            assert tm.traps_direct_stats[name] == dur
-
     def test_events_identity_preserved_across_layers(self):
         """All traps created for different layers reference the same two event objects."""
         tm = _make_mock_tensor_manager()
@@ -322,16 +263,13 @@ class TestEventReuse:
 
     def test_all_traps_share_events(self):
         tm = _make_mock_tensor_manager(use_spec=True)
-        tm.traps_direct_duration_ms = 0.0
-        tm.traps_direct_stats = {}
 
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
         warmup = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
         direct = TrapDirect(tm, "layer.0", torch.device("cuda:0"))
-        stats = StatsTrap(tm, "layer.0")
 
-        assert trap.start_event is warmup.start_event is direct.start_event is stats.start_event
-        assert trap.end_event is warmup.end_event is direct.end_event is stats.end_event
+        assert trap.start_event is warmup.start_event is direct.start_event
+        assert trap.end_event is warmup.end_event is direct.end_event
 
 
 class TestTrapNestingGuard:
@@ -421,18 +359,6 @@ class TestNestingGuard:
         tm = _make_mock_tensor_manager()
         outer = TrapDirect(tm, "layer.0", self.DEVICE)
         inner = TrapDirect(tm, "layer.1", self.DEVICE)
-
-        outer.__enter__()
-        with pytest.raises(RuntimeError, match="Nested traps are not supported"):
-            inner.__enter__()
-        outer.__exit__(None, None, None)
-
-    def test_stats_trap_rejects_nesting(self):
-        tm = _make_mock_tensor_manager(use_spec=True)
-        tm.traps_direct_duration_ms = 0.0
-        tm.traps_direct_stats = {}
-        outer = StatsTrap(tm, "layer.0")
-        inner = StatsTrap(tm, "layer.1")
 
         outer.__enter__()
         with pytest.raises(RuntimeError, match="Nested traps are not supported"):

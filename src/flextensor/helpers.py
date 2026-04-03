@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from torch.overrides import TorchFunctionMode
 
 from flextensor.types import GPUMemoryUsage
@@ -42,40 +40,6 @@ class TrapNestingGuard:
 
     def release(self) -> None:
         self._active = False
-
-
-class StatsTrap:
-    """Context manager that measures layer execution time using shared CUDA events.
-
-    Used during direct-mode profiling to accumulate per-layer durations
-    on ``tensor_manager.traps_direct_stats``.
-
-    Args:
-        tensor_manager: The ``TensorManager`` instance owning the shared
-            CUDA events and duration accumulators.
-        name: Trace identifier for the layer being measured.
-    """
-
-    def __init__(self, tensor_manager: Any, name: str) -> None:
-        self.tensor_manager = tensor_manager
-        self.current_trace_id = name
-        self.start_event = tensor_manager.trap_start_event
-        self.end_event = tensor_manager.trap_end_event
-        self._nesting_guard = tensor_manager.trap_nesting_guard
-
-    def __enter__(self):
-        self._nesting_guard.acquire(self.current_trace_id)
-        self.start_event.record()
-        return self
-
-    def __exit__(self, _type, _value, _traceback):
-        self.end_event.record()
-        self.end_event.synchronize()
-        duration_ms = self.start_event.elapsed_time(self.end_event)
-        self.tensor_manager.traps_direct_duration_ms += duration_ms
-        self.tensor_manager.traps_direct_stats[self.current_trace_id] = duration_ms
-        self._nesting_guard.release()
-        return False
 
 
 class NoOpTrap:
