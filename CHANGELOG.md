@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demonstrating FlexTensor offloading with the Wan2.2 text-to-video model, including profile
   save/load workflow.
 
+- `exclude_patterns` config option for keeping specific modules or parameters on GPU
+  (e.g., `lm_head`, `*.norm`, `*.scale`). Applied after `include_patterns`.
+
 ### Removed
 
 - **BREAKING**: Removed internal-only `OffloadConfig` fields that should not have been
@@ -31,6 +34,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compute_transfer_gap` and `enable_untraced_tensor_discovery` remain available as
   private debug parameters on `TensorManager` (`_compute_transfer_gap`,
   `_enable_untraced_tensor_discovery`).
+
+### Changed
+
+- `module_patterns` renamed to `include_patterns`. The environment variable
+  `FT_MODULE_PATTERNS` is now `FT_INCLUDE_PATTERNS`. The old names still work but
+  emit a deprecation warning.
+
+- **BREAKING**: `SHM_PROTOCOL_VERSION` bumped to 2. Existing shared-memory profiles are
+  invalidated due to namespace hash key changes (`module_patterns` → `include_patterns`,
+  added `exclude_patterns`). Multi-process deployments will re-profile on first run after
+  upgrade.
+
+### Deprecated
+
+- `module_patterns` config option — use `include_patterns` instead. Will be removed in v0.3.
+- `max_gpu_mem_bytes` config option — use `max_gpu_mem_fraction` instead. Will be removed in v0.3.
+- `use_shared_memory` config option — use `shm_enabled` instead. Will be removed in v0.3.
 
 ### Fixed
 

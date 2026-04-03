@@ -86,7 +86,7 @@ def test_tensor_inner_fields_moved_to_gpu():
     )
 
     # Offload model
-    config = config.model_copy(update={"module_patterns": ["layer1", "layer2"]})
+    config = config.model_copy(update={"include_patterns": ["layer1", "layer2"]})
     model = om.offload(model, config=config)
 
     # Run warmup
@@ -111,14 +111,14 @@ def test_tensor_inner_fields_in_offload_block():
     model = ModelWithInnerFields()
     model = model.cpu()
 
-    # Configure FlexTensor — use module_patterns=[] so offload() sets up the
+    # Configure FlexTensor — use include_patterns=[] so offload() sets up the
     # tensor manager but does NOT patch layer forwards (we wrap manually below).
     om = flextensor.get_offload_manager("test_inner_fields_block")
     config = flextensor.OffloadConfig(
         load_strategy=flextensor.NthLayerStrategy(nth_layer=1),
         warmup_iters=1,
         profile_iters=1,
-        module_patterns=[],
+        include_patterns=[],
     )
 
     model = om.offload(model, config=config)

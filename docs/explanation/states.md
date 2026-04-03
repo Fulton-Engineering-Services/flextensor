@@ -277,7 +277,7 @@ from flextensor import OffloadConfig, get_offload_manager, offload
 config = OffloadConfig(
     warmup_iters=1,
     profile_iters=5,
-    module_patterns=["layers.*"],
+    include_patterns=["layers.*"],
 )
 
 model = offload(model, config=config)

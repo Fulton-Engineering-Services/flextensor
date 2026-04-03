@@ -85,7 +85,7 @@ class TestOffloadManagerSaveProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
         om.offload(self.model, config=config)
 
         profile_dir = tmp_path / "new_profile_dir"
@@ -110,7 +110,7 @@ class TestOffloadManagerSaveProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -150,7 +150,7 @@ class TestOffloadManagerLoadProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -173,7 +173,7 @@ class TestOffloadManagerLoadProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -432,7 +432,7 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.trap = MagicMock()
 
         profile_dir = str(tmp_path / "config_profile")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"], profile_storage_dir=profile_dir)
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir)
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -454,7 +454,7 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.trap = MagicMock()
 
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"], profile_storage_dir="/config/path")
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path")
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -495,7 +495,7 @@ class TestProfileDirectoryFromConfig:
 
         config = OffloadConfig(
             enabled=True,
-            module_patterns=["linear1"],
+            include_patterns=["linear1"],
             profile_storage_dir="/some/path",
         )
         om = OffloadManager("test")
@@ -520,7 +520,7 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.trap = MagicMock()
 
         profile_dir = str(tmp_path / "config_profile")
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"], profile_storage_dir=profile_dir)
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir)
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -542,7 +542,7 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.trap = MagicMock()
 
-        config = OffloadConfig(enabled=True, module_patterns=["linear1"], profile_storage_dir="/config/path")
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path")
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -622,7 +622,7 @@ class TestOffloadFromProfile:
         from flextensor.offload_manager import offload_from_profile
 
         mock_offload.return_value = self.model
-        config = OffloadConfig(module_patterns=["linear1"])
+        config = OffloadConfig(include_patterns=["linear1"])
         profile_dir = str(tmp_path / "profile")
 
         call_order = []
@@ -642,7 +642,7 @@ class TestOffloadFromProfile:
         from flextensor.offload_manager import offload_from_profile
 
         mock_offload.return_value = self.model
-        config = OffloadConfig(module_patterns=["linear1"])
+        config = OffloadConfig(include_patterns=["linear1"])
         profile_dir = str(tmp_path / "profile")
 
         offload_from_profile(self.model, profile_dir, config=config, name="mymodel")
@@ -660,7 +660,7 @@ class TestOffloadFromProfile:
 
         proxy_model = SimpleModel()
         mock_offload.return_value = proxy_model
-        config = OffloadConfig(module_patterns=["linear1"])
+        config = OffloadConfig(include_patterns=["linear1"])
         profile_dir = str(tmp_path / "profile")
 
         result = offload_from_profile(self.model, profile_dir, config=config, name="test")

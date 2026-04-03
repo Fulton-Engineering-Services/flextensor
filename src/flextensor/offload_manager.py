@@ -5,7 +5,6 @@ from __future__ import annotations
 import functools
 import logging
 import os
-import re
 import threading
 import types
 from collections.abc import Callable
@@ -26,10 +25,58 @@ from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
+from flextensor.tensor_discovery import is_offload_patched_module
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
+from flextensor.utils import matches_any_pattern
 
 LOGGER = logging.getLogger(__name__)
 _GiB = 1 << 30
+
+
+def _collect_matches(
+    paths: list[str],
+    remaining: set[str],
+    matched: set[str],
+    *,
+    recursive_star: bool,
+) -> None:
+    """Move patterns from *remaining* to *matched* when they match any path."""
+    for path in paths:
+        for pattern in list(remaining):
+            if matches_any_pattern(path, [pattern], recursive_star=recursive_star):
+                matched.add(pattern)
+                remaining.discard(pattern)
+        if not remaining:
+            return
+
+
+def _find_matched_patterns(
+    model: nn.Module,
+    patterns: list[str],
+    *,
+    recursive_star: bool = True,
+    include_parameters: bool = False,
+) -> set[str]:
+    """Return the subset of *patterns* that match at least one module (or parameter) path.
+
+    Args:
+        model: Model to check paths against.
+        patterns: Patterns to test.
+        recursive_star: Passed through to ``matches_any_pattern``.
+        include_parameters: If True, also check against ``named_parameters()`` paths.
+            Use for exclude patterns, which can target individual parameters.
+    """
+    remaining = set(patterns)
+    matched: set[str] = set()
+
+    module_paths = [p for p, _ in model.named_modules() if p]
+    _collect_matches(module_paths, remaining, matched, recursive_star=recursive_star)
+
+    if include_parameters and remaining:
+        param_paths = [p for p, _ in model.named_parameters()]
+        _collect_matches(param_paths, remaining, matched, recursive_star=recursive_star)
+
+    return matched
 
 
 def _log_diagnostic_snapshot(label: str, om: OffloadManager | None) -> None:
@@ -331,7 +378,7 @@ class OffloadManager:
 
         Examples:
             >>> om = get_offload_manager()
-            >>> config = OffloadConfig(module_patterns=["layers.*"])
+            >>> config = OffloadConfig(include_patterns=["layers.*"])
             >>> model = om.offload(model, config=config)
             >>> # Run warmup and profile iterations
             >>> for _ in range(config.all_warmup_iters):
@@ -393,6 +440,7 @@ class OffloadManager:
                 loader_type=self.config.transfer_mode,
                 blocks=self.config.num_blocks,
                 remove_layers_operations=[],
+                exclude_patterns=self.config.exclude_patterns,
                 use_shm=self.config.shm_enabled,
                 enable_diagnostics=self.config.enable_diagnostics,
                 max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,
@@ -484,6 +532,28 @@ class OffloadManager:
 
         # Track patched module for cleanup
         self._patched_modules.append(module)
+
+    def _has_patched_ancestor(self, model: nn.Module, module_path: str) -> bool:
+        """Check if any ancestor of the given module path is already patched.
+
+        Args:
+            model: The root model to resolve ancestor paths against.
+            module_path: Dot-separated path of the module to check.
+
+        Returns:
+            True if any ancestor module has ``_ft_original_forward_func``.
+        """
+        parts = module_path.split(".")
+        for i in range(1, len(parts)):
+            ancestor_path = ".".join(parts[:i])
+            try:
+                ancestor = model.get_submodule(ancestor_path)
+            except AttributeError:
+                LOGGER.warning("Ancestor path '%s' not found in model; skipping ancestor check.", ancestor_path)
+                return False
+            if is_offload_patched_module(ancestor):
+                return True
+        return False
 
     def _restore_module_forward(self, module: nn.Module) -> None:
         """Restore module's original forward method.
@@ -585,12 +655,13 @@ class OffloadManager:
     ) -> nn.Module:
         """Offload modules in the model based on config patterns.
 
-        Patches modules matching config.module_patterns to automatically manage
-        weight transfers. Supports wildcards in module patterns.
+        Patches modules matching ``config.include_patterns`` (and applies
+        ``config.exclude_patterns``) to automatically manage tensor transfers.
+        Supports wildcards in module patterns.
 
         Args:
             model: PyTorch model to patch
-            config: OffloadConfig to use for offload (patterns from config.module_patterns)
+            config: OffloadConfig to use for offload
 
         Returns:
             A wrapper around the model that tracks state transitions
@@ -598,7 +669,7 @@ class OffloadManager:
         Examples:
             >>> model = MyModel()
             >>> om = get_offload_manager()
-            >>> config = OffloadConfig(module_patterns=["embed", "layers.*", "head"])
+            >>> config = OffloadConfig(include_patterns=["embed", "layers.*", "head"])
             >>> model = om.offload(model, config)
         """
         self.init(config)
@@ -608,8 +679,9 @@ class OffloadManager:
         old_model = self._model
         self._model = model
 
-        for module_path in self.config.module_patterns:
-            self._offload_modules(self._model, self._model, "root", ["root", *module_path.split(".")])
+        self._offload_modules(self._model, self.config.include_patterns)
+        self._exclude_modules(self._model, self.config.exclude_patterns)
+        self._check_no_modules_patched()
 
         # Create proxy that delegates to current model
         if self._model_proxy is None:
@@ -673,8 +745,9 @@ class OffloadManager:
         self._model = self._tensor_manager.initialize_profile()
         self._model = self._tensor_manager.initialize_inference()
 
-        for module_path in self.config.module_patterns:
-            self._offload_modules(self._model, self._model, "root", ["root", *module_path.split(".")])
+        self._offload_modules(self._model, self.config.include_patterns)
+        self._exclude_modules(self._model, self.config.exclude_patterns)
+        self._check_no_modules_patched()
 
         self._current_state = OffloadState.INFERENCE
 
@@ -700,46 +773,87 @@ class OffloadManager:
         self._model_proxy = None
         self._model = None
 
-    def _offload_modules(
-        self,
-        parent_module: nn.Module,
-        module: nn.Module,
-        module_name: str,
-        path_chunks: list[str],
-    ):
-        """Recursively offload modules matching the path pattern.
+    def _offload_modules(self, model: nn.Module, patterns: list[str]) -> None:
+        """Patch modules matching include patterns, skipping those with patched ancestors.
+
+        Uses flat ``named_modules()`` iteration with ``matches_any_pattern(recursive_star=False)``
+        to preserve existing single-segment ``*`` semantics (``layers.*`` matches direct children only).
+
+        Modules whose ancestors are already patched are skipped, because they belong to
+        their ancestor's offload unit rather than forming independent units. This defines
+        offload unit boundaries: only modules with no patched ancestors become offload units.
 
         Args:
-            parent_module: Parent module (for replacing child modules)
-            module: Current module being examined
-            module_name: Name of current module
-            path_chunks: Remaining path chunks to match (supports wildcards)
+            model: The model whose sub-modules to patch.
+            patterns: Include patterns to match against module paths.
         """
-        if len(path_chunks) == 0:
+        matched_patterns = _find_matched_patterns(model, patterns, recursive_star=False)
+        for module_path, module in model.named_modules():
+            if not module_path:  # skip root
+                continue
+            if matches_any_pattern(module_path, patterns, recursive_star=False):
+                if self._has_patched_ancestor(model, module_path):
+                    continue
+                # Preserve offload name format: ParentClassName.module_name
+                parts = module_path.split(".")
+                parent_path = ".".join(parts[:-1])
+                parent = model.get_submodule(parent_path) if parent_path else model
+                offload_name = f"{parent.__class__.__name__}.{parts[-1]}"
+                self._patch_module_forward(module, offload_name)
+        for pattern in patterns:
+            if pattern not in matched_patterns:
+                LOGGER.warning("Include pattern '%s' did not match any modules.", pattern)
+
+    def _exclude_modules(self, model: nn.Module, patterns: list[str]) -> None:
+        """Un-patch modules matching any exclude pattern.
+
+        Uses ``matches_any_pattern(recursive_star=True)`` (default) so that
+        ``foo.*`` matches all descendants.
+
+        Only offload units (modules without patched ancestors) are ever patched,
+        so this method naturally operates only on offload units. Exclude patterns
+        targeting descendants within an offload unit are no-ops at the module level;
+        parameter-level exclusion for those is handled in ``tensor_discovery.py``.
+
+        Args:
+            model: The model whose sub-modules to un-patch.
+            patterns: Exclude patterns to match against module paths.
+        """
+        if not patterns:
             return
+        patched_before = len(self._patched_modules)
+        matched_patterns = _find_matched_patterns(
+            model,
+            patterns,
+            recursive_star=True,
+            include_parameters=True,
+        )
+        for module_path, module in model.named_modules():
+            if not is_offload_patched_module(module):
+                continue
+            if matches_any_pattern(module_path, patterns, recursive_star=True):
+                self._restore_module_forward(module)
+                if module in self._patched_modules:
+                    self._patched_modules.remove(module)
+        for pattern in patterns:
+            if pattern not in matched_patterns:
+                LOGGER.warning("Exclude pattern '%s' did not match any modules or parameters.", pattern)
+        if patched_before > 0 and not self._patched_modules:
+            LOGGER.error(
+                "All %d included modules were removed by exclude_patterns %s. Offloading is effectively disabled.",
+                patched_before,
+                patterns,
+            )
 
-        chunk_module_name = path_chunks[0]
-        # Escape regex special characters except * and ?
-        chunk_module_name_escaped = re.escape(chunk_module_name)
-        # Convert wildcards: * -> .* and ? -> .
-        chunk_module_name_escaped = chunk_module_name_escaped.replace(r"\*", ".*").replace(r"\?", ".")
-
-        if not re.fullmatch(chunk_module_name_escaped, module_name):
-            return
-
-        if len(path_chunks) == 1:
-            # This is the target module - patch its forward method
-            offload_name = f"{parent_module.__class__.__name__}.{module_name}"
-            self._patch_module_forward(module, offload_name)
-            return
-
-        # Recurse into child modules
-        children = list(module.named_children())
-        if len(children) == 0:
-            return
-
-        for name, child_module in children:
-            self._offload_modules(module, child_module, name, path_chunks[1:])
+    def _check_no_modules_patched(self) -> None:
+        """Emit an error when no modules ended up patched after include/exclude."""
+        if not self._patched_modules:
+            LOGGER.error(
+                "No modules matched any include pattern %s. "
+                "Offloading is effectively disabled. "
+                "Check pattern spelling against model.named_modules() paths.",
+                self.config.include_patterns,
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -796,7 +910,7 @@ def offload(model: nn.Module, config: OffloadConfig | None = None, name: str = D
 
     Args:
         model: PyTorch model to patch.
-        config: OffloadConfig to use for offload (patterns from config.module_patterns).
+        config: OffloadConfig to use for offload.
         name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
 
     Returns:

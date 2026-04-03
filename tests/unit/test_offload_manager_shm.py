@@ -88,8 +88,11 @@ class TestInitializeFromShm:
 
         manager._initialize_tensor_manager = fake_init_tm
 
-        # Patch _offload_modules to no-op (avoids real module patching)
-        with patch.object(manager, "_offload_modules"):
+        # Patch _offload_modules and _exclude_modules to no-op (avoids real module patching)
+        with (
+            patch.object(manager, "_offload_modules") as mock_offload,
+            patch.object(manager, "_exclude_modules") as mock_exclude,
+        ):
             result = manager._initialize_from_shm(coordinator, model)
 
         assert isinstance(result, OffloadModelProxy)
@@ -100,6 +103,8 @@ class TestInitializeFromShm:
         mock_tm.initialize_warmup.assert_called_once()
         mock_tm.initialize_profile.assert_called_once()
         mock_tm.initialize_inference.assert_called_once()
+        mock_offload.assert_called_once_with(model, manager.config.include_patterns)
+        mock_exclude.assert_called_once_with(model, manager.config.exclude_patterns)
 
 
 class TestBlockNameFn:

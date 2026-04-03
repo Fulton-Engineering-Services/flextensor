@@ -200,8 +200,8 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        # Use empty module_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(offload_on=True, module_patterns=[])
+        # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
+        config = OffloadConfig(offload_on=True, include_patterns=[])
 
         # Offload the model
         proxy_model = om.offload(model, config=config)

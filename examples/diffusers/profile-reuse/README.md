@@ -103,7 +103,7 @@ pipe.transformer = flextensor.offload_from_profile(
 |-----------|-------------|------------|
 | `profile_iters` | `20` | not needed |
 | `min_blocks` | `2` | `2` (default is `4`; lowered to reduce GPU memory usage) |
-| `module_patterns` | see scripts | must match between profiling and inference |
+| `include_patterns` | see scripts | must match between profiling and inference |
 
 For the full list of configuration options, see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
 

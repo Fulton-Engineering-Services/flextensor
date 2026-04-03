@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-flextensor>=0.1.0
+flextensor>0.1.0
 diffusers>=0.35.0
 transformers>=4.45,<5
 accelerate

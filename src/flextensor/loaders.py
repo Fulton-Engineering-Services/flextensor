@@ -3,7 +3,7 @@
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 
 import torch
 
@@ -139,7 +139,7 @@ class TensorLayerLoader(Loader):
     def __init__(
         self,
         layer_stats: list[IterativeLayerStatistics],
-        tensors_map: dict[int, torch.Tensor],
+        tensors_map: Mapping[int, torch.Tensor],
         device_gpu: torch.device,
         delete_tensor_func: Callable[[torch.Tensor], None] = clear_and_delete_tensor,
     ) -> None:
@@ -226,7 +226,7 @@ class TensorStrategyLoader(Loader):
         layer_stats: list[LayerStatistics],
         strategy_map: dict[str, list[TensorStatistics]],
         release_strategy_map: dict[str, list[TensorStatistics]],
-        tensors_map: dict[int, torch.Tensor],
+        tensors_map: Mapping[int, torch.Tensor],
         device_gpu: torch.device,
         release_tensors: bool,
         stream_priority: int,
@@ -714,7 +714,7 @@ class AllocationBlockController:
         self,
         allocation_ordered: dict[int, list[str]],
         device_gpu: torch.device,
-        tensors_map: dict[int, torch.Tensor],
+        tensors_map: Mapping[int, torch.Tensor],
         strategy_map: dict[str, list[TensorStatistics]],
         label_to_block_id: dict[str, int],
         use_shm: bool = False,
@@ -779,7 +779,7 @@ class AllocationBlockController:
         self,
         label: str,
         strategy: list[TensorStatistics],
-        tensors_map: dict[int, torch.Tensor],
+        tensors_map: Mapping[int, torch.Tensor],
         block: AllocationBlock,
     ) -> tuple[list[torch.Tensor], list[int]]:
         """Add tensors from strategy to an allocation block.

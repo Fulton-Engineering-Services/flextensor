@@ -33,8 +33,8 @@ for name, component in pipe.components.items():
         component.to("cuda")
 
 # [FlexTensor] Configure weights streaming with proactive prefetching.
-# module_patterns selects which submodules to offload (supports wildcards).
-module_patterns = [
+# include_patterns selects which submodules to offload (supports wildcards).
+include_patterns = [
     "rope",
     "patch_embedding",
     "condition_embedder",
@@ -46,7 +46,7 @@ module_patterns = [
 offload_config = OffloadConfig(
     profile_iters=20,
     min_blocks=2,
-    module_patterns=module_patterns,
+    include_patterns=include_patterns,
 )
 
 # [FlexTensor] Enable offloading on the transformer(s)

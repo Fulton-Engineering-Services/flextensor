@@ -48,7 +48,7 @@ config = OffloadConfig(
     gpu_device=0,              # GPU to use
     warmup_iters=1,            # Iterations for tensor discovery
     profile_iters=10,          # Iterations for timing measurement
-    module_patterns=["layers.*"],  # Which modules to offload
+    include_patterns=["layers.*"],  # Which modules to offload
 )
 
 # Patch the model

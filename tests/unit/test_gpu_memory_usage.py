@@ -159,7 +159,7 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager and transition to inference
         om = OffloadManager("test_memory")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, module_patterns=["linear"])
+        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["linear"])
         model = om.offload(self.model, config=config)
 
         # Run through warmup and profile to reach inference
@@ -195,7 +195,7 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager (stays in warmup)
         om = OffloadManager("test_warmup_error")
-        config = OffloadConfig(enabled=True, warmup_iters=5, profile_iters=5, module_patterns=["linear"])
+        config = OffloadConfig(enabled=True, warmup_iters=5, profile_iters=5, include_patterns=["linear"])
         om.offload(self.model, config=config)
 
         # Verify we're in warmup state
@@ -222,7 +222,7 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager and transition to profile
         om = OffloadManager("test_profile_error")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=5, module_patterns=["linear"])
+        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=5, include_patterns=["linear"])
         model = om.offload(self.model, config=config)
 
         # Run warmup to transition to profile
@@ -285,7 +285,7 @@ class TestModuleLevelGetGPUMemoryUsage:
         mock_tensor_manager.get_gpu_memory_usage.return_value = expected_usage
 
         # Use the simplified API with default manager
-        config = flextensor.OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, module_patterns=["linear"])
+        config = flextensor.OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["linear"])
         model = flextensor.offload(self.model, config=config)
 
         # Run through warmup and profile to reach inference

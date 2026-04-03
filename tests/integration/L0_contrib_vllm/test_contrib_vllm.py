@@ -333,7 +333,7 @@ class TestContribVLLM:
     ) -> None:
         """Test that FlexTensorOffloadWorker creates per-layer traps by default.
 
-        Regression test: the worker must NOT default to wildcard module_patterns=['*'],
+        Regression test: the worker must NOT default to wildcard include_patterns=['*'],
         which collapses the entire model into one coarse trap and prevents per-layer
         pipelining. Per-layer traps are validated via the Layer Duration Statistics
         table, which lists every trap that was actually created during profiling.
@@ -355,7 +355,7 @@ class TestContribVLLM:
         output_dir = test_output_dir / "default_patterns"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Do NOT set FT_MODULE_PATTERNS — rely on worker defaults.
+        # Do NOT set FT_INCLUDE_PATTERNS — rely on worker defaults.
         # Set FT_ENABLE_DIAGNOSTICS=1 so the Layer Duration Statistics table is
         # always written to the logs regardless of measurement consistency.
         offload_memory, _, log_lines = self._run_vllm_server_test(
@@ -384,7 +384,7 @@ class TestContribVLLM:
         coarse_trap_keys = [k for k in layer_stats if k.endswith(".model")]
         assert not coarse_trap_keys, (
             f"Coarse trap detected: {coarse_trap_keys} — entire model wrapped in one trap. "
-            "Worker must use specific module_patterns (e.g. model.layers.*) "
+            "Worker must use specific include_patterns (e.g. model.layers.*) "
             "so each transformer layer gets its own trap."
         )
 
@@ -394,7 +394,7 @@ class TestContribVLLM:
         layer_entries = [k for k in layer_stats if re.search(r"\.\d+$", k)]
         assert len(layer_entries) >= 10, (
             f"Expected at least 10 individual layer traps, found {len(layer_entries)}: "
-            f"{layer_entries}. Check that module_patterns includes 'model.layers.*'."
+            f"{layer_entries}. Check that include_patterns includes 'model.layers.*'."
         )
 
         # Offloading must have moved tensors (weights_memory < full-model size)

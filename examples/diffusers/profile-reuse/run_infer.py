@@ -66,7 +66,7 @@ def main():
 
     offload_config = OffloadConfig(
         min_blocks=2,
-        module_patterns=MODULE_PATTERNS,
+        include_patterns=MODULE_PATTERNS,
     )
 
     pipe.transformer = flextensor.offload_from_profile(

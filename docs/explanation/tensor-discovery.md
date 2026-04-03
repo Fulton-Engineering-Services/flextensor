@@ -92,7 +92,7 @@ This strategy applies when you use FlexTensor's `offload()` API with module patt
 ```python
 from flextensor import offload, OffloadConfig
 
-config = OffloadConfig(module_patterns=["layers.*"])
+config = OffloadConfig(include_patterns=["layers.*"])
 model = offload(model, config=config)
 ```
 

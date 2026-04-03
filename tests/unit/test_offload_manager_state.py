@@ -237,7 +237,7 @@ class TestOffloadManagerStateMachine:
         )
 
         # Offload the model
-        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        config = config.model_copy(update={"include_patterns": ["submoduleL1.submoduleL2"]})
         model = om.offload(self.model, config=config)
 
         # Verify initial state
@@ -310,7 +310,7 @@ class TestOffloadManagerStateMachine:
         )
 
         # Offload the model
-        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        config = config.model_copy(update={"include_patterns": ["submoduleL1.submoduleL2"]})
         model = om.offload(self.model, config=config)
 
         # Verify model is a torch.nn.Module (could be original or wrapper)
@@ -394,7 +394,7 @@ class TestOffloadManagerStateMachine:
         # Old version: returns self.model (original), but hook is on warmup_model!
         # New version: returns wrapper that tracks om._model
         _original_model_id = id(self.model)
-        config = config.model_copy(update={"module_patterns": ["submoduleL1.submoduleL2"]})
+        config = config.model_copy(update={"include_patterns": ["submoduleL1.submoduleL2"]})
         returned_model = om.offload(self.model, config=config)
 
         # OLD VERSION BUG: returned_model is original, but hook is on warmup_model
@@ -456,7 +456,7 @@ class TestOffloadManagerStateMachine:
             enabled=True,
             warmup_iters=warmup_iters,
             profile_iters=profile_iters,
-            module_patterns=["submoduleL1.submoduleL2"],
+            include_patterns=["submoduleL1.submoduleL2"],
         )
         model = om.offload(self.model, config=config)
 
@@ -508,7 +508,7 @@ class TestOffloadManagerStateMachine:
                 enabled=True,
                 warmup_iters=warmup_iters,
                 profile_iters=profile_iters,
-                module_patterns=["submoduleL1.submoduleL2"],
+                include_patterns=["submoduleL1.submoduleL2"],
             )
             model = om.offload(self.model, config=config)
 
@@ -549,7 +549,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, module_patterns=["submoduleL1.submoduleL2"])
+        config = OffloadConfig(enabled=True, include_patterns=["submoduleL1.submoduleL2"])
         om.offload(self.model, config=config)
 
         # Get trap from offload_block
@@ -576,7 +576,7 @@ class TestOffloadManagerStateMachine:
         mock_noop_manager.initialize_inference.return_value = self.model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=False, module_patterns=["submoduleL1.submoduleL2"])
+        config = OffloadConfig(enabled=False, include_patterns=["submoduleL1.submoduleL2"])
         model = om.offload(self.model, config=config)
 
         # Verify NoOpTensorManager was created
@@ -610,7 +610,7 @@ class TestOffloadManagerStateMachine:
             "submoduleL2",
             "module_list.*",
         ]
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, module_patterns=patterns)
+        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=patterns)
         om.offload(self.model, config=config)
 
         # Count how many modules were patched
@@ -687,7 +687,7 @@ class TestOffloadManagerStateMachine:
         config = OffloadConfig(enabled=True)
 
         # Verify default pattern is ["*"]
-        assert config.module_patterns == ["*"]
+        assert config.include_patterns == ["*"]
 
         # Offload without specifying patterns - should use default
         model = om.offload(self.model, config=config)
@@ -701,7 +701,7 @@ class TestOffloadManagerStateMachine:
         om = OffloadManager("test")
         config = OffloadConfig(
             enabled=True,
-            module_patterns=["submoduleL1", "submoduleL2"],
+            include_patterns=["submoduleL1", "submoduleL2"],
         )
 
         model = om.offload(self.model, config=config)

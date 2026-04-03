@@ -27,8 +27,9 @@ logger = logging.getLogger(__name__)
 
 _USE_SHARED_MEMORY_MSG = "`use_shared_memory` is deprecated. Use `shm_enabled` instead. Will be removed in v0.5."
 _MAX_GPU_MEM_BYTES_MSG = (
-    "`max_gpu_mem_bytes` is deprecated. Use `max_gpu_mem_fraction` instead. Will be removed in v0.5."
+    "`max_gpu_mem_bytes` is deprecated. Use `max_gpu_mem_fraction` instead. Will be removed in v0.3."
 )
+_MODULE_PATTERNS_MSG = "`module_patterns` is deprecated. Use `include_patterns` instead. Will be removed in v0.3."
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
@@ -64,8 +65,8 @@ class OffloadConfig(BaseModel):
     )
     """Whether to use shared memory.
 
-    .. deprecated:: v0.4
-        Use :attr:`shm_enabled` instead. Will be removed in v0.5.
+    .. deprecated:: v0.1.0
+        Use :attr:`shm_enabled` instead. Will be removed in v0.3.
     """
 
     shm_enabled: bool = Field(default=False)
@@ -145,8 +146,8 @@ class OffloadConfig(BaseModel):
     )
     """Hard GPU memory limit in bytes (never exceed).
 
-    .. deprecated:: v0.4
-        Use :attr:`max_gpu_mem_fraction` instead. Will be removed in v0.5.
+    .. deprecated:: v0.1.0
+        Use :attr:`max_gpu_mem_fraction` instead. Will be removed in v0.3.
         Env var ``FT_MAX_GPU_MEM_BYTES`` is similarly deprecated; use ``FT_MAX_GPU_MEM_FRACTION``.
     """
 
@@ -165,10 +166,38 @@ class OffloadConfig(BaseModel):
     instrumentation_output_dir: str = Field(default=".flextensor/instrumentation")
     """Instrumentation output directory."""
 
-    module_patterns: list[str] = Field(default_factory=lambda: ["*"])
-    """Module path patterns to offload (supports ``*`` and ``?`` wildcards).
+    include_patterns: list[str] = Field(default_factory=lambda: ["*"])
+    """Module path patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
-    Can also be set via the ``FT_MODULE_PATTERNS`` env var as a comma-separated list.
+    Matches against module paths from ``model.named_modules()``.
+    Can also be set via the ``FT_INCLUDE_PATTERNS`` env var as a comma-separated list.
+
+    .. note::
+        Standalone ``*`` matches exactly one path segment.
+        For example, ``layers.*`` matches ``layers.0`` but not ``layers.0.attn``.
+        Use ``layers.*`` to target direct children of a module.
+
+    .. note::
+        Parameter-level matching (e.g., ``*.weight``) is not yet supported for
+        include patterns. Use ``exclude_patterns`` for parameter-level filtering.
+    """
+
+    exclude_patterns: list[str] = Field(default_factory=list)
+    """Module/parameter path patterns to exclude from offloading (supports wildcards).
+
+    Applied after include_patterns: targets matching both include and exclude are NOT offloaded.
+    Uses the same wildcard characters as include_patterns, but standalone ``*``
+    matches one or more segments (see pattern-matching docs).
+    Can also be set via the ``FT_EXCLUDE_PATTERNS`` env var as a comma-separated list.
+    """
+
+    module_patterns: Annotated[list[str] | None, _deprecated(_MODULE_PATTERNS_MSG)] = Field(
+        default=None, deprecated=_MODULE_PATTERNS_MSG
+    )
+    """Module path patterns to include for offloading.
+
+    .. deprecated:: v0.1.1
+        Use :attr:`include_patterns` instead. Will be removed in v0.3.
     """
 
     enable_diagnostics: bool = Field(default=False)
@@ -194,6 +223,20 @@ class OffloadConfig(BaseModel):
             elif bytes_set and fraction_set:
                 msg = "Cannot set both max_gpu_mem_bytes and max_gpu_mem_fraction"
                 raise ValueError(msg)
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_module_patterns(cls, data: Any) -> Any:
+        """Map deprecated module_patterns to include_patterns."""
+        if isinstance(data, dict) and "module_patterns" in data:
+            if data["module_patterns"] is None:
+                return data
+            if "include_patterns" in data:
+                msg = "Cannot set both `module_patterns` (deprecated) and `include_patterns`."
+                raise ValueError(msg)
+            warnings.warn(_MODULE_PATTERNS_MSG, DeprecationWarning, stacklevel=2)
+            data["include_patterns"] = data["module_patterns"]
         return data
 
     @model_validator(mode="before")
@@ -262,6 +305,8 @@ def _get_field_types() -> dict[str, type]:
                     field_types[name] = object
             else:
                 field_types[name] = str
+        elif origin is list:
+            field_types[name] = list
         elif isinstance(annotation, type) and annotation in (bool, int, float, str):
             field_types[name] = annotation
         else:
@@ -500,29 +545,37 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
                 msg,
             )
 
-    # Special handling for list field: module_patterns
-    env_var_name = f"{env_prefix}MODULE_PATTERNS"
-    env_value = os.environ.get(env_var_name)
-    if env_value:
-        config_dict["module_patterns"] = [p.strip() for p in env_value.split(",") if p.strip()]
+    # Deprecated FT_MODULE_PATTERNS → include_patterns
+    dep_env = f"{env_prefix}MODULE_PATTERNS"
+    dep_value = os.environ.get(dep_env)
+    if dep_value:
+        new_env = f"{env_prefix}INCLUDE_PATTERNS"
+        if os.environ.get(new_env) is not None:
+            msg = f"Cannot set both {dep_env} (deprecated) and {new_env}."
+            raise ValueError(msg)
+        warnings.warn(_MODULE_PATTERNS_MSG, DeprecationWarning, stacklevel=2)
+        config_dict["include_patterns"] = [p.strip() for p in dep_value.split(",") if p.strip()]
 
     for field_name, field_type in field_types.items():
-        # Skip module_patterns as it's handled above
-        if field_name == "module_patterns":
+        if field_type is object:
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"
         env_value = os.environ.get(env_var_name)
+        if env_value is None:
+            continue
 
-        if env_value is not None:
-            # Skip complex types like load_strategy
-            if field_type is object:
-                continue
-
-            try:
+        try:
+            if field_type is list:
+                annotation = OffloadConfig.model_fields[field_name].annotation
+                element_type = get_args(annotation)[0] if get_args(annotation) else str
+                config_dict[field_name] = [
+                    _convert_env_value(p.strip(), element_type) for p in env_value.split(",") if p.strip()
+                ]
+            else:
                 config_dict[field_name] = _convert_env_value(env_value, field_type)
-            except (ValueError, TypeError) as e:
-                raise ValueError(f"Failed to convert {env_var_name}={env_value} to {field_type.__name__}: {e}") from e
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Failed to convert {env_var_name}={env_value}: {e}") from e
 
     return config_dict
 

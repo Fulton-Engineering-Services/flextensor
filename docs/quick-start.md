@@ -41,7 +41,7 @@ config = OffloadConfig(
     gpu_device=0,              # GPU to use
     warmup_iters=1,            # Iterations for parameter discovery
     profile_iters=10,          # Iterations for timing measurement
-    module_patterns=["layers.*"],  # Which modules to offload
+    include_patterns=["layers.*"],  # Which modules to offload
 )
 
 # Patch the model
@@ -57,7 +57,7 @@ for batch in dataloader:
 
 ## Module Path Patterns
 
-The `module_patterns` field in `OffloadConfig` specifies which modules to offload using path patterns:
+The `include_patterns` field in `OffloadConfig` specifies which modules to offload using path patterns:
 
 | Pattern | Matches |
 |---------|---------|
@@ -67,7 +67,7 @@ The `module_patterns` field in `OffloadConfig` specifies which modules to offloa
 
 ```python
 config = OffloadConfig(
-    module_patterns=[
+    include_patterns=[
         "embed",           # Exact match
         "layers.*",        # Wildcard
         "head",
@@ -76,17 +76,17 @@ config = OffloadConfig(
 model = flextensor.offload(model, config=config)
 ```
 
-Module patterns can also be set via the `FT_MODULE_PATTERNS` environment variable as a comma-separated list:
+Module patterns can also be set via the `FT_INCLUDE_PATTERNS` environment variable as a comma-separated list:
 
 ```bash
-FT_MODULE_PATTERNS="layers.*,embed,head" python my_script.py
+FT_INCLUDE_PATTERNS="layers.*,embed,head" python my_script.py
 ```
 
 ## Key Configuration Options
 
 The most commonly tuned options are:
 
-- **`module_patterns`** — which modules to offload (supports `*` and `?` wildcards, default `["*"]`; use specific patterns such as `model.layers.*` for better per-layer pipelining)
+- **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards, default `["*"]`; use specific patterns such as `model.layers.*` for better per-layer pipelining)
 - **`warmup_iters`** — iterations for tensor discovery (default `1`)
 - **`profile_iters`** — iterations for timing measurement (default `10`)
 
@@ -101,7 +101,7 @@ om = flextensor.get_offload_manager()
 
 # First run: save profile after warmup completes
 config = OffloadConfig(
-    module_patterns=["layers.*"],
+    include_patterns=["layers.*"],
     profile_read_only=False,  # Allow saving profiles
 )
 model = om.offload(model, config=config)

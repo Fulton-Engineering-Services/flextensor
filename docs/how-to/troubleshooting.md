@@ -41,7 +41,7 @@ from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
     enable_instrumentation=True,
-    module_patterns=["layers.*"],
+    include_patterns=["layers.*"],
     # ... your other settings
 )
 
@@ -207,7 +207,7 @@ Or simply omit the `enable_instrumentation` parameter.
 
 ### Why this happens
 
-FlexTensor pre-allocates GPU memory blocks sized to the largest trapped module's weights. With `module_patterns=["*"]`, container modules (e.g., the top-level `model` or a `Sequential`) are also trapped — their traps see all child weights, inflating block sizes.
+FlexTensor pre-allocates GPU memory blocks sized to the largest trapped module's weights. With `include_patterns=["*"]`, container modules (e.g., the top-level `model` or a `Sequential`) are also trapped — their traps see all child weights, inflating block sizes.
 
 ### Step 1: Check for competing GPU processes
 
@@ -222,13 +222,13 @@ If another process is consuming significant memory, stop it or move your workloa
 !!! note
     Setting `max_gpu_mem_fraction` does not fully eliminate this risk. The budget is capped to available memory at the time the strategy is computed, but a competing process can allocate GPU memory between that query and the actual block allocations, causing an OOM.
 
-### Step 2: Narrow the module patterns
+### Step 2: Narrow the include patterns
 
-If `module_patterns=["*"]`, narrow the scope to target individual layers. For example, with a decoder-only model in vLLM:
+If `include_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, or container modules are inflating block sizes, narrow the scope. For example, with a decoder-only model in vLLM, these patterns target each transformer layer and special modules while leaving the rest unaffected:
 
 ```python
 config = OffloadConfig(
-    module_patterns=[
+    include_patterns=[
         "model.embed_tokens",
         "model.layers.*",
         "model.norm",
@@ -333,10 +333,10 @@ Both untraced tensor discovery and ModuleTracker are always enabled (hardcoded).
 
 ### Step 2: Use the `offload()` API with forward patching
 
-Auto trap discovery (the most reliable strategy) only activates when you use `flextensor.offload()` with explicit `module_patterns`:
+Auto trap discovery (the most reliable strategy) only activates when you use `flextensor.offload()` with explicit `include_patterns`:
 
 ```python
-config = OffloadConfig(module_patterns=["layers.*"])
+config = OffloadConfig(include_patterns=["layers.*"])
 model = flextensor.offload(model, config=config)
 ```
 
@@ -349,7 +349,7 @@ Enable debug instrumentation to capture component initialization details and ver
 ```python
 config = OffloadConfig(
     enable_instrumentation=True,
-    module_patterns=["layers.*"],
+    include_patterns=["layers.*"],
 )
 model = offload(model, config=config)
 ```
@@ -428,7 +428,7 @@ When you call `flextensor.offload(model, config=config)`, FlexTensor patches the
 
 ```python
 # BAD: new layer is not covered by offloading
-config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+config = flextensor.OffloadConfig(include_patterns=["layers.*"])
 model = flextensor.offload(model, config=config)
 model.layers.append(NewLayer())  # NewLayer will not be offloaded
 ```
@@ -440,7 +440,7 @@ Call `release()` on the offload manager to remove all patches and clear the para
 ```python
 import flextensor
 
-config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+config = flextensor.OffloadConfig(include_patterns=["layers.*"])
 
 # GOOD: patch after all modifications are done
 model.layers.append(NewLayer())
@@ -452,7 +452,7 @@ If you have already called `offload()` and need to modify the model afterward:
 ```python
 import flextensor
 
-config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+config = flextensor.OffloadConfig(include_patterns=["layers.*"])
 model = flextensor.offload(model, config=config)
 
 # Later: modify the model
@@ -490,7 +490,7 @@ import threading
 import flextensor
 
 def worker(thread_name: str, model):
-    config = flextensor.OffloadConfig(module_patterns=["layers.*"])
+    config = flextensor.OffloadConfig(include_patterns=["layers.*"])
     model = flextensor.offload(model, config=config, name=thread_name)
     for batch in dataloader:
         output = model(batch)  # Safe: single thread owns this manager + model

@@ -13,11 +13,13 @@ Three discovery mechanisms (tried sequentially):
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping  # noqa: TC003 - runtime import required by beartype
 from typing import Any
 
 import torch
 
 from flextensor.collectors import IterativeLayerStatistics
+from flextensor.utils import matches_any_pattern
 
 # =============================================================================
 # Module Tracker - tracks modules executed within trap contexts
@@ -123,7 +125,7 @@ class ModuleTracker:
 
     def get_trap_tensor_ids(
         self,
-        tensors_map: dict[int, torch.Tensor],
+        tensors_map: Mapping[int, torch.Tensor],
     ) -> dict[str, set[int]]:
         """Get tensor IDs for each trap from their executed modules.
 
@@ -181,7 +183,7 @@ class ModuleTracker:
 
 def _discover_from_module_tracker(
     tracker: ModuleTracker | None,
-    tensors_map: dict[int, torch.Tensor],
+    tensors_map: Mapping[int, torch.Tensor],
     untraced_tensor_ids: set[int],
     layer_labels_set: set[str],
     layer_to_new_tensors: dict[str, set[int]],
@@ -243,9 +245,96 @@ def get_inner_tensor_field_ids(tensor: torch.Tensor) -> list[int]:
     return inner_ids
 
 
+def _is_param_excluded(full_param_path: str, exclude_patterns: list[str]) -> bool:
+    """Check if a parameter should be excluded.
+
+    A parameter is excluded if its full path OR any of its ancestor
+    module paths matches an exclude pattern. This ensures that a
+    module-level exclude (e.g., ``foo.layers.*.bar``) cascades to all
+    parameters of that module.
+
+    Args:
+        full_param_path: Full dot-separated parameter path
+            (e.g., ``layers.0.attn.weight``).
+        exclude_patterns: List of exclude patterns.
+
+    Returns:
+        True if the parameter should be excluded.
+    """
+    parts = full_param_path.split(".")
+    # Check each prefix path (including full path)
+    for i in range(1, len(parts) + 1):
+        prefix = ".".join(parts[:i])
+        if matches_any_pattern(prefix, exclude_patterns):
+            return True
+    return False
+
+
+def _collect_excluded_ids(
+    named_tensors: Iterable[tuple[str, torch.Tensor]],
+    exclude_patterns: list[str],
+    all_tensor_ids: set[int],
+) -> set[int]:
+    """Collect tensor IDs matching exclude patterns from a name/tensor iterator.
+
+    Args:
+        named_tensors: Iterator of (name, tensor) pairs. Names use dot-separated
+            paths (e.g. ``layers.0.attn.weight``).
+        exclude_patterns: Patterns to match against.
+        all_tensor_ids: Known tensor IDs to filter against.
+
+    Returns:
+        Set of matching tensor IDs (including inner fields).
+    """
+    excluded_ids: set[int] = set()
+    for name, tensor in named_tensors:
+        if _is_param_excluded(name, exclude_patterns):
+            tensor_id = id(tensor)
+            if tensor_id in all_tensor_ids:
+                excluded_ids.add(tensor_id)
+                for inner_id in get_inner_tensor_field_ids(tensor):
+                    if inner_id in all_tensor_ids:
+                        excluded_ids.add(inner_id)
+    return excluded_ids
+
+
+def get_excluded_tensor_ids(
+    model: torch.nn.Module | dict | None,
+    tensors_map: Mapping[int, torch.Tensor],
+    exclude_patterns: list[str] | None = None,
+) -> set[int]:
+    """Get tensor IDs of parameters matching exclude patterns.
+
+    Walks model parameters (or dict items for dict models), checks each
+    against exclude_patterns using _is_param_excluded(), and returns the set
+    of matching tensor IDs (including inner fields via get_inner_tensor_field_ids()).
+
+    Args:
+        model: The model to search for excluded parameters. Supports
+            ``nn.Module`` (uses ``named_parameters()``) and ``dict`` models
+            (uses ``items()`` — keys are dot-separated paths like
+            ``layers.30.attention.wq.weight``).
+        tensors_map: Map of tensor IDs to tensors (used to filter to known tensors).
+        exclude_patterns: List of patterns to match parameters against.
+
+    Returns:
+        Set of tensor IDs that match exclude patterns and are in tensors_map.
+    """
+    if model is None or not exclude_patterns:
+        return set()
+
+    all_tensor_ids = set(tensors_map.keys())
+
+    if isinstance(model, dict):
+        return _collect_excluded_ids(model.items(), exclude_patterns, all_tensor_ids)
+
+    return _collect_excluded_ids(model.named_parameters(), exclude_patterns, all_tensor_ids)
+
+
 def get_offload_module_tensor_ids(
     model: torch.nn.Module | dict | None,
-    tensors_map: dict[int, torch.Tensor],
+    tensors_map: Mapping[int, torch.Tensor],
+    exclude_patterns: list[str] | None = None,
 ) -> dict[str, set[int]]:
     """Discover tensor IDs for each patched module in the model.
 
@@ -256,6 +345,7 @@ def get_offload_module_tensor_ids(
     Args:
         model: The model to search for patched modules.
         tensors_map: Map of tensor IDs to tensors (used to filter to known tensors).
+        exclude_patterns: Optional list of patterns to exclude parameters by path.
 
     Returns:
         Dict mapping offload_name (trap label) to set of tensor IDs.
@@ -266,7 +356,9 @@ def get_offload_module_tensor_ids(
     if model is None or isinstance(model, dict):
         return label_to_tensor_ids
 
-    for module in model.modules():
+    active_excludes = exclude_patterns or []
+
+    for module_path, module in model.named_modules():
         # Check if module has forward patching applied
         if is_offload_patched_module(module):
             label = get_offload_name(module)
@@ -275,7 +367,10 @@ def get_offload_module_tensor_ids(
             tensor_ids: set[int] = set()
 
             # Get all parameters from the patched module
-            for param in module.parameters():
+            for param_name, param in module.named_parameters():
+                full_param_path = f"{module_path}.{param_name}" if module_path else param_name
+                if active_excludes and _is_param_excluded(full_param_path, active_excludes):
+                    continue  # skip excluded parameter
                 param_id = id(param)
                 if param_id in all_tensor_ids:
                     tensor_ids.add(param_id)
@@ -460,10 +555,11 @@ def _match_tensor_to_layer_by_prefix(
 
 def _discover_from_offload_modules(
     model: torch.nn.Module | dict | None,
-    tensors_map: dict[int, torch.Tensor],
+    tensors_map: Mapping[int, torch.Tensor],
     untraced_tensor_ids: set[int],
     layer_labels_set: set[str],
     layer_to_new_tensors: dict[str, set[int]],
+    exclude_patterns: list[str] | None = None,
 ) -> set[int]:
     """Discover untraced tensors from patched modules.
 
@@ -476,12 +572,13 @@ def _discover_from_offload_modules(
         untraced_tensor_ids: Set of tensor IDs not yet traced.
         layer_labels_set: Set of valid layer labels.
         layer_to_new_tensors: Mutable dict to populate with discovered tensors.
+        exclude_patterns: Optional list of patterns to exclude parameters by path.
 
     Returns:
         Set of tensor IDs that were matched by this strategy.
     """
     matched_tensor_ids: set[int] = set()
-    label_to_module_tensors = get_offload_module_tensor_ids(model, tensors_map)
+    label_to_module_tensors = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=exclude_patterns)
 
     for label, module_tensor_ids in label_to_module_tensors.items():
         if label in layer_labels_set:
@@ -494,7 +591,7 @@ def _discover_from_offload_modules(
 
 def _discover_by_prefix_matching(
     layer_stats: list[IterativeLayerStatistics],
-    tensors_map: dict[int, torch.Tensor],
+    tensors_map: Mapping[int, torch.Tensor],
     tensor_id_to_name_map: dict[int, str],
     untraced_tensor_ids: set[int],
     already_matched: set[int],
@@ -551,10 +648,11 @@ def _discover_by_prefix_matching(
 
 def discover_untraced_tensors_for_layers(
     layer_stats: list[IterativeLayerStatistics],
-    tensors_map: dict[int, torch.Tensor],
+    tensors_map: Mapping[int, torch.Tensor],
     model: torch.nn.Module | dict | None,
     tensor_id_to_name_map: dict[int, str],
     module_tracker: ModuleTracker | None = None,
+    exclude_patterns: list[str] | None = None,
 ) -> list[IterativeLayerStatistics]:
     """Add untraced tensors to layer statistics using a sequential strategy approach.
 
@@ -575,6 +673,7 @@ def discover_untraced_tensors_for_layers(
         model: The model to search for patched modules.
         tensor_id_to_name_map: Map of tensor IDs to names (for prefix matching).
         module_tracker: Optional ModuleTracker that tracked modules during warmup.
+        exclude_patterns: Optional list of patterns to exclude parameters by path.
 
     Returns:
         New list of IterativeLayerStatistics with untraced tensors added.
@@ -603,7 +702,12 @@ def discover_untraced_tensors_for_layers(
     # This is the most accurate - try first if model is available
     if isinstance(model, torch.nn.Module) and has_offload_modules(model):
         matched_from_patching = _discover_from_offload_modules(
-            model, tensors_map, untraced_tensor_ids, layer_labels_set, layer_to_new_tensors
+            model,
+            tensors_map,
+            untraced_tensor_ids,
+            layer_labels_set,
+            layer_to_new_tensors,
+            exclude_patterns=exclude_patterns,
         )
         untraced_tensor_ids -= matched_from_patching
 

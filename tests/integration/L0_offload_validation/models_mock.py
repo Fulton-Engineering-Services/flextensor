@@ -293,7 +293,7 @@ class AutoTrapModel(nn.Module):
 
     Structured as a clean nn.Module hierarchy without any tensor_manager dependency.
     OffloadManager patches sub-module forwards with trap blocks automatically via
-    module_patterns (e.g. ``["input_projection", "layers.*", "output_projection"]``).
+    include_patterns (e.g. ``["input_projection", "layers.*", "output_projection"]``).
 
     Uses RepeatingProjection and RepeatingExpertLayer so the iteration loop runs
     inside the auto-trap block, producing the same workload as the manual-trap Model.

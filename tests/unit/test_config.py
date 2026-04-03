@@ -240,20 +240,35 @@ class TestOffloadConfig:
         config = OffloadConfig(profile_iters=0)
         assert config.profile_iters == 0
 
-    def test_module_patterns_default(self):
-        """Test module_patterns default value is ['*']."""
+    def test_include_patterns_default(self):
+        """Test include_patterns default value is ['*']."""
         config = OffloadConfig()
-        assert config.module_patterns == ["*"]
+        assert config.include_patterns == ["*"]
 
-    def test_module_patterns_custom(self):
-        """Test setting custom module_patterns."""
-        config = OffloadConfig(module_patterns=["layers.*", "head"])
-        assert config.module_patterns == ["layers.*", "head"]
+    def test_include_patterns_custom(self):
+        """Test setting custom include_patterns."""
+        config = OffloadConfig(include_patterns=["layers.*", "head"])
+        assert config.include_patterns == ["layers.*", "head"]
 
-    def test_module_patterns_empty_list(self):
-        """Test that empty module_patterns list is allowed."""
-        config = OffloadConfig(module_patterns=[])
-        assert config.module_patterns == []
+    def test_include_patterns_empty_list(self):
+        """Test that empty include_patterns list is allowed."""
+        config = OffloadConfig(include_patterns=[])
+        assert config.include_patterns == []
+
+    def test_exclude_patterns_default(self):
+        """Test exclude_patterns default value is []."""
+        config = OffloadConfig()
+        assert config.exclude_patterns == []
+
+    def test_exclude_patterns_custom(self):
+        """Test setting custom exclude_patterns."""
+        config = OffloadConfig(exclude_patterns=["lm_head", "*.norm"])
+        assert config.exclude_patterns == ["lm_head", "*.norm"]
+
+    def test_exclude_patterns_empty_list(self):
+        """Test that empty exclude_patterns list is allowed."""
+        config = OffloadConfig(exclude_patterns=[])
+        assert config.exclude_patterns == []
 
     def test_json_schema_has_field_descriptions(self):
         """All OffloadConfig fields must have descriptions in JSON Schema."""
@@ -647,35 +662,47 @@ class TestLoadConfigFromEnv:
         assert config.warmup_iters == 20  # from kwargs
         assert config.enable_diagnostics is True  # from kwargs
 
-    def test_module_patterns_from_env(self):
-        """Test loading module_patterns from FT_MODULE_PATTERNS env var."""
-        os.environ["FT_MODULE_PATTERNS"] = "layers.*,head"
+    def test_include_patterns_from_env(self):
+        """Test loading include_patterns from FT_INCLUDE_PATTERNS env var."""
+        os.environ["FT_INCLUDE_PATTERNS"] = "layers.*,head"
         config = load_config_from_env()
-        assert config.module_patterns == ["layers.*", "head"]
+        assert config.include_patterns == ["layers.*", "head"]
 
-    def test_module_patterns_from_env_with_spaces(self):
-        """Test loading module_patterns with spaces in env var."""
-        os.environ["FT_MODULE_PATTERNS"] = "layers.*, head , model.norm"
+    def test_include_patterns_from_env_with_spaces(self):
+        """Test loading include_patterns with spaces in env var."""
+        os.environ["FT_INCLUDE_PATTERNS"] = "layers.*, head , model.norm"
         config = load_config_from_env()
-        assert config.module_patterns == ["layers.*", "head", "model.norm"]
+        assert config.include_patterns == ["layers.*", "head", "model.norm"]
 
-    def test_module_patterns_from_env_single(self):
+    def test_include_patterns_from_env_single(self):
         """Test loading single module pattern from env var."""
-        os.environ["FT_MODULE_PATTERNS"] = "model.*"
+        os.environ["FT_INCLUDE_PATTERNS"] = "model.*"
         config = load_config_from_env()
-        assert config.module_patterns == ["model.*"]
+        assert config.include_patterns == ["model.*"]
 
-    def test_module_patterns_from_env_wildcard(self):
+    def test_include_patterns_from_env_wildcard(self):
         """Test loading wildcard module pattern from env var."""
-        os.environ["FT_MODULE_PATTERNS"] = "*"
+        os.environ["FT_INCLUDE_PATTERNS"] = "*"
         config = load_config_from_env()
-        assert config.module_patterns == ["*"]
+        assert config.include_patterns == ["*"]
 
-    def test_module_patterns_kwargs_override_env(self):
-        """Test that kwargs override env var for module_patterns."""
-        os.environ["FT_MODULE_PATTERNS"] = "layers.*"
-        config = load_config_from_env(module_patterns=["custom.*"])
-        assert config.module_patterns == ["custom.*"]
+    def test_include_patterns_kwargs_override_env(self):
+        """Test that kwargs override env var for include_patterns."""
+        os.environ["FT_INCLUDE_PATTERNS"] = "layers.*"
+        config = load_config_from_env(include_patterns=["custom.*"])
+        assert config.include_patterns == ["custom.*"]
+
+    def test_exclude_patterns_from_env(self):
+        """Test loading exclude_patterns from FT_EXCLUDE_PATTERNS env var."""
+        os.environ["FT_EXCLUDE_PATTERNS"] = "lm_head,*.norm"
+        config = load_config_from_env()
+        assert config.exclude_patterns == ["lm_head", "*.norm"]
+
+    def test_exclude_patterns_from_env_single(self):
+        """Test loading single exclude pattern from env var."""
+        os.environ["FT_EXCLUDE_PATTERNS"] = "lm_head"
+        config = load_config_from_env()
+        assert config.exclude_patterns == ["lm_head"]
 
 
 class TestLoadConfigFromFile:
@@ -731,6 +758,18 @@ gpu_device = 3
         assert config.warmup_iters == 8
         assert config.enable_diagnostics is False
 
+    def test_load_json_file_with_patterns(self, tmp_path):
+        """Test loading include_patterns and exclude_patterns from JSON file."""
+        config_file = tmp_path / "test_patterns.json"
+        config_file.write_text("""{
+    "enabled": true,
+    "include_patterns": ["layers.*", "head"],
+    "exclude_patterns": ["layers.*.norm"]
+}""")
+        config = load_config_from_file(config_file)
+        assert config.include_patterns == ["layers.*", "head"]
+        assert config.exclude_patterns == ["layers.*.norm"]
+
     def test_load_yaml_file(self, tmp_path):
         """Test loading config from YAML file."""
         config_file = tmp_path / "test.yaml"
@@ -744,6 +783,21 @@ enable_diagnostics: true
         assert config.gpu_device == 5
         assert config.warmup_iters == 10
         assert config.enable_diagnostics is True
+
+    def test_load_yaml_file_with_patterns(self, tmp_path):
+        """Test loading include_patterns and exclude_patterns from YAML file."""
+        config_file = tmp_path / "test_patterns.yaml"
+        config_file.write_text("""enabled: true
+include_patterns:
+  - "layers.*"
+  - "embed_tokens"
+exclude_patterns:
+  - "layers.*.norm"
+  - "lm_head"
+""")
+        config = load_config_from_file(config_file)
+        assert config.include_patterns == ["layers.*", "embed_tokens"]
+        assert config.exclude_patterns == ["layers.*.norm", "lm_head"]
 
     def test_load_yml_file(self, tmp_path):
         """Test loading config from .yml file."""
@@ -973,33 +1027,54 @@ num_blocks = 8
         config = load_config_from_file(config_file)
         assert config.max_gpu_mem_fraction == 0.6
 
-    def test_module_patterns_from_yaml_file(self, tmp_path):
-        """Test loading module_patterns from YAML file."""
+    def test_include_patterns_from_yaml_file(self, tmp_path):
+        """Test loading include_patterns from YAML file."""
         config_file = tmp_path / "patterns.yaml"
-        config_file.write_text("""module_patterns:
+        config_file.write_text("""include_patterns:
   - "layers.*"
   - "head"
   - "norm"
 """)
         config = load_config_from_file(config_file)
-        assert config.module_patterns == ["layers.*", "head", "norm"]
+        assert config.include_patterns == ["layers.*", "head", "norm"]
 
-    def test_module_patterns_from_json_file(self, tmp_path):
-        """Test loading module_patterns from JSON file."""
+    def test_include_patterns_from_json_file(self, tmp_path):
+        """Test loading include_patterns from JSON file."""
         config_file = tmp_path / "patterns.json"
         config_file.write_text("""{
-    "module_patterns": ["model.*", "lm_head"]
+    "include_patterns": ["model.*", "lm_head"]
 }""")
         config = load_config_from_file(config_file)
-        assert config.module_patterns == ["model.*", "lm_head"]
+        assert config.include_patterns == ["model.*", "lm_head"]
 
-    def test_module_patterns_default_when_not_in_file(self, tmp_path):
-        """Test that module_patterns uses default when not in config file."""
+    def test_include_patterns_default_when_not_in_file(self, tmp_path):
+        """Test that include_patterns uses default when not in config file."""
         config_file = tmp_path / "no_patterns.yaml"
         config_file.write_text("""gpu_device: 1
 """)
         config = load_config_from_file(config_file)
-        assert config.module_patterns == ["*"]  # default
+        assert config.include_patterns == ["*"]  # default
+
+    def test_exclude_patterns_from_yaml_file(self, tmp_path):
+        """Test loading exclude_patterns from YAML file."""
+        config_file = tmp_path / "exclude.yaml"
+        config_file.write_text("""exclude_patterns:
+  - "lm_head"
+  - "*.norm"
+""")
+        config = load_config_from_file(config_file)
+        assert config.exclude_patterns == ["lm_head", "*.norm"]
+
+    def test_exclude_patterns_from_json_file(self, tmp_path):
+        """Test loading exclude_patterns from JSON file."""
+        config_file = tmp_path / "exclude.json"
+        config_file.write_text("""{
+    "include_patterns": ["*"],
+    "exclude_patterns": ["lm_head", "*.scale"]
+}""")
+        config = load_config_from_file(config_file)
+        assert config.include_patterns == ["*"]
+        assert config.exclude_patterns == ["lm_head", "*.scale"]
 
 
 class TestGetFieldTypes:
@@ -1051,6 +1126,12 @@ class TestGetFieldTypes:
         """Test that complex fields (like strategies) are marked as object."""
         field_types = _get_field_types()
         assert field_types["load_strategy"] is object
+
+    def test_list_fields(self):
+        """Test that list fields are correctly identified."""
+        field_types = _get_field_types()
+        assert field_types["include_patterns"] is list
+        assert field_types["exclude_patterns"] is list
 
 
 class TestLoadConfig:
@@ -1254,6 +1335,52 @@ class TestShmConfigFields:
         assert config.shm_enabled is True
         assert config.shm_namespace == "my_model"
         assert config.shm_wait_timeout == 300.0
+
+
+class TestModulePatternsDeprecation:
+    """Tests for deprecated module_patterns → include_patterns migration."""
+
+    def test_module_patterns_maps_to_include_patterns(self):
+        """Passing module_patterns sets include_patterns with a deprecation warning."""
+        with pytest.warns(DeprecationWarning, match="module_patterns"):
+            config = OffloadConfig(module_patterns=["layers.*", "head"])
+        assert config.include_patterns == ["layers.*", "head"]
+        assert config.module_patterns == ["layers.*", "head"]
+
+    def test_both_patterns_raises_value_error(self):
+        """Passing both module_patterns and include_patterns raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot set both"):
+            OffloadConfig(include_patterns=["layers.*"], module_patterns=["head"])
+
+    def test_include_patterns_no_warning(self):
+        """Using include_patterns directly emits no deprecation warning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = OffloadConfig(include_patterns=["layers.*"])
+        assert config.include_patterns == ["layers.*"]
+        assert not any("module_patterns" in str(warning.message) for warning in w)
+
+    def test_module_patterns_env_var(self, monkeypatch):
+        """FT_MODULE_PATTERNS env var maps to include_patterns with a warning."""
+        monkeypatch.setenv("FT_MODULE_PATTERNS", "layers.*,head")
+        with pytest.warns(DeprecationWarning, match="module_patterns"):
+            config = load_config_from_env()
+        assert config.include_patterns == ["layers.*", "head"]
+
+    def test_both_env_patterns_raises_value_error(self, monkeypatch):
+        """Setting both FT_MODULE_PATTERNS and FT_INCLUDE_PATTERNS raises ValueError."""
+        monkeypatch.setenv("FT_MODULE_PATTERNS", "old_pattern")
+        monkeypatch.setenv("FT_INCLUDE_PATTERNS", "layers.*")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config_from_env()
+
+    def test_module_patterns_none_no_warning(self):
+        """Passing module_patterns=None should not emit a warning or break validation."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = OffloadConfig(module_patterns=None)
+        assert config.include_patterns == ["*"]
+        assert not any("module_patterns" in str(warning.message) for warning in w)
 
 
 class TestRemovedFieldsRejection:

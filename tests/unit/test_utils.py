@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from flextensor.utils import atomic_write_json, calculate_tensor_size
+from flextensor.utils import atomic_write_json, calculate_tensor_size, matches_any_pattern
 
 
 class TestAtomicWriteJson:
@@ -233,3 +233,106 @@ class TestCalculateTensorSize:
 
         expected_size = 1024 * 1024 * 1024 * 4  # 4GB in bytes
         assert size_bytes == expected_size
+
+
+class TestMatchesAnyPattern:
+    """Test cases for matches_any_pattern function."""
+
+    # --- recursive_star=False (include patterns) ---
+
+    def test_exact_match(self):
+        """Test exact segment matching."""
+        assert matches_any_pattern("layers", ["layers"], recursive_star=False)
+
+    def test_exact_match_multi_segment(self):
+        """Test exact multi-segment matching."""
+        assert matches_any_pattern("layers.0", ["layers.0"], recursive_star=False)
+
+    def test_single_star_matches_one_segment(self):
+        """Test that * matches exactly one segment when recursive_star=False."""
+        assert matches_any_pattern("layers.0", ["layers.*"], recursive_star=False)
+        assert matches_any_pattern("layers.1", ["layers.*"], recursive_star=False)
+
+    def test_single_star_does_not_match_nested(self):
+        """Test that * does not match nested segments when recursive_star=False."""
+        assert not matches_any_pattern("layers.0.attn", ["layers.*"], recursive_star=False)
+
+    def test_standalone_star_matches_single_segment(self):
+        """Test that standalone * matches single segment when recursive_star=False."""
+        assert matches_any_pattern("layers", ["*"], recursive_star=False)
+        assert matches_any_pattern("norm", ["*"], recursive_star=False)
+
+    def test_standalone_star_no_nested(self):
+        """Test that standalone * does not match nested paths when recursive_star=False."""
+        assert not matches_any_pattern("layers.0", ["*"], recursive_star=False)
+
+    def test_intra_segment_wildcard(self):
+        """Test wildcard within segment (e.g., layer_*)."""
+        assert matches_any_pattern("layer_0", ["layer_*"], recursive_star=False)
+        assert matches_any_pattern("layer_abc", ["layer_*"], recursive_star=False)
+        assert not matches_any_pattern("other", ["layer_*"], recursive_star=False)
+
+    def test_question_mark_wildcard(self):
+        """Test ? matches exactly one character."""
+        assert matches_any_pattern("layer0", ["layer?"], recursive_star=False)
+        assert not matches_any_pattern("layer01", ["layer?"], recursive_star=False)
+
+    def test_no_match(self):
+        """Test when no patterns match."""
+        assert not matches_any_pattern("head", ["layers.*"], recursive_star=False)
+
+    def test_multiple_patterns(self):
+        """Test matching against multiple patterns."""
+        patterns = ["layers.*", "head", "norm"]
+        assert matches_any_pattern("layers.0", patterns, recursive_star=False)
+        assert matches_any_pattern("head", patterns, recursive_star=False)
+        assert matches_any_pattern("norm", patterns, recursive_star=False)
+        assert not matches_any_pattern("embed", patterns, recursive_star=False)
+
+    def test_empty_patterns_no_match(self):
+        """Test that empty patterns list matches nothing."""
+        assert not matches_any_pattern("anything", [])
+
+    # --- recursive_star=True (exclude patterns) ---
+
+    def test_recursive_star_matches_descendants(self):
+        """Test that * matches 1+ segments when recursive_star=True."""
+        assert matches_any_pattern("foo.bar", ["foo.*"])
+        assert matches_any_pattern("foo.bar.baz", ["foo.*"])
+        assert matches_any_pattern("foo.bar.baz.weight", ["foo.*"])
+
+    def test_recursive_star_weight_suffix(self):
+        """Test *.weight matches any path ending in weight."""
+        assert matches_any_pattern("lm_head.weight", ["*.weight"])
+        assert matches_any_pattern("layers.0.self_attn.q_proj.weight", ["*.weight"])
+
+    def test_recursive_standalone_star_matches_anything(self):
+        """Test that standalone * matches any path with recursive_star=True."""
+        assert matches_any_pattern("layers", ["*"])
+        assert matches_any_pattern("layers.0", ["*"])
+        assert matches_any_pattern("a.b.c.d", ["*"])
+
+    def test_recursive_star_must_match_at_least_one(self):
+        """Test that recursive * matches at least 1 segment."""
+        # foo.* requires at least foo + one more segment
+        assert not matches_any_pattern("foo", ["foo.*"])
+
+    def test_recursive_exact_match(self):
+        """Test exact match with recursive_star=True."""
+        assert matches_any_pattern("lm_head", ["lm_head"])
+        assert not matches_any_pattern("lm_head.weight", ["lm_head"])
+
+    def test_recursive_specific_layer(self):
+        """Test specific layer match."""
+        assert matches_any_pattern("layers.31", ["layers.31"])
+        assert not matches_any_pattern("layers.30", ["layers.31"])
+
+    def test_edge_case_empty_path(self):
+        """Test empty path — split("") gives [""] which * matches as one segment."""
+        # In practice, empty paths don't occur (root module is skipped in offload_modules)
+        assert matches_any_pattern("", ["*"])
+
+    def test_intra_segment_wildcard_in_multi_segment(self):
+        """Test intra-segment wildcard in multi-segment pattern."""
+        assert matches_any_pattern("layers.0.self_attn", ["layers.*.self_attn"], recursive_star=False)
+        assert not matches_any_pattern("layers.0.ffn", ["layers.*.self_attn"], recursive_star=False)

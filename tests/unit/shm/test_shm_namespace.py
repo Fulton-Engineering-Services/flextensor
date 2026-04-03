@@ -23,7 +23,7 @@ class TestComputeShmNamespace:
 
     def test_deterministic_same_inputs(self):
         """Same inputs produce same namespace."""
-        config = OffloadConfig(module_patterns=["layers.*"])
+        config = OffloadConfig(include_patterns=["layers.*"])
         ns1 = compute_shm_namespace("/models/qwen", config)
         ns2 = compute_shm_namespace("/models/qwen", config)
         assert ns1 == ns2
@@ -37,8 +37,24 @@ class TestComputeShmNamespace:
 
     def test_different_config_different_namespace(self):
         """Different config fields produce different namespaces."""
-        c1 = OffloadConfig(module_patterns=["layers.*"])
-        c2 = OffloadConfig(module_patterns=["attention.*"])
+        c1 = OffloadConfig(include_patterns=["layers.*"])
+        c2 = OffloadConfig(include_patterns=["attention.*"])
+        ns1 = compute_shm_namespace("/models/qwen", c1)
+        ns2 = compute_shm_namespace("/models/qwen", c2)
+        assert ns1 != ns2
+
+    def test_different_exclude_patterns_different_namespace(self):
+        """Different exclude_patterns produce different namespaces."""
+        c1 = OffloadConfig(include_patterns=["*"], exclude_patterns=["lm_head"])
+        c2 = OffloadConfig(include_patterns=["*"], exclude_patterns=["lm_head", "*.norm"])
+        ns1 = compute_shm_namespace("/models/qwen", c1)
+        ns2 = compute_shm_namespace("/models/qwen", c2)
+        assert ns1 != ns2
+
+    def test_empty_exclude_patterns_differs_from_nonempty(self):
+        """Empty exclude_patterns produces a different namespace than non-empty."""
+        c1 = OffloadConfig(include_patterns=["*"], exclude_patterns=[])
+        c2 = OffloadConfig(include_patterns=["*"], exclude_patterns=["lm_head"])
         ns1 = compute_shm_namespace("/models/qwen", c1)
         ns2 = compute_shm_namespace("/models/qwen", c2)
         assert ns1 != ns2

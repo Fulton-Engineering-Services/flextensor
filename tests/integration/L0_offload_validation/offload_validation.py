@@ -827,7 +827,7 @@ class OffloadManagerExperiment:
         # transitions, so multiply by feedback_iters to account for the inner
         # feedback loop within each logical iteration.
         offload_config = OffloadConfig(
-            module_patterns=self.MODULE_PATTERNS,
+            include_patterns=self.MODULE_PATTERNS,
             warmup_iters=self.WARMUP_ITERS * feedback_iters,
             profile_iters=self.PROFILE_ITERS * feedback_iters,
             transfer_mode=self.config.transfer_mode,

@@ -14,8 +14,13 @@ from flextensor.config import OffloadConfig  # noqa: TC001
 from flextensor.offload_manager import DEFAULT_MANAGER_NAME
 from flextensor.utils import resolve_gpu_mem_bytes
 
-SHM_PROTOCOL_VERSION: int = 1
-"""Bumped when SHM data layout changes in incompatible ways."""
+SHM_PROTOCOL_VERSION: int = 2
+"""Bumped when SHM data layout changes in incompatible ways.
+
+History:
+    v2: namespace hash keys changed (module_patterns → include_patterns, added exclude_patterns).
+    v1: initial release.
+"""
 
 
 def compute_shm_namespace(
@@ -45,7 +50,8 @@ def compute_shm_namespace(
 
     hash_input: dict[str, Any] = {
         "model_path": str(pathlib.Path(model_path).resolve()),
-        "module_patterns": sorted(config.module_patterns),
+        "include_patterns": sorted(config.include_patterns),
+        "exclude_patterns": sorted(config.exclude_patterns),
         "max_gpu_mem_bytes": resolved_bytes,
         "manager_name": manager_name,
     }

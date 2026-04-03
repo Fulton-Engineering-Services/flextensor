@@ -8,6 +8,7 @@ from flextensor.collectors import IterativeLayerStatistics
 from flextensor.tensor_discovery import (
     ModuleTracker,
     discover_untraced_tensors_for_layers,
+    get_excluded_tensor_ids,
     get_offload_module_tensor_ids,
     get_offload_name,
     has_offload_modules,
@@ -426,3 +427,232 @@ def test_discover_preserves_original_tensors():
     layer1_param_ids = {id(p) for p in model.layer1.parameters()}
     assert manually_traced_id in result[0].tensor_ids
     assert result[0].tensor_ids == layer1_param_ids
+
+
+# =============================================================================
+# Tests for exclude_patterns in get_offload_module_tensor_ids
+# =============================================================================
+
+
+def test_get_offload_module_tensor_ids_with_exclude_patterns():
+    """Test that exclude_patterns filters out matching parameters."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Patch layer1
+    model.layer1._ft_original_forward_func = model.layer1.forward
+    model.layer1._ft_offload_name = "SimpleModel.layer1"
+
+    # Exclude all weight parameters
+    result = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=["*.weight"])
+
+    assert "SimpleModel.layer1" in result
+    # Only bias should remain (weight is excluded)
+    assert len(result["SimpleModel.layer1"]) == 1
+    assert id(model.layer1.bias) in result["SimpleModel.layer1"]
+    assert id(model.layer1.weight) not in result["SimpleModel.layer1"]
+
+
+def test_get_offload_module_tensor_ids_exclude_specific_param():
+    """Test excluding a specific parameter by full path."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Patch layer1
+    model.layer1._ft_original_forward_func = model.layer1.forward
+    model.layer1._ft_offload_name = "SimpleModel.layer1"
+
+    # Exclude only layer1's bias
+    result = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=["layer1.bias"])
+
+    assert "SimpleModel.layer1" in result
+    # Only weight should remain (bias is excluded)
+    assert len(result["SimpleModel.layer1"]) == 1
+    assert id(model.layer1.weight) in result["SimpleModel.layer1"]
+    assert id(model.layer1.bias) not in result["SimpleModel.layer1"]
+
+
+def test_get_offload_module_tensor_ids_empty_exclude():
+    """Test that empty exclude_patterns changes nothing."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Patch layer1
+    model.layer1._ft_original_forward_func = model.layer1.forward
+    model.layer1._ft_offload_name = "SimpleModel.layer1"
+
+    result = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=[])
+
+    assert "SimpleModel.layer1" in result
+    assert len(result["SimpleModel.layer1"]) == 2
+
+
+# =============================================================================
+# Tests for module-level exclude within offload units
+# =============================================================================
+
+
+class BarModule(torch.nn.Module):
+    """Sub-module with weight and bias."""
+
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(10, 10)
+
+    def forward(self, x):
+        return self.linear(x)
+
+
+class InnerLayer(torch.nn.Module):
+    """Layer containing a bar sub-module and a norm."""
+
+    def __init__(self):
+        super().__init__()
+        self.bar = BarModule()
+        self.norm = torch.nn.LayerNorm(10)
+
+    def forward(self, x):
+        return self.norm(self.bar(x))
+
+
+class NestedOffloadModel(torch.nn.Module):
+    """Model with nested structure for testing module-level exclude within offload units."""
+
+    def __init__(self):
+        super().__init__()
+        self.foo = torch.nn.ModuleDict({
+            "layers": torch.nn.ModuleList([InnerLayer(), InnerLayer()]),
+        })
+
+    def forward(self, x):
+        for layer in self.foo["layers"]:
+            x = layer(x)
+        return x
+
+
+def test_exclude_module_within_offload_unit():
+    """Excluding a sub-module path within an offload unit removes its parameters."""
+    model = NestedOffloadModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Patch foo.layers.0 as an offload unit
+    layer0 = model.foo["layers"][0]
+    layer0._ft_original_forward_func = type(layer0).forward
+    layer0._ft_offload_name = "ModuleList.0"
+
+    # Exclude the bar sub-module within the offload unit
+    result = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=["foo.layers.0.bar"])
+
+    assert "ModuleList.0" in result
+    # bar's parameters (linear.weight, linear.bias) should be excluded
+    bar_param_ids = {id(p) for p in layer0.bar.parameters()}
+    for pid in bar_param_ids:
+        assert pid not in result["ModuleList.0"]
+
+    # norm's parameters should still be included
+    norm_param_ids = {id(p) for p in layer0.norm.parameters()}
+    for pid in norm_param_ids:
+        if pid in tensors_map:
+            assert pid in result["ModuleList.0"]
+
+
+def test_exclude_module_cascades_to_parameters():
+    """Excluding a module path excludes ALL its parameters (weight, bias, etc.)."""
+    model = NestedOffloadModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Patch foo.layers.0 as an offload unit
+    layer0 = model.foo["layers"][0]
+    layer0._ft_original_forward_func = type(layer0).forward
+    layer0._ft_offload_name = "ModuleList.0"
+
+    # Exclude with a wildcard pattern that matches bar sub-modules in all layers
+    result = get_offload_module_tensor_ids(model, tensors_map, exclude_patterns=["foo.layers.*.bar"])
+
+    assert "ModuleList.0" in result
+    # bar's parameters should be excluded (both weight and bias of bar.linear)
+    bar_param_ids = {id(p) for p in layer0.bar.parameters()}
+    for pid in bar_param_ids:
+        assert pid not in result["ModuleList.0"]
+
+    # norm's parameters should still be present
+    norm_param_ids = {id(p) for p in layer0.norm.parameters()}
+    for pid in norm_param_ids:
+        if pid in tensors_map:
+            assert pid in result["ModuleList.0"]
+
+
+# =============================================================================
+# Tests for get_excluded_tensor_ids
+# =============================================================================
+
+
+def test_get_excluded_tensor_ids_basic_match():
+    """Test that get_excluded_tensor_ids returns IDs of matching parameters."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    # Exclude all weight parameters
+    excluded = get_excluded_tensor_ids(model, tensors_map, exclude_patterns=["*.weight"])
+
+    # Should contain weight IDs for all 3 layers
+    expected = {id(model.layer1.weight), id(model.layer2.weight), id(model.layer3.weight)}
+    assert excluded == expected
+
+
+def test_get_excluded_tensor_ids_empty_patterns():
+    """Test that empty patterns return empty set."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    assert get_excluded_tensor_ids(model, tensors_map, exclude_patterns=[]) == set()
+    assert get_excluded_tensor_ids(model, tensors_map, exclude_patterns=None) == set()
+
+
+def test_get_excluded_tensor_ids_no_match():
+    """Test that non-matching patterns return empty set."""
+    model = SimpleModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    excluded = get_excluded_tensor_ids(model, tensors_map, exclude_patterns=["nonexistent.*"])
+    assert excluded == set()
+
+
+def test_get_excluded_tensor_ids_dict_model():
+    """Test that dict models support exclude patterns via dict keys."""
+    t1 = torch.randn(10)
+    t2 = torch.randn(10)
+    t3 = torch.randn(10)
+    model_dict = {
+        "layers.0.attention.wq.weight": t1,
+        "layers.0.attention.wk.weight": t2,
+        "norm.weight": t3,
+    }
+    tensors_map = {id(t1): t1, id(t2): t2, id(t3): t3}
+
+    excluded = get_excluded_tensor_ids(model_dict, tensors_map, exclude_patterns=["norm.*"])
+    assert excluded == {id(t3)}
+
+    excluded_all = get_excluded_tensor_ids(model_dict, tensors_map, exclude_patterns=["*"])
+    assert excluded_all == {id(t1), id(t2), id(t3)}
+
+    excluded_none = get_excluded_tensor_ids(model_dict, tensors_map, exclude_patterns=["nonexistent"])
+    assert excluded_none == set()
+
+
+def test_get_excluded_tensor_ids_none_model():
+    """Test that None model returns empty set."""
+    excluded = get_excluded_tensor_ids(None, {}, exclude_patterns=["*"])
+    assert excluded == set()
+
+
+def test_get_excluded_tensor_ids_only_returns_ids_in_tensors_map():
+    """Test that only IDs present in tensors_map are returned."""
+    model = SimpleModel()
+    # Only include layer1's weight in tensors_map
+    tensors_map = {id(model.layer1.weight): model.layer1.weight}
+
+    excluded = get_excluded_tensor_ids(model, tensors_map, exclude_patterns=["*.weight"])
+
+    # Only layer1.weight should be returned (others not in tensors_map)
+    assert excluded == {id(model.layer1.weight)}

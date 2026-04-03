@@ -53,7 +53,7 @@ def main():
     offload_config = OffloadConfig(
         profile_iters=20,
         min_blocks=2,
-        module_patterns=MODULE_PATTERNS,
+        include_patterns=MODULE_PATTERNS,
     )
 
     pipe.transformer = flextensor.offload(pipe.transformer, config=offload_config, name="transformer")

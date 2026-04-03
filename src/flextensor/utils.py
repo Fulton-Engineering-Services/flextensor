@@ -4,6 +4,7 @@
 import json
 import logging
 import pathlib
+import re
 import tempfile
 from typing import Any
 
@@ -17,8 +18,65 @@ __all__ = [
     "clear_and_delete_tensor",
     "delete_tensor",
     "is_dense_layout",
+    "matches_any_pattern",
     "resolve_gpu_mem_bytes",
 ]
+
+
+def matches_any_pattern(path: str, patterns: list[str], *, recursive_star: bool = True) -> bool:
+    """Check if a dot-separated path matches any wildcard pattern.
+
+    Args:
+        path: Dot-separated path (e.g., "layers.0.self_attn").
+        patterns: List of patterns to match against.
+        recursive_star: If True, standalone ``*`` matches 1+ segments.
+            If False, standalone ``*`` matches exactly 1 segment.
+
+    Returns:
+        True if the path matches any of the patterns.
+    """
+    path_parts = path.split(".")
+    regex_cache: dict[str, re.Pattern[str]] = {}
+    for pattern in patterns:
+        pattern_parts = pattern.split(".")
+        for pp in pattern_parts:
+            if pp not in regex_cache:
+                regex_cache[pp] = re.compile(re.escape(pp).replace(r"\*", ".*").replace(r"\?", "."))
+        if _match_parts(path_parts, pattern_parts, regex_cache, recursive_star):
+            return True
+    return False
+
+
+def _match_parts(
+    path_parts: list[str],
+    pattern_parts: list[str],
+    regex_cache: dict[str, re.Pattern[str]],
+    recursive_star: bool,
+) -> bool:
+    """Recursive segment matcher.
+
+    Args:
+        path_parts: Remaining path segments.
+        pattern_parts: Remaining pattern segments.
+        regex_cache: Map from pattern segment to pre-compiled regex.
+        recursive_star: If True, standalone ``*`` matches 1+ segments.
+    """
+    if not pattern_parts:
+        return not path_parts
+    if not path_parts:
+        return False
+
+    pp = pattern_parts[0]
+    if pp == "*" and recursive_star:
+        # Standalone * matches 1 or more path segments
+        return any(
+            _match_parts(path_parts[i + 1 :], pattern_parts[1:], regex_cache, recursive_star)
+            for i in range(len(path_parts))
+        )
+    else:
+        if regex_cache[pp].fullmatch(path_parts[0]):
+            return _match_parts(path_parts[1:], pattern_parts[1:], regex_cache, recursive_star)
+        return False
 
 
 def resolve_gpu_mem_bytes(config, *, context: str = "") -> int | None:

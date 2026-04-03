@@ -47,10 +47,10 @@ FlexTensor then streams transformer weights block-by-block to the GPU during for
 
 ### Module Patterns
 
-The `module_patterns` list controls which submodules are individually offloaded:
+The `include_patterns` list controls which submodules are individually offloaded:
 
 ```python
-module_patterns = [
+include_patterns = [
     "rope",
     "patch_embedding",
     "condition_embedder",
@@ -70,7 +70,7 @@ Key `OffloadConfig` parameters used in this example:
 |-----------|-------|-------------|
 | `profile_iters` | `20` | Number of diffusion steps used for profiling |
 | `min_blocks` | `2` | Minimum number of blocks to keep on GPU (default is `4`; diffusion models are compute-heavy, so transfers easily hide behind computation — lowering to `2` saves GPU memory with minimal performance impact) |
-| `module_patterns` | see above | Submodule patterns to offload |
+| `include_patterns` | see above | Submodule patterns to offload |
 
 For the full list of configuration options, see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
 

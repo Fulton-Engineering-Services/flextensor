@@ -32,8 +32,8 @@ _BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elap
 # Default module patterns for per-layer offloading in decoder-only transformer models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to
 # overlap CPU→GPU transfers with GPU compute for subsequent layers.
-# Override via FT_MODULE_PATTERNS env var or OffloadConfig(module_patterns=[...]).
-VLLM_DEFAULT_MODULE_PATTERNS: list[str] = [
+# Override via FT_INCLUDE_PATTERNS env var or OffloadConfig(include_patterns=[...]).
+VLLM_DEFAULT_INCLUDE_PATTERNS: list[str] = [
     "model.embed_tokens",
     "model.layers.*",
     "model.norm",
@@ -114,8 +114,8 @@ class FlexTensorOffloadWorker(Worker):
             "warmup_iters": max(offload_config.warmup_iters, 3),
             "profile_iters": max(offload_config.profile_iters, 2),
         }
-        if offload_config.module_patterns == ["*"]:
-            config_updates["module_patterns"] = VLLM_DEFAULT_MODULE_PATTERNS
+        if offload_config.include_patterns == ["*"]:
+            config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
         self._offload_config = offload_config.model_copy(update=config_updates)
         if self._offload_config.enabled:
             LOGGER.info("FlexTensor offloading enabled with config: %s", self._offload_config)

@@ -29,7 +29,7 @@ class GPUMemoryUsage:
         >>> import flextensor
         >>> from flextensor import OffloadConfig
         >>> om = flextensor.get_offload_manager()
-        >>> config = OffloadConfig(module_patterns=["layers.*"])
+        >>> config = OffloadConfig(include_patterns=["layers.*"])
         >>> model = om.offload(model, config=config)
         >>> # Run warmup and profile iterations...
         >>> for _ in range(config.all_warmup_iters):

@@ -34,11 +34,13 @@ nav:
       - Installation: installation.md
   - Understand:
       - Configuration: explanation/configuration.md
+      - Pattern Matching: explanation/pattern-matching.md
       - Internal States: explanation/states.md
       - Tensor Discovery: explanation/tensor-discovery.md
   - Guides:
       - Troubleshooting: how-to/troubleshooting.md
       - Configure for Common Scenarios: how-to/configure-for-common-scenarios.md
+      - Exclude Patterns: how-to/exclude-patterns.md
   - Reference:
       - Overview: api/index.md
       - Glossary: api/glossary.md

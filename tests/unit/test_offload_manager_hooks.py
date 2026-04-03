@@ -295,8 +295,8 @@ class TestActivationCapture:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        # Use empty module_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, module_patterns=[])
+        # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
+        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, include_patterns=[])
 
         proxy_model = om.offload(model, config=config)
 
@@ -438,8 +438,8 @@ class TestGradientManipulation:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        # Use empty module_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, module_patterns=[])
+        # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
+        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, include_patterns=[])
 
         proxy_model = om.offload(model, config=config)
 

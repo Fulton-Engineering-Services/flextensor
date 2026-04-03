@@ -31,7 +31,7 @@ config = OffloadConfig(
     gpu_device=0,
     warmup_iters=1,
     profile_iters=10,
-    module_patterns=["embed", "layers.*", "head"],
+    include_patterns=["embed", "layers.*", "head"],
 )
 
 # Patch model - no code changes needed

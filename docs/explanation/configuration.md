@@ -134,31 +134,41 @@ config = load_config(
 |--------|------|---------|-------------|
 | `enabled` | bool | `True` | Master switch for offloading |
 | `gpu_device` | int | `0` | GPU device index to use |
-| `module_patterns` | list[str] | `["*"]` | Module path patterns to offload (supports `*` and `?` wildcards). Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
+| `include_patterns` | list[str] | `["*"]` | Module path patterns to include for offloading (supports `*` and `?` wildcards). Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
+| `exclude_patterns` | list[str] | `[]` | Module/parameter path patterns to exclude from offloading (supports wildcards). Applied after `include_patterns`. |
 
-#### Module Patterns
+#### Include / Exclude Patterns
 
-The `module_patterns` option specifies which modules in the model to offload. Patterns support `*` (match any sequence) and `?` (match a single character) wildcards:
+The `include_patterns` option specifies which modules in the model to offload. Patterns support `*` (match any sequence) and `?` (match a single character) wildcards:
 
 ```python
 config = OffloadConfig(
-    module_patterns=["layers.*", "embed", "head"],
+    include_patterns=["layers.*", "embed", "head"],
 )
 model = offload(model, config=config)
 ```
 
-Patterns can also be set via environment variable as a comma-separated list:
+To exclude specific modules or parameters, use `exclude_patterns`:
+
+```python
+config = OffloadConfig(
+    include_patterns=["layers.*", "embed", "head"],
+    exclude_patterns=["head", "*.norm"],
+)
+```
+
+Patterns can also be set via environment variables as comma-separated lists:
 
 ```bash
-FT_MODULE_PATTERNS="layers.*,embed,head" python my_script.py
+FT_INCLUDE_PATTERNS="layers.*,embed,head" FT_EXCLUDE_PATTERNS="head,*.norm" python my_script.py
 ```
 
 !!! tip "vLLM worker default patterns"
-    The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_MODULE_PATTERNS` is set. They are designed for decoder-only transformer layouts as served by vLLM:
+    The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_INCLUDE_PATTERNS` is set. They are designed for decoder-only transformer layouts as served by vLLM:
 
     ```python
     config = OffloadConfig(
-        module_patterns=[
+        include_patterns=[
             "model.embed_tokens",
             "model.layers.*",
             "model.norm",
