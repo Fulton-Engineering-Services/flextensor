@@ -34,17 +34,17 @@ _MODULE_PATTERNS_MSG = "`module_patterns` is deprecated. Use `include_patterns` 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
 _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
-    "release_tensors": ("v0.1.1", "GPU tensors are now always released after layer execution."),
-    "enable_direct_mode": ("v0.1.1", "Direct mode is now always enabled."),
-    "enable_tracing": ("v0.1.1", "Use TensorManager(_use_trace_tensor=True) for tracing."),
-    "rearrange_transfers": ("v0.1.1", "Transfer rearrangement is now auto-enabled when gap layers are detected."),
-    "compute_transfer_gap": ("v0.1.1", "Use TensorManager(_compute_transfer_gap=N) to override."),
+    "release_tensors": ("v0.2.0", "GPU tensors are now always released after layer execution."),
+    "enable_direct_mode": ("v0.2.0", "Direct mode is now always enabled."),
+    "enable_tracing": ("v0.2.0", "Use TensorManager(_use_trace_tensor=True) for tracing."),
+    "rearrange_transfers": ("v0.2.0", "Transfer rearrangement is now auto-enabled when gap layers are detected."),
+    "compute_transfer_gap": ("v0.2.0", "Use TensorManager(_compute_transfer_gap=N) to override."),
     "enable_untraced_tensor_discovery": (
-        "v0.1.1",
+        "v0.2.0",
         "Untraced tensor discovery is now always enabled."
         " Use TensorManager(_enable_untraced_tensor_discovery=False) to override.",
     ),
-    "enable_module_tracker": ("v0.1.1", "ModuleTracker is now always enabled for manual traps."),
+    "enable_module_tracker": ("v0.2.0", "ModuleTracker is now always enabled for manual traps."),
 }
 
 
@@ -204,7 +204,7 @@ class OffloadConfig(BaseModel):
     )
     """Module path patterns to include for offloading.
 
-    .. deprecated:: v0.1.1
+    .. deprecated:: v0.2.0
         Use :attr:`include_patterns` instead. Will be removed in v0.3.
     """
 

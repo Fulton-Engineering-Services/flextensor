@@ -1462,7 +1462,7 @@ class TestRemovedFieldsRejection:
     @pytest.mark.parametrize("field", _REMOVED)
     def test_constructor_rejects_removed_field(self, field):
         """Passing a removed field to OffloadConfig() raises ValueError."""
-        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.2.0"):
             OffloadConfig(**{field: False})
 
     @pytest.mark.parametrize("field", _REMOVED)
@@ -1479,7 +1479,7 @@ class TestRemovedFieldsRejection:
         """Removed field in an INI config file raises ValueError."""
         config_file = tmp_path / "test.conf"
         config_file.write_text(f"[flextensor]\n{field} = false\n")
-        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.2.0"):
             load_config_from_file(config_file)
 
     @pytest.mark.parametrize("field", _REMOVED)
@@ -1489,7 +1489,7 @@ class TestRemovedFieldsRejection:
 
         config_file = tmp_path / "test.json"
         config_file.write_text(json.dumps({field: False}))
-        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.1.1"):
+        with pytest.raises(ValidationError, match=f"'{field}' was removed in v0.2.0"):
             load_config_from_file(config_file)
 
     def test_pinned_memory_not_rejected(self):
