@@ -134,9 +134,9 @@ class TestForwardPatching:
         state_dict_after = model.state_dict()
         assert set(state_dict_before.keys()) == set(state_dict_after.keys())
 
-        # Values should match
+        # Values should match (offload may move tensors to CUDA, so compare on CPU)
         for key in state_dict_before:
-            assert torch.equal(state_dict_before[key], state_dict_after[key])
+            assert torch.equal(state_dict_before[key].cpu(), state_dict_after[key].cpu())
 
         om.release()
 
@@ -289,6 +289,71 @@ class NestedModel(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.head(x)
+
+
+class WrappedNestedModel(nn.Module):
+    """Wrapper-shaped model (e.g., model.layers.0.attn...) for regression testing."""
+
+    def __init__(self, num_layers: int = 2, dim: int = 10):
+        super().__init__()
+        self.model = NestedModel(num_layers, dim)
+
+    def forward(self, x):
+        return self.model(x)
+
+
+class LayerWithDirectParam(nn.Module):
+    """Layer with both a direct parameter and a child module owning parameters."""
+
+    def __init__(self, dim: int = 10):
+        super().__init__()
+        self.x = nn.Parameter(torch.randn(dim))
+        self.linear = nn.Linear(dim, dim)
+
+    def forward(self, inp):
+        return self.linear(inp) + self.x
+
+
+class ModelWithDirectParams(nn.Module):
+    """Model whose layers have both direct parameters and child modules."""
+
+    def __init__(self, num_layers: int = 2, dim: int = 10):
+        super().__init__()
+        self.layers = nn.ModuleList([LayerWithDirectParam(dim) for _ in range(num_layers)])
+
+    def forward(self, inp):
+        for layer in self.layers:
+            inp = layer(inp)
+        return inp
+
+
+class LinearWithScale(nn.Module):
+    """Linear layer mimicking the DeepSeek-V3 inner-field pattern.
+
+    ``self.weight.scale = self.scale = nn.Parameter(...)`` creates a tensor
+    attribute on weight that aliases a module parameter.
+    """
+
+    def __init__(self, dim: int = 10):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim, dim))
+        self.weight.scale = self.scale = nn.Parameter(torch.randn(dim))
+
+    def forward(self, x):
+        return torch.nn.functional.linear(x, self.weight)
+
+
+class ModelWithInnerFieldLayers(nn.Module):
+    """Model with indexed LinearWithScale layers (DeepSeek-V3 pattern)."""
+
+    def __init__(self, num_layers: int = 2, dim: int = 10):
+        super().__init__()
+        self.layers = nn.ModuleList([LinearWithScale(dim) for _ in range(num_layers)])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
 
 
 # =============================================================================
@@ -519,6 +584,284 @@ class TestPatternMatchWarnings:
         assert not any("layers.*" in m for m in caplog.messages)
         om.release()
 
+    def test_deep_param_pattern_no_false_warning(self, caplog):
+        """A pattern like layers.*.weight should not warn when it matches deep params via recursive_star.
+
+        NestedModel has parameters like layers.0.attn.q_proj.weight — with
+        recursive_star=True the pattern layers.*.weight matches these, so the
+        validation pass must not emit "did not match" warnings.
+        """
+        model = NestedModel()
+        om = OffloadManager("test_deep_param_no_warn")
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._offload_modules(model, ["layers.*.weight"])
+
+        assert not any("did not match" in m for m in caplog.messages)
+        om.release()
+
+    def test_star_weight_no_false_warning(self, caplog):
+        """*.weight must not warn on a wrapper model where it matches deep params.
+
+        Exercises the interaction of both fixes: param_recursive_star=True
+        in _find_matched_patterns and the per-parameter fallback in
+        _derive_module_patterns.
+        """
+        model = WrappedNestedModel()
+        om = OffloadManager("test_star_weight_no_warn")
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._offload_modules(model, ["*.weight"])
+
+        assert not any("did not match" in m for m in caplog.messages)
+        om.release()
+
+
+# =============================================================================
+# Tests for _derive_module_patterns and parameter-level include patterns
+# =============================================================================
+
+
+class TestDeriveModulePatterns:
+    """Tests for _derive_module_patterns() auto-truncation logic."""
+
+    def test_module_level_pattern_unchanged(self):
+        """A pattern matching a module directly is preserved."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = ModelWithLayers()
+        result = _derive_module_patterns(["layer1"], get_module_paths(model))
+        assert "layer1" in result
+
+    def test_wildcard_module_pattern_unchanged(self):
+        """Wildcard module-level pattern is kept as-is."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        result = _derive_module_patterns(["layers.*"], get_module_paths(model))
+        assert "layers.*" in result
+
+    def test_param_pattern_derives_module(self):
+        """A parameter-level pattern derives the module-level prefix."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = ModelWithLayers()
+        result = _derive_module_patterns(["layer1.linear.weight"], get_module_paths(model))
+        assert "layer1.linear" in result or "layer1" in result
+
+    def test_wildcard_param_pattern_derives_module(self):
+        """layers.*.weight derives layers.* for module patching."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        result = _derive_module_patterns(["layers.*.weight"], get_module_paths(model))
+        assert "layers.*" in result
+
+    def test_star_pattern_unchanged(self):
+        """The catch-all '*' pattern is preserved."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = ModelWithLayers()
+        result = _derive_module_patterns(["*"], get_module_paths(model))
+        assert "*" in result
+
+    def test_deduplication(self):
+        """Multiple patterns deriving the same module produce a single entry."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        result = _derive_module_patterns(["layers.*.weight", "layers.*.bias"], get_module_paths(model))
+        assert result.count("layers.*") <= 1  # set-based, no duplicates
+
+    def test_star_weight_does_not_collapse_to_star(self):
+        """*.weight must not truncate to bare * on a wrapper model."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = WrappedNestedModel()
+        module_paths = get_module_paths(model)
+        result = _derive_module_patterns(["*.weight"], module_paths, model)
+        assert "*" not in result
+        assert len(result) > 1, "should derive multiple module-level targets, not a single catch-all"
+
+    def test_star_weight_derives_correct_param_owners(self):
+        """*.weight fallback must derive the exact modules that own weight parameters."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = WrappedNestedModel()
+        result = set(_derive_module_patterns(["*.weight"], get_module_paths(model), model))
+        expected = {
+            "model.layers.0.attn.q_proj",
+            "model.layers.0.attn.k_proj",
+            "model.layers.0.norm",
+            "model.layers.1.attn.q_proj",
+            "model.layers.1.attn.k_proj",
+            "model.layers.1.norm",
+            "model.head",
+        }
+        assert result == expected
+
+    def test_star_weight_flat_model_derives_linear_modules(self):
+        """*.weight on a flat model (ModelWithLayers) derives the Linear sub-modules."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = ModelWithLayers()
+        result = set(_derive_module_patterns(["*.weight"], get_module_paths(model), model))
+        assert "*" not in result
+        assert result == {"layer1.linear", "layer2.linear", "layer3.linear"}
+
+    def test_star_weight_without_model_gracefully_skips(self):
+        """*.weight without model arg falls through truncation and is skipped (no crash)."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = WrappedNestedModel()
+        result = _derive_module_patterns(["*.weight"], get_module_paths(model))
+        assert result == []
+
+    def test_mixed_truncation_and_fallback(self):
+        """Patterns that truncate fine and patterns that need fallback coexist."""
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = WrappedNestedModel()
+        module_paths = get_module_paths(model)
+        result = set(
+            _derive_module_patterns(
+                ["model.layers.*", "*.bias"],
+                module_paths,
+                model,
+            )
+        )
+        assert "model.layers.*" in result, "truncation-derived pattern should survive"
+        assert "*" not in result, "*.bias must not collapse to *"
+        assert "model.head" in result, "model.head owns bias params"
+
+
+class TestFindMatchedPatterns:
+    """Direct tests for _find_matched_patterns with split recursive_star."""
+
+    def test_param_recursive_star_finds_deep_params(self):
+        """param_recursive_star=True matches deep parameters that recursive_star=False misses."""
+        from flextensor.offload_manager import _find_matched_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        module_paths = get_module_paths(model)
+
+        without = _find_matched_patterns(
+            model,
+            ["layers.*.weight"],
+            module_paths,
+            recursive_star=False,
+            include_parameters=True,
+        )
+        with_param = _find_matched_patterns(
+            model,
+            ["layers.*.weight"],
+            module_paths,
+            recursive_star=False,
+            param_recursive_star=True,
+            include_parameters=True,
+        )
+        assert without == set(), "recursive_star=False should miss deep parameter paths"
+        assert with_param == {"layers.*.weight"}, "param_recursive_star=True should match"
+
+    def test_param_recursive_star_defaults_to_recursive_star(self):
+        """When param_recursive_star is not set, it falls back to recursive_star."""
+        from flextensor.offload_manager import _find_matched_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        module_paths = get_module_paths(model)
+
+        with_recursive = _find_matched_patterns(
+            model,
+            ["layers.*.weight"],
+            module_paths,
+            recursive_star=True,
+            include_parameters=True,
+        )
+        assert with_recursive == {"layers.*.weight"}, (
+            "recursive_star=True without param_recursive_star should match via fallback"
+        )
+
+    def test_module_matching_unaffected_by_param_recursive_star(self):
+        """param_recursive_star does not change module-level matching semantics."""
+        from flextensor.offload_manager import _find_matched_patterns
+        from flextensor.utils import get_module_paths
+
+        model = NestedModel()
+        module_paths = get_module_paths(model)
+
+        result = _find_matched_patterns(
+            model,
+            ["layers.*"],
+            module_paths,
+            recursive_star=False,
+            param_recursive_star=True,
+            include_parameters=True,
+        )
+        assert "layers.*" in result, "module-level pattern should still match"
+
+
+class TestParameterLevelIncludePatching:
+    """Tests that parameter-level include patterns correctly patch modules."""
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
+    def test_param_pattern_patches_parent_module(self):
+        """include_patterns=['layers.*.weight'] patches layers.0 and layers.1."""
+        model = NestedModel()
+        om = OffloadManager("test_param_patch")
+
+        om._offload_modules(model, ["layers.*.weight"])
+
+        assert hasattr(model.layers[0], "_ft_original_forward_func")
+        assert hasattr(model.layers[1], "_ft_original_forward_func")
+        om.release()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
+    def test_default_star_patches_all(self):
+        """Default ['*'] patches all modules (backward compat)."""
+        model = ModelWithLayers()
+        om = OffloadManager("test_default_star")
+
+        om._offload_modules(model, ["*"])
+
+        assert hasattr(model.layer1, "_ft_original_forward_func")
+        assert hasattr(model.layer2, "_ft_original_forward_func")
+        assert hasattr(model.layer3, "_ft_original_forward_func")
+        om.release()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
+    def test_star_weight_wrapper_model_not_single_unit(self):
+        """*.weight on a wrapper model must NOT collapse into one offload unit.
+
+        Regression: truncation used to derive bare ``*``, which patched the
+        wrapper's single top-level child (``model``) and the ancestor guard
+        suppressed everything else — creating one giant offload unit.
+        """
+        model = WrappedNestedModel()
+        om = OffloadManager("test_star_weight_wrapper")
+
+        om._offload_modules(model, ["*.weight"])
+
+        assert len(om._patched_modules) > 1, (
+            f"expected multiple offload units but got {len(om._patched_modules)}; pattern likely collapsed to '*'"
+        )
+        assert not hasattr(model.model, "_ft_original_forward_func"), (
+            "top-level wrapper child 'model' should not be patched as a single unit"
+        )
+        om.release()
+
 
 class TestAggregatePatternWarnings:
     """Test aggregate error/warning signals when offloading is effectively disabled."""
@@ -593,6 +936,249 @@ class TestAggregatePatternWarnings:
             om._exclude_modules(model, ["layers.0"])
 
         assert not any("All" in m and "removed by exclude_patterns" in m for m in caplog.messages)
+
+
+# =============================================================================
+# Offload label uniqueness and pattern merging tests
+# =============================================================================
+
+
+class TestOffloadLabelUniqueness:
+    """Verify offload label uniqueness and proper merging of derived patterns.
+
+    Scenario 1 demonstrates the naming bug: sibling leaf modules derived from
+    parameter-level patterns receive identical offload labels, merging their
+    profiler stats and loader schedules.
+
+    Scenarios 2 and 3 verify that the ancestor guard correctly merges
+    overlapping patterns and that mixing module- and parameter-level patterns
+    produces consistent patching.
+    """
+
+    def test_derived_leaf_modules_get_unique_labels(self):
+        """Scenario 1: *.weight on ModelWithLayers must produce unique labels.
+
+        _derive_module_patterns maps *.weight to {layer1.linear, layer2.linear,
+        layer3.linear}.  Using module_path as the label ensures each gets a
+        distinct name.
+        """
+        model = ModelWithLayers()
+        om = OffloadManager("test_label_unique")
+
+        om._offload_modules(model, ["*.weight"])
+
+        offload_names = [m._ft_offload_name for m in om._patched_modules]
+        assert len(offload_names) == 3, f"expected 3 patched modules, got {len(offload_names)}"
+        assert len(set(offload_names)) == len(offload_names), (
+            f"offload labels must be unique but got duplicates: {offload_names}"
+        )
+
+        om.release()
+
+    def test_overlapping_param_patterns_merge_to_ancestor(self):
+        """Scenario 2: *.x + *.weight merge into one trap per layer.
+
+        layers.0 owns parameter 'x' directly while layers.0.linear owns
+        'weight'.  Both patterns derive modules under the same subtree, so the
+        ancestor guard must collapse them into a single trap on layers.0 /
+        layers.1 rather than also patching layers.0.linear / layers.1.linear.
+        """
+        model = ModelWithDirectParams()
+        om = OffloadManager("test_merge_ancestor")
+
+        om._offload_modules(model, ["*.x", "*.weight"])
+
+        assert len(om._patched_modules) == 2
+        assert hasattr(model.layers[0], "_ft_original_forward_func")
+        assert hasattr(model.layers[1], "_ft_original_forward_func")
+        assert not hasattr(model.layers[0].linear, "_ft_original_forward_func")
+        assert not hasattr(model.layers[1].linear, "_ft_original_forward_func")
+
+        om.release()
+
+    def test_module_and_param_patterns_consistent(self):
+        """Scenario 3: layers.* + *.weight does not split layers into sub-traps.
+
+        When layers.* already matches layers.0 and layers.1, adding *.weight
+        must not create extra traps on descendants like layers.0.attn.q_proj.
+        The result should be identical to layers.* alone for the layers subtree.
+        """
+        model = NestedModel()
+        om = OffloadManager("test_consistent")
+
+        om._offload_modules(model, ["layers.*", "*.weight"])
+
+        assert hasattr(model.layers[0], "_ft_original_forward_func")
+        assert hasattr(model.layers[1], "_ft_original_forward_func")
+
+        # No descendant within layers should be separately patched
+        assert not hasattr(model.layers[0].attn, "_ft_original_forward_func")
+        assert not hasattr(model.layers[0].attn.q_proj, "_ft_original_forward_func")
+        assert not hasattr(model.layers[0].attn.k_proj, "_ft_original_forward_func")
+        assert not hasattr(model.layers[0].norm, "_ft_original_forward_func")
+        assert not hasattr(model.layers[1].attn, "_ft_original_forward_func")
+        assert not hasattr(model.layers[1].attn.q_proj, "_ft_original_forward_func")
+        assert not hasattr(model.layers[1].attn.k_proj, "_ft_original_forward_func")
+        assert not hasattr(model.layers[1].norm, "_ft_original_forward_func")
+
+        om.release()
+
+
+# =============================================================================
+# DeepSeek-V3 inner field pattern tests (include/exclude)
+# =============================================================================
+
+
+class TestInnerFieldPatterns:
+    """Tests for include/exclude patterns with the DeepSeek-V3 inner field pattern.
+
+    The pattern ``self.weight.scale = self.scale = nn.Parameter(...)`` creates
+    a tensor attribute on weight that aliases a registered module parameter.
+    ``scale`` is visible to both ``named_parameters()`` (as ``layers.0.scale``)
+    and ``get_inner_tensor_field_ids()`` (as an attribute of ``weight``).
+    """
+
+    @staticmethod
+    def _build_tensors_map(model):
+        return {id(p): p for p in model.parameters()}
+
+    def test_scale_alias_identity(self):
+        """Sanity check: weight.scale and scale are the same object."""
+        model = ModelWithInnerFieldLayers()
+        for i in range(2):
+            layer = model.layers[i]
+            assert layer.scale is layer.weight.scale, (
+                f"layers.{i}.scale and layers.{i}.weight.scale must be the same object"
+            )
+
+    def test_include_star_scale_patches_correct_modules(self):
+        """*.scale derives modules from the scale parameter and patches them."""
+        model = ModelWithInnerFieldLayers()
+        om = OffloadManager("test_inner_include_scale")
+
+        om._offload_modules(model, ["*.scale"])
+
+        assert len(om._patched_modules) == 2
+        assert hasattr(model.layers[0], "_ft_original_forward_func")
+        assert hasattr(model.layers[1], "_ft_original_forward_func")
+
+        om.release()
+
+    def test_include_star_weight_discovers_inner_scale(self):
+        """*.weight includes weight.scale via inner field discovery."""
+        from flextensor.tensor_discovery import get_offload_module_tensor_ids
+
+        model = ModelWithInnerFieldLayers()
+        om = OffloadManager("test_inner_weight_discovers")
+        om._offload_modules(model, ["*.weight"])
+        tensors_map = self._build_tensors_map(model)
+
+        label_to_ids = get_offload_module_tensor_ids(
+            model,
+            tensors_map,
+            include_patterns=["*.weight"],
+        )
+
+        for i in range(2):
+            layer = model.layers[i]
+            label = layer._ft_offload_name
+            assert label in label_to_ids
+            assert id(layer.weight) in label_to_ids[label], "weight should be offloaded"
+            assert id(layer.scale) in label_to_ids[label], "weight.scale should be discovered as inner field of weight"
+
+        om.release()
+
+    def test_include_star_scale_only_offloads_scale(self):
+        """*.scale offloads only scale, not weight."""
+        from flextensor.tensor_discovery import get_offload_module_tensor_ids
+
+        model = ModelWithInnerFieldLayers()
+        om = OffloadManager("test_inner_scale_only")
+        om._offload_modules(model, ["*.scale"])
+        tensors_map = self._build_tensors_map(model)
+
+        label_to_ids = get_offload_module_tensor_ids(
+            model,
+            tensors_map,
+            include_patterns=["*.scale"],
+        )
+
+        for i in range(2):
+            layer = model.layers[i]
+            label = layer._ft_offload_name
+            assert label in label_to_ids
+            assert id(layer.scale) in label_to_ids[label], "scale should be offloaded"
+            assert id(layer.weight) not in label_to_ids[label], (
+                "weight should NOT be offloaded when only *.scale is included"
+            )
+
+        om.release()
+
+    def test_exclude_star_scale_marks_non_offloaded(self):
+        """exclude_patterns=['*.scale'] correctly identifies scale as non-offloaded."""
+        from flextensor.tensor_discovery import get_non_offloaded_tensor_ids
+
+        model = ModelWithInnerFieldLayers()
+        tensors_map = self._build_tensors_map(model)
+
+        non_offloaded = get_non_offloaded_tensor_ids(
+            model,
+            tensors_map,
+            include_patterns=["*"],
+            exclude_patterns=["*.scale"],
+        )
+
+        for i in range(2):
+            layer = model.layers[i]
+            assert id(layer.scale) in non_offloaded, f"layers.{i}.scale should be non-offloaded (excluded)"
+            assert id(layer.weight) not in non_offloaded, f"layers.{i}.weight should remain offloaded"
+
+    def test_exclude_star_scale_with_include_star_weight(self):
+        """include=['*.weight'] + exclude=['*.scale']: weight offloaded, scale excluded.
+
+        scale does not match *.weight so it is already excluded by the include
+        filter.  The explicit exclude is redundant but should not cause errors.
+        """
+        from flextensor.tensor_discovery import get_non_offloaded_tensor_ids, get_offload_module_tensor_ids
+
+        model = ModelWithInnerFieldLayers()
+        om = OffloadManager("test_inner_weight_excl_scale")
+        om._offload_modules(model, ["*.weight"])
+        tensors_map = self._build_tensors_map(model)
+
+        non_offloaded = get_non_offloaded_tensor_ids(
+            model,
+            tensors_map,
+            include_patterns=["*.weight"],
+            exclude_patterns=["*.scale"],
+        )
+
+        # scale does not match include *.weight → non-offloaded
+        for i in range(2):
+            layer = model.layers[i]
+            assert id(layer.scale) in non_offloaded
+            assert id(layer.weight) not in non_offloaded
+
+        # After removing non-offloaded from tensors_map (simulating
+        # _move_non_offloaded_tensors_to_gpu), inner field should not re-add scale
+        filtered_map = {tid: t for tid, t in tensors_map.items() if tid not in non_offloaded}
+        label_to_ids = get_offload_module_tensor_ids(
+            model,
+            filtered_map,
+            include_patterns=["*.weight"],
+            exclude_patterns=["*.scale"],
+        )
+
+        for i in range(2):
+            layer = model.layers[i]
+            label = layer._ft_offload_name
+            assert label in label_to_ids
+            assert id(layer.weight) in label_to_ids[label]
+            assert id(layer.scale) not in label_to_ids[label], (
+                "scale must not leak back via inner field after removal from tensors_map"
+            )
+
+        om.release()
 
 
 if __name__ == "__main__":

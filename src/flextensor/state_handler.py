@@ -66,7 +66,8 @@ class TensorManagerState:
     """
 
     # Schema version for serialization. Bump when the persisted structure changes.
-    SCHEMA_VERSION: ClassVar[int] = 1
+    # See CHANGELOG.md for version history.
+    SCHEMA_VERSION: ClassVar[int] = 2
 
     loader_type: str
     tensor_id_to_name_map: dict[int, str]
@@ -137,6 +138,11 @@ class TensorManagerState:
             raise ValueError(
                 f"State file schema version {version} is newer than supported "
                 f"version {TensorManagerState.SCHEMA_VERSION}. Upgrade flextensor to load this file."
+            )
+        if version < TensorManagerState.SCHEMA_VERSION:
+            raise ValueError(
+                f"State file schema version {version} is outdated (current: "
+                f"{TensorManagerState.SCHEMA_VERSION}). Re-run profiling to generate a new profile."
             )
 
     @classmethod

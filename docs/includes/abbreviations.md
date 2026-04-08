@@ -16,7 +16,7 @@
 *[manual trap]: An offload_block() context manager that the user places explicitly around model code, as opposed to auto trap / forward patching.
 *[memory block]: A pre-allocated GPU memory region used by block-based transfer modes for pipelined CPU-to-GPU copies.
 *[memory mode]: Strategy mode activated by setting max_gpu_mem_fraction to a float — keeps peak GPU usage within a budget.
-*[module pattern]: A glob-style string in OffloadConfig.module_patterns that selects which nn.Module instances to wrap with traps.
+*[include pattern]: A glob-style string in OffloadConfig.include_patterns that selects which modules or parameters to include for offloading.
 *[module execution]: The forward pass of the nn.Module wrapped by a trap — excludes the weight loading and release managed by the trap itself.
 *[offload profile]: Serialized result of warmup and profiling (parameter maps, timing, strategy) that can be saved and reloaded to skip those phases.
 *[offloading strategy]: Algorithm that decides which weights to keep on GPU vs. move to CPU (e.g., KnapsackStrategy, GreedyStrategy, AdaptiveStrategy).

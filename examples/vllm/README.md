@@ -54,7 +54,7 @@ Every `OffloadConfig` field can be set via an environment variable named `FT_` +
 |----------|-------------|---------|
 | `FT_ENABLED` | Enable offloading | `false` |
 | `FT_MAX_GPU_MEM_FRACTION` | Fraction of GPU memory to use for model weights (e.g. `0.7` = 70%); `None` disables the memory constraint | `0.9` |
-| `FT_MODULE_PATTERNS` | Comma-separated module patterns to offload | see below |
+| `FT_INCLUDE_PATTERNS` | Comma-separated include patterns to offload | see below |
 | `FT_ENABLE_DIAGNOSTICS` | Log Layer Duration Statistics and block assignment table after profiling | `false` |
 
 The worker defaults to decoder-only transformer patterns that give each layer its own
@@ -66,9 +66,9 @@ model.embed_tokens,model.layers.*,model.norm,lm_head,logits_processor
 
 These patterns work out of the box for most post-2023 decoder-only models: LLaMA 2–4, Mistral, Mixtral, Qwen2/2.5/3, Phi-3/4, Gemma 2/3, DeepSeek V2/V3, Nemotron, OLMo/OLMo2, Granite, StarCoder2, and others that follow the same `model.*` layout.
 
-For models with a different module layout, set `FT_MODULE_PATTERNS` explicitly:
+For models with a different module layout, set `FT_INCLUDE_PATTERNS` explicitly:
 
-| Family | `FT_MODULE_PATTERNS` |
+| Family | `FT_INCLUDE_PATTERNS` |
 |---|---|
 | GPT-2 / GPT-J / Falcon v1 / BLOOM / Qwen1 | `transformer.wte,transformer.h.*,transformer.ln_f,lm_head,logits_processor` |
 | GPT-NeoX / Pythia | `gpt_neox.embed_in,gpt_neox.layers.*,gpt_neox.final_layer_norm,embed_out,logits_processor` |
@@ -124,7 +124,7 @@ The `FlexTensorOffloadWorker` extends vLLM's GPU worker to:
 3. Automatically manage tensor movement between CPU and GPU
 
 When `FT_ENABLED=1` is set, the worker applies offloading using the default decoder-only transformer
-module patterns (or those set via `FT_MODULE_PATTERNS`). Otherwise it behaves like the
+include patterns (or those set via `FT_INCLUDE_PATTERNS`). Otherwise it behaves like the
 standard vLLM worker. Look for these log messages to confirm offloading is active:
 
 ```

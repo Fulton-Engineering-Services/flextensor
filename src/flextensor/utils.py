@@ -13,14 +13,30 @@ import torch
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "any_path_matches_pattern",
     "atomic_write_json",
     "calculate_tensor_size",
     "clear_and_delete_tensor",
     "delete_tensor",
+    "get_module_paths",
     "is_dense_layout",
     "matches_any_pattern",
     "resolve_gpu_mem_bytes",
 ]
+
+
+def _compile_segment_regex(segment: str) -> re.Pattern[str]:
+    """Compile a single wildcard pattern segment into a regex.
+
+    ``*`` is mapped to ``.*`` and ``?`` to ``.`` so that they behave as
+    shell-style glob wildcards within one dot-separated segment.
+    """
+    return re.compile(re.escape(segment).replace(r"\*", ".*").replace(r"\?", "."))
+
+
+def get_module_paths(model: torch.nn.Module) -> list[str]:
+    """Return dot-separated paths for all non-root modules in *model*."""
+    return [p for p, _ in model.named_modules() if p]
 
 
 def matches_any_pattern(path: str, patterns: list[str], *, recursive_star: bool = True) -> bool:
@@ -41,10 +57,34 @@ def matches_any_pattern(path: str, patterns: list[str], *, recursive_star: bool 
         pattern_parts = pattern.split(".")
         for pp in pattern_parts:
             if pp not in regex_cache:
-                regex_cache[pp] = re.compile(re.escape(pp).replace(r"\*", ".*").replace(r"\?", "."))
+                regex_cache[pp] = _compile_segment_regex(pp)
         if _match_parts(path_parts, pattern_parts, regex_cache, recursive_star):
             return True
     return False
+
+
+def any_path_matches_pattern(paths: list[str], pattern: str, *, recursive_star: bool = True) -> bool:
+    """Check if *any* path in *paths* matches a single wildcard *pattern*.
+
+    Unlike :func:`matches_any_pattern` (one path, many patterns), this function
+    is optimised for the inverse: one pattern tested against many paths.  The
+    pattern is compiled once and reused for every path.
+
+    Args:
+        paths: Dot-separated paths (e.g., module paths from ``named_modules``).
+        pattern: Wildcard pattern to match against.
+        recursive_star: If True, standalone ``*`` matches 1+ segments.
+            If False, standalone ``*`` matches exactly 1 segment.
+
+    Returns:
+        ``True`` if at least one path matches the pattern.
+    """
+    pattern_parts = pattern.split(".")
+    regex_cache: dict[str, re.Pattern[str]] = {}
+    for pp in pattern_parts:
+        if pp not in regex_cache:
+            regex_cache[pp] = _compile_segment_regex(pp)
+    return any(_match_parts(path.split("."), pattern_parts, regex_cache, recursive_star) for path in paths)
 
 
 def _match_parts(

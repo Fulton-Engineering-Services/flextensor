@@ -45,7 +45,7 @@ pipe.transformer = flextensor.offload(
 
 FlexTensor then streams transformer weights block-by-block to the GPU during forward passes, prefetching the next block while the current one executes.
 
-### Module Patterns
+### Include Patterns
 
 The `include_patterns` list controls which submodules are individually offloaded:
 

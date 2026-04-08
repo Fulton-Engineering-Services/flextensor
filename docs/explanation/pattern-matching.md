@@ -31,6 +31,8 @@ In include patterns, a standalone `*` matches **exactly one** path segment. Comb
 | `layers.*` | `layers.0`, `layers.1` | `layers.0.attn` |
 | `*` | `layers`, `norm`, `head` | `layers.0` |
 | `layers.*.self_attn` | `layers.0.self_attn` | `layers.0.self_attn.q_proj` |
+| `*.weight` | `lm_head.weight`, `norm.weight` (parameter-level) | `layers.0.attn.q_proj.weight` (more than one `*` segment) |
+| `layers.*.weight` | `layers.0.weight` (parameter-level) | `layers.0.attn.weight` |
 
 ### Exclude patterns
 
@@ -65,4 +67,5 @@ When include patterns overlap hierarchically (e.g., `["layers.*", "layers.*.attn
 ## Module-level vs parameter-level matching
 
 - **Module-level**: Include and exclude patterns match against module paths from `model.named_modules()`. Only offload units (modules with no patched ancestors) are independently patched; exclude patterns un-patch those offload units.
-- **Parameter-level**: Exclude patterns also filter individual parameters during tensor discovery. A module-level exclude pattern (e.g., `layers.*.norm`) cascades to all parameters of the matching sub-module within the offload unit. A parameter-level pattern (e.g., `*.scale`) excludes specific tensors without excluding their parent module.
+- **Parameter-level includes**: Include patterns can target individual parameters (e.g., `*.weight` or `layers.*.weight`). When a pattern's final segment matches a parameter name rather than a sub-module, only those specific tensors are selected for offloading within the matched module. This is useful for offloading only large weight tensors while keeping small biases or normalization scales on GPU.
+- **Parameter-level excludes**: Exclude patterns also filter individual parameters during tensor discovery. A module-level exclude pattern (e.g., `layers.*.norm`) cascades to all parameters of the matching sub-module within the offload unit. A parameter-level pattern (e.g., `*.scale`) excludes specific tensors without excluding their parent module.

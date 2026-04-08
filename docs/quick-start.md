@@ -55,7 +55,7 @@ for batch in dataloader:
 !!! warning "Single-thread only"
     FlexTensor is **not thread-safe**. All stages — offloading setup, warmup, profiling, and inference — must run on the same thread. Do not call `offload()`, run forward passes on a patched model, or access the offload manager from multiple threads in parallel. If you need per-thread offloading, create a separate named manager and model per thread.
 
-## Module Path Patterns
+## Include Patterns
 
 The `include_patterns` field in `OffloadConfig` specifies which modules to offload using path patterns:
 
@@ -76,7 +76,7 @@ config = OffloadConfig(
 model = flextensor.offload(model, config=config)
 ```
 
-Module patterns can also be set via the `FT_INCLUDE_PATTERNS` environment variable as a comma-separated list:
+Include patterns can also be set via the `FT_INCLUDE_PATTERNS` environment variable as a comma-separated list:
 
 ```bash
 FT_INCLUDE_PATTERNS="layers.*,embed,head" python my_script.py

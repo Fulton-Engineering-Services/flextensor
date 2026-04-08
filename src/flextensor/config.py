@@ -167,27 +167,35 @@ class OffloadConfig(BaseModel):
     """Instrumentation output directory."""
 
     include_patterns: list[str] = Field(default_factory=lambda: ["*"])
-    """Module path patterns to include for offloading (supports ``*`` and ``?`` wildcards).
+    """Module or parameter path patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
-    Matches against module paths from ``model.named_modules()``.
+    Patterns are matched against both module paths (from ``model.named_modules()``) and
+    parameter paths (from ``model.named_parameters()``).
+
+    **Module-level patterns** (e.g., ``layers.*``) patch matching modules and offload
+    all their parameters.
+
+    **Parameter-level patterns** (e.g., ``layers.*.weight``) automatically derive the
+    module-level pattern (``layers.*``) for patching, but only offload parameters that
+    match the full pattern. Non-matching parameters stay on GPU permanently.
+
     Can also be set via the ``FT_INCLUDE_PATTERNS`` env var as a comma-separated list.
 
     .. note::
-        Standalone ``*`` matches exactly one path segment.
-        For example, ``layers.*`` matches ``layers.0`` but not ``layers.0.attn``.
-        Use ``layers.*`` to target direct children of a module.
+        Standalone ``*`` has different semantics depending on context:
 
-    .. note::
-        Parameter-level matching (e.g., ``*.weight``) is not yet supported for
-        include patterns. Use ``exclude_patterns`` for parameter-level filtering.
+        * **Module selection** — ``*`` matches exactly one path segment.
+          ``layers.*`` matches ``layers.0`` but not ``layers.0.attn``.
+        * **Parameter filtering** — ``*`` matches one or more segments.
+          ``*.weight`` matches both ``linear.weight`` and ``layers.0.attn.weight``.
     """
 
     exclude_patterns: list[str] = Field(default_factory=list)
     """Module/parameter path patterns to exclude from offloading (supports wildcards).
 
     Applied after include_patterns: targets matching both include and exclude are NOT offloaded.
-    Uses the same wildcard characters as include_patterns, but standalone ``*``
-    matches one or more segments (see pattern-matching docs).
+    Standalone ``*`` matches one or more segments in both module selection and parameter
+    filtering, so ``foo.*`` excludes all descendants of ``foo``.
     Can also be set via the ``FT_EXCLUDE_PATTERNS`` env var as a comma-separated list.
     """
 
@@ -280,6 +288,7 @@ def _get_field_types() -> dict[str, type]:
     Returns:
         Dictionary mapping field names to their types.
         For Union/Optional types, returns the first non-None type.
+        For list types (e.g., ``list[str]``), returns ``list``.
         For complex types (like strategies), returns object.
     """
     field_types: dict[str, type] = {}
@@ -296,10 +305,11 @@ def _get_field_types() -> dict[str, type]:
             args = [a for a in get_args(annotation) if a is not type(None)]
             if args:
                 first_type = args[0]
-                # Check if it's a complex type (like strategies)
-                if get_origin(first_type) is Union or not isinstance(first_type, type):
+                if get_origin(first_type) is Union:
                     field_types[name] = object
-                elif first_type in (bool, int, float, str):
+                elif get_origin(first_type) is list:
+                    field_types[name] = list
+                elif isinstance(first_type, type) and first_type in (bool, int, float, str):
                     field_types[name] = first_type
                 else:
                     field_types[name] = object
@@ -416,7 +426,10 @@ def _load_ini_file(config_path: Path, field_types: dict[str, type]) -> dict[str,
             value = parser[section][field_name]
             if field_type is object:
                 continue
-            config_dict[field_name] = _convert_env_value(value, field_type)
+            if field_type is list:
+                config_dict[field_name] = [p.strip() for p in value.split(",") if p.strip()]
+            else:
+                config_dict[field_name] = _convert_env_value(value, field_type)
 
     for field in _REMOVED_FIELDS:
         if field in parser[section]:
@@ -428,8 +441,8 @@ def _load_ini_file(config_path: Path, field_types: dict[str, type]) -> dict[str,
 def _process_data_dict(data: dict[str, Any], field_types: dict[str, type]) -> dict[str, Any]:
     """Process a data dictionary into configuration values.
 
-    Common logic for JSON and YAML file loading that handles field filtering,
-    type conversion, and special cases like module_patterns.
+    Common logic for JSON and YAML file loading that handles field filtering
+    and type conversion.
 
     Args:
         data: Raw data dictionary from file
@@ -444,21 +457,18 @@ def _process_data_dict(data: dict[str, Any], field_types: dict[str, type]) -> di
             config_dict[field_name] = data[field_name]
             continue
 
-        # Skip complex types unless it's module_patterns (a list field we support)
-        if field_name in field_types and field_types[field_name] is object and field_name != "module_patterns":
+        if field_name not in field_types:
             continue
-
+        field_type = field_types[field_name]
+        if field_type is object:
+            continue  # skip complex types (Strategy, etc.)
         value = data[field_name]
-        # Handle special case for module_patterns (list field)
-        if field_name == "module_patterns":
+        if field_type is list:
+            config_dict[field_name] = value  # JSON/YAML already has proper list
+        elif isinstance(value, str) and field_type is not str:
+            config_dict[field_name] = _convert_env_value(value, field_type)
+        else:
             config_dict[field_name] = value
-        elif field_name in field_types:
-            field_type = field_types[field_name]
-            # JSON/YAML already have proper types, but handle string values
-            if isinstance(value, str) and field_type is not str and field_type is not object:
-                config_dict[field_name] = _convert_env_value(value, field_type)
-            elif field_type is not object:
-                config_dict[field_name] = value
 
     return config_dict
 
@@ -522,6 +532,16 @@ def _load_from_file(config_path: Path, field_types: dict[str, type]) -> dict[str
         raise ValueError(f"Unsupported config file format: {suffix}. Use .conf, .ini, .json, .yaml, or .yml")
 
 
+def _parse_env_list(field_name: str, env_value: str) -> list:
+    """Parse a comma-separated env var into a typed list."""
+    annotation = OffloadConfig.model_fields[field_name].annotation
+    element_type = get_args(annotation)[0] if get_args(annotation) else str
+    parts = [p.strip() for p in env_value.split(",") if p.strip()]
+    if element_type is str:
+        return parts
+    return [_convert_env_value(p, element_type) for p in parts]
+
+
 def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, Any]:
     """Load configuration from environment variables.
 
@@ -557,7 +577,9 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
         config_dict["include_patterns"] = [p.strip() for p in dep_value.split(",") if p.strip()]
 
     for field_name, field_type in field_types.items():
-        if field_type is object:
+        # module_patterns has dedicated env-var handling above (conflict
+        # check with env-var-specific error message + deprecation warning).
+        if field_type is object or field_name == "module_patterns":
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"
@@ -567,11 +589,7 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
 
         try:
             if field_type is list:
-                annotation = OffloadConfig.model_fields[field_name].annotation
-                element_type = get_args(annotation)[0] if get_args(annotation) else str
-                config_dict[field_name] = [
-                    _convert_env_value(p.strip(), element_type) for p in env_value.split(",") if p.strip()
-                ]
+                config_dict[field_name] = _parse_env_list(field_name, env_value)
             else:
                 config_dict[field_name] = _convert_env_value(env_value, field_type)
         except (ValueError, TypeError) as e:

@@ -37,6 +37,7 @@ class SimpleModel(torch.nn.Module):
 
 def _make_tensor_manager(
     device_gpu: torch.device,
+    include_patterns: list[str] | None = None,
     exclude_patterns: list[str] | None = None,
 ) -> TensorManager:
     """Create a TensorManager with sensible defaults for testing."""
@@ -45,12 +46,13 @@ def _make_tensor_manager(
         device_gpu=device_gpu,
         pinned_memory=False,
         tensor_manager_load_strategy=strategy,
+        include_patterns=include_patterns,
         exclude_patterns=exclude_patterns,
     )
 
 
 class TestMoveExcludedTensorsToGPU:
-    """Tests for _move_excluded_tensors_to_gpu()."""
+    """Tests for _move_non_offloaded_tensors_to_gpu()."""
 
     def setup_method(self):
         self.device_gpu = torch.device("cpu")  # Use CPU as "GPU" for unit tests
@@ -71,7 +73,7 @@ class TestMoveExcludedTensorsToGPU:
         assert layer1_ids.issubset(tm.tensors_map.keys())
         assert layer1_ids.issubset(tm.traced_tensors)
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
 
         # layer1 IDs should be removed
         for tid in layer1_ids:
@@ -85,21 +87,21 @@ class TestMoveExcludedTensorsToGPU:
         assert layer3_ids.issubset(tm.tensors_map.keys())
 
     def test_idempotent_on_double_call(self):
-        """Calling _move_excluded_tensors_to_gpu() twice is a no-op the second time."""
+        """Calling _move_non_offloaded_tensors_to_gpu() twice is a no-op the second time."""
         model = SimpleModel()
         tm = _make_tensor_manager(self.device_gpu, exclude_patterns=["layer1.*"])
         tm.set_model(model)
         tm.tensors_map = {id(p): p for p in model.parameters()}
         tm.traced_tensors = set(tm.tensors_map.keys())
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
         remaining_after_first = dict(tm.tensors_map)
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
         remaining_after_second = dict(tm.tensors_map)
 
         assert remaining_after_first.keys() == remaining_after_second.keys()
-        assert tm._excluded_tensors_moved is True
+        assert tm._non_offloaded_tensors_moved is True
 
     def test_noop_with_empty_patterns(self):
         """No-op when exclude_patterns is empty."""
@@ -111,10 +113,10 @@ class TestMoveExcludedTensorsToGPU:
 
         original_ids = set(tm.tensors_map.keys())
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
 
         assert set(tm.tensors_map.keys()) == original_ids
-        assert tm._excluded_tensors_moved is True
+        assert tm._non_offloaded_tensors_moved is True
 
     def test_noop_with_no_matching_patterns(self):
         """No-op when patterns don't match any parameters."""
@@ -126,21 +128,21 @@ class TestMoveExcludedTensorsToGPU:
 
         original_ids = set(tm.tensors_map.keys())
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
 
         assert set(tm.tensors_map.keys()) == original_ids
 
     def test_flag_set_after_call(self):
-        """The _excluded_tensors_moved flag is set after the call."""
+        """The _non_offloaded_tensors_moved flag is set after the call."""
         model = SimpleModel()
         tm = _make_tensor_manager(self.device_gpu, exclude_patterns=["layer1.*"])
         tm.set_model(model)
         tm.tensors_map = {id(p): p for p in model.parameters()}
         tm.traced_tensors = set(tm.tensors_map.keys())
 
-        assert tm._excluded_tensors_moved is False
-        tm._move_excluded_tensors_to_gpu()
-        assert tm._excluded_tensors_moved is True
+        assert tm._non_offloaded_tensors_moved is False
+        tm._move_non_offloaded_tensors_to_gpu()
+        assert tm._non_offloaded_tensors_moved is True
 
     def test_parameter_mapping_refreshed(self):
         """tensor_id_to_name_map is refreshed after GPU move."""
@@ -150,7 +152,7 @@ class TestMoveExcludedTensorsToGPU:
         tm.tensors_map = {id(p): p for p in model.parameters()}
         tm.traced_tensors = set(tm.tensors_map.keys())
 
-        tm._move_excluded_tensors_to_gpu()
+        tm._move_non_offloaded_tensors_to_gpu()
 
         # After refresh, all current parameter names should be mapped
         current_param_ids = {id(p) for p in model.parameters()}
@@ -171,7 +173,7 @@ class TestMoveExcludedTensorsToGPU:
             mock_processor = MagicMock()
             mock_cls.return_value = mock_processor
 
-            tm._move_excluded_tensors_to_gpu()
+            tm._move_non_offloaded_tensors_to_gpu()
 
             mock_cls.assert_called_once_with(self.device_gpu, expected_mapping)
             mock_processor.apply.assert_called_once_with(model)
@@ -190,9 +192,67 @@ class TestMoveExcludedTensorsToGPU:
             mock_processor.apply.side_effect = original_oom
             mock_cls.return_value = mock_processor
 
-            with pytest.raises(torch.cuda.OutOfMemoryError, match="exclude_patterns") as exc_info:
-                tm._move_excluded_tensors_to_gpu()
+            with pytest.raises(torch.cuda.OutOfMemoryError, match="include_patterns") as exc_info:
+                tm._move_non_offloaded_tensors_to_gpu()
 
             assert exc_info.value.__cause__ is original_oom
-            assert "excluded tensors" in str(exc_info.value)
+            assert "non-offloaded tensors" in str(exc_info.value)
             assert "GiB" in str(exc_info.value)
+
+
+class TestMoveNonIncludedTensorsToGPU:
+    """Tests for include_patterns in _move_non_offloaded_tensors_to_gpu()."""
+
+    def setup_method(self):
+        self.device_gpu = torch.device("cpu")
+
+    def test_non_included_tensors_removed_from_tracking(self):
+        """Non-included tensor IDs are removed from tensors_map and traced_tensors."""
+        model = SimpleModel()
+        tm = _make_tensor_manager(self.device_gpu, include_patterns=["*.weight"])
+        tm.set_model(model)
+        tm.tensors_map = {id(p): p for p in model.parameters()}
+        tm.traced_tensors = set(tm.tensors_map.keys())
+
+        bias_ids = {id(model.layer1.bias), id(model.layer2.bias), id(model.layer3.bias)}
+        weight_ids = {id(model.layer1.weight), id(model.layer2.weight), id(model.layer3.weight)}
+
+        tm._move_non_offloaded_tensors_to_gpu()
+
+        for tid in bias_ids:
+            assert tid not in tm.tensors_map
+            assert tid not in tm.traced_tensors
+
+        for tid in weight_ids:
+            assert tid in tm.tensors_map
+
+    def test_default_include_patterns_backward_compat(self):
+        """Default include_patterns=['*'] does not remove any tensors."""
+        model = SimpleModel()
+        tm = _make_tensor_manager(self.device_gpu)
+        tm.set_model(model)
+        tm.tensors_map = {id(p): p for p in model.parameters()}
+        tm.traced_tensors = set(tm.tensors_map.keys())
+
+        original_ids = set(tm.tensors_map.keys())
+
+        tm._move_non_offloaded_tensors_to_gpu()
+
+        assert set(tm.tensors_map.keys()) == original_ids
+
+    def test_include_and_exclude_combined(self):
+        """Include weights only + exclude layer1 → both biases and layer1.weight removed."""
+        model = SimpleModel()
+        tm = _make_tensor_manager(
+            self.device_gpu,
+            include_patterns=["*.weight"],
+            exclude_patterns=["layer1.*"],
+        )
+        tm.set_model(model)
+        tm.tensors_map = {id(p): p for p in model.parameters()}
+        tm.traced_tensors = set(tm.tensors_map.keys())
+
+        tm._move_non_offloaded_tensors_to_gpu()
+
+        expected_remaining = {id(model.layer2.weight), id(model.layer3.weight)}
+        assert set(tm.tensors_map.keys()) == expected_remaining

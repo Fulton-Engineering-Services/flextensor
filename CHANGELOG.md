@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `exclude_patterns` config option for keeping specific modules or parameters on GPU
   (e.g., `lm_head`, `*.norm`, `*.scale`). Applied after `include_patterns`.
+- `include_patterns` now accepts parameter-level patterns such as `*.weight` or
+  `layers.*.attn.q_proj.weight`, allowing users to offload specific parameters
+  while keeping others (e.g., biases, norms) on GPU for faster inference.
+  Module-level patterns (e.g., `layers.*`) continue to include all parameters
+  of the matched module.
 
 ### Removed
 
@@ -45,6 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   invalidated due to namespace hash key changes (`module_patterns` → `include_patterns`,
   added `exclude_patterns`). Multi-process deployments will re-profile on first run after
   upgrade.
+
+- **BREAKING**: Profile `SCHEMA_VERSION` bumped to 2. Offload block labels now use the
+  module path (e.g., `layers.0.attn`) instead of `ParentClassName.module_name`
+  (e.g., `TransformerLayer.attn`). The old format was incompatible with the new
+  parameter-level `include_patterns`. Saved profiles must be re-generated.
 
 ### Deprecated
 

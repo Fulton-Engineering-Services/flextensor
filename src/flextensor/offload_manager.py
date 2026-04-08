@@ -27,7 +27,7 @@ from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.tensor_discovery import is_offload_patched_module
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
-from flextensor.utils import matches_any_pattern
+from flextensor.utils import any_path_matches_pattern, get_module_paths, matches_any_pattern
 
 LOGGER = logging.getLogger(__name__)
 _GiB = 1 << 30
@@ -53,8 +53,10 @@ def _collect_matches(
 def _find_matched_patterns(
     model: nn.Module,
     patterns: list[str],
+    module_paths: list[str],
     *,
     recursive_star: bool = True,
+    param_recursive_star: bool | None = None,
     include_parameters: bool = False,
 ) -> set[str]:
     """Return the subset of *patterns* that match at least one module (or parameter) path.
@@ -62,21 +64,85 @@ def _find_matched_patterns(
     Args:
         model: Model to check paths against.
         patterns: Patterns to test.
-        recursive_star: Passed through to ``matches_any_pattern``.
-        include_parameters: If True, also check against ``named_parameters()`` paths.
-            Use for exclude patterns, which can target individual parameters.
+        module_paths: Non-root module paths (e.g. from ``named_modules()``).
+        recursive_star: Passed through to ``matches_any_pattern`` for module paths.
+        param_recursive_star: Passed through to ``matches_any_pattern`` for parameter
+            paths.  When *None* (default), falls back to *recursive_star* so existing
+            callers that don't distinguish module/param semantics keep working.
+        include_parameters: If True, also check against ``named_parameters()`` paths
+            so that parameter-level patterns (e.g. ``layers.*.weight``) are recognised.
     """
+    if param_recursive_star is None:
+        param_recursive_star = recursive_star
+
     remaining = set(patterns)
     matched: set[str] = set()
 
-    module_paths = [p for p, _ in model.named_modules() if p]
     _collect_matches(module_paths, remaining, matched, recursive_star=recursive_star)
 
     if include_parameters and remaining:
         param_paths = [p for p, _ in model.named_parameters()]
-        _collect_matches(param_paths, remaining, matched, recursive_star=recursive_star)
+        _collect_matches(param_paths, remaining, matched, recursive_star=param_recursive_star)
 
     return matched
+
+
+def _derive_module_patterns(
+    patterns: list[str],
+    module_paths: list[str],
+    model: nn.Module | None = None,
+) -> list[str]:
+    """Derive module-level patterns from potentially parameter-level include patterns.
+
+    For patterns that don't directly match any module path (e.g., ``layers.*.weight``),
+    progressively truncates from the right until a match is found (e.g., ``layers.*``).
+    This allows parameter-level patterns to implicitly determine which modules to patch.
+
+    A bare ``*`` produced by truncation is rejected because it would match every
+    top-level module and collapse the model into a single offload unit (via the
+    ancestor guard).  When truncation fails and *model* is provided, the function
+    falls back to finding all parameters that match the original pattern and
+    collecting their owning module paths.
+
+    Args:
+        patterns: Original include patterns (may target modules or parameters).
+        module_paths: Non-root module paths (e.g. from ``named_modules()``).
+        model: Optional model instance for parameter-based fallback derivation.
+
+    Returns:
+        Deduplicated list of patterns/paths that identify modules to patch.
+    """
+    result: set[str] = set()
+    module_paths_set = set(module_paths)
+    for pattern in patterns:
+        parts = pattern.split(".")
+        found = False
+        for length in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:length])
+            # A bare ``*`` produced by truncation would match every top-level
+            # module, collapsing the whole model into one offload unit.  Skip it
+            # so that the per-parameter fallback below can derive precise targets.
+            if length < len(parts) and candidate == "*":
+                continue
+            if any_path_matches_pattern(module_paths, candidate, recursive_star=False):
+                result.add(candidate)
+                found = True
+                break
+        if not found and model is not None:
+            # TODO: On large models this produces O(params) exact paths (e.g. 80
+            # literal entries for an 80-layer model).  A post-processing step
+            # could collapse sibling paths into compact wildcards (e.g.
+            # layers.*.attn.q_proj), but the heuristics are non-trivial and the
+            # current approach is correct.  Revisit if init time becomes an issue.
+            for param_path, _ in model.named_parameters():
+                if matches_any_pattern(param_path, [pattern], recursive_star=True):
+                    parent = ".".join(param_path.split(".")[:-1])
+                    if parent in module_paths_set:
+                        result.add(parent)
+                        found = True
+        if not found:
+            LOGGER.warning("No module-level prefix found for pattern '%s'; skipping.", pattern)
+    return list(result)
 
 
 def _log_diagnostic_snapshot(label: str, om: OffloadManager | None) -> None:
@@ -440,6 +506,7 @@ class OffloadManager:
                 loader_type=self.config.transfer_mode,
                 blocks=self.config.num_blocks,
                 remove_layers_operations=[],
+                include_patterns=self.config.include_patterns,
                 exclude_patterns=self.config.exclude_patterns,
                 use_shm=self.config.shm_enabled,
                 enable_diagnostics=self.config.enable_diagnostics,
@@ -657,7 +724,7 @@ class OffloadManager:
 
         Patches modules matching ``config.include_patterns`` (and applies
         ``config.exclude_patterns``) to automatically manage tensor transfers.
-        Supports wildcards in module patterns.
+        Supports wildcards in include/exclude patterns.
 
         Args:
             model: PyTorch model to patch
@@ -779,6 +846,13 @@ class OffloadManager:
         Uses flat ``named_modules()`` iteration with ``matches_any_pattern(recursive_star=False)``
         to preserve existing single-segment ``*`` semantics (``layers.*`` matches direct children only).
 
+        Parameter-level patterns (e.g., ``layers.*.weight``) are auto-truncated to derive
+        module-level patterns (e.g., ``layers.*``) via ``_derive_module_patterns``.
+
+        Validation uses ``recursive_star=False`` for module paths but
+        ``recursive_star=True`` for parameter paths, matching the runtime
+        semantics in ``_any_prefix_matches`` (tensor_discovery.py).
+
         Modules whose ancestors are already patched are skipped, because they belong to
         their ancestor's offload unit rather than forming independent units. This defines
         offload unit boundaries: only modules with no patched ancestors become offload units.
@@ -787,22 +861,26 @@ class OffloadManager:
             model: The model whose sub-modules to patch.
             patterns: Include patterns to match against module paths.
         """
-        matched_patterns = _find_matched_patterns(model, patterns, recursive_star=False)
+        module_paths = get_module_paths(model)
+        module_patterns = _derive_module_patterns(patterns, module_paths, model)
+        matched_patterns = _find_matched_patterns(
+            model,
+            patterns,
+            module_paths,
+            recursive_star=False,
+            param_recursive_star=True,
+            include_parameters=True,
+        )
         for module_path, module in model.named_modules():
             if not module_path:  # skip root
                 continue
-            if matches_any_pattern(module_path, patterns, recursive_star=False):
+            if matches_any_pattern(module_path, module_patterns, recursive_star=False):
                 if self._has_patched_ancestor(model, module_path):
                     continue
-                # Preserve offload name format: ParentClassName.module_name
-                parts = module_path.split(".")
-                parent_path = ".".join(parts[:-1])
-                parent = model.get_submodule(parent_path) if parent_path else model
-                offload_name = f"{parent.__class__.__name__}.{parts[-1]}"
-                self._patch_module_forward(module, offload_name)
+                self._patch_module_forward(module, module_path)
         for pattern in patterns:
             if pattern not in matched_patterns:
-                LOGGER.warning("Include pattern '%s' did not match any modules.", pattern)
+                LOGGER.warning("Include pattern '%s' did not match any modules or parameters.", pattern)
 
     def _exclude_modules(self, model: nn.Module, patterns: list[str]) -> None:
         """Un-patch modules matching any exclude pattern.
@@ -822,9 +900,11 @@ class OffloadManager:
         if not patterns:
             return
         patched_before = len(self._patched_modules)
+        module_paths = get_module_paths(model)
         matched_patterns = _find_matched_patterns(
             model,
             patterns,
+            module_paths,
             recursive_star=True,
             include_parameters=True,
         )
@@ -847,7 +927,7 @@ class OffloadManager:
 
     def _check_no_modules_patched(self) -> None:
         """Emit an error when no modules ended up patched after include/exclude."""
-        if not self._patched_modules:
+        if not self._patched_modules and self.config.include_patterns:
             LOGGER.error(
                 "No modules matched any include pattern %s. "
                 "Offloading is effectively disabled. "

@@ -339,11 +339,11 @@ class TestContribVLLM:
         table, which lists every trap that was actually created during profiling.
 
         Incorrect (wildcard default):
-            LlamaForCausalLM.model  130ms  ← entire model = 1 trap, no pipelining
+            model  130ms  ← entire model = 1 trap, no pipelining
 
         Correct (specific patterns like model.layers.*):
-            ModuleList.0  4ms  ← each layer has its own trap (named by class)
-            ModuleList.1  4ms
+            model.layers.0  4ms  ← each layer has its own trap
+            model.layers.1  4ms
             ...
 
         Args:
@@ -381,7 +381,7 @@ class TestContribVLLM:
         # Coarse-trap check: with wildcard ['*'], 'model' is the whole transformer
         # wrapped in a single trap — each forward pass is one giant block with no
         # opportunity to pipeline transfers for subsequent layers.
-        coarse_trap_keys = [k for k in layer_stats if k.endswith(".model")]
+        coarse_trap_keys = [k for k in layer_stats if k == "model" or k.endswith(".model")]
         assert not coarse_trap_keys, (
             f"Coarse trap detected: {coarse_trap_keys} — entire model wrapped in one trap. "
             "Worker must use specific include_patterns (e.g. model.layers.*) "
@@ -389,8 +389,8 @@ class TestContribVLLM:
         )
 
         # Per-layer check: specific patterns like 'model.layers.*' produce one trap
-        # per layer. Trap names use the module class name + index (e.g. ModuleList.0,
-        # ModuleList.1, ...) rather than the full path, so we match by numeric suffix.
+        # per layer. Trap names use the full module path (e.g. model.layers.0,
+        # model.layers.1, ...), so we match by numeric suffix.
         layer_entries = [k for k in layer_stats if re.search(r"\.\d+$", k)]
         assert len(layer_entries) >= 10, (
             f"Expected at least 10 individual layer traps, found {len(layer_entries)}: "

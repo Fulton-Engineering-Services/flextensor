@@ -54,8 +54,10 @@ from flextensor.tensor import TraceTensor
 from flextensor.tensor_discovery import (
     ModuleTracker,
     discover_untraced_tensors_for_layers,
-    get_excluded_tensor_ids,
+    get_non_offloaded_tensor_ids,
     has_offload_modules,
+    resolve_include_patterns,
+    validate_include_patterns,
 )
 from flextensor.tensor_processors import (
     BenchmarkTensorProcessor,
@@ -266,6 +268,7 @@ class TensorManager:
         blocks=4,
         move_top_level_buffers_to_gpu=True,
         use_shm=False,
+        include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         enable_diagnostics: bool = False,
         max_gpu_mem_fraction: float | None = None,
@@ -294,6 +297,8 @@ class TensorManager:
             blocks: Number of blocks to use for the block transfer loaders (default: 4)
             move_top_level_buffers_to_gpu: Whether to move top-level model buffers to GPU
                 during warmup initialization (default: True)
+            include_patterns: List of patterns to include for offloading. Parameters not matching
+                are kept on GPU permanently (default: None → ["*"]).
             exclude_patterns: List of patterns to exclude from offloading. Passed through to tensor
                 discovery for parameter-level filtering (default: None)
             enable_diagnostics: Whether to log diagnostic information (layer duration statistics,
@@ -331,6 +336,8 @@ class TensorManager:
         self.blocks = blocks
         self.move_top_level_buffers_to_gpu = move_top_level_buffers_to_gpu
         self.enable_untraced_tensor_discovery = _enable_untraced_tensor_discovery
+        validate_include_patterns(include_patterns)
+        self.include_patterns = resolve_include_patterns(include_patterns)
         self.exclude_patterns = exclude_patterns or []
         self.enable_diagnostics = enable_diagnostics
         self._max_gpu_mem_fraction = max_gpu_mem_fraction
@@ -361,7 +368,7 @@ class TensorManager:
         self.shm_namespace: str | None = None
         self._unmapped_tensors_bytes = 0
         self.module_tracker: ModuleTracker | None = None
-        self._excluded_tensors_moved = False
+        self._non_offloaded_tensors_moved = False
         self.memory_transfer_stats: dict[int, float] | None = None
         self.trap_start_event = torch.cuda.Event(enable_timing=True)
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
@@ -376,48 +383,55 @@ class TensorManager:
             for name, tensor in model.items():
                 self.tensor_id_to_name_map[id(tensor)] = name
 
-    def _move_excluded_tensors_to_gpu(self):
-        """Move excluded tensors to GPU and remove them from offload tracking.
+    def _move_non_offloaded_tensors_to_gpu(self):
+        """Move non-offloaded tensors to GPU and remove them from offload tracking.
 
-        Identifies tensors matching exclude_patterns and moves them to GPU
-        permanently. The processor receives a mapping of *non-excluded* tensors;
-        parameters absent from this mapping (the excluded ones) are treated as
-        unmapped and moved to GPU. Their IDs are then removed from tensors_map
-        and traced_tensors so the offload system ignores them.
+        Identifies tensors not matching include_patterns or matching
+        exclude_patterns and moves them to GPU permanently. The processor
+        receives a mapping of *offloaded* tensors; parameters absent from
+        this mapping (the non-offloaded ones) are treated as unmapped and
+        moved to GPU. Their IDs are then removed from tensors_map and
+        traced_tensors so the offload system ignores them.
 
         After completion, ``tensors_map`` is frozen via :class:`types.MappingProxyType`
         to prevent accidental mutation during profile and inference phases.
 
         This method is idempotent — safe to call multiple times. Guarded by
-        the _excluded_tensors_moved flag.
+        the _non_offloaded_tensors_moved flag.
         """
-        if self._excluded_tensors_moved:
+        if self._non_offloaded_tensors_moved:
             return
 
-        excluded_ids = get_excluded_tensor_ids(self.model, self.tensors_map, self.exclude_patterns)
-        if excluded_ids:
-            excluded_tensors = [self.tensors_map[tid] for tid in excluded_ids if tid in self.tensors_map]
-            excluded_bytes = sum(t.nelement() * t.element_size() for t in excluded_tensors)
+        non_offloaded_ids = get_non_offloaded_tensor_ids(
+            self.model,
+            self.tensors_map,
+            self.include_patterns,
+            self.exclude_patterns,
+        )
+        if non_offloaded_ids:
+            non_offloaded_tensors = [self.tensors_map[tid] for tid in non_offloaded_ids if tid in self.tensors_map]
+            non_offloaded_bytes = sum(t.nelement() * t.element_size() for t in non_offloaded_tensors)
 
-            identity_mapping = {tid: t for tid, t in self.tensors_map.items() if tid not in excluded_ids}
+            identity_mapping = {tid: t for tid, t in self.tensors_map.items() if tid not in non_offloaded_ids}
             processor = MoveUnmappedTensorsToGPUProcessor(self.device_gpu, identity_mapping)
             try:
                 processor.apply(self.model)
             except torch.cuda.OutOfMemoryError as e:
                 raise torch.cuda.OutOfMemoryError(
-                    f"GPU out of memory while moving {len(excluded_tensors)} excluded tensors "
-                    f"({excluded_bytes / 1024**3:.2f} GiB) to GPU. "
-                    "Tensors matching `exclude_patterns` reside on GPU permanently. "
-                    "Reduce `exclude_patterns` to lower permanent GPU memory usage."
+                    f"GPU out of memory while moving {len(non_offloaded_tensors)} non-offloaded tensors "
+                    f"({non_offloaded_bytes / 1024**3:.2f} GiB) to GPU. "
+                    "Parameters NOT matching `include_patterns` (or matching `exclude_patterns`) "
+                    "stay on GPU permanently. Broaden `include_patterns` or narrow "
+                    "`exclude_patterns` to reduce permanent GPU memory usage."
                 ) from e
 
-            for tid in excluded_ids:
+            for tid in non_offloaded_ids:
                 self.tensors_map.pop(tid, None)
                 self.traced_tensors.discard(tid)
 
             self.build_parameters_mapping(self.model)
 
-        self._excluded_tensors_moved = True
+        self._non_offloaded_tensors_moved = True
         self.tensors_map = types.MappingProxyType(self.tensors_map)
 
     def set_model(self, model):
@@ -442,7 +456,7 @@ class TensorManager:
                 pin_memory=pin_memory,
                 move_top_level_buffers_to_gpu=self.move_top_level_buffers_to_gpu,
             )
-            self._move_excluded_tensors_to_gpu()
+            self._move_non_offloaded_tensors_to_gpu()
         self.prepare_model_ids(self.model)  # TODO: Move to preprocess_model after remove benchmark context
 
         self.prepare_warmup_mode()
@@ -451,7 +465,7 @@ class TensorManager:
     def initialize_profile(self):
         if self.tensor_manager_state is not None:
             return self.model
-        self._move_excluded_tensors_to_gpu()
+        self._move_non_offloaded_tensors_to_gpu()
         profile_model = self.model
         if self.direct_enabled:
             profile_model = self.prepare_profile_direct_mode_model(self.model)
@@ -521,6 +535,7 @@ class TensorManager:
                 self.model,
                 self.tensor_id_to_name_map,
                 module_tracker=self.module_tracker,
+                include_patterns=self.include_patterns,
                 exclude_patterns=self.exclude_patterns,
             )
 
@@ -551,6 +566,7 @@ class TensorManager:
                 self.model,
                 self.tensor_id_to_name_map,
                 module_tracker=self.module_tracker,
+                include_patterns=self.include_patterns,
                 exclude_patterns=self.exclude_patterns,
             )
 

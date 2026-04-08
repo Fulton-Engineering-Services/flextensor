@@ -87,7 +87,7 @@ FlexTensor uses three discovery strategies, tried in sequence. Each strategy suc
 
 ### When It Works
 
-This strategy applies when you use FlexTensor's `offload()` API with module patterns:
+This strategy applies when you use FlexTensor's `offload()` API with include patterns:
 
 ```python
 from flextensor import offload, OffloadConfig

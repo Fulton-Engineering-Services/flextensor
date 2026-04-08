@@ -38,7 +38,7 @@ to be found and offloaded together with their parent tensor.
 ### Module
 
 A `torch.nn.Module` instance in the model graph. Modules are the unit that
-[module patterns](#module-pattern) select and [traps](#trap) wrap. In
+[include patterns](#include-pattern) select and [traps](#trap) wrap. In
 documentation prose, "module" refers to what gets executed (the `forward`
 call), while "trap" refers to the FlexTensor wrapper around that execution
 (loading weights, timing, releasing memory).
@@ -56,13 +56,19 @@ wrapper) or "module" (the `nn.Module`).
     [Trap vs layer note](#trap) for details. Issue #116 tracks renaming
     these identifiers.
 
-### Module Pattern
+### Include Pattern
 
-A glob-style string in `OffloadConfig.module_patterns` that selects which modules
-to wrap with traps. Supports `*` (match any sequence) and `?` (match a single
-character). Examples: `"layers.*"`, `"encoder.block_*"`.
+A glob-style string in `OffloadConfig.include_patterns` that selects which modules
+or parameters to include for offloading. Supports `*` (match any sequence) and
+`?` (match a single character). Patterns are matched against both module paths
+(from `named_modules()`) and parameter paths (from `named_parameters()`).
 
-See: [Configuration — Module Patterns](../explanation/configuration.md#module-patterns)
+**Module-level patterns** (e.g., `"layers.*"`) patch matching modules and offload
+all their parameters. **Parameter-level patterns** (e.g., `"layers.*.weight"`)
+automatically derive the parent module pattern for patching, but only offload
+parameters that match the full pattern.
+
+See: [Configuration — Include Patterns](../explanation/configuration.md#include-exclude-patterns)
 
 ---
 

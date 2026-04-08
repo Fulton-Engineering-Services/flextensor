@@ -250,8 +250,8 @@ class TestOffloadConfig:
         config = OffloadConfig(include_patterns=["layers.*", "head"])
         assert config.include_patterns == ["layers.*", "head"]
 
-    def test_include_patterns_empty_list(self):
-        """Test that empty include_patterns list is allowed."""
+    def test_include_patterns_empty_list_accepted(self):
+        """Empty include_patterns is accepted for manual offload_block() usage."""
         config = OffloadConfig(include_patterns=[])
         assert config.include_patterns == []
 
@@ -691,6 +691,24 @@ class TestLoadConfigFromEnv:
         os.environ["FT_INCLUDE_PATTERNS"] = "layers.*"
         config = load_config_from_env(include_patterns=["custom.*"])
         assert config.include_patterns == ["custom.*"]
+
+    def test_include_patterns_none_literal_kept_as_string(self):
+        """Ensure 'none' in a list[str] env var stays a string, not Python None."""
+        os.environ["FT_INCLUDE_PATTERNS"] = "layers.*,none,head"
+        config = load_config_from_env()
+        assert config.include_patterns == ["layers.*", "none", "head"]
+
+    def test_exclude_patterns_none_literal_kept_as_string(self):
+        """Ensure 'none' in exclude_patterns env var stays a string."""
+        os.environ["FT_EXCLUDE_PATTERNS"] = "none,lm_head"
+        config = load_config_from_env()
+        assert config.exclude_patterns == ["none", "lm_head"]
+
+    def test_str_none_field_parses_none_as_python_none(self):
+        """Ensure 'none' in a top-level str|None field becomes Python None."""
+        os.environ["FT_SHM_NAMESPACE"] = "none"
+        config = load_config_from_env()
+        assert config.shm_namespace is None
 
     def test_exclude_patterns_from_env(self):
         """Test loading exclude_patterns from FT_EXCLUDE_PATTERNS env var."""
@@ -1381,6 +1399,51 @@ class TestModulePatternsDeprecation:
             config = OffloadConfig(module_patterns=None)
         assert config.include_patterns == ["*"]
         assert not any("module_patterns" in str(warning.message) for warning in w)
+
+    def test_module_patterns_from_json_file(self, tmp_path):
+        """module_patterns in a JSON config file maps to include_patterns.
+
+        Regression: _get_field_types() classified list[str] | None as object,
+        so _process_data_dict silently dropped module_patterns before the
+        pydantic validator could migrate it to include_patterns.
+        """
+        import json
+
+        config_file = tmp_path / "test.json"
+        config_file.write_text(json.dumps({"module_patterns": ["layers.*", "head"]}))
+        with pytest.warns(DeprecationWarning, match="module_patterns"):
+            config = load_config_from_file(config_file)
+        assert config.include_patterns == ["layers.*", "head"]
+
+    def test_module_patterns_from_yaml_file(self, tmp_path):
+        """module_patterns in a YAML config file maps to include_patterns."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("module_patterns:\n  - layers.*\n  - head\n")
+        with pytest.warns(DeprecationWarning, match="module_patterns"):
+            config = load_config_from_file(config_file)
+        assert config.include_patterns == ["layers.*", "head"]
+
+    def test_module_patterns_from_ini_file(self, tmp_path):
+        """module_patterns in an INI config file maps to include_patterns.
+
+        INI files store lists as comma-separated strings, which need special
+        handling in _load_ini_file. module_patterns must survive through to
+        the pydantic validator.
+        """
+        config_file = tmp_path / "test.conf"
+        config_file.write_text("[flextensor]\nmodule_patterns = layers.*,head\n")
+        with pytest.warns(DeprecationWarning, match="module_patterns"):
+            config = load_config_from_file(config_file)
+        assert config.include_patterns == ["layers.*", "head"]
+
+    def test_get_field_types_classifies_optional_list_as_list(self):
+        """_get_field_types must classify list[str] | None as list, not object.
+
+        Regression: the Optional wrapper made the union type fall through
+        to object, silently dropping module_patterns from file configs.
+        """
+        ft = _get_field_types()
+        assert ft["module_patterns"] is list
 
 
 class TestRemovedFieldsRejection:

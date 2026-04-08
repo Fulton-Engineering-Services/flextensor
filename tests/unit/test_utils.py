@@ -11,7 +11,13 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from flextensor.utils import atomic_write_json, calculate_tensor_size, matches_any_pattern
+from flextensor.utils import (
+    _compile_segment_regex,
+    any_path_matches_pattern,
+    atomic_write_json,
+    calculate_tensor_size,
+    matches_any_pattern,
+)
 
 
 class TestAtomicWriteJson:
@@ -235,6 +241,74 @@ class TestCalculateTensorSize:
         assert size_bytes == expected_size
 
 
+class TestCompileSegmentRegex:
+    """Test cases for the _compile_segment_regex helper."""
+
+    def test_literal_segment(self):
+        """Literal segment matches itself exactly."""
+        rx = _compile_segment_regex("layers")
+        assert rx.fullmatch("layers")
+        assert not rx.fullmatch("layer")
+        assert not rx.fullmatch("layers0")
+
+    def test_star_matches_any_chars(self):
+        """* maps to .* and matches zero or more characters."""
+        rx = _compile_segment_regex("layer_*")
+        assert rx.fullmatch("layer_0")
+        assert rx.fullmatch("layer_abc")
+        assert rx.fullmatch("layer_")
+        assert not rx.fullmatch("block_0")
+
+    def test_standalone_star(self):
+        """A bare * matches any string (one segment worth of characters)."""
+        rx = _compile_segment_regex("*")
+        assert rx.fullmatch("")
+        assert rx.fullmatch("anything")
+        assert rx.fullmatch("layer_0")
+
+    def test_question_mark_matches_single_char(self):
+        """? maps to . and matches exactly one character."""
+        rx = _compile_segment_regex("layer?")
+        assert rx.fullmatch("layer0")
+        assert rx.fullmatch("layerX")
+        assert not rx.fullmatch("layer")
+        assert not rx.fullmatch("layer01")
+
+    def test_multiple_question_marks(self):
+        rx = _compile_segment_regex("l??r")
+        assert rx.fullmatch("lXYr")
+        assert not rx.fullmatch("lXr")
+        assert not rx.fullmatch("lXYZr")
+
+    def test_combined_star_and_question_mark(self):
+        rx = _compile_segment_regex("a?b*c")
+        assert rx.fullmatch("aXbc")
+        assert rx.fullmatch("aXbXYZc")
+        assert not rx.fullmatch("abc")
+
+    def test_regex_special_chars_escaped(self):
+        """Characters that are special in regex (e.g. '.', '+', '(') are escaped."""
+        rx = _compile_segment_regex("a.b")
+        assert rx.fullmatch("a.b")
+        assert not rx.fullmatch("aXb")
+
+        rx2 = _compile_segment_regex("x+y")
+        assert rx2.fullmatch("x+y")
+        assert not rx2.fullmatch("xy")
+        assert not rx2.fullmatch("xxy")
+
+    def test_numeric_segment(self):
+        rx = _compile_segment_regex("0")
+        assert rx.fullmatch("0")
+        assert not rx.fullmatch("1")
+
+    def test_return_type_is_compiled_pattern(self):
+        import re
+
+        rx = _compile_segment_regex("foo")
+        assert isinstance(rx, re.Pattern)
+
+
 class TestMatchesAnyPattern:
     """Test cases for matches_any_pattern function."""
 
@@ -336,3 +410,61 @@ class TestMatchesAnyPattern:
         """Test intra-segment wildcard in multi-segment pattern."""
         assert matches_any_pattern("layers.0.self_attn", ["layers.*.self_attn"], recursive_star=False)
         assert not matches_any_pattern("layers.0.ffn", ["layers.*.self_attn"], recursive_star=False)
+
+
+class TestAnyPathMatchesPattern:
+    """Test cases for any_path_matches_pattern (inverse of matches_any_pattern)."""
+
+    def test_exact_match_found(self):
+        paths = ["layers", "head", "norm"]
+        assert any_path_matches_pattern(paths, "head", recursive_star=False)
+
+    def test_exact_match_not_found(self):
+        paths = ["layers", "head", "norm"]
+        assert not any_path_matches_pattern(paths, "embed", recursive_star=False)
+
+    def test_wildcard_segment(self):
+        paths = ["layers.0", "layers.1", "norm"]
+        assert any_path_matches_pattern(paths, "layers.*", recursive_star=False)
+
+    def test_wildcard_no_match(self):
+        paths = ["layers.0.attn", "norm"]
+        assert not any_path_matches_pattern(paths, "head.*", recursive_star=False)
+
+    def test_single_star_not_recursive(self):
+        """Standalone * matches exactly one segment when recursive_star=False."""
+        paths = ["layers.0.attn"]
+        assert not any_path_matches_pattern(paths, "layers.*", recursive_star=False)
+
+    def test_recursive_star(self):
+        """Standalone * matches 1+ segments when recursive_star=True."""
+        paths = ["layers.0.attn", "layers.1.ffn"]
+        assert any_path_matches_pattern(paths, "layers.*", recursive_star=True)
+
+    def test_empty_paths(self):
+        assert not any_path_matches_pattern([], "layers", recursive_star=False)
+
+    def test_intra_segment_wildcard(self):
+        paths = ["layer_0", "layer_1", "norm"]
+        assert any_path_matches_pattern(paths, "layer_*", recursive_star=False)
+        assert not any_path_matches_pattern(paths, "block_*", recursive_star=False)
+
+    def test_question_mark(self):
+        paths = ["layer0", "layer1"]
+        assert any_path_matches_pattern(paths, "layer?", recursive_star=False)
+        assert not any_path_matches_pattern(paths, "layer??", recursive_star=False)
+
+    def test_multi_segment_pattern(self):
+        paths = ["layers.0.self_attn", "layers.1.ffn"]
+        assert any_path_matches_pattern(paths, "layers.*.self_attn", recursive_star=False)
+        assert not any_path_matches_pattern(paths, "layers.*.mlp", recursive_star=False)
+
+    def test_equivalence_with_matches_any_pattern(self):
+        """any_path_matches_pattern must agree with the any(matches_any_pattern(...)) loop."""
+        paths = ["layers.0.self_attn", "layers.1.ffn", "norm", "lm_head"]
+        patterns = ["layers.*", "norm", "embed", "layers.*.self_attn", "lm_head.weight"]
+        for pattern in patterns:
+            for rs in (True, False):
+                expected = any(matches_any_pattern(p, [pattern], recursive_star=rs) for p in paths)
+                actual = any_path_matches_pattern(paths, pattern, recursive_star=rs)
+                assert actual == expected, f"Mismatch for pattern={pattern!r}, recursive_star={rs}"

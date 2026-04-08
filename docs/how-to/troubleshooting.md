@@ -277,7 +277,7 @@ The GPU has less than 256 MiB free when the strategy runs — typically consumed
 
 ### Why this happens
 
-FlexTensor copies offloaded weights into pinned (page-locked) CPU memory, which cannot be swapped — it consumes physical RAM exclusively. With `module_patterns=["*"]`, every discovered weight is pinned, which can exhaust host RAM on large models.
+FlexTensor copies offloaded weights into pinned (page-locked) CPU memory, which cannot be swapped — it consumes physical RAM exclusively. With `include_patterns=["*"]`, every discovered weight is pinned, which can exhaust host RAM on large models.
 
 Since `pin_memory()` copies data, the original and pinned weights coexist briefly — peak host memory is roughly model size plus one layer's worth of weights. PyTorch may also round pinned allocations to the next power of two ([pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)).
 
@@ -290,13 +290,13 @@ dmesg | grep -i oom  # check for OOM killer
 
 You can also inspect the `host_memory` object in FlexTensor's [instrumentation output](#debug-component-initialization) for a memory snapshot at inference transition.
 
-### Step 2: Narrow the module patterns
+### Step 2: Narrow the include patterns
 
-Narrow `module_patterns` from `["*"]` to target specific layers:
+Narrow `include_patterns` from `["*"]` to target specific layers:
 
 ```python
 config = OffloadConfig(
-    module_patterns=[
+    include_patterns=[
         "model.embed_tokens",
         "model.layers.*",
         "model.norm",
@@ -304,6 +304,8 @@ config = OffloadConfig(
     ],
 )
 ```
+
+See [Step 2: Narrow the include patterns](#step-2-narrow-the-include-patterns) under [Resolve GPU Out-of-Memory Errors](#resolve-gpu-out-of-memory-errors) for more detail.
 
 **Why this helps:** Fewer trapped modules means fewer weights pinned in host RAM.
 

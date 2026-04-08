@@ -681,8 +681,14 @@ class TestOffloadManagerStateMachine:
         with pytest.raises(RuntimeError, match="Model not initialized"):
             proxy.forward(self.x)
 
-    def test_offload_uses_default_wildcard_pattern(self):
+    @patch("flextensor.tensor_manager.TensorManager")
+    def test_offload_uses_default_wildcard_pattern(self, mock_tensor_manager_cls):
         """Test that offload uses default ['*'] pattern when not specified in config."""
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+
         om = OffloadManager("test")
         config = OffloadConfig(enabled=True)
 
@@ -696,8 +702,14 @@ class TestOffloadManagerStateMachine:
         assert isinstance(model, OffloadModelProxy)
         assert om._current_state == OffloadState.WARMUP
 
-    def test_offload_with_custom_patterns_in_config(self):
+    @patch("flextensor.tensor_manager.TensorManager")
+    def test_offload_with_custom_patterns_in_config(self, mock_tensor_manager_cls):
         """Test that offload uses custom patterns from config."""
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+
         om = OffloadManager("test")
         config = OffloadConfig(
             enabled=True,

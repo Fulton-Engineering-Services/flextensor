@@ -293,7 +293,10 @@ class TestTensorManagerLoadProfile:
         profile_dir.mkdir()
         profile_file = profile_dir / "profile.json"
 
+        from flextensor.state_handler import TensorManagerState
+
         profile_data = {
+            "version": TensorManagerState.SCHEMA_VERSION,
             "loader_type": "strategy",
             "tensor_id_to_name_map": {"123": "layer.weight"},
             "allocation_ordered": {},

@@ -134,7 +134,7 @@ config = load_config(
 |--------|------|---------|-------------|
 | `enabled` | bool | `True` | Master switch for offloading |
 | `gpu_device` | int | `0` | GPU device index to use |
-| `include_patterns` | list[str] | `["*"]` | Module path patterns to include for offloading (supports `*` and `?` wildcards). Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
+| `include_patterns` | list[str] | `["*"]` | Module or parameter path patterns to include for offloading (supports `*` and `?` wildcards). Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
 | `exclude_patterns` | list[str] | `[]` | Module/parameter path patterns to exclude from offloading (supports wildcards). Applied after `include_patterns`. |
 
 #### Include / Exclude Patterns
@@ -146,6 +146,19 @@ config = OffloadConfig(
     include_patterns=["layers.*", "embed", "head"],
 )
 model = offload(model, config=config)
+```
+
+Patterns can also target individual parameters instead of entire modules. This is useful when you want to offload only specific weight tensors (e.g., large linear weights) while keeping others (e.g., small biases or normalization scales) on GPU:
+
+```python
+config = OffloadConfig(
+    include_patterns=["*.weight"],
+)
+
+# Or target specific parameters within a module subtree
+config = OffloadConfig(
+    include_patterns=["layers.*.weight"],
+)
 ```
 
 To exclude specific modules or parameters, use `exclude_patterns`:
@@ -178,7 +191,7 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head" FT_EXCLUDE_PATTERNS="head,*.norm" pyth
     )
     ```
 
-    These patterns give each transformer layer its own offload trap, enabling FlexTensor to overlap CPU→GPU transfers with GPU computation. For models with a different layout, inspect module names with `model.named_modules()` and set `FT_MODULE_PATTERNS` accordingly.
+    These patterns give each transformer layer its own offload trap, enabling FlexTensor to overlap CPU→GPU transfers with GPU computation. For models with a different layout, inspect module names with `model.named_modules()` and set `FT_INCLUDE_PATTERNS` accordingly.
 
 The default `["*"]` matches all top-level child modules. It is a reasonable starting point for quick experimentation, but for transformer models in production, prefer specific patterns such as `model.layers.*`. With `["*"]`, every top-level child is wrapped in a single coarse trap, which prevents per-trap pipelining. With patterns like `model.layers.*`, each matched module gets its own trap, and FlexTensor can overlap CPU→GPU transfers for trap N+1 while the GPU computes trap N.
 
@@ -430,7 +443,7 @@ Set `profile_read_only=True` to prevent accidental profile overwrites in product
 These options help diagnose offloading behavior:
 
 - **`enable_instrumentation`**: Captures the arguments passed to FlexTensor components at initialization time and writes them to `instrumentation_output_dir`. Useful for reproducing configuration state.
-- **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Trap Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Trap Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which module patterns were applied as traps. Useful for diagnosing per-trap pipelining setup and inspecting why specific weights were assigned to specific pipeline blocks.
+- **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Trap Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Trap Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which include patterns were applied as traps. Useful for diagnosing per-trap pipelining setup and inspecting why specific weights were assigned to specific pipeline blocks.
 
 The distinction between `enable_diagnostics` and `enable_instrumentation` is scope: `enable_diagnostics` reports strategy decisions (which tensors landed in which block and why); `enable_instrumentation` captures component initialization arguments (how each component was configured).
 
