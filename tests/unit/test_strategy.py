@@ -17,6 +17,7 @@ from flextensor.memory_transfer_benchmark import extract_memory_transfers_from_l
 from flextensor.memory_transfer_interpolator import MemoryTransferInterpolator
 from flextensor.strategy import (
     AdaptiveKnapsackStrategy,
+    GreedyStrategy,
     KnapsackBlockStrategy,
     KnapsackStrategy,
 )
@@ -528,6 +529,71 @@ class TestKnapsackBlockStrategy:
         assert strategy.scale == 2.0
         assert strategy.group_size == 2
         assert strategy.threshold_mb == 0.5
+
+
+class TestGreedyStrategy:
+    """Test cases for GreedyStrategy class."""
+
+    def test_init_default_values(self):
+        """Test initialization with default values."""
+        strategy = GreedyStrategy()
+        assert strategy.scale == 1.0
+        assert strategy.threshold_mb == 0.1
+        assert strategy.n_blocks == 4
+
+    def test_init_custom_scale(self):
+        """Test initialization with custom scale."""
+        strategy = GreedyStrategy(scale=0.8)
+        assert strategy.scale == 0.8
+
+    def test_invalid_scale_raises(self):
+        """Test that non-positive scale raises ValueError."""
+        with pytest.raises(ValueError, match="scale must be positive"):
+            GreedyStrategy(scale=0.0)
+        with pytest.raises(ValueError, match="scale must be positive"):
+            GreedyStrategy(scale=-1.0)
+
+    def test_compute_empty_layer_stats(self):
+        """Test compute with empty layer stats."""
+        strategy = GreedyStrategy()
+        result = strategy.compute([])
+        assert result.strategy_map == {}
+
+    def test_scale_increases_offloading(self):
+        """Higher scale makes offloading more aggressive (more layers offloaded)."""
+        tensor = create_tensor_stats(1, 10 * 1024 * 1024, load_time_ms=5.0)
+        layers = [create_layer_stats(f"layer_{i}", [tensor], duration=2.0) for i in range(6)]
+
+        conservative = GreedyStrategy(scale=0.5)
+        aggressive = GreedyStrategy(scale=2.0)
+
+        result_conservative = conservative.compute(layers)
+        result_aggressive = aggressive.compute(layers)
+
+        assert len(result_aggressive.strategy_map) >= len(result_conservative.strategy_map)
+
+    def test_scale_decreases_offloading(self):
+        """Lower scale makes offloading more conservative (fewer layers offloaded)."""
+        tensor = create_tensor_stats(1, 10 * 1024 * 1024, load_time_ms=5.0)
+        layers = [create_layer_stats(f"layer_{i}", [tensor], duration=2.0) for i in range(6)]
+
+        baseline = GreedyStrategy(scale=1.0)
+        conservative = GreedyStrategy(scale=0.5)
+
+        result_baseline = baseline.compute(layers)
+        result_conservative = conservative.compute(layers)
+
+        assert len(result_conservative.strategy_map) <= len(result_baseline.strategy_map)
+
+    def test_scale_one_matches_default(self):
+        """scale=1.0 produces the same result as omitting scale."""
+        tensor = create_tensor_stats(1, 10 * 1024 * 1024, load_time_ms=3.0)
+        layers = [create_layer_stats(f"layer_{i}", [tensor], duration=2.0) for i in range(5)]
+
+        default_strategy = GreedyStrategy()
+        explicit_strategy = GreedyStrategy(scale=1.0)
+
+        assert default_strategy.compute(layers).strategy_map == explicit_strategy.compute(layers).strategy_map
 
 
 class TestAdaptiveKnapsackStrategy:

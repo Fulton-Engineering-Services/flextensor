@@ -452,24 +452,24 @@ class TensorManagerFactory:
             )
         elif strategy_type == "adaptive":
             tensor_manager_load_strategy = AdaptiveStrategy(
-                scale=config.knapsack_scale,
+                scale=config.transfer_budget_scale,
                 loader_type=config.transfer_mode,
                 n_blocks=n_blocks,
             )
         elif strategy_type == "knapsack_block":
             tensor_manager_load_strategy = KnapsackBlockStrategy(
-                scale=config.knapsack_scale,
+                scale=config.transfer_budget_scale,
                 threshold_mb=1.0,
                 n_blocks=n_blocks,
             )
         elif config.model_type == "basic":
             tensor_manager_load_strategy = KnapsackStrategy(
-                scale=config.knapsack_scale,
+                scale=config.transfer_budget_scale,
                 n_blocks=n_blocks,
             )
         else:
             tensor_manager_load_strategy = KnapsackStrategy(
-                scale=config.knapsack_scale,
+                scale=config.transfer_budget_scale,
                 cyclic=False,
                 group_size=1,
                 n_blocks=n_blocks,
@@ -831,7 +831,7 @@ class OffloadManagerExperiment:
             warmup_iters=self.WARMUP_ITERS * feedback_iters,
             profile_iters=self.PROFILE_ITERS * feedback_iters,
             transfer_mode=self.config.transfer_mode,
-            knapsack_scale=self.config.knapsack_scale,
+            transfer_budget_scale=self.config.transfer_budget_scale,
             num_blocks=self.config.n_blocks,
             pinned_memory=self.config.pinned_memory,
         )

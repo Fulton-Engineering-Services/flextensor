@@ -940,10 +940,10 @@ def main() -> None:  # noqa: C901
         help="Show diagnostic tables (detailed layer stats, offload decisions, transfer table, block assignments)",
     )
     parser.add_argument(
-        "--knapsack-scale",
+        "--transfer-budget-scale",
         type=float,
         default=1.0,
-        help="Scale factor for KnapsackStrategy (default: 1.0)",
+        help="Transfer budget scale factor for strategy (default: 1.0)",
     )
     parser.add_argument(
         "--generate",
@@ -1065,7 +1065,7 @@ def main() -> None:  # noqa: C901
             "knapsack": lambda _i=profile_interpolator: run_knapsack_strategy(
                 layer_stats_list,
                 _i,
-                scale=args.knapsack_scale,
+                scale=args.transfer_budget_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
             ),
@@ -1073,7 +1073,7 @@ def main() -> None:  # noqa: C901
                 layer_stats_list,
                 _i,
                 _m,
-                scale=args.knapsack_scale,
+                scale=args.transfer_budget_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
             ),
@@ -1099,7 +1099,7 @@ def main() -> None:  # noqa: C901
                 layer_stats_list,
                 _i,
                 _m,
-                scale=args.knapsack_scale,
+                scale=args.transfer_budget_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
             ),
@@ -1107,7 +1107,7 @@ def main() -> None:  # noqa: C901
                 layer_stats_list,
                 _i,
                 _m,
-                scale=args.knapsack_scale,
+                scale=args.transfer_budget_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
                 extra_optimization=True,

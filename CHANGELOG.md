@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   demonstrating FlexTensor offloading with the Wan2.2 text-to-video model, including profile
   save/load workflow.
 
+- `scale` parameter on `GreedyStrategy` for parity with `KnapsackStrategy` and
+  `AdaptiveStrategy`. Multiplies the cumulative compute budget (< 1 adds safety
+  margin, > 1 allows more transfers). Defaults to `1.0` (no change in behaviour).
 - `exclude_patterns` config option for keeping specific modules or parameters on GPU
   (e.g., `lm_head`, `*.norm`, `*.scale`). Applied after `include_patterns`.
 - `include_patterns` now accepts parameter-level patterns such as `*.weight` or
@@ -42,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `knapsack_scale` renamed to `transfer_budget_scale`. The environment
+  variable `FT_KNAPSACK_SCALE` is now `FT_TRANSFER_BUDGET_SCALE`. The old field name
+  and env var still work but emit a deprecation warning (removed in v0.3).
 - `module_patterns` renamed to `include_patterns`. The environment variable
   `FT_MODULE_PATTERNS` is now `FT_INCLUDE_PATTERNS`. The old names still work but
   emit a deprecation warning.
@@ -58,6 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Deprecated
 
+- `knapsack_scale` config option — use `transfer_budget_scale` instead. Will be removed in v0.3.
 - `module_patterns` config option — use `include_patterns` instead. Will be removed in v0.3.
 - `max_gpu_mem_bytes` config option — use `max_gpu_mem_fraction` instead. Will be removed in v0.3.
 - `use_shared_memory` config option — use `shm_enabled` instead. Will be removed in v0.3.

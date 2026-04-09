@@ -42,7 +42,7 @@ class TestOffloadConfig:
         assert config.shm_enabled is False
         assert config.warmup_iters == 1
         assert config.profile_iters == 10
-        assert config.knapsack_scale == 1.0
+        assert config.transfer_budget_scale == 1.0
         assert config.transfer_mode == "allocation_block_transfer"
         assert config.num_blocks == 4
         assert config.profile_storage_dir is None
@@ -104,7 +104,7 @@ class TestOffloadConfig:
             pinned_memory=False,
             warmup_iters=5,
             profile_iters=20,
-            knapsack_scale=2.0,
+            transfer_budget_scale=2.0,
             transfer_mode="custom_mode",
             num_blocks=8,
         )
@@ -112,7 +112,7 @@ class TestOffloadConfig:
         assert config.pinned_memory is False
         assert config.warmup_iters == 5
         assert config.profile_iters == 20
-        assert config.knapsack_scale == 2.0
+        assert config.transfer_budget_scale == 2.0
         assert config.transfer_mode == "custom_mode"
         assert config.num_blocks == 8
 
@@ -131,15 +131,15 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError):
             OffloadConfig(profile_iters=-1)
 
-    def test_knapsack_scale_validation_zero(self):
-        """Test that zero knapsack_scale raises validation error."""
+    def test_transfer_budget_scale_validation_zero(self):
+        """Test that zero transfer_budget_scale raises validation error."""
         with pytest.raises(ValidationError):
-            OffloadConfig(knapsack_scale=0.0)
+            OffloadConfig(transfer_budget_scale=0.0)
 
-    def test_knapsack_scale_validation_negative(self):
-        """Test that negative knapsack_scale raises validation error."""
+    def test_transfer_budget_scale_validation_negative(self):
+        """Test that negative transfer_budget_scale raises validation error."""
         with pytest.raises(ValidationError):
-            OffloadConfig(knapsack_scale=-1.0)
+            OffloadConfig(transfer_budget_scale=-1.0)
 
     def test_num_blocks_validation_one(self):
         """Test that num_blocks=1 raises validation error (ge=2 constraint)."""
@@ -474,9 +474,9 @@ class TestLoadConfigFromEnv:
 
     def test_load_float_field(self):
         """Test loading float field from environment."""
-        os.environ["FT_KNAPSACK_SCALE"] = "2.5"
+        os.environ["FT_TRANSFER_BUDGET_SCALE"] = "2.5"
         config = load_config_from_env()
-        assert config.knapsack_scale == 2.5
+        assert config.transfer_budget_scale == 2.5
 
     def test_load_string_field(self):
         """Test loading string field from environment."""
@@ -533,9 +533,9 @@ class TestLoadConfigFromEnv:
 
     def test_invalid_float_raises_error(self):
         """Test that invalid float value raises error."""
-        os.environ["FT_KNAPSACK_SCALE"] = "not_a_float"
+        os.environ["FT_TRANSFER_BUDGET_SCALE"] = "not_a_float"
 
-        with pytest.raises(ValueError, match="Failed to convert FT_KNAPSACK_SCALE"):
+        with pytest.raises(ValueError, match="Failed to convert FT_TRANSFER_BUDGET_SCALE"):
             load_config_from_env()
 
     def test_invalid_bool_raises_error(self):
@@ -620,10 +620,10 @@ class TestLoadConfigFromEnv:
 
     def test_all_float_fields(self):
         """Test loading all float fields from environment."""
-        os.environ["FT_KNAPSACK_SCALE"] = "2.5"
+        os.environ["FT_TRANSFER_BUDGET_SCALE"] = "2.5"
 
         config = load_config_from_env()
-        assert config.knapsack_scale == 2.5
+        assert config.transfer_budget_scale == 2.5
 
     def test_bool_variations_yes_no(self):
         """Test boolean parsing with 'yes' and 'no'."""
@@ -903,24 +903,24 @@ gpu_device = 1
         config_file.write_text("""{
     "enabled": "true",
     "gpu_device": "5",
-    "knapsack_scale": "1.5"
+    "transfer_budget_scale": "1.5"
 }""")
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 5
-        assert config.knapsack_scale == 1.5
+        assert config.transfer_budget_scale == 1.5
 
     def test_yaml_with_string_values(self, tmp_path):
         """Test loading YAML with string values that need conversion."""
         config_file = tmp_path / "string_vals.yaml"
         config_file.write_text("""enabled: "yes"
 gpu_device: "6"
-knapsack_scale: "1.5"
+transfer_budget_scale: "1.5"
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 6
-        assert config.knapsack_scale == 1.5
+        assert config.transfer_budget_scale == 1.5
 
     def test_empty_yaml_file(self, tmp_path):
         """Test loading empty YAML file uses all defaults."""
@@ -955,7 +955,7 @@ gpu_device = 1
 pinned_memory = false
 warmup_iters = 3
 profile_iters = 15
-knapsack_scale = 2.0
+transfer_budget_scale = 2.0
 transfer_mode = custom_mode
 num_blocks = 8
 """)
@@ -965,7 +965,7 @@ num_blocks = 8
         assert config.pinned_memory is False
         assert config.warmup_iters == 3
         assert config.profile_iters == 15
-        assert config.knapsack_scale == 2.0
+        assert config.transfer_budget_scale == 2.0
         assert config.transfer_mode == "custom_mode"
         assert config.num_blocks == 8
 
@@ -1132,7 +1132,7 @@ class TestGetFieldTypes:
     def test_float_fields(self):
         """Test that float fields are correctly identified."""
         field_types = _get_field_types()
-        assert field_types["knapsack_scale"] is float
+        assert field_types["transfer_budget_scale"] is float
         assert field_types["max_gpu_mem_fraction"] is float
 
     def test_str_fields(self):
@@ -1444,6 +1444,75 @@ class TestModulePatternsDeprecation:
         """
         ft = _get_field_types()
         assert ft["module_patterns"] is list
+
+
+class TestKnapsackScaleDeprecation:
+    """Tests for deprecated knapsack_scale → transfer_budget_scale migration."""
+
+    def test_knapsack_scale_maps_to_transfer_budget_scale(self):
+        """Passing knapsack_scale sets transfer_budget_scale with a deprecation warning."""
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            config = OffloadConfig(knapsack_scale=2.0)
+        assert config.transfer_budget_scale == 2.0
+
+    def test_both_fields_raises_value_error(self):
+        """Passing both knapsack_scale and transfer_budget_scale raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot set both"):
+            OffloadConfig(transfer_budget_scale=1.5, knapsack_scale=2.0)
+
+    def test_transfer_budget_scale_no_warning(self):
+        """Using transfer_budget_scale directly emits no deprecation warning."""
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = OffloadConfig(transfer_budget_scale=1.5)
+        assert config.transfer_budget_scale == 1.5
+        assert not any("knapsack_scale" in str(warning.message) for warning in w)
+
+    def test_knapsack_scale_warns_on_access(self):
+        """Reading knapsack_scale on an instance emits DeprecationWarning."""
+        config = OffloadConfig(transfer_budget_scale=1.5)
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            assert config.knapsack_scale == 1.5
+
+    def test_knapsack_scale_env_var(self, monkeypatch):
+        """FT_KNAPSACK_SCALE env var maps to transfer_budget_scale with a warning."""
+        monkeypatch.setenv("FT_KNAPSACK_SCALE", "2.5")
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            config = load_config_from_env()
+        assert config.transfer_budget_scale == 2.5
+
+    def test_both_env_vars_raises_value_error(self, monkeypatch):
+        """Setting both FT_KNAPSACK_SCALE and FT_TRANSFER_BUDGET_SCALE raises ValueError."""
+        monkeypatch.setenv("FT_KNAPSACK_SCALE", "1.5")
+        monkeypatch.setenv("FT_TRANSFER_BUDGET_SCALE", "2.0")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config_from_env()
+
+    def test_knapsack_scale_from_json_file(self, tmp_path):
+        """knapsack_scale in a JSON config file maps to transfer_budget_scale."""
+        import json
+
+        config_file = tmp_path / "test.json"
+        config_file.write_text(json.dumps({"knapsack_scale": 2.0}))
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            config = load_config_from_file(config_file)
+        assert config.transfer_budget_scale == 2.0
+
+    def test_knapsack_scale_from_yaml_file(self, tmp_path):
+        """knapsack_scale in a YAML config file maps to transfer_budget_scale."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("knapsack_scale: 2.0\n")
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            config = load_config_from_file(config_file)
+        assert config.transfer_budget_scale == 2.0
+
+    def test_knapsack_scale_from_ini_file(self, tmp_path):
+        """knapsack_scale in an INI config file maps to transfer_budget_scale."""
+        config_file = tmp_path / "test.conf"
+        config_file.write_text("[flextensor]\nknapsack_scale = 2.0\n")
+        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
+            config = load_config_from_file(config_file)
+        assert config.transfer_budget_scale == 2.0
 
 
 class TestRemovedFieldsRejection:

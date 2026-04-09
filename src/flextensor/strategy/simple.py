@@ -9,7 +9,7 @@ require complex optimization algorithms.
 from flextensor.collectors import LayerStatistics, TensorStatistics
 
 from .protocol import StrategyResult
-from .utils import _build_block_data
+from .utils import _build_block_data, validate_memory_params
 
 # =============================================================================
 # Simple Strategy Helper Functions
@@ -41,14 +41,16 @@ def _calculate_load_time(
 def _compute_offload_tensors_greedy(
     layer_stats: list[LayerStatistics],
     threshold_mb: float = 0.1,
+    scale: float = 1.0,
 ) -> dict[str, list[TensorStatistics]]:
     """Compute offload strategy using greedy heuristic.
 
-    Offloads weights when cumulative compute time exceeds their load time.
+    Offloads weights when scaled cumulative compute time exceeds their load time.
 
     Args:
         layer_stats: List of layer statistics.
         threshold_mb: Minimum tensor size threshold in MB.
+        scale: Multiplier on the cumulative compute budget.
 
     Returns:
         Strategy dict mapping layer labels to lists of weights to offload.
@@ -59,7 +61,7 @@ def _compute_offload_tensors_greedy(
 
     for layer in layer_stats:
         load_time_in_layer, tensors = _calculate_load_time(layer, threshold_mb)
-        if load_time_in_layer < cumulative_time_ms:
+        if load_time_in_layer < cumulative_time_ms * scale:
             strategy[upload_layer.label] = tensors
             cumulative_time_ms = 0
             upload_layer = layer
@@ -109,15 +111,19 @@ def _compute_offload_tensors_nth_layer(
 class GreedyStrategy:
     """Greedy offloading strategy based on cumulative compute time heuristic."""
 
-    def __init__(self, threshold_mb: float = 0.1, n_blocks: int = 4):
+    def __init__(self, threshold_mb: float = 0.1, n_blocks: int = 4, scale: float = 1.0):
         """Initialize GreedyStrategy.
 
         Args:
             threshold_mb: Minimum tensor size threshold in MB.
             n_blocks: Number of blocks for block-based loaders.
+            scale: Multiplier on the cumulative compute budget
+                (< 1 adds safety margin, > 1 allows more transfers).
         """
+        validate_memory_params(scale)
         self.threshold_mb = threshold_mb
         self.n_blocks = n_blocks
+        self.scale = scale
 
     def compute(
         self,
@@ -138,7 +144,7 @@ class GreedyStrategy:
         if not layer_stats:
             return StrategyResult(strategy_map={}, block_data=None)
         _ = memory_stats, max_gpu_mem_bytes  # Unused, but accepted for interface consistency
-        strategy_map = _compute_offload_tensors_greedy(layer_stats, self.threshold_mb)
+        strategy_map = _compute_offload_tensors_greedy(layer_stats, self.threshold_mb, self.scale)
         block_data = _build_block_data(strategy_map, layer_stats, self.n_blocks)
         return StrategyResult(strategy_map=strategy_map, block_data=block_data)
 

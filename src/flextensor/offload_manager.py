@@ -488,7 +488,7 @@ class OffloadManager:
             tensor_manager_load_strategy = self.config.load_strategy
         else:
             tensor_manager_load_strategy = AdaptiveStrategy(
-                scale=self.config.knapsack_scale,
+                scale=self.config.transfer_budget_scale,
                 loader_type=self.config.transfer_mode,
                 n_blocks=self.config.num_blocks,
                 min_blocks=self.config.min_blocks,

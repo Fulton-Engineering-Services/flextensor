@@ -237,7 +237,7 @@ config = OffloadConfig(
 )
 ```
 
-When set to `None`, the strategy switches to *latency mode* and optimises for throughput based on the `knapsack_scale` factor, with no explicit memory cap:
+When set to `None`, the strategy switches to *latency mode* and optimises for throughput based on the `transfer_budget_scale` factor, with no explicit memory cap:
 
 ```python
 config = OffloadConfig(
@@ -366,7 +366,7 @@ Gap traps are traps whose modules contain no offloadable weights. When a model h
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `knapsack_scale` | float | `1.0` | Scale factor for knapsack algorithm |
+| `transfer_budget_scale` | float | `1.0` | Multiplier on the time budget for weight transfers |
 | `load_strategy` | Strategy | `None` | Override automatic strategy selection |
 
 #### Understanding Strategies
@@ -376,7 +376,7 @@ FlexTensor includes several offloading strategies. The table below is a conceptu
 | Strategy | Algorithm | Best For |
 |----------|-----------|----------|
 | `KnapsackStrategy` | Dynamic programming optimization | General use |
-| `GreedyStrategy` | Largest tensors first | Quick approximation |
+| `GreedyStrategy` | Cumulative compute-budget heuristic | Quick approximation |
 | `NthLayerStrategy` | Offload every Nth layer | Predictable patterns |
 | `AdaptiveKnapsackStrategy` | Knapsack with runtime adaptation | Variable workloads |
 | `AdaptiveStrategy` | Evaluates multiple candidates, selects best | Default automatic selection |

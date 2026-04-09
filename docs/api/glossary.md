@@ -201,7 +201,7 @@ usage within the specified budget.
 ### Latency Mode
 
 Strategy operating mode activated by setting `max_gpu_mem_fraction=None`. The
-strategy optimises for throughput based on `knapsack_scale`, with no explicit
+strategy optimises for throughput based on `transfer_budget_scale`, with no explicit
 memory cap.
 
 ---

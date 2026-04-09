@@ -30,6 +30,7 @@ _MAX_GPU_MEM_BYTES_MSG = (
     "`max_gpu_mem_bytes` is deprecated. Use `max_gpu_mem_fraction` instead. Will be removed in v0.3."
 )
 _MODULE_PATTERNS_MSG = "`module_patterns` is deprecated. Use `include_patterns` instead. Will be removed in v0.3."
+_KNAPSACK_SCALE_MSG = "`knapsack_scale` is deprecated. Use `transfer_budget_scale` instead. Will be removed in v0.3."
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
@@ -98,12 +99,22 @@ class OffloadConfig(BaseModel):
     profile_iters: int = Field(default=10, ge=0)
     """Number of profiling iterations to collect statistics."""
 
-    knapsack_scale: float = Field(default=1.0, gt=0.0)
-    """Duration multiplier for transfer budget estimation in latency mode.
+    transfer_budget_scale: float = Field(default=1.0, gt=0.0)
+    """Multiplier on the time budget for weight transfers.
 
     Values below 1.0 add a safety margin to absorb profiling measurement noise
-    (e.g., 0.95 = 5% margin). Only affects latency mode (``max_gpu_mem_fraction=None``);
-    in memory mode the strategy auto-scales to meet the GPU memory target.
+    (e.g., 0.95 = 5% margin). Most relevant in latency mode
+    (``max_gpu_mem_fraction=None``); in memory mode the strategy may override
+    this value to meet the GPU memory target.
+    """
+
+    knapsack_scale: Annotated[float, _deprecated(_KNAPSACK_SCALE_MSG)] = Field(
+        default=1.0, gt=0.0, deprecated=_KNAPSACK_SCALE_MSG
+    )
+    """Duration multiplier for transfer budget estimation (deprecated).
+
+    .. deprecated:: v0.2.0
+        Use :attr:`transfer_budget_scale` instead. Will be removed in v0.3.
     """
 
     transfer_mode: str = Field(default="allocation_block_transfer")
@@ -257,6 +268,23 @@ class OffloadConfig(BaseModel):
                 data["shm_enabled"] = data["use_shared_memory"]
             elif "shm_enabled" in data and "use_shared_memory" not in data:
                 data["use_shared_memory"] = data["shm_enabled"]
+        return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_knapsack_scale(cls, data: Any) -> Any:
+        """Sync deprecated knapsack_scale with transfer_budget_scale."""
+        if isinstance(data, dict):
+            old_set = "knapsack_scale" in data
+            new_set = "transfer_budget_scale" in data
+            if old_set and not new_set:
+                warnings.warn(_KNAPSACK_SCALE_MSG, DeprecationWarning, stacklevel=2)
+                data["transfer_budget_scale"] = data["knapsack_scale"]
+            elif new_set and not old_set:
+                data["knapsack_scale"] = data["transfer_budget_scale"]
+            elif old_set and new_set:
+                msg = "Cannot set both `knapsack_scale` (deprecated) and `transfer_budget_scale`."
+                raise ValueError(msg)
         return data
 
     @model_validator(mode="before")
@@ -542,6 +570,42 @@ def _parse_env_list(field_name: str, env_value: str) -> list:
     return [_convert_env_value(p, element_type) for p in parts]
 
 
+def _migrate_deprecated_env(
+    env_prefix: str,
+    old_suffix: str,
+    new_suffix: str,
+    deprecation_msg: str,
+    convert: Any = None,
+) -> tuple[str, Any] | None:
+    """Check for a deprecated env var and migrate its value to the new name.
+
+    Returns ``(new_field_name, converted_value)`` when the deprecated var is
+    set, or ``None`` when it is absent.  Raises ``ValueError`` when both the
+    old and new env vars are set simultaneously.
+
+    *convert* is an optional callable applied to the raw string value.
+    When ``None`` the raw string is returned as-is.
+    """
+    old_env = f"{env_prefix}{old_suffix}"
+    old_value = os.environ.get(old_env)
+    if old_value is None:
+        return None
+    new_env = f"{env_prefix}{new_suffix}"
+    if os.environ.get(new_env) is not None:
+        msg = f"Cannot set both {old_env} (deprecated) and {new_env}."
+        raise ValueError(msg)
+    warnings.warn(deprecation_msg, DeprecationWarning, stacklevel=3)
+    new_field = new_suffix.lower()
+    if convert is not None:
+        try:
+            converted = convert(old_value)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"Failed to convert {old_env}={old_value}: {e}") from e
+    else:
+        converted = old_value
+    return new_field, converted
+
+
 def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, Any]:
     """Load configuration from environment variables.
 
@@ -565,21 +629,20 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
                 msg,
             )
 
-    # Deprecated FT_MODULE_PATTERNS → include_patterns
-    dep_env = f"{env_prefix}MODULE_PATTERNS"
-    dep_value = os.environ.get(dep_env)
-    if dep_value:
-        new_env = f"{env_prefix}INCLUDE_PATTERNS"
-        if os.environ.get(new_env) is not None:
-            msg = f"Cannot set both {dep_env} (deprecated) and {new_env}."
-            raise ValueError(msg)
-        warnings.warn(_MODULE_PATTERNS_MSG, DeprecationWarning, stacklevel=2)
-        config_dict["include_patterns"] = [p.strip() for p in dep_value.split(",") if p.strip()]
+    csv_to_list = lambda v: [p.strip() for p in v.split(",") if p.strip()]  # noqa: E731
+    for migration in (
+        ("MODULE_PATTERNS", "INCLUDE_PATTERNS", _MODULE_PATTERNS_MSG, csv_to_list),
+        ("KNAPSACK_SCALE", "TRANSFER_BUDGET_SCALE", _KNAPSACK_SCALE_MSG, float),
+    ):
+        result = _migrate_deprecated_env(env_prefix, *migration)
+        if result is not None:
+            config_dict[result[0]] = result[1]
 
     for field_name, field_type in field_types.items():
-        # module_patterns has dedicated env-var handling above (conflict
-        # check with env-var-specific error message + deprecation warning).
-        if field_type is object or field_name == "module_patterns":
+        # module_patterns and knapsack_scale have dedicated env-var handling
+        # above (conflict check with env-var-specific error message +
+        # deprecation warning).
+        if field_type is object or field_name in ("module_patterns", "knapsack_scale"):
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"

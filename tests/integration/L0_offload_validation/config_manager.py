@@ -85,9 +85,9 @@ class TestPreset(BaseModel):
         default=True,
         description="Whether to use pinned memory for transfers",
     )
-    knapsack_scale: float = Field(
+    transfer_budget_scale: float = Field(
         default=1.0,
-        description="Knapsack scale factor for tensor manager",
+        description="Transfer budget scale factor for tensor manager",
         gt=0.0,
     )
     strategy_type: Literal["knapsack", "knapsack_block", "global_offload", "global_tensor_selection", "adaptive"] = (
@@ -181,7 +181,9 @@ class ExperimentConfig(BaseModel):
         default=True,
         description="Whether to use pinned memory for transfers",
     )
-    knapsack_scale: float = Field(default=1.0, description="Knapsack scale factor for tensor manager", gt=0.0)
+    transfer_budget_scale: float = Field(
+        default=1.0, description="Transfer budget scale factor for tensor manager", gt=0.0
+    )
     strategy_type: Literal["knapsack", "knapsack_block", "global_offload", "global_tensor_selection", "adaptive"] = (
         Field(
             default="knapsack",
@@ -259,7 +261,7 @@ class ExperimentConfig(BaseModel):
             num_experts_list=model.num_experts_list,
             # Test configuration
             pinned_memory=test.pinned_memory,
-            knapsack_scale=test.knapsack_scale,
+            transfer_budget_scale=test.transfer_budget_scale,
             strategy_type=test.strategy_type,
             n_blocks=test.n_blocks,
             max_gpu_mem_gb=test.max_gpu_mem_gb,
@@ -296,7 +298,7 @@ class ExperimentConfig(BaseModel):
             api_type=self.api_type,
             transfer_mode=self.transfer_mode,
             pinned_memory=self.pinned_memory,
-            knapsack_scale=self.knapsack_scale,
+            transfer_budget_scale=self.transfer_budget_scale,
             strategy_type=self.strategy_type,
             n_blocks=self.n_blocks,
             max_gpu_mem_gb=self.max_gpu_mem_gb,
@@ -1092,7 +1094,7 @@ class ConfigManager:
         if not config.baseline_mode:
             print(f"Transfer Mode:   {config.transfer_mode}")
             print(f"Pinned Memory:   {config.pinned_memory}")
-            print(f"Knapsack Scale:  {config.knapsack_scale}")
+            print(f"Budget Scale:  {config.transfer_budget_scale}")
             print(f"Rearrange:       {config.rearrange_transfers}")
 
         print(f"{'=' * 60}\n")
@@ -1131,7 +1133,7 @@ class ConfigManager:
         if not test.baseline_mode:
             print(f"Transfer Mode:   {test.transfer_mode}")
             print(f"Pinned Memory:   {test.pinned_memory}")
-            print(f"Knapsack Scale:  {test.knapsack_scale}")
+            print(f"Budget Scale:  {test.transfer_budget_scale}")
             if test.rearrange_transfers:
                 print("Rearrange:       Yes")
                 print(f"Transfer Gap:    {test.compute_transfer_gap}")
