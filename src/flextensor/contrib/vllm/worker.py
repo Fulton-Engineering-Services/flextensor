@@ -16,7 +16,6 @@ from contextlib import contextmanager
 from typing import Any
 
 import psutil
-import tqdm
 from vllm.logger import init_logger
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker.gpu_worker import Worker
@@ -26,8 +25,6 @@ import flextensor.contrib.vllm.loader
 from flextensor.config import load_config
 
 LOGGER = init_logger(__name__)
-
-_BAR_FORMAT = "{desc}: {percentage:3.0f}% Completed | {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n"
 
 # Default include patterns for per-layer offloading in decoder-only transformer models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to
@@ -164,16 +161,18 @@ class FlexTensorOffloadWorker(Worker):
         self.compile_or_warm_up_model()
         compile_warm_iters = 2  # _dummy_run doesn't include sampling, account for it
 
-        for _ in range(self._offload_config.warmup_iters - compile_warm_iters):
+        warmup_iters = self._offload_config.warmup_iters - compile_warm_iters
+        for i in range(warmup_iters):
+            LOGGER.info("FlexTensor: Warmup iteration %d/%d (num_tokens=1)", i + 1, warmup_iters)
             self.model_runner._dummy_run(1, skip_eplb=True)  # noqa: SLF001
 
         self.compile_or_warm_up_model()
         max_num_tokens = min(self.model_runner.max_model_len, self.vllm_config.scheduler_config.max_num_batched_tokens)
-        for _ in tqdm.tqdm(
-            range(self._offload_config.profile_iters - compile_warm_iters),
-            desc=f"FlexTensor: Profiling model with max_num_tokens={max_num_tokens}",
-            bar_format=_BAR_FORMAT,
-        ):
+        profile_iters = self._offload_config.profile_iters - compile_warm_iters
+        for i in range(profile_iters):
+            LOGGER.info(
+                "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)", i + 1, profile_iters, max_num_tokens
+            )
             self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 
         LOGGER.info("FlexTensor: Switching to inference mode")
