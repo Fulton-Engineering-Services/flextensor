@@ -364,7 +364,7 @@ For a detailed explanation of how tensor discovery works, see [Tensor Discovery]
 
 ## Diagnose High Performance Overhead
 
-**Problem**: Model inference is slower than expected. FlexTensor targets less than 5% latency overhead compared to a baseline without offloading, under the assumptions described [below](#when-to-expect-higher-overhead).
+**Problem**: Model inference is slower than expected. FlexTensor achieves low latency overhead by pipelining weight transfers to overlap with GPU computation, under the assumptions described [below](#when-to-expect-higher-overhead).
 
 ### Step 1: Check that inference state has been reached
 
@@ -404,13 +404,13 @@ Transfer rearrangement is auto-enabled when gap layers are detected.
 
 ### When to expect higher overhead
 
-The <5% overhead target holds when the CPU-to-GPU interconnect bandwidth is sufficient to transfer offloaded weights within the available compute time. This condition may not hold when:
+Low overhead depends on the CPU-to-GPU interconnect bandwidth being sufficient to transfer offloaded weights within the available compute time. This condition may not hold when:
 
 - **Low concurrency / small batch decode**: At batch=1, per-layer compute can be very short (1-3 ms for typical LLMs), while transferring hundreds of MB of weights may take 15-25 ms depending on interconnect bandwidth. The transfer cannot be overlapped with such short compute.
 - **High offload ratio**: When a large fraction of model weights are offloaded (e.g., >40%), most layers require significant weight transfers. Even modest stalls per layer accumulate across dozens of layers.
 - **Profiling/production mismatch**: FlexTensor profiles at a specific batch size to measure per-layer compute time and plan transfers accordingly. If the production workload has a substantially different batch size (e.g., profiling at large prefill size but serving single-token decode at low concurrency), the transfer schedule may be planned for a compute window that does not exist at serving time.
 
-**How to check**: Enable `FT_ENABLE_DIAGNOSTICS=1` and examine the block assignment table in the log output. Compare the "Compute" column (per-layer compute time in ms) with the transfer sizes. If the time to transfer a layer's offloaded weights exceeds the preceding layer's compute time, overhead above 5% is expected.
+**How to check**: Enable `FT_ENABLE_DIAGNOSTICS=1` and examine the block assignment table in the log output. Compare the "Compute" column (per-layer compute time in ms) with the transfer sizes. If the time to transfer a layer's offloaded weights exceeds the preceding layer's compute time, significant overhead is expected.
 
 **Mitigation**:
 
