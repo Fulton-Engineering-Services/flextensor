@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-10
+
 ### Added
 
 - `offload_from_profile()` convenience API that combines `init`, `load_profile`, and `offload`
@@ -110,5 +112,6 @@ memory snapshot collection during worker lifecycle.
 **Known limitations** — inference only (no training or backward pass); no data parallelism;
 no MoE support; not thread-safe (one thread per manager instance).
 
-[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ai-dynamo/flextensor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ai-dynamo/flextensor/releases/tag/v0.1.0
