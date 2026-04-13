@@ -16,16 +16,16 @@ from unittest.mock import patch
 import pytest
 from torch import nn
 
-from flextensor.offload_manager import OffloadManager, OffloadState, _error_boundary, _GiB, _log_diagnostic_snapshot
+from flextensor.offload_manager import OffloadManager, OffloadPhase, _error_boundary, _GiB, _log_diagnostic_snapshot
 
 
 class TestLogDiagnosticSnapshot:
     """Tests for _log_diagnostic_snapshot helper."""
 
     def test_logs_all_fields(self, caplog: pytest.LogCaptureFixture) -> None:
-        """Verify snapshot logs state, iteration, manager name, GPU info, host info, pid."""
+        """Verify snapshot logs phase, iteration, manager name, GPU info, host info, pid."""
         om = OffloadManager("test_mgr")
-        om._current_state = OffloadState.PROFILE
+        om._current_phase = OffloadPhase.PROFILING
         om._iteration_count = 5
 
         mock_props = SimpleNamespace(total_memory=80 * _GiB)
@@ -49,7 +49,7 @@ class TestLogDiagnosticSnapshot:
                 _log_diagnostic_snapshot("test_label", om)
 
         assert "FlexTensor error in test_label" in caplog.text
-        assert "state=profile" in caplog.text
+        assert "phase=profiling" in caplog.text
         assert "iteration=5" in caplog.text
         assert "manager='test_mgr'" in caplog.text
         assert "gpu0:" in caplog.text
@@ -63,7 +63,7 @@ class TestLogDiagnosticSnapshot:
     def test_diagnostic_failure_does_not_mask_original(self, caplog: pytest.LogCaptureFixture) -> None:
         """Verify GPU/host query failures degrade to '<unavailable>' without masking the error."""
         om = OffloadManager("test_degrade")
-        om._current_state = OffloadState.WARMUP
+        om._current_phase = OffloadPhase.DISCOVERY
         om._iteration_count = 2
 
         with (
@@ -77,7 +77,7 @@ class TestLogDiagnosticSnapshot:
                 _log_diagnostic_snapshot("test_degrade_label", om)
 
         assert "FlexTensor error in test_degrade_label" in caplog.text
-        assert "state=warmup" in caplog.text
+        assert "phase=discovery" in caplog.text
         assert "gpu: <unavailable>" in caplog.text
         assert "host: <unavailable>" in caplog.text
 
@@ -94,7 +94,7 @@ class TestLogDiagnosticSnapshot:
                 _log_diagnostic_snapshot("test_none_om", None)
 
         assert "FlexTensor error in test_none_om" in caplog.text
-        assert "state=" not in caplog.text  # No OM state when om is None
+        assert "phase=" not in caplog.text  # No OM phase when om is None
         assert f"pid={os.getpid()}" in caplog.text
 
 
@@ -125,7 +125,7 @@ class TestErrorBoundary:
     def test_logs_diagnostics_on_error(self, caplog: pytest.LogCaptureFixture) -> None:
         """Verify the decorator triggers diagnostic logging on exception."""
         om = OffloadManager("test_diag")
-        om._current_state = OffloadState.INFERENCE
+        om._current_phase = OffloadPhase.INFERENCE
         om._iteration_count = 42
 
         @_error_boundary
@@ -140,7 +140,7 @@ class TestErrorBoundary:
         ):
             _failing_method(om)
 
-        assert "state=inference" in caplog.text
+        assert "phase=inference" in caplog.text
         assert "iteration=42" in caplog.text
 
     def test_transition_methods_are_decorated(self) -> None:
@@ -157,7 +157,7 @@ class TestErrorBoundary:
     def test_initialize_from_shm_error_boundary(self, caplog: pytest.LogCaptureFixture) -> None:
         """Verify _initialize_from_shm logs diagnostics on failure and re-raises."""
         om = OffloadManager("test_shm")
-        om._current_state = OffloadState.NOT_INITIALIZED
+        om._current_phase = OffloadPhase.NOT_INITIALIZED
 
         # Use a concrete class that satisfies _ShmCoordinatorLike (beartype checks structural compliance).
         class _FakeCoordinator:
@@ -181,7 +181,7 @@ class TestErrorBoundary:
             om._initialize_from_shm(mock_coordinator, nn.Linear(2, 2))
 
         assert "OffloadManager._initialize_from_shm" in caplog.text
-        assert "state=not_initialized" in caplog.text
+        assert "phase=not_initialized" in caplog.text
 
 
 class TestPatchedForwardErrorBoundary:
@@ -196,7 +196,7 @@ class TestPatchedForwardErrorBoundary:
 
         module = FailingModule()
         om = OffloadManager("test_fwd")
-        om._current_state = OffloadState.WARMUP
+        om._current_phase = OffloadPhase.DISCOVERY
         om._iteration_count = 1
 
         # Mock offload_block to be a no-op context manager so we test only the error boundary
@@ -216,7 +216,7 @@ class TestPatchedForwardErrorBoundary:
             module.forward(None)
 
         assert "FlexTensor error in forward(model.layers.5)" in caplog.text
-        assert "state=warmup" in caplog.text
+        assert "phase=discovery" in caplog.text
 
     def test_patched_forward_reraises_original(self) -> None:
         """Verify original exception propagates unchanged through patched forward."""

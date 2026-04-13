@@ -40,8 +40,8 @@ class TestOffloadConfig:
         assert config.gpu_device == 0
         assert config.pinned_memory is True
         assert config.shm_enabled is False
-        assert config.warmup_iters == 1
-        assert config.profile_iters == 10
+        assert config.discovery_iters == 1
+        assert config.profiling_iters == 10
         assert config.transfer_budget_scale == 1.0
         assert config.transfer_mode == "allocation_block_transfer"
         assert config.num_blocks == 4
@@ -102,16 +102,16 @@ class TestOffloadConfig:
         config = OffloadConfig(
             gpu_device=2,
             pinned_memory=False,
-            warmup_iters=5,
-            profile_iters=20,
+            discovery_iters=5,
+            profiling_iters=20,
             transfer_budget_scale=2.0,
             transfer_mode="custom_mode",
             num_blocks=8,
         )
         assert config.gpu_device == 2
         assert config.pinned_memory is False
-        assert config.warmup_iters == 5
-        assert config.profile_iters == 20
+        assert config.discovery_iters == 5
+        assert config.profiling_iters == 20
         assert config.transfer_budget_scale == 2.0
         assert config.transfer_mode == "custom_mode"
         assert config.num_blocks == 8
@@ -121,15 +121,15 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError):
             OffloadConfig(gpu_device=-1)
 
-    def test_warmup_iters_validation_negative(self):
-        """Test that negative warmup_iters raises validation error."""
+    def test_discovery_iters_validation_negative(self):
+        """Test that negative discovery_iters raises validation error."""
         with pytest.raises(ValidationError):
-            OffloadConfig(warmup_iters=-1)
+            OffloadConfig(discovery_iters=-1)
 
-    def test_profile_iters_validation_negative(self):
-        """Test that negative profile_iters raises validation error."""
+    def test_profiling_iters_validation_negative(self):
+        """Test that negative profiling_iters raises validation error."""
         with pytest.raises(ValidationError):
-            OffloadConfig(profile_iters=-1)
+            OffloadConfig(profiling_iters=-1)
 
     def test_transfer_budget_scale_validation_zero(self):
         """Test that zero transfer_budget_scale raises validation error."""
@@ -199,15 +199,15 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError), pytest.warns(DeprecationWarning):
             OffloadConfig(max_gpu_mem_bytes=-1)
 
-    def test_all_warmup_iters_property(self):
-        """Test all_warmup_iters property calculation."""
-        config = OffloadConfig(warmup_iters=3, profile_iters=7)
-        assert config.all_warmup_iters == 10
+    def test_pre_inference_iters_property(self):
+        """Test pre_inference_iters property calculation."""
+        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
+        assert config.pre_inference_iters == 10
 
-    def test_all_warmup_iters_property_default(self):
-        """Test all_warmup_iters property with default values."""
+    def test_pre_inference_iters_property_default(self):
+        """Test pre_inference_iters property with default values."""
         config = OffloadConfig()
-        assert config.all_warmup_iters == 11  # 1 + 10
+        assert config.pre_inference_iters == 11  # 1 + 10
 
     def test_knapsack_strategy_assignment(self):
         """Test assigning KnapsackStrategy to load_strategy."""
@@ -230,15 +230,15 @@ class TestOffloadConfig:
         assert config.load_strategy is strategy
         assert isinstance(config.load_strategy, NthLayerStrategy)
 
-    def test_edge_values_warmup_iters_zero(self):
-        """Test warmup_iters at boundary value 0."""
-        config = OffloadConfig(warmup_iters=0)
-        assert config.warmup_iters == 0
+    def test_edge_values_discovery_iters_zero(self):
+        """Test discovery_iters at boundary value 0."""
+        config = OffloadConfig(discovery_iters=0)
+        assert config.discovery_iters == 0
 
-    def test_edge_values_profile_iters_zero(self):
-        """Test profile_iters at boundary value 0."""
-        config = OffloadConfig(profile_iters=0)
-        assert config.profile_iters == 0
+    def test_edge_values_profiling_iters_zero(self):
+        """Test profiling_iters at boundary value 0."""
+        config = OffloadConfig(profiling_iters=0)
+        assert config.profiling_iters == 0
 
     def test_include_patterns_default(self):
         """Test include_patterns default value is ['*']."""
@@ -419,8 +419,8 @@ class TestLoadConfigFromEnv:
         """Test loading config with no environment variables uses defaults."""
         config = load_config_from_env()
         assert config.gpu_device == 0
-        assert config.warmup_iters == 1
-        assert config.profile_iters == 10
+        assert config.discovery_iters == 1
+        assert config.profiling_iters == 10
 
     def test_enabled_default_false(self):
         """Test that enabled defaults to False when loading from env."""
@@ -487,14 +487,14 @@ class TestLoadConfigFromEnv:
     def test_load_multiple_fields(self):
         """Test loading multiple fields from environment."""
         os.environ["FT_GPU_DEVICE"] = "1"
-        os.environ["FT_WARMUP_ITERS"] = "5"
-        os.environ["FT_PROFILE_ITERS"] = "15"
+        os.environ["FT_DISCOVERY_ITERS"] = "5"
+        os.environ["FT_PROFILING_ITERS"] = "15"
         os.environ["FT_ENABLE_DIAGNOSTICS"] = "true"
 
         config = load_config_from_env()
         assert config.gpu_device == 1
-        assert config.warmup_iters == 5
-        assert config.profile_iters == 15
+        assert config.discovery_iters == 5
+        assert config.profiling_iters == 15
         assert config.enable_diagnostics is True
 
     def test_load_with_custom_prefix(self):
@@ -504,7 +504,7 @@ class TestLoadConfigFromEnv:
 
         config = load_config_from_env(prefix="CUSTOM_")
         assert config.gpu_device == 3
-        assert config.warmup_iters == 7
+        assert config.discovery_iters == 7
 
     def test_load_partial_config(self):
         """Test loading config with only some environment variables set."""
@@ -512,17 +512,17 @@ class TestLoadConfigFromEnv:
         # Other fields should use defaults
         config = load_config_from_env()
         assert config.gpu_device == 2
-        assert config.warmup_iters == 1  # default
-        assert config.profile_iters == 10  # default
+        assert config.discovery_iters == 1  # default
+        assert config.profiling_iters == 10  # default
 
     def test_kwargs_override_env_vars(self):
         """Test that kwargs override environment variables."""
         os.environ["FT_GPU_DEVICE"] = "1"
-        os.environ["FT_WARMUP_ITERS"] = "5"
+        os.environ["FT_DISCOVERY_ITERS"] = "5"
 
-        config = load_config_from_env(gpu_device=2, warmup_iters=10)
+        config = load_config_from_env(gpu_device=2, discovery_iters=10)
         assert config.gpu_device == 2  # kwargs override
-        assert config.warmup_iters == 10  # kwargs override
+        assert config.discovery_iters == 10  # kwargs override
 
     def test_invalid_int_raises_error(self):
         """Test that invalid integer value raises error."""
@@ -606,15 +606,15 @@ class TestLoadConfigFromEnv:
     def test_all_int_fields(self):
         """Test loading all integer fields from environment."""
         os.environ["FT_GPU_DEVICE"] = "3"
-        os.environ["FT_WARMUP_ITERS"] = "8"
-        os.environ["FT_PROFILE_ITERS"] = "25"
+        os.environ["FT_DISCOVERY_ITERS"] = "8"
+        os.environ["FT_PROFILING_ITERS"] = "25"
         os.environ["FT_NUM_BLOCKS"] = "10"
         os.environ["FT_MIN_BLOCKS"] = "3"
 
         config = load_config_from_env()
         assert config.gpu_device == 3
-        assert config.warmup_iters == 8
-        assert config.profile_iters == 25
+        assert config.discovery_iters == 8
+        assert config.profiling_iters == 25
         assert config.num_blocks == 10
         assert config.min_blocks == 3
 
@@ -657,9 +657,9 @@ class TestLoadConfigFromEnv:
         """Test mixed environment and kwargs with validation."""
         os.environ["FT_GPU_DEVICE"] = "1"
 
-        config = load_config_from_env(warmup_iters=20, enable_diagnostics=True)
+        config = load_config_from_env(discovery_iters=20, enable_diagnostics=True)
         assert config.gpu_device == 1  # from env
-        assert config.warmup_iters == 20  # from kwargs
+        assert config.discovery_iters == 20  # from kwargs
         assert config.enable_diagnostics is True  # from kwargs
 
     def test_include_patterns_from_env(self):
@@ -741,13 +741,13 @@ class TestLoadConfigFromFile:
         config_file.write_text("""[flextensor]
 enabled = true
 gpu_device = 2
-warmup_iters = 5
+discovery_iters = 5
 enable_diagnostics = true
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 2
-        assert config.warmup_iters == 5
+        assert config.discovery_iters == 5
         assert config.enable_diagnostics is True
 
     def test_load_ini_file_with_ini_extension(self, tmp_path):
@@ -767,13 +767,13 @@ gpu_device = 3
         config_file.write_text("""{
     "enabled": true,
     "gpu_device": 4,
-    "warmup_iters": 8,
+    "discovery_iters": 8,
     "enable_diagnostics": false
 }""")
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 4
-        assert config.warmup_iters == 8
+        assert config.discovery_iters == 8
         assert config.enable_diagnostics is False
 
     def test_load_json_file_with_patterns(self, tmp_path):
@@ -793,13 +793,13 @@ gpu_device = 3
         config_file = tmp_path / "test.yaml"
         config_file.write_text("""enabled: true
 gpu_device: 5
-warmup_iters: 10
+discovery_iters: 10
 enable_diagnostics: true
 """)
         config = load_config_from_file(config_file)
         assert config.enabled is True
         assert config.gpu_device == 5
-        assert config.warmup_iters == 10
+        assert config.discovery_iters == 10
         assert config.enable_diagnostics is True
 
     def test_load_yaml_file_with_patterns(self, tmp_path):
@@ -854,12 +854,12 @@ gpu_device: 8
         config_file = tmp_path / "override.yaml"
         config_file.write_text("""enabled: true
 gpu_device: 1
-warmup_iters: 5
+discovery_iters: 5
 """)
-        config = load_config_from_file(config_file, gpu_device=10, warmup_iters=20)
+        config = load_config_from_file(config_file, gpu_device=10, discovery_iters=20)
         assert config.enabled is True  # from file
         assert config.gpu_device == 10  # from kwargs
-        assert config.warmup_iters == 20  # from kwargs
+        assert config.discovery_iters == 20  # from kwargs
 
     def test_file_not_found(self):
         """Test that FileNotFoundError is raised for missing file."""
@@ -894,7 +894,7 @@ gpu_device = 1
 """)
         config = load_config_from_file(config_file)
         assert config.gpu_device == 3
-        assert config.warmup_iters == 1  # default
+        assert config.discovery_iters == 1  # default
         assert config.enabled is True  # default (not False like env loading)
 
     def test_json_with_string_values(self, tmp_path):
@@ -953,8 +953,8 @@ transfer_budget_scale: "1.5"
 enabled = true
 gpu_device = 1
 pinned_memory = false
-warmup_iters = 3
-profile_iters = 15
+discovery_iters = 3
+profiling_iters = 15
 transfer_budget_scale = 2.0
 transfer_mode = custom_mode
 num_blocks = 8
@@ -963,8 +963,8 @@ num_blocks = 8
         assert config.enabled is True
         assert config.gpu_device == 1
         assert config.pinned_memory is False
-        assert config.warmup_iters == 3
-        assert config.profile_iters == 15
+        assert config.discovery_iters == 3
+        assert config.profiling_iters == 15
         assert config.transfer_budget_scale == 2.0
         assert config.transfer_mode == "custom_mode"
         assert config.num_blocks == 8
@@ -1120,7 +1120,7 @@ class TestGetFieldTypes:
         """Test that integer fields are correctly identified."""
         field_types = _get_field_types()
         assert field_types["gpu_device"] is int
-        assert field_types["warmup_iters"] is int
+        assert field_types["discovery_iters"] is int
         assert field_types["num_blocks"] is int
         assert field_types["min_blocks"] is int
 
@@ -1181,29 +1181,29 @@ class TestLoadConfig:
         config_file = tmp_path / "test.yaml"
         config_file.write_text("""enabled: true
 gpu_device: 1
-warmup_iters: 5
+discovery_iters: 5
 """)
         os.environ["FT_GPU_DEVICE"] = "10"
 
         config = load_config(config_path=config_file)
         assert config.enabled is True  # from file
         assert config.gpu_device == 10  # from env (overrides file)
-        assert config.warmup_iters == 5  # from file
+        assert config.discovery_iters == 5  # from file
 
     def test_kwargs_override_env_and_file(self, tmp_path):
         """Test that kwargs override both env and file values."""
         config_file = tmp_path / "test.yaml"
         config_file.write_text("""enabled: true
 gpu_device: 1
-warmup_iters: 5
+discovery_iters: 5
 """)
         os.environ["FT_GPU_DEVICE"] = "10"
-        os.environ["FT_WARMUP_ITERS"] = "15"
+        os.environ["FT_DISCOVERY_ITERS"] = "15"
 
-        config = load_config(config_path=config_file, gpu_device=20, warmup_iters=25)
+        config = load_config(config_path=config_file, gpu_device=20, discovery_iters=25)
         assert config.enabled is True  # from file
         assert config.gpu_device == 20  # from kwargs (overrides env and file)
-        assert config.warmup_iters == 25  # from kwargs (overrides env and file)
+        assert config.discovery_iters == 25  # from kwargs (overrides env and file)
 
     def test_file_with_use_env_false(self, tmp_path):
         """Test file loading without env override when use_env=False."""
@@ -1234,7 +1234,7 @@ gpu_device: 7
         config_file = tmp_path / "test.yaml"
         config_file.write_text("""enabled: true
 gpu_device: 1
-warmup_iters: 5
+discovery_iters: 5
 """)
         os.environ["FT_CONFIG_FILE"] = str(config_file)
         os.environ["FT_GPU_DEVICE"] = "10"
@@ -1242,7 +1242,7 @@ warmup_iters: 5
         config = load_config()
         assert config.enabled is True  # from file
         assert config.gpu_device == 10  # from env (overrides file)
-        assert config.warmup_iters == 5  # from file
+        assert config.discovery_iters == 5  # from file
 
     def test_custom_env_prefix(self, tmp_path):
         """Test using custom env prefix."""
@@ -1270,27 +1270,27 @@ warmup_iters: 5
         config_file = tmp_path / "test.yaml"
         config_file.write_text("""enabled: false
 gpu_device: 1
-warmup_iters: 5
-profile_iters: 10
+discovery_iters: 5
+profiling_iters: 10
 """)
         os.environ["FT_GPU_DEVICE"] = "2"
-        os.environ["FT_WARMUP_ITERS"] = "10"
-        os.environ["FT_PROFILE_ITERS"] = "20"
+        os.environ["FT_DISCOVERY_ITERS"] = "10"
+        os.environ["FT_PROFILING_ITERS"] = "20"
 
         config = load_config(
             config_path=config_file,
-            warmup_iters=15,
-            profile_iters=25,
+            discovery_iters=15,
+            profiling_iters=25,
         )
 
         # enabled: from file (not overridden)
         assert config.enabled is False
         # gpu_device: from env (overrides file)
         assert config.gpu_device == 2
-        # warmup_iters: from kwargs (overrides env and file)
-        assert config.warmup_iters == 15
-        # profile_iters: from kwargs (overrides env and file)
-        assert config.profile_iters == 25
+        # discovery_iters: from kwargs (overrides env and file)
+        assert config.discovery_iters == 15
+        # profiling_iters: from kwargs (overrides env and file)
+        assert config.profiling_iters == 25
 
     def test_enabled_from_env_overrides_file(self, tmp_path):
         """Test that FT_ENABLED from env overrides file value."""
@@ -1565,3 +1565,95 @@ class TestRemovedFieldsRejection:
         """pinned_memory is still a valid field and must not be rejected."""
         config = OffloadConfig(pinned_memory=False)
         assert config.pinned_memory is False
+
+
+class TestIterFieldRename:
+    """Tests for the warmup_iters → discovery_iters and profile_iters → profiling_iters rename."""
+
+    def test_discovery_iters_is_primary_field(self):
+        config = OffloadConfig(discovery_iters=3)
+        assert config.discovery_iters == 3
+
+    def test_profiling_iters_is_primary_field(self):
+        config = OffloadConfig(profiling_iters=5)
+        assert config.profiling_iters == 5
+
+    def test_warmup_iters_deprecated_alias_warns(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = OffloadConfig(warmup_iters=3)
+        assert any("warmup_iters" in str(warning.message) for warning in w)
+        assert config.discovery_iters == 3
+
+    def test_profile_iters_deprecated_alias_warns(self):
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            config = OffloadConfig(profile_iters=5)
+        assert any("profile_iters" in str(warning.message) for warning in w)
+        assert config.profiling_iters == 5
+
+    def test_pre_inference_iters_property(self):
+        config = OffloadConfig(discovery_iters=2, profiling_iters=8)
+        assert config.pre_inference_iters == 10
+
+    def test_all_warmup_iters_deprecated_property_warns(self):
+        config = OffloadConfig(discovery_iters=2, profiling_iters=8)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            val = config.all_warmup_iters
+        assert val == 10
+        assert any("all_warmup_iters" in str(warning.message) for warning in w)
+
+    def test_ft_discovery_iters_env_var(self, monkeypatch):
+        monkeypatch.setenv("FT_DISCOVERY_ITERS", "7")
+        config = load_config()
+        assert config.discovery_iters == 7
+
+    def test_ft_warmup_iters_env_var_deprecated(self, monkeypatch):
+        monkeypatch.setenv("FT_WARMUP_ITERS", "4")
+        with pytest.warns(DeprecationWarning, match="warmup_iters"):
+            config = load_config()
+        assert config.discovery_iters == 4
+
+    def test_warmup_and_discovery_iters_different_raises(self):
+        """Passing both warmup_iters and discovery_iters with different values raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot set both"):
+            OffloadConfig(warmup_iters=5, discovery_iters=3)
+
+    def test_profile_and_profiling_iters_different_raises(self):
+        """Passing both profile_iters and profiling_iters with different values raises ValueError."""
+        with pytest.raises(ValueError, match="Cannot set both"):
+            OffloadConfig(profile_iters=5, profiling_iters=3)
+
+    def test_warmup_and_discovery_iters_same_value_warns(self):
+        """Passing both warmup_iters and discovery_iters with same value emits DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="warmup_iters"):
+            config = OffloadConfig(warmup_iters=5, discovery_iters=5)
+        assert config.discovery_iters == 5
+
+    def test_profile_and_profiling_iters_same_value_warns(self):
+        """Passing both profile_iters and profiling_iters with same value emits DeprecationWarning."""
+        with pytest.warns(DeprecationWarning, match="profile_iters"):
+            config = OffloadConfig(profile_iters=5, profiling_iters=5)
+        assert config.profiling_iters == 5
+
+    def test_ft_profile_iters_env_var_deprecated(self, monkeypatch):
+        """FT_PROFILE_ITERS env var maps to profiling_iters with deprecation warning."""
+        monkeypatch.setenv("FT_PROFILE_ITERS", "8")
+        with pytest.warns(DeprecationWarning, match="profile_iters"):
+            config = load_config()
+        assert config.profiling_iters == 8
+
+    def test_ft_warmup_and_discovery_iters_env_conflict_raises(self, monkeypatch):
+        """Setting both FT_WARMUP_ITERS and FT_DISCOVERY_ITERS raises ValueError."""
+        monkeypatch.setenv("FT_WARMUP_ITERS", "4")
+        monkeypatch.setenv("FT_DISCOVERY_ITERS", "7")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config()
+
+    def test_ft_profile_and_profiling_iters_env_conflict_raises(self, monkeypatch):
+        """Setting both FT_PROFILE_ITERS and FT_PROFILING_ITERS raises ValueError."""
+        monkeypatch.setenv("FT_PROFILE_ITERS", "4")
+        monkeypatch.setenv("FT_PROFILING_ITERS", "7")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config()

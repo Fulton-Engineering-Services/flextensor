@@ -35,7 +35,7 @@ nav:
   - Understand:
       - Configuration: explanation/configuration.md
       - Pattern Matching: explanation/pattern-matching.md
-      - Internal States: explanation/states.md
+      - Internal Phases: explanation/phases.md
       - Tensor Discovery: explanation/tensor-discovery.md
   - Guides:
       - Troubleshooting: how-to/troubleshooting.md

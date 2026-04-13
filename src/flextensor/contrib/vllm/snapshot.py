@@ -214,7 +214,7 @@ if FlexTensorOffloadWorker is not None:
             self._take_snapshot("after_kv_cache_init")
 
         def warmup_and_profile_model(self) -> None:
-            """Run FlexTensor warmup/profiling without triggering snapshot dump.
+            """Run FlexTensor discovery/profiling without triggering snapshot dump.
 
             Sets an internal flag so compile_or_warm_up_model() calls during
             profiling do not take snapshots or dump to disk. The snapshot and

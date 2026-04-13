@@ -31,6 +31,11 @@ _MAX_GPU_MEM_BYTES_MSG = (
 )
 _MODULE_PATTERNS_MSG = "`module_patterns` is deprecated. Use `include_patterns` instead. Will be removed in v0.3."
 _KNAPSACK_SCALE_MSG = "`knapsack_scale` is deprecated. Use `transfer_budget_scale` instead. Will be removed in v0.3."
+_WARMUP_ITERS_MSG = "`warmup_iters` is deprecated. Use `discovery_iters` instead. Will be removed in v0.4.0."
+_PROFILE_ITERS_MSG = "`profile_iters` is deprecated. Use `profiling_iters` instead. Will be removed in v0.4.0."
+_ALL_WARMUP_ITERS_MSG = (
+    "`all_warmup_iters` is deprecated. Use `pre_inference_iters` instead. Will be removed in v0.4.0."
+)
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
@@ -93,11 +98,33 @@ class OffloadConfig(BaseModel):
     Can also be set via FT_SHM_WAIT_TIMEOUT env var.
     """
 
-    warmup_iters: int = Field(default=1, ge=0)
-    """Number of warmup iterations before profiling begins."""
+    discovery_iters: int = Field(default=1, ge=0)
+    """Number of discovery-phase iterations before profiling begins.
 
-    profile_iters: int = Field(default=10, ge=0)
-    """Number of profiling iterations to collect statistics."""
+    Can also be set via the ``FT_DISCOVERY_ITERS`` env var.
+    """
+
+    profiling_iters: int = Field(default=10, ge=0)
+    """Number of profiling-phase iterations to collect timing statistics.
+
+    Can also be set via the ``FT_PROFILING_ITERS`` env var.
+    """
+
+    warmup_iters: Annotated[int, _deprecated(_WARMUP_ITERS_MSG)] = Field(default=1, ge=0, deprecated=_WARMUP_ITERS_MSG)
+    """Number of warmup iterations before profiling begins.
+
+    .. deprecated:: v0.3
+        Use :attr:`discovery_iters` instead. Will be removed in v0.4.0.
+    """
+
+    profile_iters: Annotated[int, _deprecated(_PROFILE_ITERS_MSG)] = Field(
+        default=10, ge=0, deprecated=_PROFILE_ITERS_MSG
+    )
+    """Number of profiling iterations to collect statistics.
+
+    .. deprecated:: v0.3
+        Use :attr:`profiling_iters` instead. Will be removed in v0.4.0.
+    """
 
     transfer_budget_scale: float = Field(default=1.0, gt=0.0)
     """Multiplier on the time budget for weight transfers.
@@ -226,6 +253,38 @@ class OffloadConfig(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True, "use_attribute_docstrings": True}
 
+    @model_validator(mode="before")
+    @classmethod
+    def _sync_iter_fields(cls, data: Any) -> Any:
+        """Sync deprecated warmup_iters/profile_iters with discovery_iters/profiling_iters."""
+        if isinstance(data, dict):
+            has_warmup = "warmup_iters" in data
+            has_discovery = "discovery_iters" in data
+            if has_warmup and has_discovery:
+                if data["warmup_iters"] != data["discovery_iters"]:
+                    msg = "Cannot set both `warmup_iters` and `discovery_iters` to different values"
+                    raise ValueError(msg)
+                warnings.warn(_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
+            elif has_warmup:
+                warnings.warn(_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
+                data["discovery_iters"] = data["warmup_iters"]
+            elif has_discovery:
+                data["warmup_iters"] = data["discovery_iters"]
+
+            has_profile = "profile_iters" in data
+            has_profiling = "profiling_iters" in data
+            if has_profile and has_profiling:
+                if data["profile_iters"] != data["profiling_iters"]:
+                    msg = "Cannot set both `profile_iters` and `profiling_iters` to different values"
+                    raise ValueError(msg)
+                warnings.warn(_PROFILE_ITERS_MSG, DeprecationWarning, stacklevel=2)
+            elif has_profile:
+                warnings.warn(_PROFILE_ITERS_MSG, DeprecationWarning, stacklevel=2)
+                data["profiling_iters"] = data["profile_iters"]
+            elif has_profiling:
+                data["profile_iters"] = data["profiling_iters"]
+        return data
+
     # Note: pydantic v2 runs mode="before" validators in reverse definition order.
     # _sync_shm_fields (defined after this) runs first, then this validator.
     # These two validators have no dependencies on each other, so ordering is harmless.
@@ -263,11 +322,18 @@ class OffloadConfig(BaseModel):
     def _sync_shm_fields(cls, data: Any) -> Any:
         """Sync deprecated use_shared_memory with shm_enabled."""
         if isinstance(data, dict):
-            if "use_shared_memory" in data and "shm_enabled" not in data:
+            old_set = "use_shared_memory" in data
+            new_set = "shm_enabled" in data
+            if old_set and not new_set:
                 warnings.warn(_USE_SHARED_MEMORY_MSG, DeprecationWarning, stacklevel=2)
                 data["shm_enabled"] = data["use_shared_memory"]
-            elif "shm_enabled" in data and "use_shared_memory" not in data:
+            elif new_set and not old_set:
                 data["use_shared_memory"] = data["shm_enabled"]
+            elif old_set and new_set:
+                if data["use_shared_memory"] != data["shm_enabled"]:
+                    msg = "Cannot set both `use_shared_memory` (deprecated) and `shm_enabled` to different values."
+                    raise ValueError(msg)
+                warnings.warn(_USE_SHARED_MEMORY_MSG, DeprecationWarning, stacklevel=2)
         return data
 
     @model_validator(mode="before")
@@ -305,9 +371,20 @@ class OffloadConfig(BaseModel):
         return self
 
     @property
+    def pre_inference_iters(self) -> int:
+        """Total iterations before inference (discovery + profiling)."""
+        return self.discovery_iters + self.profiling_iters
+
+    @property
+    @_deprecated(_ALL_WARMUP_ITERS_MSG, category=None)
     def all_warmup_iters(self) -> int:
-        """Total warmup iterations including profile iterations."""
-        return self.warmup_iters + self.profile_iters
+        """Total warmup iterations including profile iterations.
+
+        .. deprecated:: v0.3
+            Use :attr:`pre_inference_iters` instead. Will be removed in v0.4.0.
+        """
+        warnings.warn(_ALL_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
+        return self.pre_inference_iters
 
 
 def _get_field_types() -> dict[str, type]:
@@ -633,6 +710,8 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
     for migration in (
         ("MODULE_PATTERNS", "INCLUDE_PATTERNS", _MODULE_PATTERNS_MSG, csv_to_list),
         ("KNAPSACK_SCALE", "TRANSFER_BUDGET_SCALE", _KNAPSACK_SCALE_MSG, float),
+        ("WARMUP_ITERS", "DISCOVERY_ITERS", _WARMUP_ITERS_MSG, int),
+        ("PROFILE_ITERS", "PROFILING_ITERS", _PROFILE_ITERS_MSG, int),
     ):
         result = _migrate_deprecated_env(env_prefix, *migration)
         if result is not None:
@@ -642,7 +721,7 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
         # module_patterns and knapsack_scale have dedicated env-var handling
         # above (conflict check with env-var-specific error message +
         # deprecation warning).
-        if field_type is object or field_name in ("module_patterns", "knapsack_scale"):
+        if field_type is object or field_name in ("module_patterns", "knapsack_scale", "warmup_iters", "profile_iters"):
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"
@@ -784,7 +863,7 @@ def load_config_from_env(prefix: str = "FT_", **kwargs) -> OffloadConfig:
 
     - FT_ENABLED=1 (required to enable offloading)
     - FT_GPU_DEVICE=1
-    - FT_WARMUP_ITERS=5
+    - FT_DISCOVERY_ITERS=5
 
     Note: When loading from environment, `enabled` defaults to False.
     You must explicitly set FT_ENABLED=1 to enable offloading.

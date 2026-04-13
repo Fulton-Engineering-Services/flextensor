@@ -92,7 +92,7 @@ The exclude pattern `layers.*.norm` is not itself a patched module (it belongs t
 
 ## GPU residency behavior
 
-Excluded modules and parameters are moved to GPU permanently during initialization. They stay on GPU throughout all stages (warmup, profile, inference) and are never offloaded. This means:
+Excluded modules and parameters are moved to GPU permanently during initialization. They stay on GPU throughout all phases (discovery, profiling, inference) and are never offloaded. This means:
 
 - Excluded tensors consume GPU memory at all times
 - They do not participate in the offload scheduling strategy

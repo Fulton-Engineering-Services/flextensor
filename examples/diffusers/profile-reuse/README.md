@@ -4,7 +4,7 @@
 -->
 # Diffusers Advanced: Profile Save & Load
 
-Profile once, then generate as many videos as you want without re-profiling. This example splits the workflow into a one-time profiling step and a fast inference step, so subsequent runs skip warmup and profiling entirely.
+Profile once, then generate as many videos as you want without re-profiling. This example splits the workflow into a one-time profiling step and a fast inference step, so subsequent runs skip discovery and profiling entirely.
 
 This example uses the [Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers) 14B-parameter text-to-video model with the Hugging Face [Diffusers](https://github.com/huggingface/diffusers) library.
 
@@ -56,7 +56,7 @@ The workflow is split into two scripts:
 
 | Script | Purpose |
 |--------|---------|
-| `run_profile.py` | Runs warmup + profiling, then saves the profile to disk |
+| `run_profile.py` | Runs discovery + profiling, then saves the profile to disk |
 | `run_infer.py` | Loads the saved profile and runs inference immediately |
 
 The profiling step creates a `wan_profile/` directory with separate subdirectories for each transformer's offload schedule:
@@ -81,7 +81,7 @@ wan_profile/
 ### Inference (`run_infer.py`)
 
 1. Loads the pipeline and moves non-transformer components to GPU.
-2. Calls `flextensor.offload_from_profile()` for each transformer — this loads the saved profile and offloads the model in one step, skipping warmup and profiling entirely.
+2. Calls `flextensor.offload_from_profile()` for each transformer — this loads the saved profile and offloads the model in one step, skipping discovery and profiling entirely.
 3. Runs inference at full speed.
 
 ### Key API
@@ -101,7 +101,7 @@ pipe.transformer = flextensor.offload_from_profile(
 
 | Parameter | `run_profile.py` | `run_infer.py` |
 |-----------|-------------|------------|
-| `profile_iters` | `20` | not needed |
+| `profiling_iters` | `20` | not needed |
 | `min_blocks` | `2` | `2` (default is `4`; lowered to reduce GPU memory usage) |
 | `include_patterns` | see scripts | must match between profiling and inference |
 

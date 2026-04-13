@@ -27,7 +27,7 @@ from flextensor import (
 )
 from flextensor.benchmark_tensor_mode import calculate_tensor_size
 from flextensor.helpers import NoOpTensorManager
-from flextensor.offload_manager import OffloadState
+from flextensor.offload_manager import OffloadPhase
 
 
 def set_seed(seed: int):
@@ -558,8 +558,8 @@ class CombinedTensorOffloadExperiment:
         model: dict[str, torch.Tensor] | nn.Module,
         input_tensor: torch.Tensor,
     ) -> torch.Tensor:
-        """Run warmup phase with lazy loading."""
-        print("Running warmup phase (lazy loading)...")
+        """Run discovery phase with lazy loading."""
+        print("Running discovery phase (lazy loading)...")
 
         self.memory_tracker.reset_memory_stats()
 
@@ -713,7 +713,7 @@ class OffloadManagerExperiment:
     """Experiment orchestrator using the high-level OffloadManager API.
 
     Uses OffloadManager's auto-trap module patching and automatic state transitions
-    (warmup -> profile -> inference) instead of manual TensorManager calls.
+    (discovery -> profiling -> inference) instead of manual TensorManager calls.
     Produces the same ExperimentResults as CombinedTensorOffloadExperiment for
     unified summary reporting.
     """
@@ -777,8 +777,8 @@ class OffloadManagerExperiment:
 
         feedback_iters = self.config.feedback_iters
 
-        # Warmup
-        print(f"Running warmup phase ({feedback_iters} feedback iterations, GPU baseline)...")
+        # Discovery
+        print(f"Running discovery phase ({feedback_iters} feedback iterations, GPU baseline)...")
         self.memory_tracker.reset_memory_stats()
         start_ns = time.time_ns()
         res_warmup = x
@@ -789,8 +789,8 @@ class OffloadManagerExperiment:
         self.results.warmup_memory_mb = self.memory_tracker.cuda_usage_mb()
         print(f"Warmup - Time: {self.results.warmup_time_ms:.2f}ms, Memory: {self.results.warmup_memory_mb:.2f}MB")
 
-        # Profile
-        print(f"Running profile phase ({feedback_iters} feedback iterations, GPU baseline)...")
+        # Profiling
+        print(f"Running profiling phase ({feedback_iters} feedback iterations, GPU baseline)...")
         self.memory_tracker.reset_memory_stats()
         start_ns = time.time_ns()
         res_profile = x
@@ -828,8 +828,8 @@ class OffloadManagerExperiment:
         # feedback loop within each logical iteration.
         offload_config = OffloadConfig(
             include_patterns=self.MODULE_PATTERNS,
-            warmup_iters=self.WARMUP_ITERS * feedback_iters,
-            profile_iters=self.PROFILE_ITERS * feedback_iters,
+            discovery_iters=self.WARMUP_ITERS * feedback_iters,
+            profiling_iters=self.PROFILE_ITERS * feedback_iters,
             transfer_mode=self.config.transfer_mode,
             transfer_budget_scale=self.config.transfer_budget_scale,
             num_blocks=self.config.n_blocks,
@@ -843,8 +843,8 @@ class OffloadManagerExperiment:
         x = self.input_tensor
 
         try:
-            # Warmup phase
-            print(f"Running warmup phase ({self.WARMUP_ITERS}x{feedback_iters} iterations)...")
+            # Discovery phase
+            print(f"Running discovery phase ({self.WARMUP_ITERS}x{feedback_iters} iterations)...")
             self.memory_tracker.reset_memory_stats()
             start_ns = time.time_ns()
             for _ in range(self.WARMUP_ITERS):
@@ -858,8 +858,8 @@ class OffloadManagerExperiment:
             warmup_mem = self.results.warmup_memory_mb
             print(f"Warmup - Time: {warmup_ms:.2f}ms, Memory: {warmup_mem:.2f}MB")
 
-            # Profile phase
-            print(f"Running profile phase ({self.PROFILE_ITERS}x{feedback_iters} iterations)...")
+            # Profiling phase
+            print(f"Running profiling phase ({self.PROFILE_ITERS}x{feedback_iters} iterations)...")
             self.memory_tracker.reset_memory_stats()
             start_ns = time.time_ns()
             for i in range(self.PROFILE_ITERS):
@@ -875,9 +875,9 @@ class OffloadManagerExperiment:
             profile_mem = self.results.profile_memory_mb
             print(f"Profile - Time: {profile_ms:.2f}ms, Memory: {profile_mem:.2f}MB")
 
-            # Verify OffloadManager reached INFERENCE state after warmup + profile
-            assert om._current_state == OffloadState.INFERENCE, (
-                f"Expected INFERENCE state, got {om._current_state.value}"
+            # Verify OffloadManager reached INFERENCE phase after warmup + profile
+            assert om._current_phase == OffloadPhase.INFERENCE, (
+                f"Expected INFERENCE phase, got {om._current_phase.value}"
             )
 
             # Inference phase

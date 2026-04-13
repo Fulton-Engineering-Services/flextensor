@@ -32,22 +32,22 @@ logger = logging.getLogger(__name__)
 class ModuleTracker:
     """Tracks which modules are executed within each trap context.
 
-    During warmup, forward hooks record which modules are called. Combined with
+    During discovery, forward hooks record which modules are called. Combined with
     the current trap name, this builds a mapping: trap_name → set of modules.
 
-    After warmup, this mapping is used to discover untraced parameters by
+    After discovery, this mapping is used to discover untraced parameters by
     iterating each trap's modules and calling named_parameters().
 
     Usage:
         tracker = ModuleTracker()
         tracker.register(model)
 
-        # During warmup - enter/exit trap context
+        # During discovery - enter/exit trap context
         tracker.enter_trap("layer_0")
         model(x)  # Hooks record modules executed under "layer_0"
         tracker.exit_trap("layer_0")
 
-        # After warmup - get tensor IDs per trap and unregister
+        # After discovery - get tensor IDs per trap and unregister
         trap_to_tensors = tracker.get_trap_tensor_ids(tensors_map)
         tracker.unregister()
     """
@@ -193,7 +193,7 @@ def _discover_from_module_tracker(
 ) -> set[int]:
     """Strategy: Discover untraced tensors from ModuleTracker.
 
-    Uses the modules tracked during warmup to find their parameters
+    Uses the modules tracked during discovery to find their parameters
     that weren't traced via __torch_function__.
 
     Args:
@@ -734,7 +734,7 @@ def discover_untraced_tensors_for_layers(
     1. Forward patching discovery (auto trap): If model uses forward patching,
        directly get tensor IDs from patched modules. This is the most accurate method.
     2. ModuleTracker (manual trap): If provided and forward patching didn't succeed,
-       use modules tracked during warmup to discover parameters.
+       use modules tracked during discovery to discover parameters.
     3. Prefix matching (fallback): Only if both above fail, use name-based matching.
 
     Each strategy is tried only if the previous one didn't find all untraced tensors.
@@ -744,7 +744,7 @@ def discover_untraced_tensors_for_layers(
         tensors_map: Map of tensor IDs to actual tensors.
         model: The model to search for patched modules.
         tensor_id_to_name_map: Map of tensor IDs to names (for prefix matching).
-        module_tracker: Optional ModuleTracker that tracked modules during warmup.
+        module_tracker: Optional ModuleTracker that tracked modules during discovery.
         include_patterns: Optional list of include patterns for parameter-level filtering.
         exclude_patterns: Optional list of patterns to exclude parameters by path.
 

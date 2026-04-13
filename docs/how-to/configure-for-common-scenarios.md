@@ -22,7 +22,7 @@ Use this configuration when GPU memory is the primary constraint and you need to
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    profile_iters=15,           # Accurate profiling
+    profiling_iters=15,           # Accurate profiling
     max_gpu_mem_fraction=0.8,   # Use at most 80% of total GPU memory
     min_blocks=2,               # Fewer blocks to save GPU memory
 )
@@ -67,8 +67,8 @@ Use this configuration during development when you need fast iteration and start
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    warmup_iters=1,
-    profile_iters=3,            # Minimal profiling for fast startup
+    discovery_iters=1,
+    profiling_iters=3,            # Minimal profiling for fast startup
 )
 
 model = offload(model, config=config)
@@ -76,7 +76,7 @@ model = offload(model, config=config)
 
 Key choices:
 
-- `profile_iters=3` reduces the startup cost before reaching inference state.
+- `profiling_iters=3` reduces the startup cost before reaching inference phase.
 - This produces a less accurate offloading strategy than higher iteration counts, so it is not recommended for production.
 
 ---
@@ -89,8 +89,8 @@ Use this configuration when deploying to a stable environment where startup time
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    warmup_iters=1,
-    profile_iters=20,           # Accurate initial profiling
+    discovery_iters=1,
+    profiling_iters=20,           # Accurate initial profiling
 )
 
 model = offload(model, config=config)
@@ -98,10 +98,10 @@ model = offload(model, config=config)
 
 Key choices:
 
-- `profile_iters=20` gives the profiler more timing samples, which is especially important on shared or cloud GPUs where timing noise is higher.
+- `profiling_iters=20` gives the profiler more timing samples, which is especially important on shared or cloud GPUs where timing noise is higher.
 
 !!! tip "Use profile persistence for faster startup"
-    Save profiles after the initial warmup/profile run using `save_profile()`, then load them on subsequent runs with `load_profile()` to skip the warmup and profile phases entirely. Set `profile_storage_dir` in your config and ensure `profile_read_only=False` to enable saving.
+    Save profiles after the initial discovery/profiling run using `save_profile()`, then load them on subsequent runs with `load_profile()` to skip the discovery and profiling phases entirely. Set `profile_storage_dir` in your config and ensure `profile_read_only=False` to enable saving.
 
 ---
 

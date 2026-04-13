@@ -10,7 +10,7 @@ FlexTensor is a tensor offloading library for PyTorch that enables running large
 
 - **Automatic Model Patching**: Offload model layers without modifying model code
 - **Manual Control**: Fine-grained control with `offload_block` context managers
-- **Smart Profiling**: Automatic warmup and profiling for optimal performance
+- **Smart Profiling**: Automatic discovery and profiling for optimal performance
 - **Wildcard Support**: Use patterns like `"layers.*"` to offload multiple modules
 - **Profile Persistence**: Save and load offloading profiles for faster startup
 - **Lazy Model Initialization**: Load models from saved profiles with optimized weight loading
@@ -29,8 +29,8 @@ model = YourModel()
 # Configure offloading
 config = OffloadConfig(
     gpu_device=0,
-    warmup_iters=1,
-    profile_iters=10,
+    discovery_iters=1,
+    profiling_iters=10,
     include_patterns=["embed", "layers.*", "head"],
 )
 

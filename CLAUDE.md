@@ -38,7 +38,7 @@ tests/
 
 **Architecture**: `OffloadManager` (singleton) → `TensorManager` → Strategies (`Knapsack`/`Greedy`/`NthLayer`/`Adaptive`/`Global`)
 
-**State Machine**: `NOT_INITIALIZED` → `WARMUP` → `PROFILE` → `INFERENCE`
+**State Machine**: `NOT_INITIALIZED` → `DISCOVERY` → `PROFILING` → `INFERENCE`
 
 ---
 

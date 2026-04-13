@@ -296,7 +296,7 @@ class TensorManager:
             remove_layers_operations: List of operations to remove layers from the strategy map
             blocks: Number of blocks to use for the block transfer loaders (default: 4)
             move_top_level_buffers_to_gpu: Whether to move top-level model buffers to GPU
-                during warmup initialization (default: True)
+                during discovery initialization (default: True)
             include_patterns: List of patterns to include for offloading. Parameters not matching
                 are kept on GPU permanently (default: None → ["*"]).
             exclude_patterns: List of patterns to exclude from offloading. Passed through to tensor
@@ -539,7 +539,7 @@ class TensorManager:
                 exclude_patterns=self.exclude_patterns,
             )
 
-        # Remove module tracker hooks after warmup - no longer needed
+        # Remove module tracker hooks after discovery - no longer needed
         if self.module_tracker is not None:
             self.module_tracker.unregister()
             self.module_tracker = None
@@ -570,7 +570,7 @@ class TensorManager:
                 exclude_patterns=self.exclude_patterns,
             )
 
-        # Remove module tracker hooks after warmup - no longer needed
+        # Remove module tracker hooks after discovery - no longer needed
         if self.module_tracker is not None:
             self.module_tracker.unregister()
             self.module_tracker = None
@@ -1083,7 +1083,7 @@ class TensorManager:
 
         Returns the memory used by GPU transfer blocks and unmapped tensors
         that were moved to GPU. This method should be called after the manager
-        has transitioned to inference mode (after warmup and profile phases).
+        has transitioned to inference mode (after discovery and profiling phases).
 
         Returns:
             GPUMemoryUsage: Memory breakdown with per-component bytes and MB values.
@@ -1200,10 +1200,10 @@ class TensorManager:
 
     def run_profile_suite(self, callback, model=None, direct_mode=True):
         """
-        Run all three phases (warmup, profile, direct_mode) in sequence with a callback.
+        Run all three phases (discovery, profiling, direct_mode) in sequence with a callback.
 
         This method automates the three-phase process:
-        1. Warmup phase: Collects initial tensor statistics
+        1. Discovery phase: Collects initial tensor statistics
         2. Profile phase: Collects detailed layer statistics with tensor loading
         3. Direct mode phase: Profiles with direct tensor access (if enabled)
 
@@ -1216,7 +1216,7 @@ class TensorManager:
             The inference results
 
         """
-        # Phase 1: Warmup
+        # Phase 1: Discovery
         self.prepare_warmup_mode()
         results = callback(model)
 

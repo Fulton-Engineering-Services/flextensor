@@ -32,6 +32,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Module-level patterns (e.g., `layers.*`) continue to include all parameters
   of the matched module.
 
+### Deprecated
+
+- `OffloadState` class — use `OffloadPhase` instead. Will be removed in v0.4.0.
+- `OffloadPhase.WARMUP` member — use `OffloadPhase.DISCOVERY` instead. Will be removed in v0.4.0.
+- `OffloadPhase.PROFILE` member — use `OffloadPhase.PROFILING` instead. Will be removed in v0.4.0.
+- `warmup_iters` config field — use `discovery_iters` instead. Will be removed in v0.4.0.
+- `profile_iters` config field — use `profiling_iters` instead. Will be removed in v0.4.0.
+- `all_warmup_iters` property — use `pre_inference_iters` instead. Will be removed in v0.4.0.
+- `knapsack_scale` config option — use `transfer_budget_scale` instead. Will be removed in v0.3.
+- `module_patterns` config option — use `include_patterns` instead. Will be removed in v0.3.
+- `max_gpu_mem_bytes` config option — use `max_gpu_mem_fraction` instead. Will be removed in v0.3.
+- `use_shared_memory` config option — use `shm_enabled` instead. Will be removed in v0.3.
+
 ### Removed
 
 - **BREAKING**: Removed internal-only `OffloadConfig` fields that should not have been
@@ -47,6 +60,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: Renamed `OffloadState` enum to `OffloadPhase` with members
+  `DISCOVERY` (was `WARMUP`) and `PROFILING` (was `PROFILE`). Config fields
+  `warmup_iters`/`profile_iters` renamed to `discovery_iters`/`profiling_iters`.
+  `all_warmup_iters` property renamed to `pre_inference_iters`. Old names
+  are deprecated aliases with `DeprecationWarning` — removal in v0.4.0.
 - `knapsack_scale` renamed to `transfer_budget_scale`. The environment
   variable `FT_KNAPSACK_SCALE` is now `FT_TRANSFER_BUDGET_SCALE`. The old field name
   and env var still work but emit a deprecation warning (removed in v0.3).
@@ -63,13 +81,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   module path (e.g., `layers.0.attn`) instead of `ParentClassName.module_name`
   (e.g., `TransformerLayer.attn`). The old format was incompatible with the new
   parameter-level `include_patterns`. Saved profiles must be re-generated.
-
-### Deprecated
-
-- `knapsack_scale` config option — use `transfer_budget_scale` instead. Will be removed in v0.3.
-- `module_patterns` config option — use `include_patterns` instead. Will be removed in v0.3.
-- `max_gpu_mem_bytes` config option — use `max_gpu_mem_fraction` instead. Will be removed in v0.3.
-- `use_shared_memory` config option — use `shm_enabled` instead. Will be removed in v0.3.
 
 ### Fixed
 

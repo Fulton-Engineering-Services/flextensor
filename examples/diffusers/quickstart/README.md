@@ -21,7 +21,7 @@ The script will:
 
 1. Load the Wan2.2-T2V pipeline and move non-transformer components to GPU.
 2. Apply FlexTensor offloading to the transformer blocks.
-3. Run a warmup/profiling pass to learn the optimal prefetch schedule.
+3. Run a discovery/profiling pass to learn the optimal prefetch schedule.
 4. Run a second inference pass and export the result to `wan-t2v.mp4`.
 
 ## Prerequisites
@@ -68,7 +68,7 @@ Key `OffloadConfig` parameters used in this example:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `profile_iters` | `20` | Number of diffusion steps used for profiling |
+| `profiling_iters` | `20` | Number of diffusion steps used for profiling |
 | `min_blocks` | `2` | Minimum number of blocks to keep on GPU (default is `4`; diffusion models are compute-heavy, so transfers easily hide behind computation — lowering to `2` saves GPU memory with minimal performance impact) |
 | `include_patterns` | see above | Submodule patterns to offload |
 

@@ -51,7 +51,7 @@ class TestForwardPatching:
         """Test that isinstance checks still work after patching."""
         model = ModelWithLayers()
         om = OffloadManager("test_isinstance")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Verify isinstance works before patching
         assert isinstance(model.layer1, SimpleLayer)
@@ -71,7 +71,7 @@ class TestForwardPatching:
         """Test that model hierarchy is preserved after patching."""
         model = ModelWithLayers()
         om = OffloadManager("test_hierarchy")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Get references before patching
         layer1_before = model.layer1
@@ -95,7 +95,7 @@ class TestForwardPatching:
         """Test that release() restores original forward methods."""
         model = ModelWithLayers()
         om = OffloadManager("test_restore")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Save original forward
         original_forward = model.layer1.forward
@@ -122,7 +122,9 @@ class TestForwardPatching:
         """Test that state_dict() works correctly with patched modules."""
         model = ModelWithLayers()
         om = OffloadManager("test_state_dict")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1", "layer2"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1", "layer2"]
+        )
 
         # Get state_dict before patching
         state_dict_before = model.state_dict()
@@ -145,7 +147,7 @@ class TestForwardPatching:
         """Test that custom attributes are still accessible after patching."""
         model = ModelWithLayers()
         om = OffloadManager("test_attributes")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Offload and patch
         om.offload(model, config=config)
@@ -162,7 +164,7 @@ class TestForwardPatching:
         """Test that patching the same module twice is handled correctly."""
         model = ModelWithLayers()
         om = OffloadManager("test_double_patch")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Offload and patch
         om.offload(model, config=config)
@@ -181,7 +183,9 @@ class TestForwardPatching:
         """Test that named_modules() works correctly with patched modules."""
         model = ModelWithLayers()
         om = OffloadManager("test_named_modules")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1", "layer2"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1", "layer2"]
+        )
 
         # Get named modules before patching
         named_modules_before = dict(model.named_modules())
@@ -204,7 +208,7 @@ class TestForwardPatching:
         """Test that patched forward is callable and wraps the original."""
         model = ModelWithLayers()
         om = OffloadManager("test_callable")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1"])
 
         # Save original forward
         original_forward = model.layer1.forward
@@ -230,7 +234,9 @@ class TestForwardPatching:
         """Test that patched modules are tracked correctly."""
         model = ModelWithLayers()
         om = OffloadManager("test_tracking")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layer1", "layer2"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1", "layer2"]
+        )
 
         # Initially no patched modules
         assert len(om._patched_modules) == 0
@@ -370,7 +376,7 @@ class TestAncestorGuard:
         model = NestedModel()
         om = OffloadManager("test_ancestor_skip")
         config = OffloadConfig(
-            enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layers.*", "layers.*.attn"]
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layers.*", "layers.*.attn"]
         )
 
         om.offload(model, config=config)
@@ -394,7 +400,7 @@ class TestAncestorGuard:
         model = NestedModel()
         om = OffloadManager("test_ancestor_non_overlap")
         config = OffloadConfig(
-            enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layers.*.attn", "head"]
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layers.*.attn", "head"]
         )
 
         om.offload(model, config=config)
@@ -419,7 +425,7 @@ class TestAncestorGuard:
         model = NestedModel()
         om = OffloadManager("test_ancestor_deep")
         config = OffloadConfig(
-            enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["layers.*", "layers.*.attn.q_proj"]
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layers.*", "layers.*.attn.q_proj"]
         )
 
         om.offload(model, config=config)
@@ -443,8 +449,8 @@ class TestAncestorGuard:
         om = OffloadManager("test_ancestor_exclude")
         config = OffloadConfig(
             enabled=True,
-            warmup_iters=1,
-            profile_iters=1,
+            discovery_iters=1,
+            profiling_iters=1,
             include_patterns=["layers.*"],
             exclude_patterns=["layers.*.attn"],
         )

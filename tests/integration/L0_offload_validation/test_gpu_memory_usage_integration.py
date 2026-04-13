@@ -98,11 +98,11 @@ class TestGPUMemoryUsageIntegration:
 
         # Run through phases
         with torch.no_grad():
-            # Warmup phase
+            # Discovery phase
             model = tensor_manager.initialize_warmup()
             _ = model(x)
 
-            # Profile phase
+            # Profiling phase
             model = tensor_manager.initialize_profile()
             x = torch.randn(1, 256, device=device_gpu)
             _ = model(x)
@@ -138,7 +138,7 @@ class TestGPUMemoryUsageIntegration:
 
         tensor_manager.set_model(model)
 
-        # Initialize warmup only
+        # Initialize discovery only
         model = tensor_manager.initialize_warmup()
 
         # Attempt to get memory usage should raise
@@ -218,19 +218,19 @@ class TestGPUMemoryUsageWithDictModel:
 
         x = torch.randn(1, hidden_size, device=device_gpu)
 
-        def run_model_warmup(model_dict, x, tensor_manager, num_layers):
-            """Run forward pass during warmup - tensors are moved on demand."""
+        def run_model_discovery(model_dict, x, tensor_manager, num_layers):
+            """Run forward pass during discovery - tensors are moved on demand."""
             for i in range(num_layers):
                 with tensor_manager.trap(f"layer_{i}"):
                     w = model_dict[f"layer_{i}_weight"]
-                    # During warmup, use tensor on its current device
+                    # During discovery, use tensor on its current device
                     if w.device != x.device:
                         w = w.to(x.device)
                     x = x @ w
             return x
 
         def run_model_profile(model_dict, x, tensor_manager, num_layers):
-            """Run forward pass during profile - use tensor_layer_loader."""
+            """Run forward pass during profiling - use tensor_layer_loader."""
             for i in range(num_layers):
                 with tensor_manager.trap(f"layer_{i}"):
                     w = model_dict[f"layer_{i}_weight"]
@@ -245,11 +245,11 @@ class TestGPUMemoryUsageWithDictModel:
             return x + 0
 
         with torch.no_grad():
-            # Warmup phase
+            # Discovery phase
             tensor_manager.initialize_warmup()
-            _ = run_model_warmup(model, x, tensor_manager, num_layers)
+            _ = run_model_discovery(model, x, tensor_manager, num_layers)
 
-            # Profile phase
+            # Profiling phase
             tensor_manager.initialize_profile()
             x = torch.randn(1, hidden_size, device=device_gpu)
             _ = run_model_profile(model, x, tensor_manager, num_layers)

@@ -7,8 +7,8 @@
 Lower-level components for custom workflows. In most cases, use the
 [Simplified API](simplified.md) or [`OffloadManager`](offload-manager.md) instead.
 
-`TensorManager` provides direct control over warmup, profiling, and inference phases.
-See [Internal States](../explanation/states.md) for details on how these components work together.
+`TensorManager` provides direct control over discovery, profiling, and inference phases.
+See [Internal Phases](../explanation/phases.md) for details on how these components work together.
 
 ::: flextensor.tensor_manager.TensorManager
     options:

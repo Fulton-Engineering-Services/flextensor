@@ -51,7 +51,7 @@ def main():
             component.to("cuda")
 
     offload_config = OffloadConfig(
-        profile_iters=20,
+        profiling_iters=20,
         min_blocks=2,
         include_patterns=MODULE_PATTERNS,
     )

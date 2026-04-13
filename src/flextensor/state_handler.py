@@ -508,7 +508,7 @@ class TensorManagerStateHandler:
         # Deep-copy the state so we don't mutate the caller's object (it may be reused).
         state = copy.deepcopy(state)
 
-        # Put model in the same state as the warmup path: disable grad, params/buffers on GPU,
+        # Put model in the same state as the discovery path: disable grad, params/buffers on GPU,
         # pinned memory for strategy loader, and traced_tensors populated for inference traps.
         if not tm.use_trace_tensor:  # TODO: add support for trace tensor
             pin_memory = tm.pinned_memory

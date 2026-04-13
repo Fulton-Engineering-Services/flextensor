@@ -66,16 +66,16 @@ config = load_config()  # reads FT_* environment variables
 model = offload(model, config=config)
 ```
 
-#### 2. Run Your Model Through Warmup and Profiling
+#### 2. Run Your Model Through Discovery and Profiling
 
-Execute your model for the configured number of warmup and profile iterations:
+Execute your model for the configured number of discovery and profiling iterations:
 
 ```python
-for _ in range(config.warmup_iters + config.profile_iters):
+for _ in range(config.discovery_iters + config.profiling_iters):
     output = model(input_data)
 ```
 
-When FlexTensor transitions to inference state, it automatically dumps the instrumentation data.
+When FlexTensor transitions to inference phase, it automatically dumps the instrumentation data.
 
 #### 3. Locate the Output File
 
@@ -203,7 +203,7 @@ Or simply omit the `enable_instrumentation` parameter.
 
 ## Resolve GPU Out-of-Memory Errors
 
-**Problem**: `torch.cuda.OutOfMemoryError` or `CUDA out of memory` during warmup, profiling, or inference.
+**Problem**: `torch.cuda.OutOfMemoryError` or `CUDA out of memory` during discovery, profiling, or inference.
 
 ### Why this happens
 
@@ -273,7 +273,7 @@ The GPU has less than 256 MiB free when the strategy runs — typically consumed
 
 ## Resolve Host Out-of-Memory Errors
 
-**Problem**: Python `MemoryError`, the Linux OOM killer terminating the process (`Killed`), or severe swap thrashing during warmup or profiling.
+**Problem**: Python `MemoryError`, the Linux OOM killer terminating the process (`Killed`), or severe swap thrashing during discovery or profiling.
 
 ### Why this happens
 
@@ -327,7 +327,7 @@ config = OffloadConfig(
 
 **Problem**: A runtime error such as `RuntimeError: Expected all tensors to be on the same device` during inference.
 
-This typically occurs when FlexTensor offloads a parameter but a custom kernel (for example, a Triton or CUDA kernel) accesses a related metadata attribute (such as a scale tensor) that was not discovered during warmup.
+This typically occurs when FlexTensor offloads a parameter but a custom kernel (for example, a Triton or CUDA kernel) accesses a related metadata attribute (such as a scale tensor) that was not mapped during the discovery phase.
 
 ### Step 1: Verify tensor discovery is enabled
 
@@ -366,27 +366,27 @@ For a detailed explanation of how tensor discovery works, see [Tensor Discovery]
 
 **Problem**: Model inference is slower than expected. FlexTensor achieves low latency overhead by pipelining weight transfers to overlap with GPU computation, under the assumptions described [below](#when-to-expect-higher-overhead).
 
-### Step 1: Check that inference state has been reached
+### Step 1: Check that inference phase has been reached
 
-Warmup and profile iterations are intentionally slower—overhead measurements are only meaningful after all warmup and profile iterations complete:
+Discovery and profiling iterations are intentionally slower—overhead measurements are only meaningful after all discovery and profiling iterations complete:
 
 ```python
-config = OffloadConfig(warmup_iters=1, profile_iters=10)
+config = OffloadConfig(discovery_iters=1, profiling_iters=10)
 model = flextensor.offload(model, config=config)
 
-# First warmup_iters + profile_iters iterations are measurement phases
+# First discovery_iters + profiling_iters iterations are measurement phases
 for i, batch in enumerate(dataloader):
     output = model(batch)
-    if i == config.warmup_iters + config.profile_iters:
-        print("Inference state reached — timing is now production overhead")
+    if i == config.discovery_iters + config.profiling_iters:
+        print("Inference phase reached — timing is now production overhead")
 ```
 
 ### Step 2: Increase profile iterations for noisy environments
 
-On shared or cloud GPUs, thermal throttling and multi-tenancy can cause noisy timing data. Increase `profile_iters` for a more accurate strategy:
+On shared or cloud GPUs, thermal throttling and multi-tenancy can cause noisy timing data. Increase `profiling_iters` for a more accurate strategy:
 
 ```python
-config = OffloadConfig(profile_iters=20)  # default: 10
+config = OffloadConfig(profiling_iters=20)  # default: 10
 ```
 
 ### Step 3: Tune transfer mode and block count
@@ -426,7 +426,7 @@ Low overhead depends on the CPU-to-GPU interconnect bandwidth being sufficient t
 
 ### Why This Happens
 
-When you call `flextensor.offload(model, config=config)`, FlexTensor patches the `forward` methods of matched modules and builds a parameter-to-trap map during warmup. This map is fixed at the end of the warmup state. Any module added to the model after `offload()` is called is not part of that map and will not be offloaded.
+When you call `flextensor.offload(model, config=config)`, FlexTensor patches the `forward` methods of matched modules and builds a parameter-to-trap map during discovery. This map is fixed at the end of the discovery phase. Any module added to the model after `offload()` is called is not part of that map and will not be offloaded.
 
 ```python
 # BAD: new layer is not covered by offloading
@@ -475,7 +475,7 @@ The safest approach is to finalize your model architecture before calling `offlo
 **Problem**: A `RuntimeError` with a message like `OffloadManager 'default' belongs to thread 12345, but accessed from thread 67890`, or silent data corruption when using FlexTensor from multiple threads.
 
 !!! danger "FlexTensor is not thread-safe"
-    The entire offloading lifecycle — setup, warmup, profiling, **and inference** — must run on a single thread per manager. FlexTensor's internal state (tensor maps, CUDA streams, memory blocks, profiling counters) is not protected against concurrent access. Using a patched model from multiple threads in parallel can cause silent data corruption, CUDA errors, or incorrect inference results even if no `RuntimeError` is raised.
+    The entire offloading lifecycle — setup, discovery, profiling, **and inference** — must run on a single thread per manager. FlexTensor's internal state (tensor maps, CUDA streams, memory blocks, profiling counters) is not protected against concurrent access. Using a patched model from multiple threads in parallel can cause silent data corruption, CUDA errors, or incorrect inference results even if no `RuntimeError` is raised.
 
 The `get_offload_manager()` thread-ownership guard catches the most common mistake (calling the API from the wrong thread), but it does **not** protect against running forward passes on a patched model concurrently.
 
@@ -505,7 +505,7 @@ t2.start()
 
 ### Step 3: Restructure to single-thread access
 
-If threads must share a single model, perform all FlexTensor operations (offloading, warmup, profiling, and inference) on one thread and dispatch results to other threads afterward. Do not run forward passes on a patched model from multiple threads concurrently.
+If threads must share a single model, perform all FlexTensor operations (offloading, discovery, profiling, and inference) on one thread and dispatch results to other threads afterward. Do not run forward passes on a patched model from multiple threads concurrently.
 
 ---
 

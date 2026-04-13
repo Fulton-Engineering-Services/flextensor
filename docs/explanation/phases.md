@@ -2,48 +2,48 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 -->
-# Understanding FlexTensor's Internal States
+# Understanding FlexTensor's Internal Phases
 
-This document explains the internal state machine that FlexTensor uses to manage tensor offloading. These states are implementation details that users don't need to interact with directly—FlexTensor handles state transitions automatically. However, understanding them helps explain what happens during model execution and aids in debugging.
+This document explains the internal state machine that FlexTensor uses to manage tensor offloading. These phases are implementation details that users don't need to interact with directly—FlexTensor handles phase transitions automatically. However, understanding them helps explain what happens during model execution and aids in debugging.
 
 ## Overview
 
-FlexTensor uses an internal state machine with four states: **Not Initialized**, **Warmup**, **Profile**, and **Inference**. After initialization, the system automatically progresses through three active states (Warmup, Profile, Inference) during the first few model iterations.
+FlexTensor uses an internal state machine with four phases: **Not Initialized**, **Discovery**, **Profiling**, and **Inference**. After initialization, the system automatically progresses through three active phases (Discovery, Profiling, Inference) during the first few model iterations.
 
-### Why States?
+### Why Phases?
 
 Tensor offloading presents a fundamental challenge: to efficiently move model weights between CPU and GPU, we need to know *which* parameters to offload and *when* to transfer them. Making poor decisions leads to either memory exhaustion (offloading too little) or performance degradation (offloading too much or at the wrong time).
 
 FlexTensor solves this by learning about your model's tensor usage patterns before optimizing:
 
-1. **Discovers** which parameters belong to which traps (Warmup state)
-2. **Measures** per-trap execution timing with weight loading (Profile state)
-3. **Applies** an optimized offloading strategy (Inference state)
+1. **Discovers** which parameters belong to which traps (Discovery phase)
+2. **Measures** per-trap execution timing with weight loading (Profiling phase)
+3. **Applies** an optimized offloading strategy (Inference phase)
 
 This learning process happens transparently during the first few iterations of model execution.
 
 ## State Progression
 
 ```
-NOT_INITIALIZED → WARMUP → PROFILE → INFERENCE
-                    ↓          ↓
-              (warmup_iters) (profile_iters)
+NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
+                       ↓           ↓
+                 (discovery_iters) (profiling_iters)
 ```
 
-The `OffloadManager` tracks the current state internally and transitions automatically based on iteration counts configured via `OffloadConfig`:
+The `OffloadManager` tracks the current phase internally and transitions automatically based on iteration counts configured via `OffloadConfig`:
 
 ```python
 config = OffloadConfig(
-    warmup_iters=1,    # Iterations in warmup state
-    profile_iters=10,  # Iterations in profile state
+    discovery_iters=1,    # Iterations in discovery phase
+    profiling_iters=10,  # Iterations in profiling phase
 )
 ```
 
-## Warmup State
+## Discovery Phase
 
 ### Purpose
 
-The warmup state identifies the relationship between modules and their parameters. It answers the question: "Which parameters does each module use?"
+The discovery phase identifies the relationship between modules and their parameters. It answers the question: "Which parameters does each module use?"
 
 ### What Happens Internally
 
@@ -54,7 +54,7 @@ The warmup state identifies the relationship between modules and their parameter
 
 ### Internal Mechanics
 
-During warmup, the `WarmupTrap` context manager:
+During discovery, the `WarmupTrap` context manager:
 
 - Intercepts all PyTorch operations via `__torch_function__`
 - Tracks tensor IDs used in each operation
@@ -63,7 +63,7 @@ During warmup, the `WarmupTrap` context manager:
 - Collects parameter-to-trap mapping data
 
 ```python
-# Internal flow during warmup (simplified)
+# Internal flow during discovery (simplified)
 with WarmupTrap(tensor_manager, layer_name, device_gpu):
     # Tensors are copied to GPU as needed
     # Tensor IDs are recorded
@@ -73,11 +73,11 @@ with WarmupTrap(tensor_manager, layer_name, device_gpu):
 
 ### Why It Matters
 
-Without warmup, we wouldn't know which weights to preload for each trap. This mapping is essential for the profile state to measure realistic transfer overhead.
+Without discovery, we wouldn't know which weights to preload for each trap. This mapping is essential for the profiling phase to measure realistic transfer overhead.
 
 ### Outputs and Model State
 
-At the end of the warmup state, FlexTensor has collected:
+At the end of the discovery phase, FlexTensor has collected:
 
 | Output | Description |
 |--------|-------------|
@@ -85,30 +85,30 @@ At the end of the warmup state, FlexTensor has collected:
 | `layer_statistics_collector` | Contains parameter-to-trap mappings and baseline timing per trap |
 | `model_ids` | Set of all tensor IDs belonging to the model |
 
-**Model state after warmup**:
+**Model state after discovery**:
 - All model tensors reside on **CPU memory**
 - For the strategy loader, tensors are **pinned** (if `pinned_memory=True`) at this stage; for block transfer loaders, pinned buffers are allocated later during inference setup
 - The model structure is unchanged—only tensor locations have moved
 - No GPU memory is permanently allocated yet (weights were copied on-demand and released)
 
-This CPU-resident model with collected statistics is the foundation for the profile state.
+This CPU-resident model with collected statistics is the foundation for the profiling phase.
 
-## Profile State
+## Profiling Phase
 
 ### Purpose
 
-The profile state measures how long each trap takes to execute *with* weight loading overhead included. It answers: "How much time does each module need, including weight transfers?"
+The profiling phase measures how long each trap takes to execute *with* weight loading overhead included. It answers: "How much time does each module need, including weight transfers?"
 
 ### What Happens Internally
 
-1. **Statistics Initialization**: Per-trap statistics from warmup are processed
+1. **Statistics Initialization**: Per-trap statistics from discovery are processed
 2. **Weight Loader Setup**: A loader is configured with the parameter-to-trap mapping
 3. **Detailed Timing**: Each trap's execution time is measured using CUDA events (`start_event.record()` / `end_event.record()`)
 4. **Duration Collection**: Statistics are accumulated across multiple iterations for accuracy
 
 ### Internal Mechanics
 
-The profile state uses either `Trap` (indirect mode) or `TrapDirect` (direct mode):
+The profiling phase uses either `Trap` (indirect mode) or `TrapDirect` (direct mode):
 
 **Indirect Mode (`Trap`)**:
 - Uses PyTorch's `TorchFunctionMode` to intercept operations
@@ -121,7 +121,7 @@ The profile state uses either `Trap` (indirect mode) or `TrapDirect` (direct mod
 - Lower overhead, suitable for most transformer architectures
 
 ```python
-# Internal flow during profile (simplified)
+# Internal flow during profiling (simplified)
 with Trap(tensor_manager, layer_name, device_gpu):
     # trap_nesting_guard.acquire() - prevent nested traps
     # tensor_layer_loader.enter() - preload tensors
@@ -147,7 +147,7 @@ Profile data enables the offloading strategy (e.g., Knapsack, Greedy, Adaptive, 
 
 ### Outputs and Model State
 
-At the end of the profile state, FlexTensor has collected:
+At the end of the profiling phase, FlexTensor has collected:
 
 | Output | Description |
 |--------|-------------|
@@ -155,19 +155,19 @@ At the end of the profile state, FlexTensor has collected:
 | `tensor_statistics_map` | Per-tensor statistics (size, transfer time estimates) |
 | `tensor_layer_loader` | Configured loader with parameter-to-trap mapping |
 
-**Model state after profile**:
+**Model state after profiling**:
 - Model tensors still reside on **CPU memory**
 - In direct mode: model may have been copied with shared tensor references for profiling
-- `layer_statistics_collector` contains averaged per-trap timing across all profile iterations
+- `layer_statistics_collector` contains averaged per-trap timing across all profiling iterations
 - System is ready to compute the optimal offloading strategy
 
-The collected timing data is the input for strategy computation in the inference state.
+The collected timing data is the input for strategy computation in the inference phase.
 
-## Inference State
+## Inference Phase
 
 ### Purpose
 
-The inference state applies the computed offloading strategy for production execution. It answers: "How do we execute optimally based on what we learned?"
+The inference phase applies the computed offloading strategy for production execution. It answers: "How do we execute optimally based on what we learned?"
 
 ### What Happens Internally
 
@@ -178,7 +178,7 @@ The inference state applies the computed offloading strategy for production exec
 
 ### Internal Mechanics
 
-The inference state uses `TrapInfer` or `TrapInferDirect`:
+The inference phase uses `TrapInfer` or `TrapInferDirect`:
 
 **Key Differences from Profile**:
 - No timing collection (removes measurement overhead)
@@ -198,7 +198,7 @@ FlexTensor supports different transfer strategies internally:
 
 ### Why It Matters
 
-The inference state is where the performance gains are realized. By using the learned statistics and optimized strategies, FlexTensor achieves:
+The inference phase is where the performance gains are realized. By using the learned statistics and optimized strategies, FlexTensor achieves:
 
 - Minimal GPU memory usage (weights offloaded to CPU when not needed)
 - Low latency overhead (transfers scheduled to overlap with computation)
@@ -206,7 +206,7 @@ The inference state is where the performance gains are realized. By using the le
 
 ### Outputs and Model State
 
-At the end of state transition to inference, FlexTensor has computed:
+At the end of phase transition to inference, FlexTensor has computed:
 
 | Output | Description |
 |--------|-------------|
@@ -230,23 +230,23 @@ This is the steady-state for all subsequent model executions.
 
 ## State Transitions
 
-The `OffloadManager` handles state transitions automatically and internally:
+The `OffloadManager` handles phase transitions automatically and internally:
 
 ```python
 def update_state(self):
     """Check and update state if necessary."""
-    if self._current_state in {OffloadState.NOT_INITIALIZED, OffloadState.INFERENCE}:
+    if self._current_phase in {OffloadPhase.NOT_INITIALIZED, OffloadPhase.INFERENCE}:
         return
     self._iteration_count += 1
 
-    if self._current_state == OffloadState.WARMUP and self._iteration_count >= self.config.warmup_iters:
+    if self._current_phase == OffloadPhase.DISCOVERY and self._iteration_count >= self.config.discovery_iters:
         self._transition_to_profile()
-    elif self._current_state == OffloadState.PROFILE and self._iteration_count >= self.config.profile_iters:
+    elif self._current_phase == OffloadPhase.PROFILING and self._iteration_count >= self.config.profiling_iters:
         self._transition_to_inference()
 ```
 
 Each transition:
-1. Prepares the tensor manager for the new state
+1. Prepares the tensor manager for the new phase
 2. Updates the model with appropriate hooks
 3. Resets the iteration counter
 
@@ -254,15 +254,15 @@ Users don't need to call this method—it's invoked automatically when using `of
 
 ## Configuration
 
-While users don't interact with states directly, they can influence state behavior through configuration:
+While users don't interact with phases directly, they can influence phase behavior through configuration:
 
-### Warmup Iterations (`warmup_iters`)
+### Discovery Iterations (`discovery_iters`)
 
 - **Default**: 1
-- **Purpose**: How many iterations to run in warmup state
+- **Purpose**: How many iterations to run in discovery phase
 - **Guidance**: Usually 1 is sufficient unless your model has dynamic tensor access patterns
 
-### Profile Iterations (`profile_iters`)
+### Profiling Iterations (`profiling_iters`)
 
 - **Default**: 10
 - **Purpose**: How many iterations to collect timing data
@@ -273,16 +273,16 @@ While users don't interact with states directly, they can influence state behavi
 ```python
 from flextensor import OffloadConfig, get_offload_manager, offload
 
-# Configuration affects internal state duration
+# Configuration affects internal phase duration
 config = OffloadConfig(
-    warmup_iters=1,
-    profile_iters=5,
+    discovery_iters=1,
+    profiling_iters=5,
     include_patterns=["layers.*"],
 )
 
 model = offload(model, config=config)
 
-# First warmup_iters + profile_iters iterations: internal learning
+# First discovery_iters + profiling_iters iterations: internal learning
 # Subsequent iterations: optimized inference
 for batch in dataloader:
     output = model(batch)
@@ -292,22 +292,22 @@ for batch in dataloader:
 
 Understanding the state machine explains some behaviors that might otherwise seem surprising.
 
-**Profile iteration count affects strategy quality.** The profile state accumulates timing statistics across `profile_iters` iterations. Too few iterations can produce inaccurate estimates, especially on systems with thermal throttling or when sharing the GPU with other processes. If you observe variable inference performance, increasing `profile_iters` gives the strategy more data to work with.
+**Profiling iteration count affects strategy quality.** The profiling phase accumulates timing statistics across `profiling_iters` iterations. Too few iterations can produce inaccurate estimates, especially on systems with thermal throttling or when sharing the GPU with other processes. If you observe variable inference performance, increasing `profiling_iters` gives the strategy more data to work with.
 
-**Parameter-to-trap mapping is fixed after warmup.** The warmup state builds a complete map of which parameters belong to which traps. Any module added to the model after `offload()` is called will not be part of this map and will not be offloaded. The system does not re-run warmup when the model changes.
+**Parameter-to-trap mapping is fixed after discovery.** The discovery phase builds a complete map of which parameters belong to which traps. Any module added to the model after `offload()` is called will not be part of this map and will not be offloaded. The system does not re-run discovery when the model changes.
 
-**State transitions are irreversible within a run.** Once FlexTensor enters inference state, it does not return to warmup or profile. To re-profile (for example, after changing the model), call `release()` and then `offload()` again.
+**Phase transitions are irreversible within a run.** Once FlexTensor enters inference phase, it does not return to discovery or profiling. To re-profile (for example, after changing the model), call `release()` and then `offload()` again.
 
-**Profile persistence can skip warmup and profile.** By saving the offloading profile after the first run (using `save_profile()`), subsequent runs can load the saved state (using `load_profile()`) and skip the warmup and profile phases entirely. The loaded state contains the parameter-to-trap mappings, timing statistics, and computed strategy, allowing the system to proceed directly to inference-ready configuration. See `OffloadConfig.profile_storage_dir` for configuration.
+**Profile persistence can skip discovery and profiling.** By saving the offloading profile after the first run (using `save_profile()`), subsequent runs can load the saved state (using `load_profile()`) and skip the discovery and profiling phases entirely. The loaded state contains the parameter-to-trap mappings, timing statistics, and computed strategy, allowing the system to proceed directly to inference-ready configuration. See `OffloadConfig.profile_storage_dir` for configuration.
 
 For practical guidance on avoiding mistakes related to these behaviors, see [Troubleshooting](../how-to/troubleshooting.md).
 
 ## Summary
 
-| State | Purpose | Internal Trap Class | Key Output |
+| Phase | Purpose | Internal Trap Class | Key Output |
 |-------|---------|---------------------|------------|
-| Warmup | Discover parameter-to-trap relationships | `WarmupTrap` | Parameter ID mapping |
-| Profile | Measure per-trap execution timing | `Trap` / `TrapDirect` | Per-trap statistics |
+| Discovery | Discover parameter-to-trap relationships | `WarmupTrap` | Parameter ID mapping |
+| Profiling | Measure per-trap execution timing | `Trap` / `TrapDirect` | Per-trap statistics |
 | Inference | Apply optimized strategy | `TrapInfer` / `TrapInferDirect` | Production execution |
 
 This state machine approach enables FlexTensor to intelligently offload model weights without requiring manual configuration. By learning from your model's actual behavior, it achieves near-optimal memory efficiency with minimal performance overhead -- all transparently managed as an internal implementation detail.

@@ -83,7 +83,7 @@ class TestForwardHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -126,7 +126,7 @@ class TestForwardHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -164,7 +164,7 @@ class TestForwardHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -207,7 +207,7 @@ class TestBackwardHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -250,7 +250,7 @@ class TestBackwardHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -296,7 +296,7 @@ class TestActivationCapture:
 
         om = OffloadManager("test")
         # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, include_patterns=[])
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0, include_patterns=[])
 
         proxy_model = om.offload(model, config=config)
 
@@ -351,7 +351,7 @@ class TestActivationCapture:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -395,7 +395,7 @@ class TestGradientManipulation:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -439,7 +439,7 @@ class TestGradientManipulation:
 
         om = OffloadManager("test")
         # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0, include_patterns=[])
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0, include_patterns=[])
 
         proxy_model = om.offload(model, config=config)
 
@@ -503,7 +503,7 @@ class TestMultipleHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -555,7 +555,7 @@ class TestMultipleHooks:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -604,7 +604,7 @@ class TestHookRemoval:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -647,7 +647,7 @@ class TestHookRemoval:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -711,7 +711,7 @@ class TestHooksAcrossStateTransitions:
         mock_tensor_manager.initialize_inference.return_value = inference_model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=1, profile_iters=2)
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=2)
 
         # Offload the warmup model (initialize_warmup will return it)
         proxy_model = om.offload(warmup_model, config=config)
@@ -720,7 +720,7 @@ class TestHooksAcrossStateTransitions:
         hook_calls = []
 
         def forward_hook(module, input, output):  # noqa: A002
-            hook_calls.append(om._current_state.name)
+            hook_calls.append(om._current_phase.name)
 
         # Register on the actual module, not the proxy
         handle = proxy_model.fc1.register_forward_hook(forward_hook)
@@ -728,15 +728,15 @@ class TestHooksAcrossStateTransitions:
         # Run through state transitions
         x = torch.randn(4, 10)
         with torch.no_grad():
-            _ = proxy_model(x)  # WARMUP (count=1, >= 1, transition after)
-            _ = proxy_model(x)  # PROFILE (count=1)
-            _ = proxy_model(x)  # PROFILE (count=2, >= 2, transition after)
+            _ = proxy_model(x)  # DISCOVERY (count=1, >= 1, transition after)
+            _ = proxy_model(x)  # PROFILING (count=1)
+            _ = proxy_model(x)  # PROFILING (count=2, >= 2, transition after)
             _ = proxy_model(x)  # INFERENCE
             _ = proxy_model(x)  # INFERENCE
 
         # With automatic hook transfer, hooks should persist across transitions
         assert len(hook_calls) == 5, f"Hook should be called 5 times, got {len(hook_calls)}"
-        assert hook_calls == ["WARMUP", "PROFILE", "PROFILE", "INFERENCE", "INFERENCE"], (
+        assert hook_calls == ["DISCOVERY", "PROFILING", "PROFILING", "INFERENCE", "INFERENCE"], (
             f"Hook should be called in all states, got {hook_calls}"
         )
 
@@ -763,7 +763,7 @@ class TestHooksAcrossStateTransitions:
         mock_tensor_manager.initialize_inference.return_value = inference_model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=1, profile_iters=2)
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=2)
 
         proxy_model = om.offload(warmup_model, config=config)
 
@@ -771,22 +771,22 @@ class TestHooksAcrossStateTransitions:
         hook_calls = []
 
         def forward_hook(module, input, output):  # noqa: A002
-            hook_calls.append(om._current_state.name)
+            hook_calls.append(om._current_phase.name)
 
         handle = proxy_model.register_forward_hook(forward_hook)
 
         # Run forward passes through state transitions
         x = torch.randn(4, 10)
         with torch.no_grad():
-            _ = proxy_model(x)  # WARMUP (count=1, >= 1, transition after)
-            _ = proxy_model(x)  # PROFILE (count=1)
-            _ = proxy_model(x)  # PROFILE (count=2, >= 2, transition after)
+            _ = proxy_model(x)  # DISCOVERY (count=1, >= 1, transition after)
+            _ = proxy_model(x)  # PROFILING (count=1)
+            _ = proxy_model(x)  # PROFILING (count=2, >= 2, transition after)
             _ = proxy_model(x)  # INFERENCE
             _ = proxy_model(x)  # INFERENCE
 
         # With explicit delegation and hook transfer, hooks should work and persist
         assert len(hook_calls) == 5, f"Hook should be called 5 times, got {len(hook_calls)}"
-        assert hook_calls == ["WARMUP", "PROFILE", "PROFILE", "INFERENCE", "INFERENCE"], (
+        assert hook_calls == ["DISCOVERY", "PROFILING", "PROFILING", "INFERENCE", "INFERENCE"], (
             f"Hook should be called in all states, got {hook_calls}"
         )
 
@@ -807,7 +807,7 @@ class TestHooksAcrossStateTransitions:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -862,7 +862,7 @@ class TestHooksAcrossStateTransitions:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         proxy_model = om.offload(model, config=config)
 
@@ -910,7 +910,7 @@ class TestHooksAcrossStateTransitions:
         mock_tensor_manager.initialize_inference.return_value = model1
 
         om = OffloadManager("test")
-        config = OffloadConfig(offload_on=True, warmup_iters=0, profile_iters=0)
+        config = OffloadConfig(enabled=True, discovery_iters=0, profiling_iters=0)
 
         # First offload call
         proxy_model = om.offload(model1, config=config)

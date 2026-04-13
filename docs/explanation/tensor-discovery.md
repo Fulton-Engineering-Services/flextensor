@@ -8,7 +8,7 @@ This document explains how FlexTensor discovers tensors that aren't traced throu
 
 ## The Problem: Untraced Tensors
 
-During the warmup state, FlexTensor intercepts PyTorch operations via `__torch_function__` to build a map of which tensors belong to which layers. This works well for standard PyTorch operations, but some tensors slip through:
+During the discovery phase, FlexTensor intercepts PyTorch operations via `__torch_function__` to build a map of which tensors belong to which layers. This works well for standard PyTorch operations, but some tensors slip through:
 
 ### Why Some Tensors Go Untraced
 
@@ -16,7 +16,7 @@ During the warmup state, FlexTensor intercepts PyTorch operations via `__torch_f
 
 2. **Optimized fused operations**: Fused attention or MLP implementations may access parameters through C++ bindings that don't invoke `__torch_function__`.
 
-3. **Lazy tensor access**: Parameters that are only accessed under certain conditions during inference but not during warmup.
+3. **Lazy tensor access**: Parameters that are only accessed under certain conditions during inference but not during discovery.
 
 The consequence: if FlexTensor doesn't know a tensor belongs to a layer, it can't offload it properly. The tensor either stays on GPU (wasting memory) or gets offloaded incorrectly (causing errors).
 
@@ -36,7 +36,7 @@ class FP8Linear(torch.nn.Module):
         return triton_fp8_matmul(x, self.weight, self.weight.scale)
 ```
 
-During warmup, FlexTensor traces `self.weight` through PyTorch operations. But `self.weight.scale` is accessed by the Triton kernel, which doesn't trigger `__torch_function__`. Without tensor discovery, the scale tensor would be left on CPU when the weight is loaded to GPU, causing a device mismatch error.
+During discovery, FlexTensor traces `self.weight` through PyTorch operations. But `self.weight.scale` is accessed by the Triton kernel, which doesn't trigger `__torch_function__`. Without tensor discovery, the scale tensor would be left on CPU when the weight is loaded to GPU, causing a device mismatch error.
 
 ## The Solution: Multi-Strategy Discovery
 
@@ -146,10 +146,10 @@ In this mode, FlexTensor doesn't know which module corresponds to which trap nam
 
 The `ModuleTracker` class solves this by using forward hooks:
 
-1. **Registration**: At warmup start, forward hooks are registered on all modules with parameters
+1. **Registration**: At discovery start, forward hooks are registered on all modules with parameters
 2. **Tracking**: When a trap context is entered, the tracker records the current trap name
 3. **Recording**: Forward hooks fire as modules execute, recording which modules ran under which trap
-4. **Discovery**: After warmup, each trap's modules are known, and their parameters can be retrieved
+4. **Discovery**: After the discovery phase, each trap's modules are known, and their parameters can be retrieved
 
 ```python
 # How ModuleTracker builds the mapping (simplified)
@@ -248,31 +248,31 @@ This ensures that when a weight tensor is offloaded, its scale and other metadat
 
 Both untraced tensor discovery and ModuleTracker are always enabled (hardcoded). No configuration is required. If you need to disable untraced tensor discovery for benchmarking or debugging, use the private `TensorManager` parameter `_enable_untraced_tensor_discovery`.
 
-## Integration with FlexTensor States
+## Integration with FlexTensor Phases
 
-Tensor discovery happens at a specific point in the warmup → profile transition:
+Tensor discovery happens at a specific point in the discovery → profiling transition:
 
 ```
-WARMUP STATE
+DISCOVERY PHASE
 ├── WarmupTrap intercepts operations
 ├── Traced tensors recorded via __torch_function__
 ├── ModuleTracker records module → trap mapping (Strategy 2)
-└── Warmup complete
+└── Discovery complete
 
-TRANSITION TO PROFILE
+TRANSITION TO PROFILING
 ├── discover_untraced_tensors_for_layers() called
 │   ├── Strategy 1: Check for forward-patched modules
 │   ├── Strategy 2: Query ModuleTracker for module mappings
 │   └── Strategy 3: Prefix match remaining tensors
 ├── Layer statistics augmented with discovered tensors
 ├── ModuleTracker hooks removed (no longer needed)
-└── Profile state begins with complete tensor mapping
+└── Profiling phase begins with complete tensor mapping
 
-PROFILE STATE
+PROFILING PHASE
 └── All tensors (traced + discovered) properly loaded per layer
 ```
 
-The discovery runs once, at the warmup-to-profile boundary. By the time inference runs, FlexTensor has a complete picture of which tensors belong to which layers.
+The discovery runs once, at the discovery-to-profiling boundary. By the time inference runs, FlexTensor has a complete picture of which tensors belong to which layers.
 
 ## Debugging Untraced Tensors
 
@@ -286,14 +286,14 @@ If you suspect tensor discovery issues:
 
 ### Verification
 
-Check the tensor mapping after warmup:
+Check the tensor mapping after discovery:
 
 ```python
 manager = get_offload_manager()
 model = manager.offload(model, config)
 
-# Run warmup
-for i in range(config.warmup_iters):
+# Run discovery
+for i in range(config.discovery_iters):
     model(dummy_input)
 
 # Examine layer statistics

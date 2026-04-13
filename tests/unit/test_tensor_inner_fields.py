@@ -81,17 +81,17 @@ def test_tensor_inner_fields_moved_to_gpu():
     om = flextensor.get_offload_manager("test_inner_fields")
     config = flextensor.OffloadConfig(
         load_strategy=flextensor.NthLayerStrategy(nth_layer=1),
-        warmup_iters=1,
-        profile_iters=1,
+        discovery_iters=1,
+        profiling_iters=1,
     )
 
     # Offload model
     config = config.model_copy(update={"include_patterns": ["layer1", "layer2"]})
     model = om.offload(model, config=config)
 
-    # Run warmup
+    # Run discovery + profiling iterations
     input_tensor = torch.randn(2, 64, device="cuda")
-    for _ in range(config.warmup_iters + config.profile_iters):
+    for _ in range(config.discovery_iters + config.profiling_iters):
         output = model(input_tensor)
 
     # The model should complete without errors
@@ -116,15 +116,15 @@ def test_tensor_inner_fields_in_offload_block():
     om = flextensor.get_offload_manager("test_inner_fields_block")
     config = flextensor.OffloadConfig(
         load_strategy=flextensor.NthLayerStrategy(nth_layer=1),
-        warmup_iters=1,
-        profile_iters=1,
+        discovery_iters=1,
+        profiling_iters=1,
         include_patterns=[],
     )
 
     model = om.offload(model, config=config)
 
     input_tensor = torch.randn(2, 64, device="cuda")
-    for _ in range(config.warmup_iters + config.profile_iters):
+    for _ in range(config.discovery_iters + config.profiling_iters):
         with om.offload_block("layer1"):
             x = model.layer1(input_tensor)
         x = torch.relu(x)

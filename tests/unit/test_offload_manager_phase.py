@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for OffloadManager state machine and lifecycle.
+"""Unit tests for OffloadManager phase transitions and lifecycle.
 
 This test suite validates the OffloadManager's state machine logic by mocking the
 TensorManager and trap calls. It verifies:
 
-1. State Transitions: Proper transitions through WARMUP -> PROFILE -> INFERENCE states
+1. State Transitions: Proper transitions through DISCOVERY -> PROFILING -> INFERENCE states
 2. Iteration Counting: Correct tracking of iterations in each state
 3. Automatic State Tracking: Via ManagedModelWrapper (new) or forward hooks (old)
-4. Configuration: Different warmup and profile iteration counts
+4. Configuration: Different discovery and profiling iteration counts
 5. Pattern Matching: Multiple module patterns for offloading
 
 Key behaviors tested:
@@ -24,14 +24,14 @@ Test Compatibility:
   bug that exists in the old version where hooks don't work when model objects
   change during state transitions
 
-Example flow with warmup_iters=2, profile_iters=3:
-  Forward 0: WARMUP (count 0 -> 1)
-  Forward 1: WARMUP (count 1 -> 2)
-  Forward 2: WARMUP -> PROFILE transition (count reset to 0)
-  Forward 3: PROFILE (count 0 -> 1)
-  Forward 4: PROFILE (count 1 -> 2)
-  Forward 5: PROFILE (count 2 -> 3)
-  Forward 6: PROFILE -> INFERENCE transition (count reset to 0)
+Example flow with discovery_iters=2, profiling_iters=3:
+  Forward 0: DISCOVERY (count 0 -> 1)
+  Forward 1: DISCOVERY (count 1 -> 2)
+  Forward 2: DISCOVERY -> PROFILING transition (count reset to 0)
+  Forward 3: PROFILING (count 0 -> 1)
+  Forward 4: PROFILING (count 1 -> 2)
+  Forward 5: PROFILING (count 2 -> 3)
+  Forward 6: PROFILING -> INFERENCE transition (count reset to 0)
   Forward 7+: INFERENCE (no counting)
 """
 
@@ -40,7 +40,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadModelProxy, OffloadState
+from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadModelProxy, OffloadPhase
 
 
 # Simple model for testing
@@ -202,12 +202,12 @@ class TestOffloadManagerStateMachine:
 
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
-    def test_state_transitions_warmup_to_profile_to_inference(
+    def test_phase_transitions_discovery_to_profiling_to_inference(
         self,
         mock_strategy_cls,
         mock_tensor_manager_cls,
     ):
-        """Test state transitions from NOT_INITIALIZED -> WARMUP -> PROFILE -> INFERENCE."""
+        """Test state transitions from NOT_INITIALIZED -> DISCOVERY -> PROFILING -> INFERENCE."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
         mock_tensor_manager_cls.return_value = mock_tensor_manager
@@ -226,14 +226,14 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_inference.return_value = self.model
 
         # Configure offload manager with specific iteration counts
-        warmup_iters = 2
-        profile_iters = 7
+        discovery_iters = 2
+        profiling_iters = 7
 
         om = OffloadManager("test")
         config = OffloadConfig(
             enabled=True,
-            warmup_iters=warmup_iters,
-            profile_iters=profile_iters,
+            discovery_iters=discovery_iters,
+            profiling_iters=profiling_iters,
         )
 
         # Offload the model
@@ -241,28 +241,28 @@ class TestOffloadManagerStateMachine:
         model = om.offload(self.model, config=config)
 
         # Verify initial state
-        assert om._current_state == OffloadState.WARMUP
+        assert om._current_phase == OffloadPhase.DISCOVERY
         assert om._iteration_count == 0
 
-        # Run warmup iterations - wrapper automatically calls update_state()
-        for _ in range(warmup_iters):
+        # Run discovery iterations - wrapper automatically calls update_state()
+        for _ in range(discovery_iters):
             with torch.no_grad():
                 _ = model(self.x)  # Wrapper automatically calls update_state()
 
-        # Should have transitioned to PROFILE after warmup_iters iterations
-        assert om._current_state == OffloadState.PROFILE
+        # Should have transitioned to PROFILING after discovery_iters iterations
+        assert om._current_phase == OffloadPhase.PROFILING
         assert om._iteration_count == 0  # Counter resets on transition
 
         # Verify transition to profile was called
         mock_tensor_manager.initialize_profile.assert_called_once()
 
-        # Run profile iterations
-        for _ in range(profile_iters):
+        # Run profiling iterations
+        for _ in range(profiling_iters):
             with torch.no_grad():
                 _ = model(self.x)  # Wrapper automatically calls update_state()
 
-        # Should have transitioned to INFERENCE after profile_iters iterations
-        assert om._current_state == OffloadState.INFERENCE
+        # Should have transitioned to INFERENCE after profiling_iters iterations
+        assert om._current_phase == OffloadPhase.INFERENCE
         assert om._iteration_count == 0  # Counter resets on transition
 
         # Verify transition to inference was called
@@ -272,7 +272,7 @@ class TestOffloadManagerStateMachine:
         for _i in range(5):
             with torch.no_grad():
                 _ = model(self.x)  # Wrapper automatically calls update_state()
-            assert om._current_state == OffloadState.INFERENCE
+            assert om._current_phase == OffloadPhase.INFERENCE
 
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
@@ -299,14 +299,14 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_inference.return_value = self.model
 
         # Configure with minimal iterations
-        warmup_iters = 1
-        profile_iters = 1
+        discovery_iters = 1
+        profiling_iters = 1
 
         om = OffloadManager("test")
         config = OffloadConfig(
             enabled=True,
-            warmup_iters=warmup_iters,
-            profile_iters=profile_iters,
+            discovery_iters=discovery_iters,
+            profiling_iters=profiling_iters,
         )
 
         # Offload the model
@@ -316,27 +316,27 @@ class TestOffloadManagerStateMachine:
         # Verify model is a torch.nn.Module (could be original or wrapper)
         assert isinstance(model, torch.nn.Module)
 
-        # Initial state should be WARMUP
-        assert om._current_state == OffloadState.WARMUP
+        # Initial state should be DISCOVERY
+        assert om._current_phase == OffloadPhase.DISCOVERY
         assert om._iteration_count == 0
 
-        # Run warmup iterations to trigger transition
+        # Run discovery iterations to trigger transition
         # State transitions should happen automatically during forward passes
-        for _ in range(warmup_iters):
+        for _ in range(discovery_iters):
             with torch.no_grad():
                 _ = model(self.x)
 
-        # Should have transitioned to PROFILE
-        assert om._current_state == OffloadState.PROFILE
+        # Should have transitioned to PROFILING
+        assert om._current_phase == OffloadPhase.PROFILING
         assert om._iteration_count == 0
 
-        # Run profile iterations to trigger transition
-        for _ in range(profile_iters):
+        # Run profiling iterations to trigger transition
+        for _ in range(profiling_iters):
             with torch.no_grad():
                 _ = model(self.x)
 
         # Should now be in INFERENCE
-        assert om._current_state == OffloadState.INFERENCE
+        assert om._current_phase == OffloadPhase.INFERENCE
         assert om._iteration_count == 0
 
         # Verify all transition methods were called
@@ -380,14 +380,14 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_inference.return_value = inference_model
 
         # Configure with minimal iterations
-        warmup_iters = 1
-        profile_iters = 1
+        discovery_iters = 1
+        profiling_iters = 1
 
         om = OffloadManager("test_changing_models")
         config = OffloadConfig(
-            offload_on=True,
-            warmup_iters=warmup_iters,
-            profile_iters=profile_iters,
+            enabled=True,
+            discovery_iters=discovery_iters,
+            profiling_iters=profiling_iters,
         )
 
         # Offload - KEY DIFFERENCE:
@@ -401,34 +401,34 @@ class TestOffloadManagerStateMachine:
         # This causes hooks to never fire because user calls returned_model
         # NEW VERSION FIX: returned_model is wrapper that always calls om._model
 
-        # Initial state should be WARMUP
-        assert om._current_state == OffloadState.WARMUP
+        # Initial state should be DISCOVERY
+        assert om._current_phase == OffloadPhase.DISCOVERY
         assert om._iteration_count == 0
 
-        # Run warmup iterations to trigger transition
+        # Run discovery iterations to trigger transition
         # After transition, om._model becomes profile_model
         # Old version: still calling warmup_model (hook fires)
         # New version: wrapper calls om._model (profile_model)
-        for _ in range(warmup_iters):
+        for _ in range(discovery_iters):
             with torch.no_grad():
                 _ = returned_model(self.x)
 
-        # Should have transitioned to PROFILE
+        # Should have transitioned to PROFILING
         # Old version: This PASSES because hook is still on warmup_model
         # But in REAL usage, user would call the internal model which changes!
-        assert om._current_state == OffloadState.PROFILE
+        assert om._current_phase == OffloadPhase.PROFILING
         assert om._iteration_count == 0
 
-        # Run profile iterations to trigger transition
+        # Run profiling iterations to trigger transition
         # After transition, om._model becomes inference_model
         # Old version: still calling warmup_model (hook still fires)
         # New version: wrapper calls om._model (inference_model)
-        for _ in range(profile_iters):
+        for _ in range(profiling_iters):
             with torch.no_grad():
                 _ = returned_model(self.x)
 
         # Should now be in INFERENCE
-        assert om._current_state == OffloadState.INFERENCE
+        assert om._current_phase == OffloadPhase.INFERENCE
         assert om._iteration_count == 0
 
         # Verify all transition methods were called
@@ -448,44 +448,44 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model
 
-        warmup_iters = 3
-        profile_iters = 5
+        discovery_iters = 3
+        profiling_iters = 5
 
         om = OffloadManager("test")
         config = OffloadConfig(
             enabled=True,
-            warmup_iters=warmup_iters,
-            profile_iters=profile_iters,
+            discovery_iters=discovery_iters,
+            profiling_iters=profiling_iters,
             include_patterns=["submoduleL1.submoduleL2"],
         )
         model = om.offload(self.model, config=config)
 
-        # Track iteration count during warmup
-        for _ in range(warmup_iters):
+        # Track iteration count during discovery
+        for _ in range(discovery_iters):
             with torch.no_grad():
                 _ = model(self.x)  # Wrapper automatically calls update_state()
 
-        # Should have transitioned to PROFILE
-        assert om._current_state == OffloadState.PROFILE
+        # Should have transitioned to PROFILING
+        assert om._current_phase == OffloadPhase.PROFILING
         assert om._iteration_count == 0
 
-        # Track iteration count during profile
-        for _ in range(profile_iters):
+        # Track iteration count during profiling
+        for _ in range(profiling_iters):
             with torch.no_grad():
                 _ = model(self.x)  # Wrapper automatically calls update_state()
 
         # Should have transitioned to INFERENCE
-        assert om._current_state == OffloadState.INFERENCE
+        assert om._current_phase == OffloadPhase.INFERENCE
         assert om._iteration_count == 0
 
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
-    def test_custom_warmup_and_profile_iterations(
+    def test_custom_discovery_and_profiling_iterations(
         self,
         mock_strategy_cls,
         mock_tensor_manager_cls,
     ):
-        """Test with custom warmup and profile iteration counts."""
+        """Test with custom discovery and profiling iteration counts."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
         mock_tensor_manager_cls.return_value = mock_tensor_manager
@@ -502,31 +502,31 @@ class TestOffloadManagerStateMachine:
             (10, 5),
         ]
 
-        for warmup_iters, profile_iters in test_cases:
-            om = OffloadManager(f"test_{warmup_iters}_{profile_iters}")
+        for discovery_iters, profiling_iters in test_cases:
+            om = OffloadManager(f"test_{discovery_iters}_{profiling_iters}")
             config = OffloadConfig(
                 enabled=True,
-                warmup_iters=warmup_iters,
-                profile_iters=profile_iters,
+                discovery_iters=discovery_iters,
+                profiling_iters=profiling_iters,
                 include_patterns=["submoduleL1.submoduleL2"],
             )
             model = om.offload(self.model, config=config)
 
-            # Run warmup iterations to trigger transition
-            for _ in range(warmup_iters):
+            # Run discovery iterations to trigger transition
+            for _ in range(discovery_iters):
                 with torch.no_grad():
                     _ = model(self.x)  # Wrapper automatically calls update_state()
 
-            # Should have transitioned to PROFILE
-            assert om._current_state == OffloadState.PROFILE
+            # Should have transitioned to PROFILING
+            assert om._current_phase == OffloadPhase.PROFILING
 
-            # Run profile iterations to trigger transition
-            for _ in range(profile_iters):
+            # Run profiling iterations to trigger transition
+            for _ in range(profiling_iters):
                 with torch.no_grad():
                     _ = model(self.x)  # Wrapper automatically calls update_state()
 
             # Should have transitioned to INFERENCE
-            assert om._current_state == OffloadState.INFERENCE
+            assert om._current_phase == OffloadPhase.INFERENCE
 
             # Verify initialize methods were called
             mock_tensor_manager.initialize_warmup.assert_called()
@@ -587,7 +587,7 @@ class TestOffloadManagerStateMachine:
             with torch.no_grad():
                 _ = model(self.x)
 
-        # Should still be in warmup or have transitioned minimally
+        # Should still be in discovery or have transitioned minimally
         # (NoOp manager doesn't do real state management)
         assert om._tensor_manager is mock_noop_manager
 
@@ -610,7 +610,7 @@ class TestOffloadManagerStateMachine:
             "submoduleL2",
             "module_list.*",
         ]
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=patterns)
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=patterns)
         om.offload(self.model, config=config)
 
         # Count how many modules were patched
@@ -700,7 +700,7 @@ class TestOffloadManagerStateMachine:
 
         # Verify model was wrapped
         assert isinstance(model, OffloadModelProxy)
-        assert om._current_state == OffloadState.WARMUP
+        assert om._current_phase == OffloadPhase.DISCOVERY
 
     @patch("flextensor.tensor_manager.TensorManager")
     def test_offload_with_custom_patterns_in_config(self, mock_tensor_manager_cls):
@@ -720,22 +720,22 @@ class TestOffloadManagerStateMachine:
 
         # Verify model was wrapped
         assert isinstance(model, OffloadModelProxy)
-        assert om._current_state == OffloadState.WARMUP
+        assert om._current_phase == OffloadPhase.DISCOVERY
 
 
 class TestOffloadManagerConfig:
     """Test cases for OffloadConfig and configuration management."""
 
-    def test_config_all_warmup_iters_property(self):
-        """Test that all_warmup_iters property returns sum of warmup and profile iters."""
-        config = OffloadConfig(warmup_iters=3, profile_iters=7)
-        assert config.all_warmup_iters == 10  # 3 + 7
+    def test_config_pre_inference_iters_property(self):
+        """Test that pre_inference_iters property returns sum of discovery and profiling iters."""
+        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
+        assert config.pre_inference_iters == 10  # 3 + 7
 
-        config = OffloadConfig(warmup_iters=1, profile_iters=10)
-        assert config.all_warmup_iters == 11  # 1 + 10
+        config = OffloadConfig(discovery_iters=1, profiling_iters=10)
+        assert config.pre_inference_iters == 11  # 1 + 10
 
-        config = OffloadConfig(warmup_iters=5, profile_iters=5)
-        assert config.all_warmup_iters == 10  # 5 + 5
+        config = OffloadConfig(discovery_iters=5, profiling_iters=5)
+        assert config.pre_inference_iters == 10  # 5 + 5
 
     def test_config_defaults(self):
         """Test default configuration values."""
@@ -743,8 +743,8 @@ class TestOffloadManagerConfig:
 
         assert config.enabled is True
         assert config.gpu_device == 0
-        assert config.warmup_iters == 1
-        assert config.profile_iters == 10
+        assert config.discovery_iters == 1
+        assert config.profiling_iters == 10
         assert config.pinned_memory is True
         assert config.shm_enabled is False
 
@@ -753,12 +753,12 @@ class TestOffloadManagerConfig:
         config = OffloadConfig(
             enabled=False,
             gpu_device=1,
-            warmup_iters=5,
-            profile_iters=15,
+            discovery_iters=5,
+            profiling_iters=15,
         )
 
         assert config.enabled is False
         assert config.gpu_device == 1
-        assert config.warmup_iters == 5
-        assert config.profile_iters == 15
-        assert config.all_warmup_iters == 20  # 5 + 15
+        assert config.discovery_iters == 5
+        assert config.profiling_iters == 15
+        assert config.pre_inference_iters == 20  # 5 + 15

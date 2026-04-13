@@ -46,6 +46,6 @@ Offloading strategies for `OffloadConfig.load_strategy`:
 
 Lower-level components for custom workflows:
 
-- [`TensorManager`](advanced.md#flextensor.tensor_manager.TensorManager) — Direct control over warmup, profiling, and inference phases
+- [`TensorManager`](advanced.md#flextensor.tensor_manager.TensorManager) — Direct control over discovery, profiling, and inference phases
 - [`TensorBenchmarkMode`](advanced.md#flextensor.benchmark_tensor_mode.TensorBenchmarkMode) — Benchmark mode base class
 - [`BenchmarkReplace`](advanced.md#flextensor.benchmark_tensor_mode.BenchmarkReplace) / [`PreloadToDevice`](advanced.md#flextensor.benchmark_tensor_mode.PreloadToDevice) — Benchmark implementations

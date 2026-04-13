@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadState
+from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadPhase
 from flextensor.types import GPUMemoryUsage
 
 # Note: TensorStatistics and LayerStatistics imports are done locally
@@ -159,16 +159,16 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager and transition to inference
         om = OffloadManager("test_memory")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["linear"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"])
         model = om.offload(self.model, config=config)
 
-        # Run through warmup and profile to reach inference
-        for _ in range(config.all_warmup_iters):
+        # Run through discovery and profiling to reach inference
+        for _ in range(config.pre_inference_iters):
             with torch.no_grad():
                 _ = model(self.x)
 
-        # Verify we're in inference state
-        assert om._current_state == OffloadState.INFERENCE
+        # Verify we're in inference phase
+        assert om._current_phase == OffloadPhase.INFERENCE
 
         # Get memory usage
         usage = om.get_gpu_memory_usage()
@@ -181,38 +181,38 @@ class TestOffloadManagerGPUMemoryUsage:
 
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
-    def test_get_gpu_memory_usage_raises_in_warmup_state(
+    def test_get_gpu_memory_usage_raises_in_discovery_phase(
         self,
         _mock_strategy_cls,
         mock_tensor_manager_cls,
     ):
-        """Test get_gpu_memory_usage() raises RuntimeError in warmup state."""
+        """Test get_gpu_memory_usage() raises RuntimeError in discovery phase."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
-        # Create offload manager (stays in warmup)
+        # Create offload manager (stays in discovery)
         om = OffloadManager("test_warmup_error")
-        config = OffloadConfig(enabled=True, warmup_iters=5, profile_iters=5, include_patterns=["linear"])
+        config = OffloadConfig(enabled=True, discovery_iters=5, profiling_iters=5, include_patterns=["linear"])
         om.offload(self.model, config=config)
 
-        # Verify we're in warmup state
-        assert om._current_state == OffloadState.WARMUP
+        # Verify we're in discovery phase
+        assert om._current_phase == OffloadPhase.DISCOVERY
 
         # Attempt to get memory usage should raise
-        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in state warmup"):
+        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in phase discovery"):
             om.get_gpu_memory_usage()
 
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
-    def test_get_gpu_memory_usage_raises_in_profile_state(
+    def test_get_gpu_memory_usage_raises_in_profiling_phase(
         self,
         _mock_strategy_cls,
         mock_tensor_manager_cls,
     ):
-        """Test get_gpu_memory_usage() raises RuntimeError in profile state."""
+        """Test get_gpu_memory_usage() raises RuntimeError in profiling phase."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
         mock_tensor_manager_cls.return_value = mock_tensor_manager
@@ -220,20 +220,20 @@ class TestOffloadManagerGPUMemoryUsage:
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
 
-        # Create offload manager and transition to profile
+        # Create offload manager and transition to profiling
         om = OffloadManager("test_profile_error")
-        config = OffloadConfig(enabled=True, warmup_iters=1, profile_iters=5, include_patterns=["linear"])
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=5, include_patterns=["linear"])
         model = om.offload(self.model, config=config)
 
-        # Run warmup to transition to profile
+        # Run discovery to transition to profiling
         with torch.no_grad():
             _ = model(self.x)
 
-        # Verify we're in profile state
-        assert om._current_state == OffloadState.PROFILE
+        # Verify we're in profiling phase
+        assert om._current_phase == OffloadPhase.PROFILING
 
         # Attempt to get memory usage should raise
-        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in state profile"):
+        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in phase profiling"):
             om.get_gpu_memory_usage()
 
     def test_get_gpu_memory_usage_raises_in_not_initialized_state(self):
@@ -241,10 +241,10 @@ class TestOffloadManagerGPUMemoryUsage:
         om = OffloadManager("test_not_init_error")
 
         # Verify we're in not_initialized state
-        assert om._current_state == OffloadState.NOT_INITIALIZED
+        assert om._current_phase == OffloadPhase.NOT_INITIALIZED
 
         # Attempt to get memory usage should raise
-        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in state not_initialized"):
+        with pytest.raises(RuntimeError, match="Cannot get GPU memory usage in phase not_initialized"):
             om.get_gpu_memory_usage()
 
 
@@ -285,11 +285,13 @@ class TestModuleLevelGetGPUMemoryUsage:
         mock_tensor_manager.get_gpu_memory_usage.return_value = expected_usage
 
         # Use the simplified API with default manager
-        config = flextensor.OffloadConfig(enabled=True, warmup_iters=1, profile_iters=1, include_patterns=["linear"])
+        config = flextensor.OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"]
+        )
         model = flextensor.offload(self.model, config=config)
 
-        # Run through warmup and profile to reach inference
-        for _ in range(config.all_warmup_iters):
+        # Run through discovery and profiling to reach inference
+        for _ in range(config.pre_inference_iters):
             with torch.no_grad():
                 _ = model(self.x)
 

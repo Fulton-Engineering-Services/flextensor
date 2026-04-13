@@ -46,7 +46,7 @@ pip install -r examples/vllm/requirements.txt
 
 FlexTensor loads configuration from environment variables (`FT_*`).
 
-Every `OffloadConfig` field can be set via an environment variable named `FT_` + the uppercase field name. For example, `warmup_iters` → `FT_WARMUP_ITERS`. Values follow standard Python literals (`true`/`false`, integers, floats, comma-separated lists).
+Every `OffloadConfig` field can be set via an environment variable named `FT_` + the uppercase field name. For example, `discovery_iters` → `FT_DISCOVERY_ITERS`. Values follow standard Python literals (`true`/`false`, integers, floats, comma-separated lists).
 
 ### Environment Variables
 
@@ -79,7 +79,7 @@ For models with a different module layout, set `FT_INCLUDE_PATTERNS` explicitly:
 | OPT | `model.decoder.embed_tokens,model.decoder.layers.*,model.decoder.final_layer_norm,lm_head,logits_processor` |
 | ChatGLM v1–3 | `transformer.embedding,transformer.encoder.layers.*,transformer.encoder.final_layernorm,lm_head,logits_processor` |
 
-For the full list of configuration options (config files, warmup/profile tuning, transfer modes), see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
+For the full list of configuration options (config files, discovery/profiling tuning, transfer modes), see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
 
 ## Usage Examples
 

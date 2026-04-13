@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from flextensor.loaders import AllocationBlockController
-from flextensor.offload_manager import OffloadManager, OffloadModelProxy, OffloadState
+from flextensor.offload_manager import OffloadManager, OffloadModelProxy, OffloadPhase
 
 
 class _FakeCoordinator:
@@ -96,7 +96,7 @@ class TestInitializeFromShm:
             result = manager._initialize_from_shm(coordinator, model)
 
         assert isinstance(result, OffloadModelProxy)
-        assert manager._current_state == OffloadState.INFERENCE
+        assert manager._current_phase == OffloadPhase.INFERENCE
         coordinator.wait_for_ready.assert_called_once()
         coordinator.read_profile.assert_called_once()
         mock_tm.restore_state.assert_called_once()

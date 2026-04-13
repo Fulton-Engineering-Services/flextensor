@@ -44,7 +44,7 @@ include_patterns = [
 ]
 
 offload_config = OffloadConfig(
-    profile_iters=20,
+    profiling_iters=20,
     min_blocks=2,
     include_patterns=include_patterns,
 )
@@ -53,7 +53,7 @@ offload_config = OffloadConfig(
 pipe.transformer = flextensor.offload(pipe.transformer, config=offload_config, name="transformer")
 pipe.transformer_2 = flextensor.offload(pipe.transformer_2, config=offload_config, name="transformer2")
 
-# [FlexTensor] First run: warmup + profiling pass (learns optimal prefetch schedule)
+# [FlexTensor] First run: discovery + profiling pass (learns optimal prefetch schedule)
 frames = pipe(prompt=prompt, negative_prompt=negative_prompt, num_frames=num_frames).frames[0]
 
 # [FlexTensor] Subsequent runs: optimized inference with proactive prefetching

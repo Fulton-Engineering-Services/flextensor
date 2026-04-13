@@ -23,15 +23,15 @@ config = OffloadConfig()
 # Tuned configuration for specific requirements
 config = OffloadConfig(
     gpu_device=0,
-    warmup_iters=1,
-    profile_iters=10,
+    discovery_iters=1,
+    profiling_iters=10,
 )
 
 model = offload(model, config=config)
 ```
 
 !!! warning "Single-thread only"
-    FlexTensor is **not thread-safe**. The entire offloading lifecycle — setup, warmup, profiling, and inference — must run on one thread. Do not call `offload()`, run forward passes on a patched model, or access the same offload manager from multiple threads concurrently. If you need per-thread offloading, use a separate named manager and model per thread (see [Troubleshooting](../how-to/troubleshooting.md#fix-cross-thread-manager-access-errors)).
+    FlexTensor is **not thread-safe**. The entire offloading lifecycle — setup, discovery, profiling, and inference — must run on one thread. Do not call `offload()`, run forward passes on a patched model, or access the same offload manager from multiple threads concurrently. If you need per-thread offloading, use a separate named manager and model per thread (see [Troubleshooting](../how-to/troubleshooting.md#fix-cross-thread-manager-access-errors)).
 
 ## Configuration Loading
 
@@ -53,7 +53,7 @@ Environment variables use the `FT_` prefix by default:
 ```bash
 export FT_ENABLED=1
 export FT_GPU_DEVICE=0
-export FT_WARMUP_ITERS=2
+export FT_DISCOVERY_ITERS=2
 ```
 
 ```python
@@ -76,8 +76,8 @@ FlexTensor supports INI, JSON, and YAML formats:
     [flextensor]
     enabled = true
     gpu_device = 0
-    warmup_iters = 1
-    profile_iters = 10
+    discovery_iters = 1
+    profiling_iters = 10
     ```
 
 === "YAML Format"
@@ -86,8 +86,8 @@ FlexTensor supports INI, JSON, and YAML formats:
     # flextensor.yaml
     enabled: true
     gpu_device: 0
-    warmup_iters: 1
-    profile_iters: 10
+    discovery_iters: 1
+    profiling_iters: 10
     ```
 
 === "JSON Format"
@@ -96,8 +96,8 @@ FlexTensor supports INI, JSON, and YAML formats:
     {
       "enabled": true,
       "gpu_device": 0,
-      "warmup_iters": 1,
-      "profile_iters": 10
+      "discovery_iters": 1,
+      "profiling_iters": 10
     }
     ```
 
@@ -294,24 +294,24 @@ These options can also be set via `FT_SHM_ENABLED`, `FT_SHM_NAMESPACE`, and
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `warmup_iters` | int | `1` | Iterations to discover parameter-to-trap mappings |
-| `profile_iters` | int | `10` | Iterations to measure execution timing |
+| `discovery_iters` | int | `1` | Iterations to discover parameter-to-trap mappings |
+| `profiling_iters` | int | `10` | Iterations to measure execution timing |
 
 FlexTensor learns your model's behavior during initial iterations:
 
 ```
-First N iterations:  WARMUP (warmup_iters) → PROFILE (profile_iters) → INFERENCE
+First N iterations:  DISCOVERY (discovery_iters) → PROFILING (profiling_iters) → INFERENCE
 Remaining iterations: Optimized execution with learned strategy
 ```
 
 #### Tuning Iteration Counts
 
-**`warmup_iters`**: Usually 1 is sufficient. Increase if your model has:
+**`discovery_iters`**: Usually 1 is sufficient. Increase if your model has:
 
 - Dynamic control flow affecting parameter access patterns
 - Variable-length inputs that change which parameters are used
 
-**`profile_iters`**: More iterations = more accurate timing estimates. Consider:
+**`profiling_iters`**: More iterations = more accurate timing estimates. Consider:
 
 - **Noisy environments**: Increase to 20-50 for shared/cloud GPUs
 - **Deterministic workloads**: 5-10 is often sufficient
@@ -319,10 +319,10 @@ Remaining iterations: Optimized execution with learned strategy
 
 ```python
 # Production deployment (accurate profiling)
-config = OffloadConfig(warmup_iters=1, profile_iters=20)
+config = OffloadConfig(discovery_iters=1, profiling_iters=20)
 
 # Development/debugging (fast iteration)
-config = OffloadConfig(warmup_iters=1, profile_iters=3)
+config = OffloadConfig(discovery_iters=1, profiling_iters=3)
 ```
 
 ### Transfer Modes
@@ -409,7 +409,7 @@ config = OffloadConfig(load_strategy=GreedyStrategy())
 | `profile_storage_dir` | str | `None` | Directory for profile persistence |
 | `profile_read_only` | bool | `False` | Only load profiles, don't save |
 
-Profile storage enables skipping the warmup/profile phases on subsequent runs by saving and loading offload profiles. Profiles are stored as JSON files in the specified directory.
+Profile storage enables skipping the discovery/profiling phases on subsequent runs by saving and loading offload profiles. Profiles are stored as JSON files in the specified directory.
 
 ```python
 config = OffloadConfig(
@@ -417,10 +417,10 @@ config = OffloadConfig(
     profile_read_only=False,  # Allow saving profiles (default)
 )
 
-# First run: warmup → profile → save → inference
+# First run: discovery → profiling → save → inference
 om = flextensor.get_offload_manager()
 model = om.offload(model, config=config)
-for _ in range(config.warmup_iters + config.profile_iters):
+for _ in range(config.discovery_iters + config.profiling_iters):
     model(sample_input)
 om.save_profile()  # Saves to profile_storage_dir
 
@@ -474,7 +474,7 @@ For ready-to-use starting configurations covering memory-constrained systems, pe
 |----------|-------------|----------------|
 | **Core** | `enabled`, `gpu_device` | Set based on deployment |
 | **Memory** | `pinned_memory`, `max_gpu_mem_fraction`, `shm_enabled` | Balance memory vs. performance |
-| **Profiling** | `warmup_iters`, `profile_iters` | More iters = more accurate |
+| **Profiling** | `discovery_iters`, `profiling_iters` | More iters = more accurate |
 | **Transfer** | `transfer_mode`, `num_blocks`, `min_blocks` | Default works for most cases |
 | **Debug** | `enable_diagnostics`, `enable_instrumentation` | Only when troubleshooting |
 

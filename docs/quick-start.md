@@ -23,9 +23,9 @@ assert torch.cuda.is_available(), "CUDA required"
 
 ## How It Works
 
-FlexTensor manages weight transfers automatically through a short learning phase (warmup and profile) before switching to optimized inference. You don't manage these phases directly — FlexTensor handles them during the first few iterations.
+FlexTensor manages weight transfers automatically through a short learning phase (discovery and profiling) before switching to optimized inference. You don't manage these phases directly — FlexTensor handles them during the first few iterations.
 
-For a deeper explanation of the warmup, profile, and inference states and the decisions made during each, see [Internal States](explanation/states.md).
+For a deeper explanation of the discovery, profiling, and inference phases and the decisions made during each, see [Internal Phases](explanation/phases.md).
 
 ## Basic Usage
 
@@ -39,21 +39,21 @@ model = YourModel()
 # Configure offloading
 config = OffloadConfig(
     gpu_device=0,              # GPU to use
-    warmup_iters=1,            # Iterations for parameter discovery
-    profile_iters=10,          # Iterations for timing measurement
+    discovery_iters=1,            # Iterations for parameter discovery
+    profiling_iters=10,          # Iterations for timing measurement
     include_patterns=["layers.*"],  # Which modules to offload
 )
 
 # Patch the model
 model = flextensor.offload(model, config=config)
 
-# Use normally - first warmup_iters + profile_iters iterations are warmup/profile
+# Use normally - first discovery_iters + profiling_iters iterations are discovery/profiling
 for batch in dataloader:
     output = model(batch)  # FlexTensor handles everything
 ```
 
 !!! warning "Single-thread only"
-    FlexTensor is **not thread-safe**. All stages — offloading setup, warmup, profiling, and inference — must run on the same thread. Do not call `offload()`, run forward passes on a patched model, or access the offload manager from multiple threads in parallel. If you need per-thread offloading, create a separate named manager and model per thread.
+    FlexTensor is **not thread-safe**. All stages — offloading setup, discovery, profiling, and inference — must run on the same thread. Do not call `offload()`, run forward passes on a patched model, or access the offload manager from multiple threads in parallel. If you need per-thread offloading, create a separate named manager and model per thread.
 
 ## Include Patterns
 
@@ -87,29 +87,29 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head" python my_script.py
 The most commonly tuned options are:
 
 - **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards, default `["*"]`; use specific patterns such as `model.layers.*` for better per-layer pipelining)
-- **`warmup_iters`** — iterations for tensor discovery (default `1`)
-- **`profile_iters`** — iterations for timing measurement (default `10`)
+- **`discovery_iters`** — iterations for tensor discovery (default `1`)
+- **`profiling_iters`** — iterations for timing measurement (default `10`)
 
 See [Configuration](explanation/configuration.md) for the full list of options and explanations.
 
 ## Profile Caching
 
-Skip warmup/profile on subsequent runs by saving and loading profiles:
+Skip discovery/profiling on subsequent runs by saving and loading profiles:
 
 ```python
 om = flextensor.get_offload_manager()
 
-# First run: save profile after warmup completes
+# First run: save profile after discovery completes
 config = OffloadConfig(
     include_patterns=["layers.*"],
     profile_read_only=False,  # Allow saving profiles
 )
 model = om.offload(model, config=config)
-for _ in range(config.warmup_iters + config.profile_iters):
+for _ in range(config.discovery_iters + config.profiling_iters):
     model(sample_input)
 om.save_profile("/tmp/profiles/my_model")
 
-# Later runs: load profile, skip warmup/profile
+# Later runs: load profile, skip discovery/profiling
 model = flextensor.offload_from_profile(
     model,
     "/tmp/profiles/my_model",
@@ -118,7 +118,7 @@ model = flextensor.offload_from_profile(
 ```
 
 `offload_from_profile` combines `init`, `load_profile`, and `offload` into a single call —
-the model is ready for inference immediately with no warmup or profiling overhead.
+the model is ready for inference immediately with no discovery or profiling overhead.
 
 ## Verify It's Working
 
@@ -131,5 +131,5 @@ print(f"GPU memory: {usage.total_mb:.1f} MB")
 
 - [Configuration](explanation/configuration.md) -- All options explained
 - [Troubleshooting](how-to/troubleshooting.md) -- Debug issues
-- [Internal States](explanation/states.md) -- How the state machine works
+- [Internal Phases](explanation/phases.md) -- How the state machine works
 - [Tensor Discovery](explanation/tensor-discovery.md) -- How untraced tensors are found

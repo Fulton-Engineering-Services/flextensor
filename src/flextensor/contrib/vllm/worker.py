@@ -108,8 +108,8 @@ class FlexTensorOffloadWorker(Worker):
         # Create offload config using the device set by init_device()
         offload_config = load_config(gpu_device=self.device.index)
         config_updates: dict[str, Any] = {
-            "warmup_iters": max(offload_config.warmup_iters, 3),
-            "profile_iters": max(offload_config.profile_iters, 2),
+            "discovery_iters": max(offload_config.discovery_iters, 3),
+            "profiling_iters": max(offload_config.profiling_iters, 2),
         }
         if offload_config.include_patterns == ["*"]:
             config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
@@ -152,26 +152,26 @@ class FlexTensorOffloadWorker(Worker):
         )
 
     def warmup_and_profile_model(self) -> None:
-        """Run warmup and profiling iterations for FlexTensor offloading.
+        """Run discovery and profiling iterations for FlexTensor offloading.
 
-        Executes warmup iterations to stabilize memory patterns, then runs
+        Executes discovery iterations to map parameters to traps, then runs
         profiling iterations at max batch size to collect layer statistics
         for the offloading strategy. Finally switches to inference mode.
         """
         self.compile_or_warm_up_model()
         compile_warm_iters = 2  # _dummy_run doesn't include sampling, account for it
 
-        warmup_iters = self._offload_config.warmup_iters - compile_warm_iters
-        for i in range(warmup_iters):
-            LOGGER.info("FlexTensor: Warmup iteration %d/%d (num_tokens=1)", i + 1, warmup_iters)
+        discovery_iters = self._offload_config.discovery_iters - compile_warm_iters
+        for i in range(discovery_iters):
+            LOGGER.info("FlexTensor: Discovery iteration %d/%d (num_tokens=1)", i + 1, discovery_iters)
             self.model_runner._dummy_run(1, skip_eplb=True)  # noqa: SLF001
 
         self.compile_or_warm_up_model()
         max_num_tokens = min(self.model_runner.max_model_len, self.vllm_config.scheduler_config.max_num_batched_tokens)
-        profile_iters = self._offload_config.profile_iters - compile_warm_iters
-        for i in range(profile_iters):
+        profiling_iters = self._offload_config.profiling_iters - compile_warm_iters
+        for i in range(profiling_iters):
             LOGGER.info(
-                "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)", i + 1, profile_iters, max_num_tokens
+                "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)", i + 1, profiling_iters, max_num_tokens
             )
             self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 

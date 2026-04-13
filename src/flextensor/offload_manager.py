@@ -7,10 +7,11 @@ import logging
 import os
 import threading
 import types
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
+from enum import Enum, EnumMeta
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
     from flextensor.state_handler import TensorManagerState
@@ -158,7 +159,7 @@ def _log_diagnostic_snapshot(label: str, om: OffloadManager | None) -> None:
     parts = [f"FlexTensor error in {label}"]
 
     if om is not None:
-        parts.append(f"  state={om._current_state.value}")  # noqa: SLF001
+        parts.append(f"  phase={om._current_phase.value}")  # noqa: SLF001
         parts.append(f"  iteration={om._iteration_count}")  # noqa: SLF001
         parts.append(f"  manager={om.name!r}")
 
@@ -227,13 +228,58 @@ class _ShmCoordinatorLike(Protocol):
     def read_profile(self) -> TensorManagerState: ...
 
 
-class OffloadState(Enum):
-    """State of the offload manager during profiling and inference."""
+_WARMUP_DEPRECATION = (
+    "`OffloadPhase.WARMUP` (and `OffloadState.WARMUP`) are deprecated. "
+    "Use `OffloadPhase.DISCOVERY` instead. Will be removed in v0.4.0."
+)
+_PROFILE_DEPRECATION = (
+    "`OffloadPhase.PROFILE` (and `OffloadState.PROFILE`) are deprecated. "
+    "Use `OffloadPhase.PROFILING` instead. Will be removed in v0.4.0."
+)
+_OFFLOAD_STATE_DEPRECATION = "`OffloadState` is deprecated. Use `OffloadPhase` instead. Will be removed in v0.4.0."
+
+
+class _DeprecatedMemberMeta(EnumMeta):
+    """EnumMeta subclass that issues DeprecationWarning for deprecated member names."""
+
+    _DEPRECATED_MEMBERS: ClassVar[dict[str, tuple[str, object]]] = {}
+
+    def __getattr__(cls, name: str) -> object:
+        if name in cls._DEPRECATED_MEMBERS:
+            msg, target = cls._DEPRECATED_MEMBERS[name]
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
+            return target
+        raise AttributeError(name)
+
+    def __getitem__(cls, name: str) -> object:
+        if name in cls._DEPRECATED_MEMBERS:
+            msg, target = cls._DEPRECATED_MEMBERS[name]
+            warnings.warn(msg, DeprecationWarning, stacklevel=2)
+            return target
+        return super().__getitem__(name)
+
+
+class OffloadPhase(Enum, metaclass=_DeprecatedMemberMeta):
+    """Phase of the offload manager during tensor discovery, profiling, and inference."""
 
     NOT_INITIALIZED = "not_initialized"
-    WARMUP = "warmup"
-    PROFILE = "profile"
+    DISCOVERY = "discovery"
+    PROFILING = "profiling"
     INFERENCE = "inference"
+
+
+OffloadPhase._DEPRECATED_MEMBERS = {  # noqa: SLF001
+    "WARMUP": (_WARMUP_DEPRECATION, OffloadPhase.DISCOVERY),
+    "PROFILE": (_PROFILE_DEPRECATION, OffloadPhase.PROFILING),
+}
+
+
+def __getattr__(name: str) -> object:
+    """Module-level __getattr__ for deprecated names (PEP 562)."""
+    if name == "OffloadState":
+        warnings.warn(_OFFLOAD_STATE_DEPRECATION, DeprecationWarning, stacklevel=2)
+        return OffloadPhase
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 DEFAULT_MANAGER_NAME: str = "default"
@@ -245,7 +291,7 @@ _MANAGER_MAP_LOCK = threading.Lock()
 
 
 class OffloadModelProxy(ObjectWrapper):
-    """Proxy that delegates to the current model version during offload state transitions."""
+    """Proxy that delegates to the current model version during offload phase transitions."""
 
     def __init__(self, model, offload_manager: OffloadManager):
         ObjectWrapper.__init__(self, model)
@@ -321,7 +367,7 @@ class OffloadManager:
     """Simplified offload manager API.
 
     Provides a high-level interface for weight offloading with automatic
-    state management, profiling, and module patching capabilities.
+    phase management, profiling, and module patching capabilities.
     """
 
     def __init__(self, name: str):
@@ -329,7 +375,7 @@ class OffloadManager:
         self.config = OffloadConfig()
         self._tensor_manager = None
         self._initialized = False
-        self._current_state = OffloadState.NOT_INITIALIZED
+        self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._iteration_count = 0
         self._model = None
         self._model_proxy = None
@@ -432,22 +478,22 @@ class OffloadManager:
 
         Returns the memory used by GPU transfer blocks and unmapped tensors
         that were moved to GPU. This method should be called after the manager
-        has transitioned to inference mode (after warmup and profile phases).
+        has transitioned to inference mode (after discovery and profiling phases).
 
         Returns:
             GPUMemoryUsage: Memory breakdown with per-component bytes and MB values.
                 See `GPUMemoryUsage` for field details.
 
         Raises:
-            RuntimeError: If called before inference mode (before all warmup
-                and profile iterations have completed)
+            RuntimeError: If called before inference mode (before all discovery
+                and profiling iterations have completed)
 
         Examples:
             >>> om = get_offload_manager()
             >>> config = OffloadConfig(include_patterns=["layers.*"])
             >>> model = om.offload(model, config=config)
-            >>> # Run warmup and profile iterations
-            >>> for _ in range(config.all_warmup_iters):
+            >>> # Run discovery and profiling iterations
+            >>> for _ in range(config.pre_inference_iters):
             ...     model(input)
             >>> # Now in inference mode, get memory usage
             >>> usage = om.get_gpu_memory_usage()
@@ -455,9 +501,9 @@ class OffloadManager:
             >>> print(f"  Transfer blocks: {usage.blocks_mb:.2f} MB")
             >>> print(f"  Unmapped tensors: {usage.unmapped_tensors_mb:.2f} MB")
         """
-        if self._current_state != OffloadState.INFERENCE:
+        if self._current_phase != OffloadPhase.INFERENCE:
             msg = (
-                f"Cannot get GPU memory usage in state {self._current_state.value}. "
+                f"Cannot get GPU memory usage in phase {self._current_phase.value}. "
                 "This method is only available after transitioning to inference mode."
             )
             raise RuntimeError(msg)
@@ -638,7 +684,10 @@ class OffloadManager:
 
     @_error_boundary
     def _transition_to_warmup(self):
-        """Transition to warmup state."""
+        """Transition to discovery phase.
+
+        Method name kept to align with ``TensorManager.initialize_warmup()``.
+        """
 
         self._tensor_manager.set_model(self._model)
         old_model = self._model
@@ -647,16 +696,19 @@ class OffloadManager:
         # Transfer hooks from old model to new model (if re-initializing)
         self._transfer_hooks(old_model, self._model)
 
-        # Update proxy to point to new warmup model (if proxy already exists)
+        # Update proxy to point to new discovery-phase model (if proxy already exists)
         if self._model_proxy is not None:
             self._model_proxy.__subject__ = self._model
 
-        self._current_state = OffloadState.WARMUP
+        self._current_phase = OffloadPhase.DISCOVERY
         self._iteration_count = 0
 
     @_error_boundary
     def _transition_to_profile(self):
-        """Transition to profile state."""
+        """Transition to profiling phase.
+
+        Method name kept to align with ``TensorManager.initialize_profile()``.
+        """
         if self._tensor_manager is None:
             return
 
@@ -667,12 +719,12 @@ class OffloadManager:
         self._transfer_hooks(old_model, self._model)
 
         self._model_proxy.__subject__ = self._model
-        self._current_state = OffloadState.PROFILE
+        self._current_phase = OffloadPhase.PROFILING
         self._iteration_count = 0
 
     @_error_boundary
     def _transition_to_inference(self):
-        """Transition to inference state."""
+        """Transition to inference phase."""
         try:
             if self._tensor_manager is None:
                 return
@@ -684,7 +736,7 @@ class OffloadManager:
             self._transfer_hooks(old_model, self._model)
 
             self._model_proxy.__subject__ = self._model
-            self._current_state = OffloadState.INFERENCE
+            self._current_phase = OffloadPhase.INFERENCE
             self._iteration_count = 0
         finally:
             # Dump instrumentation data if enabled and output directory is configured
@@ -700,13 +752,13 @@ class OffloadManager:
 
     def update_state(self):
         """Check and update state if necessary."""
-        if self._current_state in {OffloadState.NOT_INITIALIZED, OffloadState.INFERENCE}:
+        if self._current_phase in {OffloadPhase.NOT_INITIALIZED, OffloadPhase.INFERENCE}:
             return
         self._iteration_count += 1
 
-        if self._current_state == OffloadState.WARMUP and self._iteration_count >= self.config.warmup_iters:
+        if self._current_phase == OffloadPhase.DISCOVERY and self._iteration_count >= self.config.discovery_iters:
             self._transition_to_profile()
-        elif self._current_state == OffloadState.PROFILE and self._iteration_count >= self.config.profile_iters:
+        elif self._current_phase == OffloadPhase.PROFILING and self._iteration_count >= self.config.profiling_iters:
             self._transition_to_inference()
 
     def init(self, config: OffloadConfig | None = None):
@@ -791,7 +843,7 @@ class OffloadManager:
             model: Model constructed on meta device.
 
         Returns:
-            Proxy-wrapped model in INFERENCE state.
+            Proxy-wrapped model in INFERENCE phase.
 
         Raises:
             RuntimeError: If coordinator is a creator (not a follower).
@@ -816,7 +868,7 @@ class OffloadManager:
         self._exclude_modules(self._model, self.config.exclude_patterns)
         self._check_no_modules_patched()
 
-        self._current_state = OffloadState.INFERENCE
+        self._current_phase = OffloadPhase.INFERENCE
 
         # Wrap in proxy for API consistency with offload() — follower is already
         # in INFERENCE so update_state() is a no-op on each forward call.
@@ -836,7 +888,7 @@ class OffloadManager:
             self._tensor_manager.shutdown()
             self._tensor_manager = None
         self._initialized = False
-        self._current_state = OffloadState.NOT_INITIALIZED
+        self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._model_proxy = None
         self._model = None
 
@@ -1048,7 +1100,7 @@ def offload_from_profile(
 
     Convenience wrapper that combines :func:`init`, :func:`load_profile`, and
     :func:`offload`.  The profile must be loaded *before* offloading so that
-    ``initialize_warmup`` sees the saved state and skips warmup/profiling,
+    ``initialize_warmup`` sees the saved state and skips discovery/profiling,
     going straight to inference mode.
 
     Args:

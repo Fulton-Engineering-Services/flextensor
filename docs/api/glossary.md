@@ -80,12 +80,12 @@ A context manager that wraps a module's `forward` method to manage weight loadin
 timing measurement, and memory release for that module. Each matched module gets its
 own trap instance.
 
-Internal trap classes by state:
+Internal trap classes by phase:
 
-| State | Indirect mode | Direct mode |
+| Phase | Indirect mode | Direct mode |
 |-------|---------------|-------------|
-| Warmup | `WarmupTrap` | `WarmupTrap` |
-| Profile | `Trap` | `TrapDirect` |
+| Discovery | `WarmupTrap` | `WarmupTrap` |
+| Profiling | `Trap` | `TrapDirect` |
 | Inference | `TrapInfer` | `TrapInferDirect` |
 
 !!! note "Trap vs layer in code identifiers"
@@ -124,7 +124,7 @@ pre-fetching. Sometimes called "gap layer" in code identifiers — see the
 
 ### Direct Mode
 
-Trap implementation (used during profile and inference states) that patches model
+Trap implementation (used during profiling and inference phases) that patches model
 parameters in-place so the module's `forward` uses GPU tensor references directly.
 Lower overhead than indirect mode.
 
@@ -141,27 +141,27 @@ mode (handles varying access patterns) but adds dispatch overhead.
 FlexTensor uses an internal state machine that progresses automatically:
 
 ```text
-NOT_INITIALIZED → WARMUP → PROFILING → INFERENCE
+NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
 ```
 
-See: [Internal States](../explanation/states.md)
+See: [Internal Phases](../explanation/phases.md)
 
-### Warmup State
+### Discovery Phase
 
-First active state. Runs for `warmup_iters` iterations. Discovers which parameters
+First active phase. Runs for `discovery_iters` iterations. Discovers which parameters
 belong to which traps by intercepting PyTorch operations via `WarmupTrap`. Also
 referred to as the "parameter discovery phase."
 
-### Profiling State
+### Profiling Phase
 
-Second active state. Runs for `profile_iters` iterations. Measures per-trap
+Second active phase. Runs for `profiling_iters` iterations. Measures per-trap
 execution timing using CUDA events. The collected statistics feed into strategy
 computation. "Profiling" is the process; the [offload profile](#offload-profile)
 is the artifact it produces.
 
-### Inference State
+### Inference Phase
 
-Third active state (steady-state). Applies the computed offloading and release
+Third active phase (steady-state). Applies the computed offloading and release
 strategies for production execution. No timing collection overhead.
 
 ---
@@ -246,12 +246,12 @@ transfers via DMA (Direct Memory Access). Controlled by
 
 ### Offload Profile
 
-The serialized artifact produced by warmup and profiling: parameter-to-trap maps,
+The serialized artifact produced by discovery and profiling: parameter-to-trap maps,
 timing statistics, and the computed strategy. Saved via `save_profile()` and
 reloaded via `load_profile()` or `offload_from_profile()` to skip those phases on
 subsequent runs.
 
-Not to be confused with the [profiling state](#profiling-state), which is the
+Not to be confused with the [profiling phase](#profiling-phase), which is the
 phase that *produces* the profile.
 
 ---
