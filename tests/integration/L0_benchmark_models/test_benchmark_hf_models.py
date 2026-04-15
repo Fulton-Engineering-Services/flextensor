@@ -12,6 +12,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from flextensor import TensorManager
 from flextensor.strategy import KnapsackStrategy
+from tests.integration.conftest import enable_offline_if_cached
 
 
 class TestHuggingFaceModelBenchmarking:
@@ -34,8 +35,7 @@ class TestHuggingFaceModelBenchmarking:
         )
 
     def load_hf_model(self, model_name: str):
-        """
-        Load HuggingFace model with error handling.
+        """Load HuggingFace model, enabling offline mode when the cache is warm.
 
         Args:
             model_name: HuggingFace model identifier
@@ -43,6 +43,7 @@ class TestHuggingFaceModelBenchmarking:
         Returns:
             Tuple of (model, tokenizer, model_size_mb)
         """
+        enable_offline_if_cached(model_name)
         tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=False, padding_side="left")
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token

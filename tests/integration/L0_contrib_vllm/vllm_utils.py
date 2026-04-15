@@ -237,6 +237,10 @@ def start_vllm_server(
         env_vars["FT_ENABLED"] = "1"
         cmd += ["--worker-cls", "flextensor.contrib.vllm.worker.FlexTensorOffloadWorker"]
 
+    from tests.integration.conftest import enable_offline_if_cached
+
+    enable_offline_if_cached(model_name)
+
     if additional_env_vars:
         env_vars.update(additional_env_vars)
 
