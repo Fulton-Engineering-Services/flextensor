@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - FlexTensor log messages (offloading config, loader phases) now visible on
   vLLM v0.18+ where spawn-mode child processes don't inherit parent logging
   state. Loggers use the `vllm.*` namespace to flow through vLLM's handler.
+- vLLM snapshot dumps now serialize module parameters as metadata instead of raw
+  tensor values, which produced megabytes of unbounded output.
 
 ## [0.2.0] — 2026-04-10
 

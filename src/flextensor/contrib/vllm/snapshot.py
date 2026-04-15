@@ -20,6 +20,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 try:
     from vllm.logger import init_logger
@@ -53,6 +54,56 @@ _SNAPSHOT_FIELDS = (
     "non_torch_memory",
     "timestamp",
 )
+
+
+def _serialize_module_parameters(params: Any) -> dict[str, dict[str, Any]]:
+    """Serialize a module's ``_parameters`` to metadata-only dicts.
+
+    Extracts only shape, dtype, numel, and size_bytes — never raw tensor
+    values — so the output is safe for JSON/ElasticSearch ingestion.
+
+    Args:
+        params: A module's ``_parameters`` mapping (name → Parameter|None).
+
+    Returns:
+        Dict mapping parameter names to their metadata.
+        None-valued parameters (e.g., optional bias) are skipped.
+    """
+    result: dict[str, dict[str, Any]] = {}
+    for name, p in params.items():
+        if p is None:
+            continue
+        numel = p.numel()
+        result[name] = {
+            "shape": list(p.shape),
+            "dtype": str(p.dtype),
+            "numel": numel,
+            "size_bytes": numel * p.element_size(),
+        }
+    return result
+
+
+def _collect_model_modules(model: Any) -> list[dict[str, Any]]:
+    """Collect parameter metadata for all modules in a model.
+
+    Iterates over ``model.named_modules()`` and serializes each module's
+    parameters as metadata-only dicts (no raw tensor values).
+
+    Args:
+        model: A PyTorch ``nn.Module`` (or vLLM wrapper with ``named_modules``).
+
+    Returns:
+        List of dicts, each with ``name`` and ``tensors_map`` keys.
+        Only modules with at least one non-None parameter are included.
+    """
+    modules: list[dict[str, Any]] = []
+    for name, module in model.named_modules():
+        if not hasattr(module, "_parameters") or not module._parameters:  # noqa: SLF001
+            continue
+        tensors_map = _serialize_module_parameters(module._parameters)  # noqa: SLF001
+        if tensors_map:
+            modules.append({"name": name, "tensors_map": tensors_map})
+    return modules
 
 
 class MemorySnapshotMixin:
@@ -111,7 +162,7 @@ class MemorySnapshotMixin:
         filename = f"gpu_snapshots_rank{self.rank}_device{self.local_rank}_{ts}.json"  # type: ignore[attr-defined]
         output_path = output_dir / filename
 
-        data = {
+        data: dict[str, Any] = {
             "worker_type": type(self).__name__,
             "model": self.vllm_config.model_config.model,  # type: ignore[attr-defined]
             "rank": self.rank,  # type: ignore[attr-defined]
@@ -119,6 +170,15 @@ class MemorySnapshotMixin:
             "device": str(self.device),  # type: ignore[attr-defined]
             "snapshots": self._snapshots,
         }
+
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is not None:
+            model = getattr(model_runner, "model", None)
+            if model is not None:
+                try:
+                    data["modules"] = _collect_model_modules(model)
+                except (AttributeError, TypeError, RuntimeError):
+                    logger.warning("Failed to collect module data for %s", type(model).__name__, exc_info=True)
 
         output_path.write_text(json.dumps(data, indent=2))
         logger.info("GPU memory snapshots written to %s", output_path)

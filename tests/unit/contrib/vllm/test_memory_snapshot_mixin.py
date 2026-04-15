@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for MemorySnapshotMixin.
+"""Unit tests for MemorySnapshotMixin and parameter serialization helpers.
 
 This test suite validates the MemorySnapshotMixin class in isolation by
 mocking vLLM's MemorySnapshot. No GPU required.
@@ -11,12 +11,16 @@ Key behaviors tested:
 - _take_snapshot() accumulates multiple snapshots
 - _dump_snapshots() writes JSON with correct structure and filename
 - _dump_snapshots() handles empty snapshot list
+- _serialize_module_parameters() produces metadata-only output (no raw tensor values)
+- _collect_model_modules() filters parameterless modules
 """
 
 import json
+from collections import OrderedDict
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 
 @pytest.fixture()
@@ -261,3 +265,274 @@ class TestDumpSnapshots:
 
         json_files = list(tmp_path.glob("gpu_snapshots_*.json"))
         assert len(json_files) == 0
+
+    def test_dump_includes_modules_metadata(self, mixin_instance, mock_memory_snapshot, tmp_path):
+        """Verify dump includes modules key with metadata-only parameter info."""
+        model = torch.nn.Linear(10, 5, bias=False)
+        mixin_instance.model_runner = MagicMock()
+        mixin_instance.model_runner.model = model
+
+        with patch(
+            "flextensor.contrib.vllm.snapshot.MemorySnapshot",
+            return_value=mock_memory_snapshot,
+        ):
+            mixin_instance._take_snapshot("after_load_model")
+
+        with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}):
+            mixin_instance._dump_snapshots()
+
+        json_files = list(tmp_path.glob("gpu_snapshots_*.json"))
+        data = json.loads(json_files[0].read_text())
+
+        assert "modules" in data
+        assert len(data["modules"]) > 0
+        # Verify metadata-only — no raw tensor values
+        serialized = json.dumps(data["modules"])
+        assert "tensor(" not in serialized
+        assert "Parameter containing" not in serialized
+
+    def test_dump_without_model_runner_omits_modules(self, mixin_instance, mock_memory_snapshot, tmp_path):
+        """Verify dump works without model_runner — modules key omitted gracefully."""
+        with patch(
+            "flextensor.contrib.vllm.snapshot.MemorySnapshot",
+            return_value=mock_memory_snapshot,
+        ):
+            mixin_instance._take_snapshot("after_init_device")
+
+        with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}):
+            mixin_instance._dump_snapshots()
+
+        json_files = list(tmp_path.glob("gpu_snapshots_*.json"))
+        data = json.loads(json_files[0].read_text())
+        assert "modules" not in data
+
+    def test_dump_with_model_runner_model_none_omits_modules(self, mixin_instance, mock_memory_snapshot, tmp_path):
+        """Verify dump works when model_runner.model is None — modules key omitted."""
+        mixin_instance.model_runner = MagicMock()
+        mixin_instance.model_runner.model = None
+
+        with patch(
+            "flextensor.contrib.vllm.snapshot.MemorySnapshot",
+            return_value=mock_memory_snapshot,
+        ):
+            mixin_instance._take_snapshot("after_init_device")
+
+        with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}):
+            mixin_instance._dump_snapshots()
+
+        json_files = list(tmp_path.glob("gpu_snapshots_*.json"))
+        data = json.loads(json_files[0].read_text())
+        assert "modules" not in data
+
+    def test_dump_still_writes_when_module_collection_fails(self, mixin_instance, mock_memory_snapshot, tmp_path):
+        """Verify snapshot file is written even when _collect_model_modules raises."""
+        model = MagicMock()
+        model.named_modules.side_effect = RuntimeError("wrapped model")
+        mixin_instance.model_runner = MagicMock()
+        mixin_instance.model_runner.model = model
+
+        with patch(
+            "flextensor.contrib.vllm.snapshot.MemorySnapshot",
+            return_value=mock_memory_snapshot,
+        ):
+            mixin_instance._take_snapshot("after_load_model")
+
+        with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}):
+            mixin_instance._dump_snapshots()
+
+        json_files = list(tmp_path.glob("gpu_snapshots_*.json"))
+        assert len(json_files) == 1
+        data = json.loads(json_files[0].read_text())
+        assert "modules" not in data
+        assert len(data["snapshots"]) == 1
+
+
+class TestLogitsProcessorSerialization:
+    """Functional test reproducing issue #128.
+
+    Simulates a vLLM-like model with a logits_processor module containing
+    large bfloat16 parameters. Verifies that _collect_model_modules produces
+    JSON-safe output where str(module._parameters) would not.
+    """
+
+    @pytest.fixture()
+    def vllm_like_model(self):
+        """Build a model mimicking vLLM's structure with a logits_processor."""
+        model = torch.nn.Module()
+        # Model layers (normal model weights)
+        model.model = torch.nn.Sequential(
+            torch.nn.Linear(4096, 4096, dtype=torch.bfloat16, bias=False),
+        )
+        # vLLM-added logits_processor with large vocab projection
+        model.logits_processor = torch.nn.Linear(4096, 32000, dtype=torch.bfloat16, bias=False)
+        return model
+
+    def test_str_parameters_produces_raw_tensor_values(self, vllm_like_model):
+        """Demonstrate the broken approach: str(module._parameters) dumps raw tensor data."""
+        broken_output = str(vllm_like_model.logits_processor._parameters)
+        assert "Parameter containing" in broken_output
+        assert "tensor(" in broken_output
+
+    def test_collect_model_modules_produces_no_raw_tensor_values(self, vllm_like_model):
+        """Verify _collect_model_modules never includes raw tensor values."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        result = _collect_model_modules(vllm_like_model)
+        serialized = json.dumps(result)
+
+        assert "tensor(" not in serialized
+        assert "Parameter containing" not in serialized
+        assert "mappingproxy" not in serialized
+
+    def test_serialized_output_fits_es_flattened_field(self, vllm_like_model):
+        """Verify serialized output is bounded — no unbounded tensor repr growth."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        result = _collect_model_modules(vllm_like_model)
+        serialized = json.dumps(result)
+
+        # str(module._parameters) for a 32000x4096 bf16 tensor would produce
+        # megabytes of output. Metadata-only serialization should be tiny.
+        assert len(serialized) < 2000
+
+    def test_logits_processor_metadata_is_correct(self, vllm_like_model):
+        """Verify logits_processor parameter metadata matches actual tensor properties."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        result = _collect_model_modules(vllm_like_model)
+        lp_entry = next(m for m in result if m["name"] == "logits_processor")
+
+        weight = lp_entry["tensors_map"]["weight"]
+        assert weight["shape"] == [32000, 4096]
+        assert weight["dtype"] == "torch.bfloat16"
+        assert weight["numel"] == 32000 * 4096
+        assert weight["size_bytes"] == 32000 * 4096 * 2  # bfloat16 = 2 bytes
+
+
+class TestSerializeModuleParameters:
+    """Tests for _serialize_module_parameters helper."""
+
+    def test_serializes_parameter_metadata(self):
+        """Verify shape, dtype, numel, and size_bytes are captured correctly."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        param = torch.nn.Parameter(torch.zeros(32, 64, dtype=torch.float32))
+        params = OrderedDict({"weight": param})
+        result = _serialize_module_parameters(params)
+
+        assert "weight" in result
+        assert result["weight"]["shape"] == [32, 64]
+        assert result["weight"]["dtype"] == "torch.float32"
+        assert result["weight"]["numel"] == 32 * 64
+        assert result["weight"]["size_bytes"] == 32 * 64 * 4  # float32 = 4 bytes
+
+    def test_skips_none_parameters(self):
+        """Verify None parameters (e.g. optional bias) are excluded."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        params = OrderedDict({"weight": torch.nn.Parameter(torch.zeros(4)), "bias": None})
+        result = _serialize_module_parameters(params)
+
+        assert "weight" in result
+        assert "bias" not in result
+
+    def test_empty_parameters(self):
+        """Verify empty _parameters mapping returns empty dict."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        result = _serialize_module_parameters(OrderedDict())
+        assert result == {}
+
+    def test_no_raw_tensor_values_in_output(self):
+        """Verify serialized output contains no raw tensor data — the core fix for #128."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        param = torch.nn.Parameter(torch.randn(100, 200, dtype=torch.bfloat16))
+        params = OrderedDict({"weight": param})
+        result = _serialize_module_parameters(params)
+
+        serialized = json.dumps(result)
+        assert "tensor(" not in serialized
+        assert "Parameter containing" not in serialized
+        assert "mappingproxy" not in serialized
+
+    def test_output_is_json_serializable(self):
+        """Verify the output can be serialized to JSON without TypeError."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        param = torch.nn.Parameter(torch.zeros(8, 16, dtype=torch.bfloat16))
+        params = OrderedDict({"weight": param})
+        result = _serialize_module_parameters(params)
+
+        serialized = json.dumps(result)
+        roundtripped = json.loads(serialized)
+        assert roundtripped["weight"]["shape"] == [8, 16]
+
+    def test_bfloat16_size_bytes(self):
+        """Verify size_bytes is correct for bfloat16 (2 bytes per element)."""
+        from flextensor.contrib.vllm.snapshot import _serialize_module_parameters
+
+        param = torch.nn.Parameter(torch.zeros(1000, dtype=torch.bfloat16))
+        params = OrderedDict({"weight": param})
+        result = _serialize_module_parameters(params)
+
+        assert result["weight"]["size_bytes"] == 1000 * 2
+
+
+class TestCollectModelModules:
+    """Tests for _collect_model_modules helper."""
+
+    def test_collects_modules_with_parameters(self):
+        """Verify modules with parameters are included."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        model = torch.nn.Sequential(torch.nn.Linear(10, 5), torch.nn.ReLU(), torch.nn.Linear(5, 2))
+        result = _collect_model_modules(model)
+
+        names = [m["name"] for m in result]
+        assert "0" in names  # first Linear
+        assert "2" in names  # second Linear
+
+    def test_excludes_parameterless_modules(self):
+        """Verify modules without parameters (e.g. ReLU) are excluded."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        model = torch.nn.Sequential(torch.nn.Linear(10, 5), torch.nn.ReLU())
+        result = _collect_model_modules(model)
+
+        names = [m["name"] for m in result]
+        assert "1" not in names  # ReLU has no parameters
+
+    def test_tensors_map_contains_metadata(self):
+        """Verify each module's tensors_map has correct parameter metadata."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        model = torch.nn.Linear(10, 5, bias=True)
+        result = _collect_model_modules(model)
+
+        # The Linear module itself should be in the list (named "")
+        linear_entry = next(m for m in result if "weight" in m["tensors_map"])
+        assert linear_entry["tensors_map"]["weight"]["shape"] == [5, 10]
+        assert "bias" in linear_entry["tensors_map"]
+        assert linear_entry["tensors_map"]["bias"]["shape"] == [5]
+
+    def test_empty_model(self):
+        """Verify empty model returns empty list."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        model = torch.nn.Sequential()
+        result = _collect_model_modules(model)
+
+        # Sequential itself has no parameters, so only the container
+        assert all(m["tensors_map"] for m in result)  # no empty tensors_maps
+
+    def test_output_is_json_serializable(self):
+        """Verify full module collection output can round-trip through JSON."""
+        from flextensor.contrib.vllm.snapshot import _collect_model_modules
+
+        model = torch.nn.Sequential(torch.nn.Linear(10, 5), torch.nn.Linear(5, 2))
+        result = _collect_model_modules(model)
+
+        serialized = json.dumps(result)
+        roundtripped = json.loads(serialized)
+        assert len(roundtripped) == len(result)
