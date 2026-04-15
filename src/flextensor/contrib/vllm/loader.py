@@ -12,10 +12,9 @@ from contextlib import suppress
 
 import torch
 from torch import nn
-from vllm.attention.layer import Attention, MLAAttention
 from vllm.config import ModelConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.utils import (
@@ -24,7 +23,9 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-logger = init_logger(__name__)
+# Use vllm.* namespace so logs flow through vLLM's configured handler
+# (vLLM only attaches handlers to the 'vllm' logger hierarchy).
+logger = init_logger("vllm.flextensor.loader")
 
 
 @register_model_loader("flextensor")
@@ -33,24 +34,18 @@ class FlexTensorModelLoader(DefaultModelLoader):
 
     _UNDERLYING_FORMAT = "auto"
 
-    def _prepare_weights(
-        self,
-        model_name_or_path: str,
-        revision: str | None,
-        fall_back_to_pt: bool,
-        allow_patterns_overrides: list[str] | None,
-    ) -> tuple[str, list[str], bool]:
+    def _prepare_weights(self, *args: object, **kwargs: object) -> tuple[str, list[str], bool]:
         """Prepare weights, mapping flextensor format to auto."""
         original_format = self.load_config.load_format
         if original_format == "flextensor":
             self.load_config.load_format = self._UNDERLYING_FORMAT
 
         try:
-            return super()._prepare_weights(model_name_or_path, revision, fall_back_to_pt, allow_patterns_overrides)
+            return super()._prepare_weights(*args, **kwargs)
         finally:
             self.load_config.load_format = original_format
 
-    def load_model(self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = "") -> nn.Module:
+    def load_model(self, vllm_config: VllmConfig, model_config: ModelConfig, **kwargs: object) -> nn.Module:
         """Load model with 2-phase strategy: CPU init/load -> GPU weight processing (if needed)."""
         cpu_device = torch.device("cpu")
         gpu_device = vllm_config.device_config.device
@@ -67,7 +62,7 @@ class FlexTensorModelLoader(DefaultModelLoader):
                 original_default_device = torch.get_default_device()
                 torch.set_default_device("cpu")
             with set_default_torch_dtype(model_config.dtype):
-                model = initialize_model(vllm_config=vllm_config, model_config=model_config, prefix=prefix)
+                model = initialize_model(vllm_config=vllm_config, model_config=model_config, **kwargs)
                 self.load_weights(model, model_config)
         finally:
             current_platform.device_type = original_platform_device_type
@@ -85,8 +80,8 @@ class FlexTensorModelLoader(DefaultModelLoader):
 
         for name, module in model.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            has_quant = isinstance(quant_method, QuantizeMethodBase)
-            has_attn_processing = isinstance(module, (Attention, MLAAttention)) and hasattr(
+            has_quant = quant_method is not None and hasattr(quant_method, "process_weights_after_loading")
+            has_attn_processing = isinstance(module, AttentionLayerBase) and hasattr(
                 module, "process_weights_after_loading"
             )
 
@@ -158,8 +153,8 @@ class FlexTensorModelLoader(DefaultModelLoader):
         """Process weights for a single layer on GPU."""
         for _name, module in layer.named_modules():
             quant_method = getattr(module, "quant_method", None)
-            if isinstance(quant_method, QuantizeMethodBase):
+            if quant_method is not None and hasattr(quant_method, "process_weights_after_loading"):
                 quant_method.process_weights_after_loading(module)
 
-            if isinstance(module, (Attention, MLAAttention)) and hasattr(module, "process_weights_after_loading"):
+            if isinstance(module, AttentionLayerBase) and hasattr(module, "process_weights_after_loading"):
                 module.process_weights_after_loading(model_config.dtype)

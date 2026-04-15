@@ -11,6 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- vLLM integration now supports v0.11.2 through v0.19.0. Previously broke on
+  v0.16+ due to `vllm.attention` module being moved to
+  `vllm.model_executor.layers.attention`, and on v0.18+ due to a new
+  `subfolder` parameter added to the model loader's weight preparation method.
+- FlexTensor log messages (offloading config, loader phases) now visible on
+  vLLM v0.18+ where spawn-mode child processes don't inherit parent logging
+  state. Loggers use the `vllm.*` namespace to flow through vLLM's handler.
+
 ## [0.2.0] — 2026-04-10
 
 ### Added

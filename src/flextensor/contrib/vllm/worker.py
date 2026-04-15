@@ -24,7 +24,9 @@ import flextensor
 import flextensor.contrib.vllm.loader
 from flextensor.config import load_config
 
-LOGGER = init_logger(__name__)
+# Use vllm.* namespace so logs flow through vLLM's configured handler
+# (vLLM only attaches handlers to the 'vllm' logger hierarchy).
+LOGGER = init_logger("vllm.flextensor.worker")
 
 # Default include patterns for per-layer offloading in decoder-only transformer models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to

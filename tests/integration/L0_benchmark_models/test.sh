@@ -28,6 +28,6 @@ if [ -n "${PYTEST_MARKER:-}" ]; then
   PYTEST_ARGS+=(-m "$PYTEST_MARKER")
 fi
 
-timeout "$TIMEOUT" python -m pytest "$SCRIPT_DIR" "${PYTEST_ARGS[@]}"
+timeout "$TIMEOUT" python3 -m pytest "$SCRIPT_DIR" "${PYTEST_ARGS[@]}"
 
 echo "Integration tests completed successfully!"

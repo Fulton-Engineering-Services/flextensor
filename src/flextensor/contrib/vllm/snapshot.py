@@ -27,7 +27,8 @@ try:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu_worker import Worker
 
-    logger = init_logger(__name__)
+    # Use vllm.* namespace so logs flow through vLLM's configured handler.
+    logger = init_logger("vllm.flextensor.snapshot")
 except ModuleNotFoundError:  # vllm not installed (e.g. unit-test environment)
     MemorySnapshot = None  # type: ignore[assignment,misc]
     KVCacheConfig = None  # type: ignore[assignment,misc]
