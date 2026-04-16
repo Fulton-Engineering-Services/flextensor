@@ -1657,3 +1657,115 @@ class TestIterFieldRename:
         monkeypatch.setenv("FT_PROFILING_ITERS", "7")
         with pytest.raises(ValueError, match="Cannot set both"):
             load_config()
+
+
+class TestModelCopyDeprecatedFieldSync:
+    """Tests that model_copy(update=...) keeps deprecated fields in sync.
+
+    Pydantic v2's model_copy bypasses mode='before' validators.  The
+    OffloadConfig.model_copy override mirrors updates to deprecated
+    counterparts so fields never desync.
+    """
+
+    def test_model_copy_syncs_discovery_to_warmup(self):
+        config = OffloadConfig(discovery_iters=1)
+        copied = config.model_copy(update={"discovery_iters": 5})
+        assert copied.discovery_iters == 5
+        assert copied.warmup_iters == 5
+
+    def test_model_copy_syncs_warmup_to_discovery(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            config = OffloadConfig(warmup_iters=1)
+        copied = config.model_copy(update={"warmup_iters": 7})
+        assert copied.warmup_iters == 7
+        assert copied.discovery_iters == 7
+
+    def test_model_copy_syncs_profiling_to_profile(self):
+        config = OffloadConfig(profiling_iters=10)
+        copied = config.model_copy(update={"profiling_iters": 3})
+        assert copied.profiling_iters == 3
+        assert copied.profile_iters == 3
+
+    def test_model_copy_syncs_profile_to_profiling(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            config = OffloadConfig(profile_iters=10)
+        copied = config.model_copy(update={"profile_iters": 4})
+        assert copied.profile_iters == 4
+        assert copied.profiling_iters == 4
+
+    def test_model_copy_syncs_shm_enabled_to_use_shared_memory(self):
+        config = OffloadConfig(shm_enabled=False)
+        copied = config.model_copy(update={"shm_enabled": True})
+        assert copied.shm_enabled is True
+        assert copied.use_shared_memory is True
+
+    def test_model_copy_syncs_use_shared_memory_to_shm_enabled(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            config = OffloadConfig(use_shared_memory=False)
+        copied = config.model_copy(update={"use_shared_memory": True})
+        assert copied.use_shared_memory is True
+        assert copied.shm_enabled is True
+
+    def test_model_copy_syncs_transfer_budget_scale_to_knapsack_scale(self):
+        config = OffloadConfig(transfer_budget_scale=1.0)
+        copied = config.model_copy(update={"transfer_budget_scale": 0.8})
+        assert copied.transfer_budget_scale == 0.8
+        assert copied.knapsack_scale == 0.8
+
+    def test_model_copy_syncs_knapsack_scale_to_transfer_budget_scale(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            config = OffloadConfig(knapsack_scale=1.0)
+        copied = config.model_copy(update={"knapsack_scale": 0.6})
+        assert copied.knapsack_scale == 0.6
+        assert copied.transfer_budget_scale == 0.6
+
+    def test_model_copy_explicit_both_sides_no_mirror(self):
+        """When both sides of a pair are in the update with the same value, no mirroring happens."""
+        config = OffloadConfig(discovery_iters=1)
+        copied = config.model_copy(update={"discovery_iters": 5, "warmup_iters": 5})
+        assert copied.discovery_iters == 5
+        assert copied.warmup_iters == 5
+
+    def test_model_copy_conflicting_both_sides_raises(self):
+        """When both sides of a pair are in the update with different values, raise ValueError."""
+        config = OffloadConfig(discovery_iters=1)
+        with pytest.raises(ValueError, match="Cannot set both"):
+            config.model_copy(update={"discovery_iters": 5, "warmup_iters": 3})
+
+    def test_model_copy_without_update_unchanged(self):
+        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
+        copied = config.model_copy()
+        assert copied.discovery_iters == 3
+        assert copied.warmup_iters == 3
+        assert copied.profiling_iters == 7
+        assert copied.profile_iters == 7
+
+    def test_model_copy_deep_preserves_sync(self):
+        config = OffloadConfig(discovery_iters=2)
+        copied = config.model_copy(update={"discovery_iters": 9}, deep=True)
+        assert copied.discovery_iters == 9
+        assert copied.warmup_iters == 9
+
+    def test_model_copy_multiple_pairs_updated(self):
+        config = OffloadConfig(discovery_iters=1, profiling_iters=10, shm_enabled=False)
+        copied = config.model_copy(update={"discovery_iters": 3, "profiling_iters": 2, "shm_enabled": True})
+        assert copied.discovery_iters == 3
+        assert copied.warmup_iters == 3
+        assert copied.profiling_iters == 2
+        assert copied.profile_iters == 2
+        assert copied.shm_enabled is True
+        assert copied.use_shared_memory is True
+
+    def test_model_copy_unrelated_field_no_side_effects(self):
+        """Updating include_patterns does not alter iter fields."""
+        config = OffloadConfig(discovery_iters=5, profiling_iters=10)
+        copied = config.model_copy(update={"include_patterns": ["layers.*"]})
+        assert copied.include_patterns == ["layers.*"]
+        assert copied.discovery_iters == 5
+        assert copied.warmup_iters == 5
+        assert copied.profiling_iters == 10
+        assert copied.profile_iters == 10

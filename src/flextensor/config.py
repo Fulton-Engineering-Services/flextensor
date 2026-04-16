@@ -13,6 +13,7 @@ import logging
 import os
 import types
 import warnings
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any, Union, get_args, get_origin
 
@@ -38,6 +39,22 @@ _ALL_WARMUP_ITERS_MSG = (
 )
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
+
+# Bidirectional deprecated ↔ canonical field pairs.  Used by model_copy()
+# to mirror updates so that Pydantic v2's validator-bypass doesn't desync
+# deprecated fields from their replacements.  One-directional deprecations
+# (module_patterns, max_gpu_mem_bytes) are excluded — their sync logic is
+# not a simple value mirror.
+_DEPRECATED_FIELD_MIRRORS: dict[str, str] = {
+    "discovery_iters": "warmup_iters",
+    "warmup_iters": "discovery_iters",
+    "profiling_iters": "profile_iters",
+    "profile_iters": "profiling_iters",
+    "shm_enabled": "use_shared_memory",
+    "use_shared_memory": "shm_enabled",
+    "transfer_budget_scale": "knapsack_scale",
+    "knapsack_scale": "transfer_budget_scale",
+}
 
 _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
     "release_tensors": ("v0.2.0", "GPU tensors are now always released after layer execution."),
@@ -369,6 +386,32 @@ class OffloadConfig(BaseModel):
         if self.num_blocks < self.min_blocks:
             raise ValueError(f"num_blocks ({self.num_blocks}) must be >= min_blocks ({self.min_blocks})")
         return self
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Return a copy, mirroring updates to deprecated field counterparts.
+
+        Pydantic v2's ``model_copy(update=...)`` bypasses ``mode='before'``
+        validators, so deprecated fields desync from their canonical
+        replacements.  This override mirrors each updated field to its
+        counterpart before delegating to the base implementation.
+
+        See ``_DEPRECATED_FIELD_MIRRORS`` for the set of mirrored pairs.
+
+        Raises:
+            ValueError: If both sides of a pair appear in *update* with
+                differing values.
+        """
+        if update:
+            synced_update = dict(update)
+            for key, mirror in _DEPRECATED_FIELD_MIRRORS.items():
+                if key in synced_update and mirror in synced_update:
+                    if synced_update[key] != synced_update[mirror]:
+                        msg = f"Cannot set both `{key}` and `{mirror}` to different values"
+                        raise ValueError(msg)
+                elif key in synced_update:
+                    synced_update[mirror] = synced_update[key]
+            return super().model_copy(update=synced_update, deep=deep)
+        return super().model_copy(deep=deep)
 
     @property
     def pre_inference_iters(self) -> int:
