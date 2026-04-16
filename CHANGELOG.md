@@ -11,23 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- vLLM integration now supports v0.11.2 through v0.19.0. Previously broke on
-  v0.16+ due to `vllm.attention` module being moved to
-  `vllm.model_executor.layers.attention`, and on v0.18+ due to a new
-  `subfolder` parameter added to the model loader's weight preparation method.
-- FlexTensor log messages (offloading config, loader phases) now visible on
-  vLLM v0.18+ where spawn-mode child processes don't inherit parent logging
-  state. Loggers use the `vllm.*` namespace to flow through vLLM's handler.
-- vLLM snapshot dumps now serialize module parameters as metadata instead of raw
-  tensor values, which produced megabytes of unbounded output.
-
-### Changed
-
-- vLLM example updated to v0.19.0 with shell scripts replacing the Dockerfile.
-
-## [0.2.0] — 2026-04-10
+## [0.2.0] — 2026-04-16
 
 ### Added
 
@@ -88,6 +72,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FT_MODULE_PATTERNS` is now `FT_INCLUDE_PATTERNS`. The old names still work but
   emit a deprecation warning.
 
+- vLLM example updated to v0.19.0 with shell scripts replacing the Dockerfile.
+
 - **BREAKING**: `SHM_PROTOCOL_VERSION` bumped to 2. Existing shared-memory profiles are
   invalidated due to namespace hash key changes (`module_patterns` → `include_patterns`,
   added `exclude_patterns`). Multi-process deployments will re-profile on first run after
@@ -100,6 +86,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- vLLM integration now supports v0.11.2 through v0.19.0. Previously broke on
+  v0.16+ due to `vllm.attention` module being moved to
+  `vllm.model_executor.layers.attention`, and on v0.18+ due to a new
+  `subfolder` parameter added to the model loader's weight preparation method.
+- FlexTensor log messages (offloading config, loader phases) now visible on
+  vLLM v0.18+ where spawn-mode child processes don't inherit parent logging
+  state. Loggers use the `vllm.*` namespace to flow through vLLM's handler.
+- vLLM snapshot dumps now serialize module parameters as metadata instead of raw
+  tensor values, which produced megabytes of unbounded output.
 - Profiling traps now use CUDA events instead of `time.time_ns()` for timing. Host-side
   wall-clock time included kernel-launch overhead and scheduler jitter; CUDA events record
   timestamps on the GPU timeline, giving accurate device-side compute duration for strategy
