@@ -12653,7 +12653,7 @@ THE SOFTWARE.
   - `Documentation`: https://pyproject-hooks.readthedocs.io/
   - `Source`: https://github.com/pypa/pyproject-hooks
 
-## pytest (9.0.2)
+## pytest (9.0.3)
 ### Licenses
 License: `MIT`
 
@@ -12690,7 +12690,7 @@ SOFTWARE.
   - `Source`: https://github.com/pytest-dev/pytest
   - `Tracker`: https://github.com/pytest-dev/pytest/issues
 
-## pytest-cov (7.0.0)
+## pytest-cov (7.1.0)
 ### Licenses
 License: `MIT`
 
