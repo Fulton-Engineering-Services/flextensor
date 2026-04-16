@@ -12,6 +12,8 @@ This example demonstrates how to use FlexTensor's tensor offloading with vLLM to
 
 **Compatible vLLM versions**: This integration requires vLLM 0.11.x or later (uses the `vllm.v1` worker API). The `FlexTensorOffloadWorker` class extends vLLM's internal worker API, which may change between major vLLM releases.
 
+**Docker image**: This example uses the official [vllm/vllm-openai](https://hub.docker.com/r/vllm/vllm-openai) image (`v0.19.0`).
+
 ## Feature Support
 
 | Feature | Status | Notes |
@@ -25,21 +27,56 @@ This example demonstrates how to use FlexTensor's tensor offloading with vLLM to
 
 ## Quick Start
 
-After [installing dependencies](#installation):
+Start the server inside the vLLM container:
 
 ```bash
-# Enable offloading and serve a model
-FT_ENABLED=1 FT_MAX_GPU_MEM_FRACTION=0.7 vllm serve Qwen/Qwen2.5-72B-Instruct \
-    --enforce-eager \
-    --worker-cls flextensor.contrib.vllm.worker.FlexTensorOffloadWorker
+docker run --gpus all -p 8000:8000 \
+    -v ./examples/vllm:/workspace \
+    vllm/vllm-openai:v0.19.0 \
+    bash -c "/workspace/install.sh && /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct"
 ```
 
-## Installation
-
-Install example requirements:
+Pass `FT_*` environment variables with `-e` to configure offloading:
 
 ```bash
-pip install -r examples/vllm/requirements.txt
+docker run --gpus all -p 8000:8000 \
+    -e FT_MAX_GPU_MEM_FRACTION=0.7 \
+    -e FT_ENABLE_DIAGNOSTICS=1 \
+    -v ./examples/vllm:/workspace \
+    vllm/vllm-openai:v0.19.0 \
+    bash -c "/workspace/install.sh && /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct"
+```
+
+Test it from the host:
+
+```bash
+bash examples/vllm/client.sh Qwen/Qwen2.5-72B-Instruct
+```
+
+## Scripts
+
+### install.sh
+
+Installs FlexTensor and its dependencies inside the container:
+
+```bash
+bash /workspace/install.sh
+```
+
+### serve.sh
+
+Starts vLLM with the FlexTensor offload worker. Takes the model name as the first argument:
+
+```bash
+bash /workspace/serve.sh MODEL_NAME
+```
+
+### client.sh
+
+Sends a chat completion request and lists available models. Takes the model name as the first argument and an optional port (default 8000):
+
+```bash
+bash examples/vllm/client.sh MODEL_NAME [PORT]
 ```
 
 ## Configuration
@@ -80,40 +117,6 @@ For models with a different module layout, set `FT_INCLUDE_PATTERNS` explicitly:
 | ChatGLM v1–3 | `transformer.embedding,transformer.encoder.layers.*,transformer.encoder.final_layernorm,lm_head,logits_processor` |
 
 For the full list of configuration options (config files, discovery/profiling tuning, transfer modes), see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
-
-## Usage Examples
-
-### Testing the Deployment
-
-Once the server is running, test it with curl:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-        "model": "Qwen/Qwen2.5-72B-Instruct",
-        "messages": [
-            {"role": "user", "content": "The capital of France is"}
-        ],
-        "max_tokens": 10
-    }'
-
-# Check available models
-curl http://localhost:8000/v1/models
-```
-
-## Docker
-
-Build and run with Docker:
-
-```bash
-# Build
-docker build -t vllm-flextensor examples/vllm/
-
-# Run
-docker run --gpus all -p 8000:8000 -e FT_ENABLED=1 vllm-flextensor \
-    Qwen/Qwen2.5-72B-Instruct
-```
 
 ## How It Works
 

@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Integration test requirements for L0_example_vllm
+# These are in addition to the example's own requirements (installed via install.sh)
+requests~=2.32

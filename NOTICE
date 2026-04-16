@@ -29,6 +29,13 @@ NVIDIA Materials
   NVIDIA PyTorch Container    https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch
   NVIDIA vLLM Container       https://catalog.ngc.nvidia.com/orgs/nvidia/containers/vllm
 
+Third-Party Container Images
+----------------------------
+
+  Material                    Source
+  --------------------------  --------------------------------------------------
+  vllm/vllm-openai            https://hub.docker.com/r/vllm/vllm-openai
+
 HuggingFace Models and Datasets
 -------------------------------
 
@@ -39,6 +46,7 @@ integration tests and examples.
   ------------------------------------  --------------------  -------------------------
   TinyLlama/TinyLlama_v1.1             Apache 2.0            Integration tests
   Qwen/Qwen3-0.6B                      Apache 2.0            Integration tests
+  Qwen/Qwen2.5-0.5B-Instruct           Apache 2.0            Integration tests
   Qwen/Qwen2.5-7B-Instruct             Apache 2.0            Integration tests
   Qwen/Qwen2.5-72B-Instruct            Qwen License          Examples
   Wan-AI/Wan2.2-T2V-A14B-Diffusers     Apache 2.0            Examples

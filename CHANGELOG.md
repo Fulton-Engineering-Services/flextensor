@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - vLLM snapshot dumps now serialize module parameters as metadata instead of raw
   tensor values, which produced megabytes of unbounded output.
 
+### Changed
+
+- vLLM example updated to v0.19.0 with shell scripts replacing the Dockerfile.
+
 ## [0.2.0] — 2026-04-10
 
 ### Added
