@@ -1664,6 +1664,20 @@ class TestIterFieldRename:
         with pytest.raises(ValueError, match="Cannot set both"):
             load_config()
 
+    def test_warmup_and_discovery_iters_from_env_conflict_raises(self, monkeypatch):
+        """Setting both FT_WARMUP_ITERS and FT_DISCOVERY_ITERS via load_config_from_env raises ValueError."""
+        monkeypatch.setenv("FT_WARMUP_ITERS", "3")
+        monkeypatch.setenv("FT_DISCOVERY_ITERS", "5")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config_from_env()
+
+    def test_profile_and_profiling_iters_from_env_conflict_raises(self, monkeypatch):
+        """Setting both FT_PROFILE_ITERS and FT_PROFILING_ITERS via load_config_from_env raises ValueError."""
+        monkeypatch.setenv("FT_PROFILE_ITERS", "10")
+        monkeypatch.setenv("FT_PROFILING_ITERS", "20")
+        with pytest.raises(ValueError, match="Cannot set both"):
+            load_config_from_env()
+
 
 class TestModelCopyDeprecatedFieldSync:
     """Tests that model_copy(update=...) keeps deprecated fields in sync.
