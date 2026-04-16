@@ -1637,6 +1637,12 @@ class TestIterFieldRename:
             config = OffloadConfig(profile_iters=5, profiling_iters=5)
         assert config.profiling_iters == 5
 
+    def test_ft_profiling_iters_env_var(self, monkeypatch):
+        """FT_PROFILING_ITERS env var maps to profiling_iters."""
+        monkeypatch.setenv("FT_PROFILING_ITERS", "15")
+        config = load_config()
+        assert config.profiling_iters == 15
+
     def test_ft_profile_iters_env_var_deprecated(self, monkeypatch):
         """FT_PROFILE_ITERS env var maps to profiling_iters with deprecation warning."""
         monkeypatch.setenv("FT_PROFILE_ITERS", "8")
