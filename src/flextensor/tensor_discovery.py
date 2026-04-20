@@ -232,6 +232,12 @@ def get_inner_tensor_field_ids(tensor: torch.Tensor) -> list[int]:
 
     Returns:
         List of tensor IDs for inner tensor fields.
+
+    Note:
+        Fields whose descriptor raises an exception in ``_PROBE_EXCEPTIONS``
+        are skipped with a ``DEBUG`` log entry, so a single misbehaving
+        attribute on an exotic tensor subclass cannot drop the whole layer's
+        inner-field discovery.
     """
     inner_ids = []
     tensor_fields = set(dir(tensor))
@@ -241,7 +247,21 @@ def get_inner_tensor_field_ids(tensor: torch.Tensor) -> list[int]:
     for field_name in custom_fields:
         if field_name.startswith("_"):
             continue
-        field = getattr(tensor, field_name, None)
+        # Same hazard as ``is_offload_patched_module``: a tensor subclass may
+        # expose attributes whose descriptor raises a non-``AttributeError``
+        # (e.g. quantised / vLLM-style wrappers). A single bad field must not
+        # drop the whole layer's inner-field discovery.
+        try:
+            field = getattr(tensor, field_name, None)
+        except _PROBE_EXCEPTIONS as exc:
+            logger.debug(
+                "tensor_discovery inner-field probe on %s raised %s while accessing %s: %s; skipping.",
+                type(tensor).__name__,
+                type(exc).__name__,
+                field_name,
+                exc,
+            )
+            continue
         if isinstance(field, torch.Tensor):
             inner_ids.append(id(field))
 
@@ -450,6 +470,33 @@ def get_offload_module_tensor_ids(
     return label_to_tensor_ids
 
 
+# Attribute-probe failures we swallow when walking arbitrary modules / tensor
+# subclasses. ``hasattr`` / ``getattr(..., default)`` only catch
+# ``AttributeError``; anything else escapes and crashes FT mid-traversal.
+# ``KeyError`` covers vLLM 0.18.x ``StageMissingLayer``;
+# ``TypeError`` / ``RuntimeError`` cover wrapped / quantised / lazy-tensor
+# descriptors seen in the wild. Safe here because each guarded call is a
+# pure read — do not widen the ``try`` scope over real work.
+_PROBE_EXCEPTIONS: tuple[type[BaseException], ...] = (AttributeError, KeyError, TypeError, RuntimeError)
+
+
+def _log_probe_swallowed(module: torch.nn.Module, attr: str, exc: BaseException) -> None:
+    """Record a debug entry when a probe swallows a non-AttributeError.
+
+    Without this trail, "offloading was silently not applied to module X"
+    requires a debugger to diagnose. ``debug`` level is deliberate: the probes
+    run once per module in ``model.modules()``, so a higher level would flood
+    logs on every discovery pass.
+    """
+    logger.debug(
+        "tensor_discovery probe on %s raised %s while accessing %s: %s; treating as not patched.",
+        type(module).__name__,
+        type(exc).__name__,
+        attr,
+        exc,
+    )
+
+
 def is_offload_patched_module(module: torch.nn.Module) -> bool:
     """Check if a module has forward patching applied.
 
@@ -458,8 +505,15 @@ def is_offload_patched_module(module: torch.nn.Module) -> bool:
 
     Returns:
         True if the module has forward patching applied (i.e., has _ft_original_forward_func).
+        False if the probe fails because ``module`` has a misbehaving ``__getattr__``
+        that raises a non-``AttributeError`` (e.g. vLLM's ``StageMissingLayer``
+        raising ``KeyError``). Suppressed exceptions are logged at ``DEBUG``.
     """
-    return hasattr(module, "_ft_original_forward_func")
+    try:
+        return hasattr(module, "_ft_original_forward_func")
+    except _PROBE_EXCEPTIONS as exc:
+        _log_probe_swallowed(module, "_ft_original_forward_func", exc)
+        return False
 
 
 def get_offload_name(module: torch.nn.Module) -> str | None:
@@ -469,9 +523,16 @@ def get_offload_name(module: torch.nn.Module) -> str | None:
         module: The module to get the offload name from.
 
     Returns:
-        The offload name if the module is patched, None otherwise.
+        The offload name if the module is patched, None otherwise (including the
+        case where ``module.__getattr__`` raises a non-``AttributeError``; see
+        :func:`is_offload_patched_module`). Suppressed exceptions are logged at
+        ``DEBUG``.
     """
-    return getattr(module, "_ft_offload_name", None)
+    try:
+        return getattr(module, "_ft_offload_name", None)
+    except _PROBE_EXCEPTIONS as exc:
+        _log_probe_swallowed(module, "_ft_offload_name", exc)
+        return None
 
 
 def has_offload_modules(model: torch.nn.Module | dict | None) -> bool:

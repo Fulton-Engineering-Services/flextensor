@@ -2,20 +2,32 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for tensor discovery utilities."""
 
+import pytest
 import torch
 
 from flextensor.collectors import IterativeLayerStatistics
 from flextensor.tensor_discovery import (
+    _PROBE_EXCEPTIONS,
     ModuleTracker,
     _any_prefix_matches,
     _should_offload_param,
     discover_untraced_tensors_for_layers,
+    get_inner_tensor_field_ids,
     get_non_offloaded_tensor_ids,
     get_offload_module_tensor_ids,
     get_offload_name,
     has_offload_modules,
     is_offload_patched_module,
 )
+
+# Exception types a misbehaving ``__getattr__`` / descriptor may raise that the
+# FT probes must tolerate. Parametrised over production's ``_PROBE_EXCEPTIONS``
+# so widening the tuple auto-extends test coverage.
+_PROBE_EXCEPTION_INSTANCES = [
+    exc_cls("module") if exc_cls is KeyError else exc_cls("boom")
+    for exc_cls in _PROBE_EXCEPTIONS
+    if exc_cls is not AttributeError
+]
 
 
 class SimpleModule(torch.nn.Module):
@@ -69,6 +81,145 @@ def test_get_offload_name():
     # Simulate patching
     module._ft_offload_name = "test_layer"
     assert get_offload_name(module) == "test_layer"
+
+
+class _MisbehavingGetattrModule(torch.nn.Module):
+    """Module whose ``__getattr__`` raises a non-AttributeError exception.
+
+    Mirrors vLLM 0.18.x ``StageMissingLayer.__getattr__`` — it accesses
+    ``self.__dict__["module"]`` and raises ``KeyError`` when that entry is
+    missing.
+    """
+
+    def __init__(self, exc: BaseException) -> None:
+        super().__init__()
+        self._exc = exc
+
+    def __getattr__(self, name: str):
+        # Delegate PyTorch-internal and private attrs to ``super().__getattr__``
+        # so ``nn.Module``'s own machinery (parameter/buffer/module storage,
+        # ``_exc``) still works. Any other attribute access raises — FT's probes
+        # (``_ft_original_forward_func``, ``_ft_offload_name``) are the ones
+        # the tests exercise, but the behaviour is not gated to them.
+        reserved = {"_parameters", "_buffers", "_modules", "_non_persistent_buffers_set"}
+        if name in reserved or name.startswith("__") or name == "_exc":
+            return super().__getattr__(name)
+        raise self._exc
+
+
+class _MisbehavingAttrTensor(torch.Tensor):
+    """Tensor subclass whose custom attribute probe raises a non-AttributeError.
+
+    Simulates a quantised / wrapped tensor subclass exposing a ``bad_attr`` in
+    ``dir(self)`` that is not in ``dir(torch.Tensor)`` but blows up on access —
+    the exact pattern ``get_inner_tensor_field_ids`` probes via
+    ``getattr(tensor, field_name, None)``.
+    """
+
+    @staticmethod
+    def __new__(cls, data):
+        return torch.Tensor._make_subclass(cls, data)
+
+    def __init__(self, _data) -> None:
+        super().__init__()
+        self._exc_cls = KeyError
+
+    def __dir__(self):
+        return [*super().__dir__(), "bad_attr"]
+
+    def __getattribute__(self, name: str):
+        if name == "bad_attr":
+            raise object.__getattribute__(self, "_exc_cls")("bad_attr")
+        return super().__getattribute__(name)
+
+
+@pytest.mark.parametrize("exc", _PROBE_EXCEPTION_INSTANCES, ids=lambda e: type(e).__name__)
+def test_is_offload_patched_module_returns_false_on_non_attribute_error(exc):
+    """Probe must fail-closed when a module's ``__getattr__`` raises non-AttributeError.
+
+    vLLM's ``StageMissingLayer.__getattr__`` raises ``KeyError`` when its
+    internal ``__dict__["module"]`` entry is missing; other modules may raise
+    ``TypeError`` or ``RuntimeError``. Treating these as "not patched" is
+    always correct for a read-only probe.
+    """
+    module = _MisbehavingGetattrModule(exc)
+    assert is_offload_patched_module(module) is False
+
+
+@pytest.mark.parametrize("exc", _PROBE_EXCEPTION_INSTANCES, ids=lambda e: type(e).__name__)
+def test_get_offload_name_returns_none_on_non_attribute_error(exc):
+    """``get_offload_name`` must also fail-closed on misbehaving ``__getattr__``."""
+    module = _MisbehavingGetattrModule(exc)
+    assert get_offload_name(module) is None
+
+
+@pytest.mark.parametrize("exc", _PROBE_EXCEPTION_INSTANCES, ids=lambda e: type(e).__name__)
+def test_has_offload_modules_tolerates_misbehaving_submodule(exc):
+    """``has_offload_modules`` must not crash when traversing a model that
+    contains a module whose ``__getattr__`` raises a non-AttributeError (the
+    vLLM StageMissingLayer case)."""
+
+    model = SimpleModel()
+    # Assigning the misbehaving module as a child forces it into the
+    # ``model.modules()`` traversal. Pre-fix, the probe propagated the
+    # non-AttributeError out of the generator.
+    model.stage_missing = _MisbehavingGetattrModule(exc)
+
+    assert has_offload_modules(model) is False
+
+    # And remains correct when a *real* patched module is also present.
+    model.layer1._ft_original_forward_func = model.layer1.forward
+    model.layer1._ft_offload_name = "layer1"
+    assert has_offload_modules(model) is True
+
+
+def test_get_offload_module_tensor_ids_tolerates_misbehaving_submodule():
+    """End-to-end aggregator path: ``get_offload_module_tensor_ids`` must walk
+    past a misbehaving sibling and still return the real patched module's
+    tensor IDs. Guards against a future refactor that bypasses
+    ``_PROBE_EXCEPTIONS`` (e.g., reinstated inline ``hasattr``)."""
+    model = SimpleModel()
+    model.layer1._ft_original_forward_func = model.layer1.forward
+    model.layer1._ft_offload_name = "layer1"
+    model.stage_missing = _MisbehavingGetattrModule(KeyError("module"))
+
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    result = get_offload_module_tensor_ids(model, tensors_map)
+
+    assert "layer1" in result
+    expected_ids = {id(p) for p in model.layer1.parameters()}
+    assert result["layer1"] == expected_ids
+
+
+def test_probe_logs_debug_when_swallowing_non_attribute_error(caplog):
+    """A swallowed probe exception must leave a diagnostic trail so operators
+    can answer "why didn't my layer offload?" without attaching a debugger."""
+    module = _MisbehavingGetattrModule(KeyError("module"))
+    with caplog.at_level("DEBUG", logger="flextensor.tensor_discovery"):
+        assert is_offload_patched_module(module) is False
+        assert get_offload_name(module) is None
+
+    messages = [r.getMessage() for r in caplog.records if r.name == "flextensor.tensor_discovery"]
+    # Expect one debug record per probe. Must name the exception type so the
+    # operator can distinguish "genuinely not patched" from "probe suppressed".
+    assert any("KeyError" in m for m in messages), f"no KeyError in debug log: {messages}"
+
+
+def test_get_inner_tensor_field_ids_tolerates_misbehaving_tensor_attr():
+    """Same probe hazard applies to tensor subclasses: an exotic quantised /
+    wrapped tensor with a custom attribute that raises on access must not
+    abort inner-field discovery. This is the tensor counterpart to the
+    module-tree probes."""
+    tensor = _MisbehavingAttrTensor(torch.zeros(4))
+
+    # Sanity check: the misbehaving attribute really is picked up by the
+    # ``dir(tensor) - dir(torch.Tensor)`` selection used by production code.
+    assert "bad_attr" in set(dir(tensor)) - set(dir(torch.Tensor))
+
+    # Pre-fix, this raises KeyError and drops the entire layer's inner-field
+    # discovery.
+    assert get_inner_tensor_field_ids(tensor) == []
 
 
 def test_has_offload_modules_with_none():

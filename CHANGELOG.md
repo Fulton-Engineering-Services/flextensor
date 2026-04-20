@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- FlexTensor no longer crashes during model discovery on modules or tensor
+  subclasses whose attribute access raises a non-`AttributeError` (e.g. vLLM
+  0.18.x `StageMissingLayer` raising `KeyError`). Probes that walk arbitrary
+  model trees now fail closed and log at `DEBUG` instead of aborting the run.
+
 ## [0.2.0] — 2026-04-16
 
 ### Added
