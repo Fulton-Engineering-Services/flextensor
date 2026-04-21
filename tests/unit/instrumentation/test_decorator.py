@@ -175,3 +175,51 @@ class TestInstrumentableDecorator:
         # Should capture 'first' but not the varargs
         assert "first" in records[0].args
         assert records[0].args["first"] == "one"
+
+    def test_instrumentation_failure_does_not_break_instantiation(self, registry, caplog):
+        """A crash inside serialize_args must not propagate out of the decorated __init__.
+
+        Instrumentation is a non-essential side effect — if it fails (e.g. an init arg
+        is a Mapping whose ``__iter__`` raises), the user's class must still construct
+        successfully and the failure must surface as a logged warning, not an exception.
+        """
+        import logging
+        from collections.abc import Mapping
+
+        class ExplodingMapping(Mapping):
+            def __getitem__(self, key):
+                raise KeyError(key)
+
+            def __len__(self):
+                return 0
+
+            def __iter__(self):
+                raise RuntimeError("iter blew up")
+
+        @instrumentable
+        class Consumer:
+            def __init__(self, config):
+                self.config = config
+
+        bad = ExplodingMapping()
+
+        with caplog.at_level(logging.WARNING, logger="flextensor.instrumentation.decorator"):
+            obj = Consumer(config=bad)
+
+        assert obj.config is bad
+        # Registry should not have a half-broken record for this class.
+        assert all(r.class_name != "Consumer" for r in registry.get_records())
+        # The failure must be observable — not silently swallowed. Lock in the
+        # signal contract: WARNING level, decorator logger, full traceback attached.
+        matching = [
+            r
+            for r in caplog.records
+            if "Consumer" in r.message
+            and r.levelno == logging.WARNING
+            and r.name == "flextensor.instrumentation.decorator"
+            and r.exc_info is not None
+        ]
+        assert matching, (
+            f"expected WARNING from flextensor.instrumentation.decorator mentioning "
+            f"'Consumer' with exc_info; got: {[(r.levelname, r.name, r.message) for r in caplog.records]}"
+        )

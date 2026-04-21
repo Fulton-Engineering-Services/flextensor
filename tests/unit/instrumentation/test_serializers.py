@@ -2,10 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for instrumentation serializers."""
 
+import json
+import types
+
 import torch
 from pydantic import BaseModel
 
-from flextensor.instrumentation.serializers import serialize_args, serialize_value
+from flextensor.instrumentation.serializers import CIRCULAR_REF_MARKER, serialize_args, serialize_value
 
 
 class SamplePydanticModel(BaseModel):
@@ -208,6 +211,177 @@ class TestSerializeValue:
         assert result["weight"]["shape"] == [5]
         assert result["weight"]["numel"] == 5
         assert result["name"] == "layer1"
+
+    def test_serialize_mappingproxy(self):
+        """MappingProxyType is not a dict subclass; must still serialize as a mapping.
+
+        Regression for #141: the serializer fell back to ``repr(value)`` and emitted
+        ``"mappingproxy({..: Parameter containing: tensor(...)})"`` strings — non-JSON,
+        rejected by downstream JSON consumers (JET's ES flattened-field indexer hit
+        this first, but any `json.loads` round-trip on the payload would break).
+        """
+        param = torch.nn.Parameter(torch.tensor([-4.3030e-03, -1.7822e-02], dtype=torch.bfloat16))
+        frozen = types.MappingProxyType({"layer.0.weight": param, "n_blocks": 8})
+
+        result = serialize_value(frozen)
+
+        assert isinstance(result, dict)
+        assert result["layer.0.weight"]["_type"] == "torch.Tensor"
+        assert result["layer.0.weight"]["dtype"] == "torch.bfloat16"
+        assert result["n_blocks"] == 8
+
+        payload = json.dumps(result)
+        assert "mappingproxy" not in payload
+        assert "Parameter containing" not in payload
+        assert "tensor(" not in payload
+
+    def test_serialize_args_with_mappingproxy(self):
+        """End-to-end: serialize_args sanitises frozen ``{id(tensor): Parameter}`` maps.
+
+        Mirrors the real-world shape ``TensorManager.tensors_map`` takes at
+        ``tensor_manager.py:435`` (``self.tensors_map = types.MappingProxyType(...)``)
+        and is then passed to downstream ``@instrumentable`` components via their
+        ``__init__`` kwargs.
+        """
+        param = torch.nn.Parameter(torch.randn(4, dtype=torch.bfloat16))
+        tensors_map = types.MappingProxyType({id(param): param})
+
+        result = serialize_args({"tensors_map": tensors_map})
+
+        payload = json.dumps(result)
+        assert "mappingproxy" not in payload
+        assert "Parameter containing" not in payload
+        assert result["tensors_map"][str(id(param))]["_type"] == "torch.Tensor"
+
+    def test_serialize_mappingproxy_with_none_values(self):
+        """MappingProxyType values can be None — matches ``_parameters.items()`` shape.
+
+        See tensor_processors.py: ``_parameters.items()`` yields ``None`` for unset
+        parameters, which is why the codebase deliberately avoids ``named_parameters()``.
+        The serializer must not choke on that.
+        """
+        frozen = types.MappingProxyType({"weight": None, "count": 5})
+
+        result = serialize_value(frozen)
+
+        assert result == {"weight": None, "count": 5}
+
+    def test_serialize_nested_mappingproxy(self):
+        """Nested MappingProxyType inside a dict and a list must both recurse, not repr."""
+        outer = {
+            "frozen": types.MappingProxyType({"inner": 1}),
+            "also": [types.MappingProxyType({"leaf": 2})],
+        }
+
+        result = serialize_value(outer)
+
+        assert result == {"frozen": {"inner": 1}, "also": [{"leaf": 2}]}
+
+    def test_serialize_unknown_type_returns_sentinel(self, caplog):
+        """Unknown non-JSON types must serialize as a discoverable sentinel + warning.
+
+        The pre-existing ``repr(value)`` fallback is the silent-failure shape that
+        originally produced FT #141 — a raw repr string masquerading as valid data.
+        Replace with a structured ``_type: "_unserialized"`` envelope and a logged
+        warning so future unknown types are observable in logs AND indexable downstream.
+        """
+        import logging
+
+        def gen() -> object:
+            yield 1
+
+        generator = gen()
+
+        with caplog.at_level(logging.WARNING, logger="flextensor.instrumentation.serializers"):
+            result = serialize_value(generator)
+
+        assert isinstance(result, dict)
+        assert result["_type"] == "_unserialized"
+        assert "generator" in result["_class"]
+        assert "generator object" in result["_repr"]
+        # A warning must be logged so ops can spot the fallback in CI/production.
+        assert any("_unserialized" in r.message or "no handler" in r.message for r in caplog.records)
+
+    def test_serialize_unknown_type_with_broken_repr(self):
+        """The sentinel fallback must tolerate objects whose ``__repr__`` raises.
+
+        Partially-initialised objects (common during ML model construction) often
+        have ``__repr__`` methods that depend on attrs set later in ``__init__``.
+        The sentinel branch is meant to *be* the graceful-degradation path — it
+        must not itself raise when the value's ``__repr__`` is broken.
+
+        Uses ``__slots__ = ()`` so the instance has no ``__dict__`` and falls
+        through the object-introspection branch into the fallback.
+        """
+
+        class Broken:
+            __slots__ = ()
+
+            def __repr__(self) -> str:
+                raise RuntimeError("repr blew up")
+
+        result = serialize_value(Broken())
+
+        assert isinstance(result, dict)
+        assert result["_type"] == "_unserialized"
+        assert "Broken" in result["_class"]
+        assert "repr failed" in result["_repr"]
+        assert "RuntimeError" in result["_repr"]
+
+    def test_serialize_cyclic_mappingproxy(self):
+        """Cycles through MappingProxyType must emit ``<circular reference>``, not recurse.
+
+        Pre-fix, MappingProxyType hit the ``repr(value)`` fallback which handled cycles
+        accidentally. Post-fix the Mapping branch recurses via ``_serialize_dict``, so
+        dict/MappingProxyType cycle tracking is required to avoid ``RecursionError``.
+        """
+        inner: dict[str, object] = {}
+        frozen = types.MappingProxyType(inner)
+        inner["self"] = frozen
+
+        # Must not raise RecursionError.
+        result = serialize_value(frozen)
+
+        assert result == {"self": CIRCULAR_REF_MARKER}
+
+    def test_serialize_shared_mapping_is_not_a_cycle(self):
+        """Same Mapping instance reused as siblings must serialize both times, not collapse.
+
+        Cycle detection keyed on ``id(value)`` must only match *on the ancestor path*,
+        not on every ancestor-ever-visited. Sibling-reuse (``[proxy, proxy]``,
+        ``{"a": proxy, "b": proxy}``) has no cycle — both occurrences must render in full.
+        A seen-set that's never pruned conflates "seen on the current path" with
+        "seen anywhere" and wrongly stamps the second sibling ``<circular reference>``.
+        """
+        shared = types.MappingProxyType({"k": 1})
+        result = serialize_value([shared, shared])
+        assert result == [{"k": 1}, {"k": 1}]
+
+    def test_serialize_shared_dict_is_not_a_cycle(self):
+        """Plain dicts also must not collapse on sibling reuse.
+
+        The widening to ``Mapping`` routed plain ``dict`` through the same cycle-tracked
+        helper as ``MappingProxyType``. Before the fix, ``dict`` sibling-reuse worked by
+        accident (no cycle tracking). Post-fix, same invariant must hold.
+        """
+        shared = {"k": 1}
+        result = serialize_value({"a": shared, "b": shared})
+        assert result == {"a": {"k": 1}, "b": {"k": 1}}
+
+    def test_serialize_shared_object_is_not_a_cycle(self):
+        """Same invariant for attribute-introspected objects."""
+
+        class Holder:
+            def __init__(self) -> None:
+                self.v = 1
+
+        shared = Holder()
+        result = serialize_value([shared, shared])
+        # Both entries must render; neither is a circular reference.
+        assert len(result) == 2
+        assert result[0] == result[1]
+        assert result[0].get("v") == 1
+        assert CIRCULAR_REF_MARKER not in result
 
 
 class TestSerializeArgs:

@@ -16,6 +16,7 @@ from typing import Any
 import flextensor
 from flextensor.instrumentation.host_resources import capture_host_resources
 from flextensor.instrumentation.registry import ComponentRecord, InstrumentationRegistry
+from flextensor.instrumentation.serializers import serialize_value
 
 LOGGER = logging.getLogger(__name__)
 
@@ -80,8 +81,23 @@ def dump_to_file(output_path: str | Path, *, extra: dict[str, Any] | None = None
     # Create parent directories if they don't exist
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with output_path.open("w") as f:
-        json.dump(output_data, f, indent=2)
+    # `extra` is merged raw; its values haven't been through `serialize_args` like
+    # component records have. Route any non-JSON-native leftover through `serialize_value`
+    # so a torch.dtype / mapping / tensor in `extra` degrades gracefully instead of
+    # aborting the whole dump with a late TypeError.
+    #
+    # Write via a sibling tempfile + atomic rename so a mid-dump raise can't leave a
+    # truncated JSON file on disk — the original (if any) stays intact and a failed
+    # dump leaves no partial artefact for downstream consumers to mis-parse.
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    try:
+        with tmp_path.open("w") as f:
+            json.dump(output_data, f, indent=2, default=serialize_value)
+        tmp_path.replace(output_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        LOGGER.error("Instrumentation dump to %s failed; partial file removed", output_path)
+        raise
 
     LOGGER.info("Instrumentation data dumped to %s (%d components)", output_path, len(records))
 

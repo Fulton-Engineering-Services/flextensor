@@ -263,3 +263,65 @@ class TestDumpExtra:
             data = json.load(f)
 
         assert data["custom"] == 123
+
+    def test_dump_failure_preserves_original_file(self, registry, temp_dir, monkeypatch):
+        """A mid-dump exception must not clobber an existing dump file.
+
+        Before the atomic-write guard, ``output_path.open("w")`` truncated the
+        target file immediately, so any exception inside ``json.dump`` left an
+        empty or partial file on disk — indistinguishable from a valid empty
+        dump to downstream consumers. Atomic rename keeps the pre-existing file
+        intact on failure.
+        """
+        from flextensor.instrumentation import dumper
+
+        output_path = temp_dir / "dump.json"
+        output_path.write_text('{"old": "content"}')
+
+        def boom(value):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(dumper, "serialize_value", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            dump_to_file(output_path, extra={"weird": object()})
+
+        assert output_path.read_text() == '{"old": "content"}'
+        assert not (temp_dir / "dump.json.tmp").exists()
+
+    def test_dump_failure_leaves_no_partial_file(self, registry, temp_dir, monkeypatch):
+        """When dumping to a fresh path, a mid-dump exception must not create a partial file."""
+        from flextensor.instrumentation import dumper
+
+        output_path = temp_dir / "fresh.json"
+
+        def boom(value):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(dumper, "serialize_value", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            dump_to_file(output_path, extra={"weird": object()})
+
+        assert not output_path.exists()
+        assert not (temp_dir / "fresh.json.tmp").exists()
+
+    def test_dump_with_nonjson_extra_does_not_crash(self, registry, temp_dir):
+        """``extra`` is merged raw into the JSON tree; non-JSON values must not crash.
+
+        Before this guard, a ``torch.dtype`` (or any other non-JSON-native type) in
+        ``extra`` raised ``TypeError: Object of type dtype is not JSON serializable``
+        late, wasting the entire dump. Route unknown types through ``serialize_value``
+        so we degrade gracefully.
+        """
+        import torch
+
+        output_path = temp_dir / "nonjson_extra.json"
+        dump_to_file(output_path, extra={"stats": {"dtype": torch.float32, "count": 3}})
+
+        with output_path.open() as f:
+            data = json.load(f)
+
+        # torch.dtype routes through serialize_value -> str.
+        assert data["stats"]["dtype"] == "torch.float32"
+        assert data["stats"]["count"] == 3

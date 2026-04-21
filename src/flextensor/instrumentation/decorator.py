@@ -8,10 +8,13 @@ initialization arguments when a class is instantiated.
 
 import functools
 import inspect
+import logging
 from typing import Any, TypeVar
 
 from flextensor.instrumentation.registry import InstrumentationRegistry
 from flextensor.instrumentation.serializers import serialize_args
+
+LOGGER = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -57,8 +60,19 @@ def instrumentable(cls: type[T]) -> type[T]:
         # Capture init arguments
         captured_args = _capture_init_args(original_init, args, kwargs)
 
-        # Serialize and register
-        serialized_args = serialize_args(captured_args)
+        # Serialize and register. Instrumentation is a non-essential side effect —
+        # a failure here (e.g. an init arg is a Mapping whose __iter__ raises) must
+        # not propagate out of the decorated class's __init__, which has already
+        # succeeded. Log and skip the record instead.
+        try:
+            serialized_args = serialize_args(captured_args)
+        except Exception:
+            LOGGER.warning(
+                "instrumentation: failed to serialize init args for %s; skipping record",
+                cls.__name__,
+                exc_info=True,
+            )
+            return
         registry.register(
             class_name=cls.__name__,
             module_path=f"{cls.__module__}.{cls.__name__}",

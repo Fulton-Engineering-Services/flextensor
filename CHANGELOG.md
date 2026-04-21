@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Instrumentation dumps are now valid JSON when components hold frozen maps
+  (e.g. `TensorManager.tensors_map`, a `MappingProxyType`); serializer failures
+  and non-JSON values in `dump_instrumentation(extra=…)` degrade gracefully
+  instead of aborting the dump or propagating out of decorated `__init__`. (#141)
 - FlexTensor no longer crashes during model discovery on modules or tensor
   subclasses whose attribute access raises a non-`AttributeError` (e.g. vLLM
   0.18.x `StageMissingLayer` raising `KeyError`). Probes that walk arbitrary
