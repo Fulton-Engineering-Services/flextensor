@@ -115,14 +115,11 @@ def parse_memory_profiling_logs(log_lines: list[str]) -> MemoryProfilingMetrics:
 def parse_layer_duration_stats(log_lines: list[str]) -> dict[str, dict[str, float | int]]:
     """Parse the Layer Duration Statistics table from FlexTensor log output.
 
-    The table is emitted by FlexTensor after profiling and shows every offload trap
-    with its timing statistics. It is the authoritative source for which module
-    patterns were actually applied as traps.
-
-    The table appears after every profiling run when FT_ENABLE_DIAGNOSTICS=1 (INFO path,
-    consistent measurements), and also when any layer has insufficient samples or high
-    unexplained CV (WARNING path, inconsistent measurements). Exactly one of these two
-    paths fires per run.
+    The table is emitted only on the WARNING path of
+    ``LayerStatisticsAnalyzer.check_measurement_consistency`` when any layer has
+    insufficient samples or high unexplained CV. Consistent-measurement runs
+    produce no table — use :func:`parse_block_assignment_layers` for trap
+    enumeration when presence must be guaranteed.
 
     Args:
         log_lines: List of log lines captured from vLLM server
@@ -144,6 +141,10 @@ def parse_layer_duration_stats(log_lines: list[str]) -> dict[str, dict[str, floa
     ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
     # Row: LayerName  float float float float float  float%  int
     row_re = re.compile(r"^(\S+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)%\s+(\d+)$")
+    # vLLM formats records as: "LEVEL MM-DD HH:MM:SS [module/file.py:LINE] <message>"
+    vllm_prefix_re = re.compile(
+        r"^(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\[[^\]]+\]\s*"
+    )
     in_table = False
     result: dict[str, dict[str, float | int]] = {}
 
@@ -157,7 +158,10 @@ def parse_layer_duration_stats(log_lines: list[str]) -> dict[str, dict[str, floa
         line = re.sub(r"^\[vLLM\]\s*", "", line)
         line = re.sub(r"^\(\S+ pid=\d+\)\s*", "", line)
         # Strip optional FlexTensor timestamp: [2026-01-01 ...] LEVEL module.py:N:
-        line = re.sub(r"^\[\d{4}-\d{2}-\d{2}.*?\]\s*\w+\s+\S+:\s*", "", line).strip()
+        line = re.sub(r"^\[\d{4}-\d{2}-\d{2}.*?\]\s*\w+\s+\S+:\s*", "", line)
+        # Strip optional vLLM log-record prefix left on records that propagated through
+        # the vLLM bridge: "LEVEL MM-DD HH:MM:SS [file.py:LINE] "
+        line = vllm_prefix_re.sub("", line).strip()
 
         if "Layer Duration Statistics" in line:
             in_table = True
@@ -181,6 +185,63 @@ def parse_layer_duration_stats(log_lines: list[str]) -> dict[str, dict[str, floa
                 in_table = False  # non-data line ends the table
 
     return result
+
+
+def parse_block_assignment_layers(log_lines: list[str]) -> list[str]:
+    """Parse layer labels from the BLOCK ASSIGNMENT table in FlexTensor log output.
+
+    The BLOCK ASSIGNMENT table always emits when ``FT_ENABLE_DIAGNOSTICS=1``
+    (unlike Layer Duration Statistics, which only emits on the WARNING path
+    for inconsistent measurements), so it is the reliable source for trap
+    enumeration regardless of measurement quality.
+
+    Rows have the layer label as the first whitespace-delimited token; the
+    header and separator rows are skipped.
+
+    Args:
+        log_lines: List of log lines captured from the vLLM server.
+
+    Returns:
+        Ordered list of layer labels (e.g. ``["model.layers.0", "model.layers.1", ...]``)
+        or ``[]`` if the table is not found.
+    """
+    ansi_escape = re.compile(r"\x1b\[[0-9;]*m")
+    vllm_prefix_re = re.compile(
+        r"^(?:DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\[[^\]]+\]\s*"
+    )
+    # Data row: label followed by a size token like "12.34MB" or "1.23GB" or "-".
+    row_re = re.compile(r"^(\S+)\s+(?:\d+(?:\.\d+)?\s*[KMGT]?B|-)\s")
+
+    in_table = False
+    layers: list[str] = []
+
+    for raw_line in log_lines:
+        line = ansi_escape.sub("", raw_line)
+        line = re.sub(r"^\[vLLM\]\s*", "", line)
+        line = re.sub(r"^\(\S+ pid=\d+\)\s*", "", line)
+        line = re.sub(r"^\[\d{4}-\d{2}-\d{2}.*?\]\s*\w+\s+\S+:\s*", "", line)
+        line = vllm_prefix_re.sub("", line).strip()
+
+        if line.startswith("BLOCK ASSIGNMENT:"):
+            in_table = True
+            continue
+
+        if not in_table:
+            continue
+
+        if line.startswith(("=", "-", "Layer ", "Total:", "Compute:", "Block Sizes:", "  Block ")):
+            continue
+
+        m = row_re.match(line)
+        if m:
+            layers.append(m.group(1))
+        elif line == "":
+            continue
+        else:
+            # Non-row, non-separator content ends the table section.
+            in_table = False
+
+    return layers
 
 
 def _log_reader_thread(process: subprocess.Popen[bytes], log_lines: list[str], prefix: str = "[vLLM]") -> None:
@@ -387,3 +448,31 @@ def make_chat_request(
     response = requests.post(url, json=payload, timeout=timeout)
     response.raise_for_status()
     return response.json()
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_LEVEL_LINE_RE = re.compile(
+    r"^(?:\(\S+ pid=\d+\)\s*)?"  # optional '(ProcessName pid=N) '
+    r"(?:\[\d{4}-\d{2}-\d{2}.*?\]\s*)?"  # optional FT timestamp
+    r"(?P<level>DEBUG|INFO|WARNING|ERROR|CRITICAL)\b"
+)
+
+
+def parse_log_level(line: str) -> str | None:
+    """Return the level token from a vLLM-formatted log line, or None if absent.
+
+    Strips ANSI escapes and the optional '[vLLM] ' test prefix, then matches the
+    ``(ProcessName pid=N) LEVEL …`` pattern that vLLM uses in its subprocess
+    output.
+
+    Args:
+        line: Raw log line captured from vLLM subprocess stdout/stderr.
+
+    Returns:
+        The level name (e.g. ``'INFO'``) or ``None`` if the line does not carry
+        a recognisable level token.
+    """
+    stripped = _ANSI_RE.sub("", line)
+    stripped = re.sub(r"^\[vLLM\]\s*", "", stripped)
+    m = _LEVEL_LINE_RE.match(stripped)
+    return m.group("level") if m else None

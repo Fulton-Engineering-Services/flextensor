@@ -11,22 +11,23 @@ See flextensor.config.OffloadConfig for configuration options (FT_* env vars).
 """
 
 import atexit
+import logging
 from collections.abc import Generator
 from contextlib import contextmanager
 from typing import Any
 
 import psutil
-from vllm.logger import init_logger
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker.gpu_worker import Worker
 
 import flextensor
 import flextensor.contrib.vllm.loader
 from flextensor.config import load_config
+from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
 
-# Use vllm.* namespace so logs flow through vLLM's configured handler
-# (vLLM only attaches handlers to the 'vllm' logger hierarchy).
-LOGGER = init_logger("vllm.flextensor.worker")
+safely_install_flextensor_logging_bridge()
+
+LOGGER = logging.getLogger(__name__)
 
 # Default include patterns for per-layer offloading in decoder-only transformer models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to

@@ -98,6 +98,25 @@ class TestParseLayerDurationStats:
         result = parse_layer_duration_stats(lines)
         assert "model.layers.0" in result
 
+    def test_vllm_record_prefix_stripped(self):
+        """LEVEL MM-DD HH:MM:SS [file.py:LINE] prefix from vLLM's formatter is stripped.
+
+        Records propagated through the vLLM bridge (both INFO from the diagnostics
+        logger and WARNING direct from flextensor) arrive with this prefix; without
+        stripping it the row regex never matches and the table comes back empty.
+        """
+        info_prefix = "(EngineCore_DP0 pid=951) INFO 04-21 10:22:35 [flextensor/tensor_manager.py:898] "
+        warn_prefix = "(EngineCore_DP0 pid=951) WARNING 04-21 10:22:35 [flextensor/layer_statistics_analyzer.py:184] "
+        lines = [
+            f"{info_prefix}Layer Duration Statistics (ms)",
+            info_prefix + "=" * 60,
+            f"{info_prefix}{_ROW_A}",
+            f"{warn_prefix}{_ROW_B}",
+        ]
+        result = parse_layer_duration_stats(lines)
+        assert "model.layers.0" in result
+        assert "model.layers.1" in result
+
     def test_layer_prefix_data_rows_not_skipped(self):
         """Data rows whose name begins with 'Layer' must not be treated as column headers."""
         lines = _make_table(

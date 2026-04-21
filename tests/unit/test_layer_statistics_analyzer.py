@@ -213,6 +213,12 @@ class TestMeasurementConsistency:
         assert "Min" in caplog.text
         assert "Max" in caplog.text
         assert "CV" in caplog.text
+        # The table must emit on a ``flextensor.*`` logger so the vLLM bridge
+        # picks it up. A refactor that moves it to a standalone namespace
+        # would silently hide the table under vLLM.
+        assert any(r.name.startswith("flextensor") for r in caplog.records), (
+            f"Layer statistics table emitted on non-flextensor logger(s): {sorted({r.name for r in caplog.records})}"
+        )
 
     def test_custom_thresholds(self):
         """Test that custom thresholds are respected."""

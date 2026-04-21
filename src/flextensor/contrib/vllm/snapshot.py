@@ -23,25 +23,29 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from vllm.logger import init_logger
     from vllm.utils.mem_utils import MemorySnapshot
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu_worker import Worker
-
-    # Use vllm.* namespace so logs flow through vLLM's configured handler.
-    logger = init_logger("vllm.flextensor.snapshot")
 except ModuleNotFoundError:  # vllm not installed (e.g. unit-test environment)
     MemorySnapshot = None  # type: ignore[assignment,misc]
     KVCacheConfig = None  # type: ignore[assignment,misc]
     Worker = None  # type: ignore[assignment,misc]
-    logger = logging.getLogger(__name__)
+else:
+    # In the else clause so a rename of flextensor.contrib.vllm._logging is
+    # not misclassified as "vLLM not installed".
+    from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
+
+    safely_install_flextensor_logging_bridge()
+
+logger = logging.getLogger(__name__)
 
 try:
     from flextensor.contrib.vllm.worker import FlexTensorOffloadWorker
 except (ModuleNotFoundError, ImportError):
     FlexTensorOffloadWorker = None  # type: ignore[assignment,misc]
 
-from flextensor.instrumentation.host_resources import capture_host_resources
+# E402: must sit below the vLLM/bridge try/except/else so absent vLLM doesn't mask this import.
+from flextensor.instrumentation.host_resources import capture_host_resources  # noqa: E402
 
 _GIB = 1024**3
 

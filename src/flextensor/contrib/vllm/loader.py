@@ -8,12 +8,12 @@ like FP8 quantization or MLA attention) before moving them back to CPU for FlexT
 management. Automatically used by FlexTensorOffloadWorker.
 """
 
+import logging
 from contextlib import suppress
 
 import torch
 from torch import nn
 from vllm.config import ModelConfig, VllmConfig
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import register_model_loader
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
@@ -23,9 +23,11 @@ from vllm.model_executor.model_loader.utils import (
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-# Use vllm.* namespace so logs flow through vLLM's configured handler
-# (vLLM only attaches handlers to the 'vllm' logger hierarchy).
-logger = init_logger("vllm.flextensor.loader")
+from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
+
+safely_install_flextensor_logging_bridge()
+
+logger = logging.getLogger(__name__)
 
 
 @register_model_loader("flextensor")

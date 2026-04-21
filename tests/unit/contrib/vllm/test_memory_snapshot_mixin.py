@@ -15,7 +15,10 @@ Key behaviors tested:
 - _collect_model_modules() filters parameterless modules
 """
 
+import importlib
 import json
+import sys
+import types
 from collections import OrderedDict
 from unittest.mock import MagicMock, patch
 
@@ -536,3 +539,60 @@ class TestCollectModelModules:
         serialized = json.dumps(result)
         roundtripped = json.loads(serialized)
         assert len(roundtripped) == len(result)
+
+
+class TestSnapshotImportScope:
+    """Regression guards for the module-level try/except in snapshot.py."""
+
+    def test_non_vllm_module_not_found_propagates(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A ModuleNotFoundError for a FlexTensor-internal module must not be silently swallowed.
+
+        The module-level ``try/except ModuleNotFoundError`` was intended to
+        detect "vLLM not installed" and set ``MemorySnapshot``/``KVCacheConfig``/
+        ``Worker`` to ``None`` in unit-test environments. If the except scope
+        widens to cover the FlexTensor-internal bridge import, a rename of
+        ``flextensor.contrib.vllm._logging`` would be misclassified as
+        "vLLM not installed" while vLLM is actually present — silently
+        disabling ``SnapshotWorker`` / ``FlexTensorSnapshotWorker`` and
+        producing confusing errors at distant call sites.
+        """
+        # Stub vLLM submodules so the vLLM imports inside snapshot.py succeed.
+        vllm_stubs: dict[str, types.ModuleType] = {
+            "vllm": types.ModuleType("vllm"),
+            "vllm.utils": types.ModuleType("vllm.utils"),
+            "vllm.utils.mem_utils": types.ModuleType("vllm.utils.mem_utils"),
+            "vllm.v1": types.ModuleType("vllm.v1"),
+            "vllm.v1.kv_cache_interface": types.ModuleType("vllm.v1.kv_cache_interface"),
+            "vllm.v1.worker": types.ModuleType("vllm.v1.worker"),
+            "vllm.v1.worker.gpu_worker": types.ModuleType("vllm.v1.worker.gpu_worker"),
+        }
+        vllm_stubs["vllm.utils.mem_utils"].MemorySnapshot = type("_MemorySnapshot", (), {})  # type: ignore[attr-defined]
+        vllm_stubs["vllm.v1.kv_cache_interface"].KVCacheConfig = type("_KVCacheConfig", (), {})  # type: ignore[attr-defined]
+        vllm_stubs["vllm.v1.worker.gpu_worker"].Worker = type("_Worker", (), {})  # type: ignore[attr-defined]
+        for name, mod in vllm_stubs.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+
+        # Force snapshot and the FT-internal bridge to re-import under our finder.
+        monkeypatch.delitem(sys.modules, "flextensor.contrib.vllm.snapshot", raising=False)
+        monkeypatch.delitem(sys.modules, "flextensor.contrib.vllm._logging", raising=False)
+
+        blocked = "flextensor.contrib.vllm._logging"
+
+        class BlockingFinder:
+            def find_spec(self, name: str, path: object = None, target: object = None) -> None:
+                if name == blocked:
+                    raise ModuleNotFoundError(
+                        f"No module named {name!r} (simulated by test)",
+                        name=name,
+                    )
+                return None
+
+        finder = BlockingFinder()
+        sys.meta_path.insert(0, finder)
+        try:
+            with pytest.raises(ModuleNotFoundError, match=r"flextensor\.contrib\.vllm\._logging"):
+                importlib.import_module("flextensor.contrib.vllm.snapshot")
+        finally:
+            sys.meta_path.remove(finder)
+            # Let monkeypatch restore the real module on teardown.
+            sys.modules.pop("flextensor.contrib.vllm.snapshot", None)

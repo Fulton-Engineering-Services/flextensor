@@ -10,6 +10,7 @@ from typing import Any
 
 import torch
 
+from flextensor._logging import ensure_diagnostics_visible, get_diagnostics_logger
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, TensorBenchmarkMode
 from flextensor.collectors import (
     IterativeLayerStatisticsCollector,
@@ -340,6 +341,8 @@ class TensorManager:
         self.include_patterns = resolve_include_patterns(include_patterns)
         self.exclude_patterns = exclude_patterns or []
         self.enable_diagnostics = enable_diagnostics
+        if self.enable_diagnostics:
+            ensure_diagnostics_visible()
         self._max_gpu_mem_fraction = max_gpu_mem_fraction
 
         self.traps_duration_ms = 0
@@ -887,12 +890,9 @@ class TensorManager:
         This method is called after profiling to compute the load strategy and create
         the appropriate loader for inference.
         """
-        # Analyze layer statistics and check measurement consistency
-        layer_statistics_analyzer = LayerStatisticsAnalyzer(self.layer_statistics_collector)
-        is_consistent = layer_statistics_analyzer.check_measurement_consistency()
-
-        if self.enable_diagnostics and is_consistent:
-            logger.info("Layer duration statistics:\n%s", layer_statistics_analyzer.format_statistics_table())
+        # Called for side effect: emits WARNING + the Layer Duration table on
+        # inconsistent measurements. Return value intentionally discarded.
+        LayerStatisticsAnalyzer(self.layer_statistics_collector).check_measurement_consistency()
 
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
         # Remove tensors that are not parameters!
@@ -917,7 +917,10 @@ class TensorManager:
         self.memory_transfer_stats = memory_stats
 
         if self.enable_diagnostics and memory_stats:
-            logger.info("Memory transfer statistics:\n%s", format_memory_transfer_table(memory_stats))
+            get_diagnostics_logger().info(
+                "Memory transfer statistics:\n%s",
+                format_memory_transfer_table(memory_stats),
+            )
 
         max_gpu_mem_bytes = self._resolve_gpu_budget()
         result = self.tensor_manager_load_strategy.compute(self.stats, memory_stats, max_gpu_mem_bytes)

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subclasses whose attribute access raises a non-`AttributeError` (e.g. vLLM
   0.18.x `StageMissingLayer` raising `KeyError`). Probes that walk arbitrary
   model trees now fail closed and log at `DEBUG` instead of aborting the run.
+- Diagnostic tables (block assignment, memory transfer) now appear under
+  vLLM and standalone when `FT_ENABLE_DIAGNOSTICS=1`, regardless of the
+  host application's log level.
 
 ## [0.2.0] — 2026-04-16
 

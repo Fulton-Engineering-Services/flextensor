@@ -15,7 +15,7 @@ from vllm_utils import (
     MemoryProfilingMetrics,
     load_gpu_memory_snapshots,
     make_chat_request,
-    parse_layer_duration_stats,
+    parse_block_assignment_layers,
     parse_memory_profiling_logs,
     start_vllm_server,
     stop_vllm_server,
@@ -335,15 +335,15 @@ class TestContribVLLM:
 
         Regression test: the worker must NOT default to wildcard include_patterns=['*'],
         which collapses the entire model into one coarse trap and prevents per-layer
-        pipelining. Per-layer traps are validated via the Layer Duration Statistics
-        table, which lists every trap that was actually created during profiling.
+        pipelining. Per-layer traps are validated via the BLOCK ASSIGNMENT table,
+        which lists every trap that was actually created during profiling.
 
         Incorrect (wildcard default):
-            model  130ms  ← entire model = 1 trap, no pipelining
+            model  ← entire model = 1 trap, no pipelining
 
         Correct (specific patterns like model.layers.*):
-            model.layers.0  4ms  ← each layer has its own trap
-            model.layers.1  4ms
+            model.layers.0  ← each layer has its own trap
+            model.layers.1
             ...
 
         Args:
@@ -356,8 +356,8 @@ class TestContribVLLM:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Do NOT set FT_INCLUDE_PATTERNS — rely on worker defaults.
-        # Set FT_ENABLE_DIAGNOSTICS=1 so the Layer Duration Statistics table is
-        # always written to the logs regardless of measurement consistency.
+        # FT_ENABLE_DIAGNOSTICS=1 makes the BLOCK ASSIGNMENT table available for
+        # trap enumeration regardless of measurement consistency.
         offload_memory, _, log_lines = self._run_vllm_server_test(
             model_name=model_name,
             enable_offload=True,
@@ -366,22 +366,20 @@ class TestContribVLLM:
             extra_env_vars={"FT_ENABLE_DIAGNOSTICS": "1"},
         )
 
-        # Parse the Layer Duration Statistics table — authoritative record of
-        # which traps were actually created during profiling.
-        layer_stats = parse_layer_duration_stats(log_lines)
-        assert layer_stats, (
-            "Layer Duration Statistics table not found in logs. "
+        trap_labels = parse_block_assignment_layers(log_lines)
+        assert trap_labels, (
+            "BLOCK ASSIGNMENT table not found in logs. "
             "Set FT_ENABLE_DIAGNOSTICS=1 was not honoured or profiling did not complete."
         )
 
-        print(f"\nLayer Duration Statistics ({len(layer_stats)} traps):")
-        for name, stats in sorted(layer_stats.items()):
-            print(f"  {name:50s} {stats['avg']:.1f} ms  ({stats['count']} samples)")
+        print(f"\nBLOCK ASSIGNMENT ({len(trap_labels)} traps):")
+        for name in trap_labels:
+            print(f"  {name}")
 
         # Coarse-trap check: with wildcard ['*'], 'model' is the whole transformer
         # wrapped in a single trap — each forward pass is one giant block with no
         # opportunity to pipeline transfers for subsequent layers.
-        coarse_trap_keys = [k for k in layer_stats if k == "model" or k.endswith(".model")]
+        coarse_trap_keys = [k for k in trap_labels if k == "model" or k.endswith(".model")]
         assert not coarse_trap_keys, (
             f"Coarse trap detected: {coarse_trap_keys} — entire model wrapped in one trap. "
             "Worker must use specific include_patterns (e.g. model.layers.*) "
@@ -391,7 +389,7 @@ class TestContribVLLM:
         # Per-layer check: specific patterns like 'model.layers.*' produce one trap
         # per layer. Trap names use the full module path (e.g. model.layers.0,
         # model.layers.1, ...), so we match by numeric suffix.
-        layer_entries = [k for k in layer_stats if re.search(r"\.\d+$", k)]
+        layer_entries = [k for k in trap_labels if re.search(r"\.\d+$", k)]
         assert len(layer_entries) >= 10, (
             f"Expected at least 10 individual layer traps, found {len(layer_entries)}: "
             f"{layer_entries}. Check that include_patterns includes 'model.layers.*'."
@@ -407,6 +405,60 @@ class TestContribVLLM:
 
         print(f"\nPer-layer trap check passed: {len(layer_entries)} layer traps found")
         print(f"Weights memory: {offload_memory.weights_memory_gib:.2f} GiB")
+
+    @pytest.mark.gpu_mem_40g
+    @pytest.mark.parametrize(
+        "model_name, cli_args",
+        [
+            (
+                "Qwen/Qwen2.5-7B-Instruct",
+                [],
+            ),
+        ],
+    )
+    def test_diagnostics_tables_appear_under_vllm(
+        self,
+        model_name: str,
+        cli_args: list[str],
+        device_gpu: torch.device,
+        test_output_dir: Path,
+    ) -> None:
+        """Block Assignment and Memory Transfer tables must appear in the vLLM server log.
+
+        Regression test for issue 139: with FT_ENABLE_DIAGNOSTICS=1 set, the
+        Block Assignment and Memory Transfer Statistics tables must appear in
+        the captured server log at INFO level. Each table must appear exactly
+        once per profiling run. (Layer Duration Statistics is intentionally
+        emitted only via the WARNING path when measurements are inconsistent;
+        consistent runs are covered by the strategy table.)
+        """
+        output_dir = test_output_dir / "diagnostics"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        _, _, log_lines = self._run_vllm_server_test(
+            model_name=model_name,
+            enable_offload=True,
+            cli_args=cli_args,
+            output_dir=output_dir,
+            extra_env_vars={"FT_ENABLE_DIAGNOSTICS": "1"},
+        )
+
+        log_text = "\n".join(log_lines)
+
+        assert "BLOCK ASSIGNMENT:" in log_text, (
+            "Block Assignment table missing from vLLM server log — diagnostics bridge may not be installed."
+        )
+        assert "Memory Transfer Statistics" in log_text, (
+            "Memory Transfer Statistics table missing from vLLM server log "
+            "— INFO-path diagnostic records are being dropped."
+        )
+
+        # No duplicate emission: exactly one BLOCK ASSIGNMENT header per run.
+        block_assignment_headers = [line for line in log_lines if "BLOCK ASSIGNMENT:" in line]
+        assert len(block_assignment_headers) == 1, (
+            f"Expected exactly 1 'BLOCK ASSIGNMENT:' header, got {len(block_assignment_headers)}: "
+            f"{block_assignment_headers}"
+        )
 
     @pytest.mark.gpu_mem_40g
     @pytest.mark.parametrize(
