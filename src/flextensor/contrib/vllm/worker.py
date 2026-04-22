@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu_worker import Worker
 import flextensor
 import flextensor.contrib.vllm.loader
 from flextensor.config import load_config
+from flextensor.contrib.vllm._drafter_device import ensure_drafter_on_device
 from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
 
 safely_install_flextensor_logging_bridge()
@@ -141,6 +142,19 @@ class FlexTensorOffloadWorker(Worker):
             return
         if not self.vllm_config.model_config.enforce_eager:
             LOGGER.warning("FlexTensor offloading requires eager mode. Add --enforce-eager flag.")
+
+        # Speculative-decoding drafter (e.g. MTP / Eagle) lives outside the
+        # main model and is not reached by flextensor.offload(). FT's
+        # CPU-first loader leaves its weights on CPU; warmup then crashes
+        # when vLLM's @torch.compile layernorm helper sees CPU weights
+        # against CUDA inputs (flex-tensor #140). Push the drafter to GPU
+        # BEFORE flextensor.offload() walks the main model — some drafter
+        # submodules (e.g. embed_tokens) can be identity-shared with the
+        # main model. If offload runs first, FT installs forward patches
+        # against the still-CPU tensor IDs; the later .to(cuda) swaps
+        # those tensors out, and the first drafter forward then hits a
+        # KeyError in FT's cpu_to_gpu_map on trap exit.
+        ensure_drafter_on_device(self.model_runner, self.device)
 
         atexit.register(flextensor.release)
         # Extract, offload, and update model using context manager

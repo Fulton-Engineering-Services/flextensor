@@ -13,6 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `FlexTensorOffloadWorker` now pushes the speculative-decoding drafter
+  (e.g. MTP / Eagle) to GPU before `flextensor.offload()` runs, so drafter
+  weights don't remain on CPU where FT's loader leaves them. This resolves
+  the Dynamo `cpu/cuda` device mismatch in vLLM's `@torch.compile`
+  layernorm helper that previously crashed warmup on every MTP + FT tier. (#140)
 - Instrumentation dumps are now valid JSON when components hold frozen maps
   (e.g. `TensorManager.tensors_map`, a `MappingProxyType`); serializer failures
   and non-JSON values in `dump_instrumentation(extra=…)` degrade gracefully
