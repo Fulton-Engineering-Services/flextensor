@@ -71,13 +71,24 @@ class IterativeTensorStatistics(BaseModel):
 
 
 class IterativeLayerStatistics(BaseModel):
-    """Statistics for layer operations including tensors and duration metrics."""
+    """Collection-time (partial) layer statistics; ``duration`` may be ``None``.
+
+    The strategy-time strict counterpart is :class:`LayerStatistics`, which
+    also enriches ``tensor_ids`` with full :class:`TensorStatistics`. The
+    only narrowing path is
+    :func:`flextensor.tensor_manager.compute_layer_statistics`, which both
+    filters out rows with ``duration is None`` and performs the
+    ``tensor_id`` → :class:`TensorStatistics` join.
+
+    Code that does arithmetic on ``duration`` must consume
+    :class:`LayerStatistics`, not this type.
+    """
 
     model_config = ConfigDict(frozen=True)
 
     label: str
     tensor_ids: list[int] | set[int]
-    duration: float
+    duration: float | None = None
 
 
 class IterativeLayerStatisticsCollector:
@@ -107,13 +118,15 @@ class IterativeLayerStatisticsCollector:
     def get_median_duration_ms(self) -> dict[str, float]:
         median_duration_ms: dict[str, float] = {}
         for label in self.tensor_measurements:
-            median_duration_ms[label] = np.median(self.duration_measurements[label])
+            if label in self.duration_measurements:
+                median_duration_ms[label] = np.median(self.duration_measurements[label])
         return median_duration_ms
 
     def get_min_duration_ms(self) -> dict[str, float]:
         min_duration_ms: dict[str, float] = {}
         for label in self.tensor_measurements:
-            min_duration_ms[label] = np.min(self.duration_measurements[label])
+            if label in self.duration_measurements:
+                min_duration_ms[label] = np.min(self.duration_measurements[label])
         return min_duration_ms
 
     def get_union_tensor_ids(self) -> dict[str, set[int]]:
@@ -131,7 +144,8 @@ class IterativeLayerStatisticsCollector:
                 IterativeLayerStatistics(
                     label=label,
                     tensor_ids=union_tensor_ids[label],
-                    duration=durations_map[label],
+                    # None when the label has no duration samples yet.
+                    duration=durations_map.get(label),
                 ),
             )
         return stats

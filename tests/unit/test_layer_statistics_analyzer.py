@@ -198,27 +198,31 @@ class TestMeasurementConsistency:
         assert "High duration variability" in caplog.text
         assert "layer1" in caplog.text
 
-    def test_statistics_table_shown_on_warning(self, caplog):
-        """Test that statistics table is shown when warnings are issued."""
+    def test_check_measurement_consistency_does_not_emit_full_table(self, caplog):
+        """check_measurement_consistency must not dump the full table.
+
+        Per-issue WARNINGs (low samples, high CV) are the only output
+        from the consistency check itself; the full troubleshooting
+        table is emitted separately by ``report_profiling_quality``
+        (and therefore ``TensorManager.prepare_infer_mode``) only when
+        ``enable_diagnostics`` is set *and* the consistency check
+        flagged a problem. The emission contract for that path is
+        anchored in
+        ``tests/unit/test_tensor_manager_diagnostics_emission.py``.
+        """
         collector = IterativeLayerStatisticsCollector()
         collector.add_duration("layer1", 10.0)
         collector.add_duration("layer1", 15.0)  # Only 2 samples
 
         analyzer = LayerStatisticsAnalyzer(collector)
 
-        with caplog.at_level(logging.WARNING):
+        # INFO floor (rather than WARNING) so a regression that re-introduces
+        # the table at INFO would also flip this assertion.
+        with caplog.at_level(logging.INFO):
             analyzer.check_measurement_consistency()
 
-        assert "Layer Duration Statistics" in caplog.text
-        assert "Min" in caplog.text
-        assert "Max" in caplog.text
-        assert "CV" in caplog.text
-        # The table must emit on a ``flextensor.*`` logger so the vLLM bridge
-        # picks it up. A refactor that moves it to a standalone namespace
-        # would silently hide the table under vLLM.
-        assert any(r.name.startswith("flextensor") for r in caplog.records), (
-            f"Layer statistics table emitted on non-flextensor logger(s): {sorted({r.name for r in caplog.records})}"
-        )
+        assert "Low sample count" in caplog.text, "per-issue warning must still fire"
+        assert "Layer Duration Statistics" not in caplog.text, "full table must not be dumped by the consistency check"
 
     def test_custom_thresholds(self):
         """Test that custom thresholds are respected."""
@@ -394,3 +398,62 @@ class TestStatisticsTableFormatting:
         table = analyzer.format_statistics_table()
 
         assert table == "No layer statistics available."
+
+
+class TestUntimedTrapsReport:
+    """Traps that registered tensor IDs but have no duration samples.
+
+    These are labels whose ``add_tensors`` path fired but ``add_duration``
+    never did — e.g. decode-only traps like vLLM's ``logits_processor`` or
+    traps that ran only while profiling was suspended.
+    """
+
+    def test_empty_collector_reports_nothing(self):
+        from flextensor.layer_statistics_analyzer import UntimedTrapsReport
+
+        report = UntimedTrapsReport(IterativeLayerStatisticsCollector())
+        assert report.is_empty()
+        assert report.labels == []
+        assert report.format() == ""
+
+    def test_fully_timed_collector_reports_nothing(self):
+        """Labels that got durations are not in the report."""
+        from flextensor.layer_statistics_analyzer import UntimedTrapsReport
+
+        collector = IterativeLayerStatisticsCollector()
+        collector.add_tensors("layer1", {1})
+        collector.add_duration("layer1", 10.0)
+
+        report = UntimedTrapsReport(collector)
+        assert report.is_empty()
+        assert report.format() == ""
+
+    def test_tensors_without_duration_are_reported(self):
+        """Tensors registered without any duration sample appear in the report."""
+        from flextensor.layer_statistics_analyzer import UntimedTrapsReport
+
+        collector = IterativeLayerStatisticsCollector()
+        collector.add_tensors("logits_processor", {42})
+
+        report = UntimedTrapsReport(collector)
+        assert not report.is_empty()
+        assert report.labels == ["logits_processor"]
+        line = report.format()
+        assert "Traps with no duration samples (dropped from strategy input):" in line
+        assert "logits_processor" in line
+
+    def test_mixed_timed_and_untimed_reports_only_untimed(self):
+        """Only labels without durations show up; timed ones are filtered out."""
+        from flextensor.layer_statistics_analyzer import UntimedTrapsReport
+
+        collector = IterativeLayerStatisticsCollector()
+        collector.add_tensors("timed", {1})
+        collector.add_duration("timed", 10.0)
+        collector.add_tensors("untimed_a", {2})
+        collector.add_tensors("untimed_b", {3})
+
+        report = UntimedTrapsReport(collector)
+        assert set(report.labels) == {"untimed_a", "untimed_b"}
+        line = report.format()
+        assert "timed" not in line.replace("untimed_a", "").replace("untimed_b", "")
+        assert "untimed_a" in line and "untimed_b" in line

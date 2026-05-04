@@ -59,7 +59,6 @@ During discovery, the `WarmupTrap` context manager:
 - Intercepts all PyTorch operations via `__torch_function__`
 - Tracks tensor IDs used in each operation
 - Copies weights to GPU on-demand when needed for computation
-- Measures baseline module execution time
 - Collects parameter-to-trap mapping data
 
 ```python
@@ -67,7 +66,7 @@ During discovery, the `WarmupTrap` context manager:
 with WarmupTrap(tensor_manager, layer_name, device_gpu):
     # Tensors are copied to GPU as needed
     # Tensor IDs are recorded
-    # Timing is measured
+    # (No per-iteration timing — durations are measured in the Profiling phase)
     output = layer(input)
 ```
 
@@ -82,7 +81,7 @@ At the end of the discovery phase, FlexTensor has collected:
 | Output | Description |
 |--------|-------------|
 | `tensors_map` | Dictionary mapping tensor IDs to CPU tensor references |
-| `layer_statistics_collector` | Contains parameter-to-trap mappings and baseline timing per trap |
+| `layer_statistics_collector` | Contains parameter-to-trap mappings (durations are populated in the Profiling phase) |
 | `model_ids` | Set of all tensor IDs belonging to the model |
 
 **Model state after discovery**:
@@ -230,13 +229,18 @@ This is the steady-state for all subsequent model executions.
 
 ## State Transitions
 
-The `OffloadManager` handles phase transitions automatically and internally:
+The `OffloadManager` handles phase transitions automatically and internally. Conceptually, `update_state()` does the following (the real implementation lives in `offload_manager.py`; the inline comments below are illustrative, not verbatim):
 
 ```python
 def update_state(self):
-    """Check and update state if necessary."""
     if self._current_phase in {OffloadPhase.NOT_INITIALIZED, OffloadPhase.INFERENCE}:
         return
+
+    # When profiling is suspended during PROFILING, freeze the counter so
+    # suppressed passes don't consume the profiling_iters budget.
+    if self._tensor_manager.is_profiling_suspended() and self._current_phase == OffloadPhase.PROFILING:
+        return
+
     self._iteration_count += 1
 
     if self._current_phase == OffloadPhase.DISCOVERY and self._iteration_count >= self.config.discovery_iters:
@@ -286,6 +290,86 @@ model = offload(model, config=config)
 # Subsequent iterations: optimized inference
 for batch in dataloader:
     output = model(batch)
+```
+
+## Profiling Data Control
+
+Backend integrations (e.g., vLLM) often run warmup forward passes at mixed batch sizes before profiling begins. These passes fire FlexTensor traps and record junk duration measurements that would pollute the offloading strategy. The profiling data control API lets backends prevent or remove this pollution without reaching into FlexTensor internals.
+
+The suspension state lives in `TensorManager`, the single source of truth. `OffloadManager` reads this state (e.g., in `update_state()`) but does not maintain its own copy.
+
+### API Overview
+
+| Function | Purpose |
+|----------|---------|
+| `flextensor.clear_profiling_durations()` | Wipe all accumulated duration data. Tensor mappings (discovery) are unaffected. |
+| `flextensor.suspend_profiling()` | Suppress duration recording until `resume_profiling()`. |
+| `flextensor.resume_profiling()` | Release one outstanding `suspend_profiling()`. Recording resumes once every outstanding suspension has been released. |
+| `flextensor.pause_profiling()` | Context-manager form of `suspend_profiling()` / `resume_profiling()`. Guarantees `resume` on exception and shares the refcount with the raw calls, so it nests freely with them. Preferred over the raw calls when the suspended section is lexically scoped. |
+
+### Phase-Dependent Behaviour
+
+When profiling is suspended, the effect on the iteration counter depends on the current phase:
+
+| Phase | Recording | Iteration counter | Rationale |
+|-------|-----------|-------------------|-----------|
+| Discovery | N/A | **Still advances** | DISCOVERY uses `WarmupTrap` → `record_tensors()`, which never consults suspension — the tensor-to-layer mapping is a hard prerequisite for every later phase. The counter advances because each pass contributes valid tensor mapping. |
+| Profiling | Fully suppressed | **Paused** | Core protection — `TensorManager.record_all()` is a complete no-op while suspended (skips both tensor IDs and durations), so paused passes contribute nothing to per-layer statistics. The counter is paused so suppressed passes don't consume `profiling_iters` budget. |
+| Inference | N/A | N/A | `update_state()` already returns early. No recording or counting. |
+
+> **Note:** When `OffloadConfig(enabled=False)`, FlexTensor uses `NoOpTensorManager`. The phase state machine still advances (`offload()` enters DISCOVERY, and `update_state()` progresses through PROFILING to INFERENCE per `discovery_iters` / `profiling_iters`), but the profiling-control API cannot influence it: `is_profiling_suspended()` always returns `False`, so the "Paused" iteration-counter row above never triggers, and `suspend_profiling()` / `resume_profiling()` / `pause_profiling()` / `clear_profiling_durations()` are all no-ops. There are also no durations being recorded to suppress or clear.
+
+### Usage Patterns
+
+**Proactive suppression (recommended):**
+
+```python
+model = flextensor.offload(model, config=config)
+
+flextensor.suspend_profiling()
+model(warmup_batch)           # profiling fully suppressed; tensor mapping in DISCOVERY still recorded
+flextensor.resume_profiling()
+
+for batch in dataloader:      # durations are now collected for the real workload
+    output = model(batch)
+```
+
+**Variable batch-size warmup:**
+
+```python
+model = flextensor.offload(model, config=config)
+
+# Backends like vLLM run warmup passes at varying batch sizes to
+# pre-allocate KV cache and memory pools.  These durations are
+# unrepresentative of the real workload and must not enter profiling.
+flextensor.suspend_profiling()
+for size in [1, 8, 32, 128]:
+    model(make_dummy_input(size))   # profiling fully suppressed; tensor mapping in DISCOVERY still recorded
+flextensor.resume_profiling()
+
+for batch in dataloader:            # durations are now collected for the real workload
+    output = model(batch)
+```
+
+**Retroactive cleanup:**
+
+```python
+model(warmup_batch)                        # junk recorded
+flextensor.clear_profiling_durations()     # wipe it
+
+for batch in dataloader:                   # profiling starts clean
+    output = model(batch)
+```
+
+> **Caveat:** `clear_profiling_durations()` wipes accumulated duration samples but does **not** reset `OffloadManager._iteration_count`. If the warmup passes already advanced the counter in the PROFILING phase, those iterations are still counted against the `profiling_iters` budget, leaving fewer remaining iterations to collect clean samples. For a fully clean budget, prefer proactive suppression with `suspend_profiling()` / `resume_profiling()` around warmup (which pauses the counter in PROFILING), or combine both as shown below.
+
+**Combined (junk already recorded + noisy section ahead):**
+
+```python
+flextensor.clear_profiling_durations()     # wipe existing junk
+flextensor.suspend_profiling()
+model(warmup_batch)                        # suppressed
+flextensor.resume_profiling()
 ```
 
 ## Design Consequences

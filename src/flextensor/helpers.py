@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from typing import Any
+
 from torch.overrides import TorchFunctionMode
 
 from flextensor.types import GPUMemoryUsage
@@ -42,6 +45,62 @@ class TrapNestingGuard:
         self._active = False
 
 
+class ProfilingSuspender:
+    """Reference-counted suspension of profiling duration recording.
+
+    Owns a single non-negative counter.  :meth:`suspend` increments it and
+    :meth:`resume` decrements it; :meth:`is_suspended` returns ``True`` iff
+    the counter is above zero.  Recording is therefore only re-enabled once
+    every outstanding suspension has been released, which lets independent
+    callers bracket their own sections without accidentally resuming
+    someone else's suspension.
+
+    Invariants:
+
+    * The counter never goes negative. :meth:`resume` on a non-suspended
+      suspender raises :class:`RuntimeError` — almost always a sign of
+      unbalanced ``suspend`` / ``resume`` calls, and the traceback points
+      directly at the offending call site.
+    * Prefer :meth:`suspended` over raw :meth:`suspend` / :meth:`resume`
+      where possible; the context manager guarantees balance even on
+      exceptions.
+
+    One instance lives on ``TensorManager``; the public
+    ``suspend_profiling()`` / ``resume_profiling()`` / ``pause_profiling()``
+    API delegates to it.
+    """
+
+    def __init__(self) -> None:
+        self._count = 0
+
+    def suspend(self) -> None:
+        self._count += 1
+
+    def resume(self) -> None:
+        if self._count == 0:
+            raise RuntimeError(
+                "resume_profiling() called while profiling was not suspended; "
+                "suspend_profiling() / resume_profiling() calls are unbalanced."
+            )
+        self._count -= 1
+
+    # Return type is `Any` instead of `Iterator[None]` or `AbstractContextManager[None]` due to
+    # beartype compatibility issues across Python versions. The `@contextmanager` decorator returns
+    # a `_GeneratorContextManager` which beartype fails to validate against `Iterator`/`Generator`
+    # on Python 3.10, while `AbstractContextManager` fails on Python 3.11+.
+    @contextmanager
+    def suspended(self) -> Any:
+        """Context manager form; guarantees balance on exceptions."""
+        self.suspend()
+        try:
+            yield
+        finally:
+            self.resume()
+
+    def is_suspended(self) -> bool:
+        return self._count > 0
+
+
 class NoOpTrap:
     def __init__(self):
         pass
@@ -68,6 +127,18 @@ class EmptyFunctionModeTrap(TorchFunctionMode):
 
 
 class NoOpTensorManager:
+    """Stand-in ``TensorManager`` used when ``OffloadConfig(enabled=False)``.
+
+    All profiling-control hooks (``suspend_profiling`` / ``resume_profiling``
+    / ``pause_profiling`` / ``clear_profiling_durations``) are no-ops because
+    no durations are ever recorded. In particular, :meth:`is_profiling_suspended`
+    permanently returns ``False``, so callers should not assume the
+    suspend/iteration semantics documented for the real ``TensorManager``
+    (see ``docs/explanation/phases.md``) apply when offloading is disabled —
+    ``OffloadManager.update_state()`` will not freeze the profiling counter
+    in this mode.
+    """
+
     def __init__(
         self,
         device_gpu,
@@ -84,6 +155,9 @@ class NoOpTensorManager:
         self.traced_tensors = set()
         self.loader_type = ""
 
+    def build_parameters_mapping(self, _model):
+        pass
+
     def prepare_warmup_mode(self):
         pass
 
@@ -95,6 +169,24 @@ class NoOpTensorManager:
 
     def prepare_infer_mode(self):
         pass
+
+    def is_profiling_suspended(self) -> bool:
+        return False
+
+    def clear_profiling_durations(self) -> None:
+        pass
+
+    def suspend_profiling(self) -> None:
+        pass
+
+    def resume_profiling(self) -> None:
+        pass
+
+    # See `ProfilingSuspender.suspended` for the `-> Any` rationale
+    # (beartype + @contextmanager cross-version compatibility).
+    @contextmanager
+    def pause_profiling(self) -> Any:
+        yield
 
     def trap(self, _name):
         return NoOpTrap()

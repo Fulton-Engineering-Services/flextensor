@@ -11,6 +11,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Profiling data control API: `flextensor.clear_profiling_durations()`,
+  `suspend_profiling()` / `resume_profiling()`, and the `pause_profiling()`
+  context manager. Lets backends (e.g. vLLM) bracket mixed-batch warmup so
+  paused passes contribute neither duration samples nor tensor IDs to the
+  PROFILING input — important on data-dependent models (MoE experts,
+  conditional branches, mixed-batch shapes) where a paused pass might
+  exercise a different parameter set than the real workload. The PROFILING
+  iteration counter is also frozen so suppressed passes don't consume the
+  `profiling_iters` budget. Suspensions are reference-counted, so
+  independent callers can nest without stepping on each other. See
+  [Profiling Data Control](docs/explanation/phases.md#profiling-data-control).
+
+### Changed
+
+- `UntimedTrapsReport` is now emitted at `WARNING` whenever any trap has
+  tensor IDs but no duration samples, regardless of `enable_diagnostics`.
+  These labels are silently dropped from the strategy input; users need
+  visibility in production. The verbose layer-duration table remains
+  gated on `enable_diagnostics`.
+- Internal: `WarmupTrap` no longer measures per-iteration CUDA-event
+  durations (they were wiped before profiling began anyway), and the new
+  `TensorManager.record_tensors(label, tensor_ids)` is the DISCOVERY-only
+  recorder. Affects plugin authors who subclassed `WarmupTrap` or called
+  the recorders directly.
+
 ### Fixed
 
 - `FlexTensorOffloadWorker` now pushes the speculative-decoding drafter

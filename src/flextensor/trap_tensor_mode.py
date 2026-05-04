@@ -11,7 +11,6 @@ class Trap(TorchFunctionMode):
         self.device_gpu = device_gpu
         self.tensor_layer_loader = tensor_manager.tensor_layer_loader
         self.tensors_ids = set()
-        self.layer_statistics_collector = tensor_manager.layer_statistics_collector
         self.tensor_manager = tensor_manager
         self.start_event = tensor_manager.trap_start_event
         self.end_event = tensor_manager.trap_end_event
@@ -31,7 +30,7 @@ class Trap(TorchFunctionMode):
 
         self.tensor_layer_loader.exit(self.current_trace_id)
 
-        self.layer_statistics_collector.add_all(self.current_trace_id, self.tensors_ids, duration_ms)
+        self.tensor_manager.record_all(self.current_trace_id, self.tensors_ids, duration_ms)
         self._nesting_guard.release()
 
         super().__exit__(_type, _value, _traceback)
@@ -73,25 +72,18 @@ class WarmupTrap(TorchFunctionMode):
         self.device_gpu = device_gpu
         self.tensors_ids = set()
         self.tensor_manager = tensor_manager
-        self.start_event = tensor_manager.trap_start_event
-        self.end_event = tensor_manager.trap_end_event
         self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
         self._nesting_guard.acquire(self.current_trace_id)
-        self.start_event.record()
         if self.tensor_manager.module_tracker is not None:
             self.tensor_manager.module_tracker.enter_trap(self.current_trace_id)
         return super().__enter__()
 
     def __exit__(self, _type, _value, _traceback):
-        self.end_event.record()
-        self.end_event.synchronize()
         if self.tensor_manager.module_tracker is not None:
             self.tensor_manager.module_tracker.exit_trap(self.current_trace_id)
-
-        duration_ms = self.start_event.elapsed_time(self.end_event)
-        self.tensor_manager.layer_statistics_collector.add_all(self.current_trace_id, self.tensors_ids, duration_ms)
+        self.tensor_manager.record_tensors(self.current_trace_id, self.tensors_ids)
         self._nesting_guard.release()
         super().__exit__(_type, _value, _traceback)
 
@@ -202,7 +194,7 @@ class TrapDirect:
         self.end_event.record()
         self.end_event.synchronize()
         duration_ms = self.start_event.elapsed_time(self.end_event)
-        self.tensor_manager.layer_statistics_collector.add_duration(self.current_trace_id, duration_ms)
+        self.tensor_manager.record_duration(self.current_trace_id, duration_ms)
 
         self.tensor_layer_loader.exit(self.current_trace_id)
         self._nesting_guard.release()

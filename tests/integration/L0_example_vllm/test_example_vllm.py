@@ -223,8 +223,9 @@ class TestExampleVLLM:
 
         Simulates ``docker run -e FT_ENABLE_DIAGNOSTICS=1`` by setting the
         variable in the subprocess environment. Verifies that FlexTensor
-        receives the variable by checking for the Layer Duration Statistics
-        table in server logs, which is only emitted when diagnostics are on.
+        receives the variable by checking for the BLOCK ASSIGNMENT table in
+        server logs, which is only emitted when diagnostics are on and does
+        not depend on profiling-data consistency.
         """
         log_lines = self._run_serve_and_validate(
             extra_env={"FT_ENABLE_DIAGNOSTICS": "1"},
@@ -232,7 +233,7 @@ class TestExampleVLLM:
         )
 
         log_text = "\n".join(log_lines)
-        assert "Layer Duration Statistics" in log_text, (
-            "FT_ENABLE_DIAGNOSTICS=1 was set but Layer Duration Statistics "
-            "table not found in server logs — env var passthrough may be broken"
+        assert "BLOCK ASSIGNMENT" in log_text, (
+            "FT_ENABLE_DIAGNOSTICS=1 was set but BLOCK ASSIGNMENT table not "
+            "found in server logs — env var passthrough may be broken"
         )

@@ -176,16 +176,23 @@ class FlexTensorOffloadWorker(Worker):
         for the offloading strategy. Finally switches to inference mode.
         """
         self.compile_or_warm_up_model()
-        compile_warm_iters = 2  # _dummy_run doesn't include sampling, account for it
+        # vLLM's first compile_or_warm_up_model() runs 2 forward passes through
+        # the offloaded model; each one counts as a discovery iteration in the
+        # OffloadManager, so the loop below only tops up to discovery_iters.
+        compile_warm_iters = 2
 
         discovery_iters = self._offload_config.discovery_iters - compile_warm_iters
         for i in range(discovery_iters):
             LOGGER.info("FlexTensor: Discovery iteration %d/%d (num_tokens=1)", i + 1, discovery_iters)
             self.model_runner._dummy_run(1, skip_eplb=True)  # noqa: SLF001
 
-        self.compile_or_warm_up_model()
+        # Pause profiling around vLLM's mixed-batch warmup: durations are suppressed
+        # and the PROFILING counter is frozen, so only the explicit iterations below
+        # feed the profile. The context manager also guarantees resume on exception.
+        with flextensor.pause_profiling():
+            self.compile_or_warm_up_model()
         max_num_tokens = min(self.model_runner.max_model_len, self.vllm_config.scheduler_config.max_num_batched_tokens)
-        profiling_iters = self._offload_config.profiling_iters - compile_warm_iters
+        profiling_iters = self._offload_config.profiling_iters
         for i in range(profiling_iters):
             LOGGER.info(
                 "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)", i + 1, profiling_iters, max_num_tokens
@@ -193,6 +200,8 @@ class FlexTensorOffloadWorker(Worker):
             self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 
         LOGGER.info("FlexTensor: Switching to inference mode")
+        # Informational-only host-memory hint; psutil probes /proc which can fail
+        # on hardened containers (gVisor / distroless / restricted /proc).
         try:
             vm = psutil.virtual_memory()
             free_gib = vm.available / GiB_bytes
@@ -201,8 +210,11 @@ class FlexTensorOffloadWorker(Worker):
                     "FlexTensor: Low host memory (%.1f GiB free) — inference transition may OOM",
                     free_gib,
                 )
-        except Exception:  # noqa: S110
-            pass
+        except (OSError, AttributeError, psutil.Error) as exc:
+            LOGGER.debug(
+                "FlexTensor: host-memory pre-check failed (%s); continuing without low-mem warning",
+                exc,
+            )
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 

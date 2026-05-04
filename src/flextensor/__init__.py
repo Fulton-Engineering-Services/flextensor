@@ -28,6 +28,7 @@ from flextensor.lazy_model_init import load_model_from_profile
 from flextensor.offload_manager import (
     DEFAULT_MANAGER_NAME,
     OffloadManager,
+    clear_profiling_durations,
     get_gpu_memory_usage,
     get_offload_manager,
     init,
@@ -35,9 +36,12 @@ from flextensor.offload_manager import (
     offload,
     offload_block,
     offload_from_profile,
+    pause_profiling,
     release,
+    resume_profiling,
     save_profile,
     set_config,
+    suspend_profiling,
 )
 from flextensor.strategy import (
     AdaptiveKnapsackStrategy,
@@ -64,6 +68,7 @@ __all__ = [  # noqa: RUF022
     "GPUMemoryUsage",
     "OffloadConfig",
     "OffloadManager",
+    "clear_profiling_durations",
     "get_gpu_memory_usage",
     "get_offload_manager",
     "init",
@@ -76,7 +81,10 @@ __all__ = [  # noqa: RUF022
     "set_config",
     "save_profile",
     "load_profile",
+    "pause_profiling",
     "release",
+    "resume_profiling",
+    "suspend_profiling",
     # Internal/Advanced API (for backward compatibility)
     "AdaptiveKnapsackStrategy",
     "AdaptiveStrategy",

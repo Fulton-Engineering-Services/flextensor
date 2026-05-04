@@ -18,4 +18,8 @@ rather than constructing one directly.
         - get_gpu_memory_usage
         - save_profile
         - load_profile
+        - clear_profiling_durations
+        - suspend_profiling
+        - resume_profiling
+        - pause_profiling
         - release

@@ -684,6 +684,70 @@ class TensorMappingProcessor(TensorProcessor):
 
 
 @instrumentable
+class ReachableTensorIdsProcessor(TensorProcessor):
+    """Collect ``id(tensor)`` for every tensor reachable from a model.
+
+    Read-only walk over an ``nn.Module`` (parameters, buffers, attributes,
+    submodules) or a ``dict`` model, plus tensor inner fields (e.g. the
+    ``scale`` attribute on a quantised ``nn.Parameter``). Skips meta
+    tensors — their ``id()`` doesn't correspond to a real allocation, so
+    they aren't useful as a narrowing input.
+
+    Used by :class:`flextensor.loaders.TensorStrategyLoader` to narrow its
+    untimed-traced rescue
+    (:func:`flextensor.loaders._compute_untimed_traced_preload`) to
+    tensors the live model can still reach. Anything in ``tensors_map``
+    outside this set is treated as suspicious — likely a stale ``id()``
+    or a non-model tensor — and excluded from auto-pinning.
+
+    Inherits the full :class:`TensorProcessor` traversal, so it covers the
+    same surface area as the other read-only collectors
+    (:class:`TensorMappingProcessor`, :class:`BenchmarkTensorProcessor`).
+    The convenience wrapper :func:`compute_reachable_tensor_ids` is the
+    typical entry point for callers that just want the resulting set.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(update_attributes=False)
+        self.reachable_ids: set[int] = set()
+
+    def get_results(self) -> set[int]:
+        return self.reachable_ids
+
+    def map_inner_fields(self, src: torch.Tensor) -> None:
+        ref_tensor_fields = set(dir(src))
+        new_tensor_fields = set(dir(torch.Tensor))
+        missing_fields = ref_tensor_fields - new_tensor_fields
+        missing_fields = [name for name in missing_fields if not name.startswith("_")]
+        for missing_field in missing_fields:
+            field = getattr(src, missing_field)
+            if isinstance(field, torch.Tensor):
+                self.process(field)
+
+    def process(self, src):
+        if not isinstance(src, torch.Tensor) or src.is_meta:
+            return src
+        self.reachable_ids.add(id(src))
+        self.map_inner_fields(src)
+        return src
+
+
+def compute_reachable_tensor_ids(model) -> set[int]:
+    """Convenience wrapper around :class:`ReachableTensorIdsProcessor`.
+
+    Returns the set of tensor IDs reachable from ``model``. ``None`` is
+    accepted and yields an empty set so callers can use this as a
+    narrowing input to :class:`~flextensor.loaders.TensorStrategyLoader`
+    without an extra ``None`` check.
+    """
+    if model is None:
+        return set()
+    collector = ReachableTensorIdsProcessor()
+    collector.apply(model)
+    return collector.get_results()
+
+
+@instrumentable
 class BenchmarkTensorProcessor(TensorProcessor):
     def __init__(
         self,

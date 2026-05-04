@@ -210,6 +210,7 @@ class TestOffloadManagerStateMachine:
         """Test state transitions from NOT_INITIALIZED -> DISCOVERY -> PROFILING -> INFERENCE."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
 
         # Mock trap to track calls
@@ -292,6 +293,7 @@ class TestOffloadManagerStateMachine:
         """
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -366,6 +368,7 @@ class TestOffloadManagerStateMachine:
         """
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
 
@@ -442,6 +445,7 @@ class TestOffloadManagerStateMachine:
         """Test that iteration counts are tracked correctly during state transitions."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -488,6 +492,7 @@ class TestOffloadManagerStateMachine:
         """Test with custom discovery and profiling iteration counts."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -542,6 +547,7 @@ class TestOffloadManagerStateMachine:
         """Test that offload_block returns the correct trap object."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
 
         mock_trap = MockTrap("test_trap")
@@ -591,12 +597,32 @@ class TestOffloadManagerStateMachine:
         # (NoOp manager doesn't do real state management)
         assert om._tensor_manager is mock_noop_manager
 
+    def test_offload_disabled_with_real_noop_manager(self):
+        """`offload(enabled=False)` must work without mocking `NoOpTensorManager`.
+
+        Regression guard: ``OffloadManager.offload()`` calls
+        ``self._tensor_manager.build_parameters_mapping(model)`` unconditionally,
+        so the real ``NoOpTensorManager`` needs that method. Other tests patch
+        ``NoOpTensorManager`` with a ``MagicMock`` and would mask a missing
+        attribute.
+        """
+        om = OffloadManager("test_noop_real")
+        config = OffloadConfig(enabled=False, include_patterns=["submodule_l1.submodule_l2"])
+
+        model = om.offload(self.model, config=config)
+
+        assert om._tensor_manager is not None
+        assert om._tensor_manager.__class__.__name__ == "NoOpTensorManager"
+        with torch.no_grad():
+            _ = model(self.x)
+
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
     def test_multiple_offload_patterns(self, mock_strategy_cls, mock_tensor_manager_cls):
         """Test offloading multiple module patterns."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -685,6 +711,7 @@ class TestOffloadManagerStateMachine:
     def test_offload_uses_default_wildcard_pattern(self, mock_tensor_manager_cls):
         """Test that offload uses default ['*'] pattern when not specified in config."""
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -706,6 +733,7 @@ class TestOffloadManagerStateMachine:
     def test_offload_with_custom_patterns_in_config(self, mock_tensor_manager_cls):
         """Test that offload uses custom patterns from config."""
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model

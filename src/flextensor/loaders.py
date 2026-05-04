@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+import logging
 import os
 import time
 from abc import ABC, abstractmethod
@@ -13,6 +14,8 @@ from flextensor.strategy_operations import find_transfers_for_preload
 
 from .collectors import IterativeLayerStatistics, LayerStatistics, TensorStatistics
 from .utils import calculate_tensor_size, clear_and_delete_tensor, delete_tensor, is_dense_layout
+
+LOGGER = logging.getLogger(__name__)
 
 # =============================================================================
 # Helper Functions
@@ -46,6 +49,46 @@ def _compute_preload(
             if tensor_info.tensor_id not in strategy_tensors_ids:
                 preload_tensors_ids.add(tensor_info.tensor_id)
     return preload_tensors_ids
+
+
+def _compute_untimed_traced_preload(
+    layer_stats: list[LayerStatistics],
+    tensors_map: Mapping[int, torch.Tensor],
+) -> set[int]:
+    """Tensor IDs in ``tensors_map`` that appear in no layer at all.
+
+    These are *traced but untimed* — their trap fired (so the tensor is
+    registered in ``tensors_map`` and ``traced_tensors``) but no duration
+    sample was recorded, so the label was dropped by
+    :func:`flextensor.tensor_manager.compute_layer_statistics`. Without
+    this rescue, ``TensorStrategyLoader.get(...)`` returns ``None`` for
+    them and the trap path falls through to the original CPU tensor
+    (a device-mismatch crash for parameterized GPU ops, or silent CPU
+    compute when all operands happen to be CPU).
+
+    Block loaders don't need an analogous rescue:
+    ``MoveUnmappedTensorsToGPUProcessor`` already routes any non-view-mapped
+    tensor to GPU as a *routing* decision (mapped → block view, unmapped →
+    GPU pin), so the strategy-loader fall-through-to-CPU failure mode
+    cannot occur there. The cost on the strategy path is permanent GPU
+    residence for the rescued IDs (they sit in ``cpu_to_gpu_map`` for the
+    loader's lifetime).
+
+    The typical trigger is a profile-coverage gap (e.g. vLLM's
+    ``logits_processor`` firing only at decode-time but profiled with
+    prefill-shaped inputs). Anchored by
+    ``tests/unit/test_untimed_traps_runtime.py``.
+
+    Note: ``TensorStrategyLoader`` further narrows this set against
+    the model's reachable tensor IDs (passed via
+    ``reachable_tensor_ids``) so that ``tensors_map`` entries from any
+    future non-model code path don't get force-pinned to GPU.
+    """
+    layer_tensor_ids: set[int] = set()
+    for layer_stat in layer_stats:
+        for tensor_info in layer_stat.tensors:
+            layer_tensor_ids.add(tensor_info.tensor_id)
+    return {tid for tid in tensors_map if tid not in layer_tensor_ids}
 
 
 def _compute_peak_memory_from_strategy(
@@ -231,6 +274,8 @@ class TensorStrategyLoader(Loader):
         release_tensors: bool,
         stream_priority: int,
         delete_tensor_func: Callable[[torch.Tensor], None] = delete_tensor,
+        *,
+        reachable_tensor_ids: set[int] | None = None,
     ) -> None:
         self.device_gpu = device_gpu
         self.layer_stats = layer_stats
@@ -247,6 +292,24 @@ class TensorStrategyLoader(Loader):
         # preload tensors
         # TODO: create method for preloading tensors
         self.preload_ids = _compute_preload(layer_stats, strategy_map)
+        # Rescue traced-but-untimed tensors so .get(...) doesn't return None
+        # and fall through to the CPU tensor at trap time.
+        rescue_ids = _compute_untimed_traced_preload(layer_stats, self.tensors_map)
+        if reachable_tensor_ids is not None:
+            # Narrow the rescue to model-reachable tensors only.
+            rescue_ids &= reachable_tensor_ids
+        if rescue_ids:
+            # Only signal on the saved-state path; report_profiling_quality covers fresh runs.
+            rescue_bytes = sum(
+                self.tensors_map[tid].numel() * self.tensors_map[tid].element_size() for tid in rescue_ids
+            )
+            LOGGER.warning(
+                "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) force-pinned to GPU. "
+                "Likely a profile-coverage gap.",
+                len(rescue_ids),
+                rescue_bytes / (1024 * 1024),
+            )
+        self.preload_ids |= rescue_ids
         for tensor_id, tensor in self.tensors_map.items():
             if tensor_id in self.preload_ids:
                 gpu_tensor = tensor.to(device=device_gpu, copy=True)

@@ -74,6 +74,7 @@ class TestForwardHooks:
         """Test registering a forward hook on the proxy model."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -117,6 +118,7 @@ class TestForwardHooks:
         """Test that forward hook can capture model output."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -155,6 +157,7 @@ class TestForwardHooks:
         """Test registering forward hook on a specific submodule."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -198,6 +201,7 @@ class TestBackwardHooks:
         """Test registering a backward hook on the proxy model."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -241,6 +245,7 @@ class TestBackwardHooks:
         """Test using backward hook for gradient clipping."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -286,6 +291,7 @@ class TestActivationCapture:
         """Test capturing activations from all layers."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -342,6 +348,7 @@ class TestActivationCapture:
         """Test capturing activations from a specific layer."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -386,6 +393,7 @@ class TestGradientManipulation:
         """Test gradient clipping through backward hook."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -429,6 +437,7 @@ class TestGradientManipulation:
         """Test monitoring gradients through hooks."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -494,6 +503,7 @@ class TestMultipleHooks:
         """Test registering multiple forward hooks on the same module."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -546,6 +556,7 @@ class TestMultipleHooks:
         """Test that hooks execute in registration order."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -595,6 +606,7 @@ class TestHookRemoval:
         """Test removing a forward hook."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -638,6 +650,7 @@ class TestHookRemoval:
         """Test removing one hook while others remain."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -695,6 +708,7 @@ class TestHooksAcrossStateTransitions:
         """Test that hooks registered on model modules persist across state transitions."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -748,6 +762,7 @@ class TestHooksAcrossStateTransitions:
         """Test that hooks registered directly on proxy work with explicit delegation."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -798,6 +813,7 @@ class TestHooksAcrossStateTransitions:
         """Test all hook types (forward, forward_pre, backward, backward_pre) on proxy."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -853,6 +869,7 @@ class TestHooksAcrossStateTransitions:
         """Test backward pre-hook on proxy (if available in PyTorch version)."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 
@@ -896,6 +913,7 @@ class TestHooksAcrossStateTransitions:
         """Test that hooks persist when offload() is called multiple times (re-initialization)."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
 

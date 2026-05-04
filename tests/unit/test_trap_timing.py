@@ -78,7 +78,7 @@ class TestTrapTiming:
         trap.__enter__()
         trap.__exit__(None, None, None)
 
-        tm.layer_statistics_collector.add_all.assert_called_once_with("layer.5", set(), 4.2)
+        tm.record_all.assert_called_once_with("layer.5", set(), 4.2)
 
     def test_uses_event_sync_not_global_sync(self):
         tm = _make_mock_tensor_manager()
@@ -100,39 +100,37 @@ class TestTrapTiming:
         tm.tensor_layer_loader.exit.assert_called_once_with("layer.0")
 
 
-class TestWarmupTrapTiming:
-    """Test CUDA event timing in WarmupTrap."""
+class TestWarmupTrapRecording:
+    """Verify WarmupTrap records tensor IDs only — no CUDA event timing.
 
-    def test_events_from_tensor_manager(self):
+    Discovery captures only the tensor-to-layer mapping; durations measured
+    here would be wiped before profiling iterations begin, so WarmupTrap
+    intentionally skips the CUDA-event start/sync/elapsed_time machinery
+    that ``Trap`` and ``TrapDirect`` use.
+    """
+
+    def test_does_not_use_cuda_events(self):
         tm = _make_mock_tensor_manager(with_loader=False)
         trap = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
 
-        assert trap.start_event is tm.trap_start_event
-        assert trap.end_event is tm.trap_end_event
-
-    def test_record_and_sync_ordering(self):
-        tm = _make_mock_tensor_manager(elapsed_time_ms=1.0, with_loader=False)
-
-        call_order = []
-        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
-        tm.trap_end_event.record.side_effect = lambda: call_order.append("end.record")
-        tm.trap_end_event.synchronize.side_effect = lambda: call_order.append("end.synchronize")
-        tm.trap_start_event.elapsed_time.side_effect = lambda e: (call_order.append("elapsed_time"), 1.0)[1]
-
-        trap = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
         trap.__enter__()
         trap.__exit__(None, None, None)
 
-        assert call_order == ["start.record", "end.record", "end.synchronize", "elapsed_time"]
+        tm.trap_start_event.record.assert_not_called()
+        tm.trap_end_event.record.assert_not_called()
+        tm.trap_end_event.synchronize.assert_not_called()
+        tm.trap_start_event.elapsed_time.assert_not_called()
 
-    def test_duration_flows_to_collector(self):
-        tm = _make_mock_tensor_manager(elapsed_time_ms=7.3, with_loader=False)
+    def test_records_tensors_without_duration(self):
+        tm = _make_mock_tensor_manager(with_loader=False)
         trap = WarmupTrap(tm, "encoder.2", torch.device("cuda:0"))
 
         trap.__enter__()
         trap.__exit__(None, None, None)
 
-        tm.layer_statistics_collector.add_all.assert_called_once_with("encoder.2", set(), 7.3)
+        tm.record_tensors.assert_called_once_with("encoder.2", set())
+        tm.record_all.assert_not_called()
+        tm.record_duration.assert_not_called()
 
     def test_module_tracker_enter_exit(self):
         tm = _make_mock_tensor_manager(with_loader=False, with_module_tracker=True)
@@ -151,7 +149,7 @@ class TestWarmupTrapTiming:
         trap.__enter__()
         trap.__exit__(None, None, None)
 
-        tm.layer_statistics_collector.add_all.assert_called_once()
+        tm.record_tensors.assert_called_once()
 
 
 class TestTrapDirectTiming:
@@ -186,7 +184,7 @@ class TestTrapDirectTiming:
         trap.__enter__()
         trap.__exit__(None, None, None)
 
-        tm.layer_statistics_collector.add_duration.assert_called_once_with("attn.3", 6.1)
+        tm.record_duration.assert_called_once_with("attn.3", 6.1)
 
     def test_tensor_layer_loader_enter_exit(self):
         tm = _make_mock_tensor_manager()
@@ -230,21 +228,24 @@ class TestMultiLayerTraps:
         assert tm.trap_end_event.synchronize.call_count == len(self.LAYER_NAMES)
 
         expected_calls = [call(name, dur) for name, dur in zip(self.LAYER_NAMES, self.LAYER_DURATIONS, strict=False)]
-        tm.layer_statistics_collector.add_duration.assert_has_calls(expected_calls)
+        tm.record_duration.assert_has_calls(expected_calls)
 
     def test_warmup_trap_multi_layer(self):
+        """WarmupTrap records tensor IDs per layer without touching CUDA events."""
         tm = _make_mock_tensor_manager(with_loader=False)
         device = torch.device("cuda:0")
 
-        self._run_layers(WarmupTrap, tm, device)
+        for name in self.LAYER_NAMES:
+            trap = WarmupTrap(tm, name, device)
+            trap.__enter__()
+            trap.__exit__(None, None, None)
 
-        assert tm.trap_start_event.record.call_count == len(self.LAYER_NAMES)
-        assert tm.trap_end_event.record.call_count == len(self.LAYER_NAMES)
+        assert tm.trap_start_event.record.call_count == 0
+        assert tm.trap_end_event.record.call_count == 0
 
-        expected_calls = [
-            call(name, set(), dur) for name, dur in zip(self.LAYER_NAMES, self.LAYER_DURATIONS, strict=False)
-        ]
-        tm.layer_statistics_collector.add_all.assert_has_calls(expected_calls)
+        expected_calls = [call(name, set()) for name in self.LAYER_NAMES]
+        tm.record_tensors.assert_has_calls(expected_calls)
+        tm.record_all.assert_not_called()
 
     def test_events_identity_preserved_across_layers(self):
         """All traps created for different layers reference the same two event objects."""
@@ -259,17 +260,20 @@ class TestMultiLayerTraps:
 
 
 class TestEventReuse:
-    """Verify that all trap types share the same event objects from TensorManager."""
+    """Verify that timed trap types share the same event objects from TensorManager.
 
-    def test_all_traps_share_events(self):
+    ``WarmupTrap`` is intentionally excluded — it does not measure CUDA events
+    because discovery durations are unused (see :class:`TestWarmupTrapRecording`).
+    """
+
+    def test_timed_traps_share_events(self):
         tm = _make_mock_tensor_manager(use_spec=True)
 
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
-        warmup = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
         direct = TrapDirect(tm, "layer.0", torch.device("cuda:0"))
 
-        assert trap.start_event is warmup.start_event is direct.start_event
-        assert trap.end_event is warmup.end_event is direct.end_event
+        assert trap.start_event is direct.start_event
+        assert trap.end_event is direct.end_event
 
 
 class TestTrapNestingGuard:

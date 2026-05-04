@@ -9,6 +9,7 @@ import threading
 import types
 import warnings
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar, runtime_checkable
@@ -751,9 +752,28 @@ class OffloadManager:
                 )
 
     def update_state(self):
-        """Check and update state if necessary."""
+        """Advance the phase state machine by one iteration.
+
+        No-op in ``NOT_INITIALIZED`` and ``INFERENCE`` phases.
+
+        When profiling is suspended:
+
+        - During DISCOVERY the iteration counter still advances (discovery
+          durations are unused and cleared at the transition anyway).
+        - During PROFILING the counter is paused so that suppressed passes
+          don't consume the ``profiling_iters`` budget.
+        """
         if self._current_phase in {OffloadPhase.NOT_INITIALIZED, OffloadPhase.INFERENCE}:
             return
+
+        if self._tensor_manager is None:
+            raise RuntimeError(
+                f"OffloadManager is in phase {self._current_phase.name} but its TensorManager is not set."
+            )
+
+        if self._tensor_manager.is_profiling_suspended() and self._current_phase == OffloadPhase.PROFILING:
+            return
+
         self._iteration_count += 1
 
         if self._current_phase == OffloadPhase.DISCOVERY and self._iteration_count >= self.config.discovery_iters:
@@ -876,6 +896,105 @@ class OffloadManager:
             self._model_proxy = OffloadModelProxy(self._model, self)
         self._model_proxy.__subject__ = self._model
         return self._model_proxy
+
+    def clear_profiling_durations(self) -> None:
+        """Clear all accumulated duration measurements.
+
+        Wipes every duration sample collected so far.  Tensor-to-layer
+        mappings (discovery data) are **not** affected.
+
+        Raises:
+            RuntimeError: if called before :func:`flextensor.offload` —
+                no active ``TensorManager`` to clear.
+
+        .. note::
+            With ``OffloadConfig(enabled=False)`` the active manager is
+            :class:`NoOpTensorManager`: this method is a no-op because
+            no durations are ever recorded.
+        """
+        if self._tensor_manager is None:
+            raise RuntimeError(
+                "clear_profiling_durations() called before flextensor.offload(...); "
+                "call flextensor.offload(model, config=...) first."
+            )
+        self._tensor_manager.clear_profiling_durations()
+
+    def suspend_profiling(self) -> None:
+        """Suppress profiling recording and (in PROFILING phase) freeze the iteration counter.
+
+        While suspended:
+
+        * ``record_all()`` (the PROFILING recorder) is a **complete no-op**
+          — neither tensor IDs nor duration samples are stored, so a paused
+          warmup pass cannot widen per-layer tensor sets on data-dependent
+          models (MoE / conditional branches / mixed-batch shapes).
+        * ``record_duration()`` skips duration recording.
+        * ``record_tensors()`` (the DISCOVERY recorder) is **not** affected
+          — discovery's tensor-to-layer mapping is a hard prerequisite for
+          every later phase.
+        * In DISCOVERY the iteration counter **still advances** (discovery
+          durations are unused).
+        * In PROFILING the counter is **paused** so suppressed passes don't
+          consume the ``profiling_iters`` budget.
+
+        Suspensions are reference-counted: each call must be matched by a
+        :meth:`resume_profiling`, and recording only resumes once every
+        outstanding suspension has been released.  Independent callers can
+        therefore bracket their own sections without accidentally resuming
+        someone else's suspension.
+
+        Raises:
+            RuntimeError: if called before :func:`flextensor.offload` —
+                no active ``TensorManager`` to suspend.
+
+        .. note::
+            With ``OffloadConfig(enabled=False)`` the active manager is
+            :class:`NoOpTensorManager`: these methods are no-ops and the
+            profiling-iteration counter is not frozen.
+        """
+        if self._tensor_manager is None:
+            raise RuntimeError(
+                "suspend_profiling() called before flextensor.offload(...); "
+                "call flextensor.offload(model, config=...) first."
+            )
+        self._tensor_manager.suspend_profiling()
+
+    def resume_profiling(self) -> None:
+        """Release one outstanding :meth:`suspend_profiling` call.
+
+        Recording only resumes once every outstanding suspension has been
+        released.
+
+        Raises:
+            RuntimeError: if called before :func:`flextensor.offload`
+                (no active ``TensorManager``), or if called while not
+                suspended (unbalanced ``suspend`` / ``resume``).
+        """
+        if self._tensor_manager is None:
+            raise RuntimeError(
+                "resume_profiling() called before flextensor.offload(...); "
+                "call flextensor.offload(model, config=...) first."
+            )
+        self._tensor_manager.resume_profiling()
+
+    # See `flextensor.helpers.ProfilingSuspender.suspended` for the `-> Any` rationale
+    # (beartype + @contextmanager cross-version compatibility).
+    @contextmanager
+    def pause_profiling(self) -> Any:
+        """Context-manager form of :meth:`suspend_profiling` / :meth:`resume_profiling`.
+
+        Raises:
+            RuntimeError: if called before :func:`flextensor.offload` —
+                no active ``TensorManager``, so the ``with`` block cannot
+                actually run with profiling paused.
+        """
+        if self._tensor_manager is None:
+            raise RuntimeError(
+                "pause_profiling() called before flextensor.offload(...); "
+                "call flextensor.offload(model, config=...) first."
+            )
+        with self._tensor_manager.pause_profiling():
+            yield
 
     def release(self):
         # Restore original forward methods for all patched modules
@@ -1155,3 +1274,100 @@ def get_gpu_memory_usage(name: str = DEFAULT_MANAGER_NAME) -> GPUMemoryUsage:
     """
     om = get_offload_manager(name)
     return om.get_gpu_memory_usage()
+
+
+# ---------------------------------------------------------------------------
+# Profiling data control API
+# ---------------------------------------------------------------------------
+
+
+def clear_profiling_durations(name: str = DEFAULT_MANAGER_NAME) -> None:
+    """Clear all accumulated profiling duration measurements.
+
+    Wipes every duration sample collected so far.  Tensor-to-layer
+    mappings (discovery data) are **not** affected.
+
+    Args:
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+    """
+    om = get_offload_manager(name)
+    om.clear_profiling_durations()
+
+
+def suspend_profiling(name: str = DEFAULT_MANAGER_NAME) -> None:
+    """Suppress profiling recording (durations and tensor IDs).
+
+    In PROFILING, suppression is total — ``TensorManager.record_all()`` is
+    a complete no-op, so a paused warmup pass cannot widen per-layer tensor
+    sets on data-dependent models (MoE / conditional branches / mixed-batch
+    shapes). In DISCOVERY, ``record_tensors()`` is **not** affected (the
+    tensor-to-layer mapping is a hard prerequisite for every later phase).
+    The iteration counter is frozen in PROFILING so suppressed passes don't
+    consume the ``profiling_iters`` budget. See
+    :meth:`OffloadManager.suspend_profiling` for the full per-phase contract.
+
+    Suspensions are reference-counted: each :func:`suspend_profiling` must
+    be matched by a :func:`resume_profiling`, and recording only resumes
+    once every outstanding suspension has been released.  Independent
+    callers can therefore bracket their own sections without accidentally
+    resuming someone else's suspension.
+
+    .. note::
+        With ``OffloadConfig(enabled=False)`` the active manager is
+        :class:`NoOpTensorManager`: these functions are no-ops and the
+        profiling-iteration counter is not frozen.
+
+    Args:
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+
+    Example::
+
+        model = flextensor.offload(model, config=config)
+
+        flextensor.suspend_profiling()
+        for size in [1, 8, 32, 128]:
+            model(make_dummy_input(size))   # profiling suppressed during warmup
+        flextensor.resume_profiling()
+
+        for batch in dataloader:            # durations are now collected for the real workload
+            output = model(batch)
+    """
+    om = get_offload_manager(name)
+    om.suspend_profiling()
+
+
+def resume_profiling(name: str = DEFAULT_MANAGER_NAME) -> None:
+    """Resume profiling duration recording after :func:`suspend_profiling`.
+
+    Args:
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+    """
+    om = get_offload_manager(name)
+    om.resume_profiling()
+
+
+# See `flextensor.helpers.ProfilingSuspender.suspended` for the `-> Any` rationale
+# (beartype + @contextmanager cross-version compatibility).
+@contextmanager
+def pause_profiling(name: str = DEFAULT_MANAGER_NAME) -> Any:
+    """Context-manager form of :func:`suspend_profiling` / :func:`resume_profiling`.
+
+    Shares the refcount with the raw functions, so it nests freely with them.
+
+    Args:
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+
+    Example::
+
+        model = flextensor.offload(model, config=config)
+
+        with flextensor.pause_profiling():
+            for size in [1, 8, 32, 128]:
+                model(make_dummy_input(size))   # profiling suppressed during warmup
+
+        for batch in dataloader:                # durations are now collected for the real workload
+            output = model(batch)
+    """
+    om = get_offload_manager(name)
+    with om.pause_profiling():
+        yield

@@ -465,9 +465,9 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.LayerStatisticsAnalyzer")
+    @patch("flextensor.tensor_manager.report_profiling_quality")
     def test_auto_enables_on_gap_layers(
-        self, _analyzer, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
+        self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
         stats_with_gaps = [_make_layer("layer_0"), _make_gap_layer("gap"), _make_layer("layer_2")]
         mock_compute_stats.return_value = stats_with_gaps
@@ -492,9 +492,9 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.LayerStatisticsAnalyzer")
+    @patch("flextensor.tensor_manager.report_profiling_quality")
     def test_no_auto_enable_without_transfer_gaps(
-        self, _analyzer, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
+        self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
         stats_with_gaps = [_make_layer("layer_0"), _make_gap_layer("gap"), _make_layer("layer_2")]
         mock_compute_stats.return_value = stats_with_gaps
@@ -518,9 +518,9 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.LayerStatisticsAnalyzer")
+    @patch("flextensor.tensor_manager.report_profiling_quality")
     def test_no_auto_enable_without_gap_layers(
-        self, _analyzer, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
+        self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
         stats_no_gaps = [_make_layer("layer_0"), _make_layer("layer_1"), _make_layer("layer_2")]
         mock_compute_stats.return_value = stats_no_gaps
@@ -545,9 +545,9 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.LayerStatisticsAnalyzer")
+    @patch("flextensor.tensor_manager.report_profiling_quality")
     def test_already_enabled_skips_auto_detection(
-        self, _analyzer, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
+        self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
         stats_with_gaps = [_make_layer("layer_0"), _make_gap_layer("gap"), _make_layer("layer_2")]
         mock_compute_stats.return_value = stats_with_gaps

@@ -143,6 +143,7 @@ class TestOffloadManagerGPUMemoryUsage:
         """Test get_gpu_memory_usage() returns correct values in inference state."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -189,6 +190,7 @@ class TestOffloadManagerGPUMemoryUsage:
         """Test get_gpu_memory_usage() raises RuntimeError in discovery phase."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -215,6 +217,7 @@ class TestOffloadManagerGPUMemoryUsage:
         """Test get_gpu_memory_usage() raises RuntimeError in profiling phase."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
@@ -270,6 +273,7 @@ class TestModuleLevelGetGPUMemoryUsage:
 
         # Setup mocks
         mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
         mock_tensor_manager.trap = lambda name: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model

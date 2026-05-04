@@ -20,17 +20,36 @@ from flextensor._logging import (
 
 @pytest.fixture(autouse=True)
 def _reset_logger_state() -> None:
-    """Reset flextensor and flextensor.diagnostics logger state around each test."""
+    """Reset flextensor and flextensor.diagnostics logger state around each test.
+
+    Snapshots existing state for restoration on teardown, then forces a clean
+    slate (no handlers, NOTSET level, propagate=True, no markers) before
+    yielding. The clean-slate step matters because Python's ``logging``
+    registry is process-global: prior test modules can install handlers or
+    raise the level on the ``flextensor`` logger (e.g. via the vLLM logging
+    bridge) and those side effects would otherwise leak into preconditions
+    here like ``assert not ft.handlers``.
+    """
     ft = logging.getLogger("flextensor")
     diag = logging.getLogger(DIAGNOSTICS_LOGGER_NAME)
 
-    # Snapshot before
     ft_before = (list(ft.handlers), ft.level, ft.propagate, getattr(ft, _BRIDGE_MARKER, None))
     diag_before = (list(diag.handlers), diag.level, diag.propagate, getattr(diag, _DIAGNOSTICS_MARKER, None))
 
+    ft.handlers[:] = []
+    ft.setLevel(logging.NOTSET)
+    ft.propagate = True
+    if hasattr(ft, _BRIDGE_MARKER):
+        delattr(ft, _BRIDGE_MARKER)
+
+    diag.handlers[:] = []
+    diag.setLevel(logging.NOTSET)
+    diag.propagate = True
+    if hasattr(diag, _DIAGNOSTICS_MARKER):
+        delattr(diag, _DIAGNOSTICS_MARKER)
+
     yield
 
-    # Restore after
     ft.handlers[:] = ft_before[0]
     ft.setLevel(ft_before[1])
     ft.propagate = ft_before[2]

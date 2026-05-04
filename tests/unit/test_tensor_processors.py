@@ -14,8 +14,10 @@ from flextensor.tensor_processors import (
     MoveBuffersToGPUTensorProcessor,
     MoveUnmappedTensorsToGPUProcessor,
     ProcessingContext,
+    ReachableTensorIdsProcessor,
     TensorMappingProcessor,
     TensorProcessor,
+    compute_reachable_tensor_ids,
     create_model_with_shared_tensors,
     preserve_parameter_type,
 )
@@ -199,6 +201,125 @@ class TestTensorMappingProcessor:
         assert id(param) in processor.tensors_map
         assert processor.tensors_map[id(param)] is param
         assert result is param
+
+
+class TestReachableTensorIdsProcessor:
+    """Contract for ``ReachableTensorIdsProcessor`` and its convenience wrapper.
+
+    The processor walks an ``nn.Module`` (parameters, buffers, submodules,
+    attributes) or a ``dict`` model, plus tensor inner fields (e.g.
+    ``weight.scale`` on a quantised parameter), and records ``id(tensor)``
+    for every non-meta tensor visited.
+
+    The narrowing input it produces is consumed by
+    :class:`flextensor.loaders.TensorStrategyLoader` to scope the
+    untimed-traced rescue — see
+    ``tests/unit/test_untimed_traps_runtime.py::TestStrategyLoaderUntimedRescue``
+    for the rescue-side assertions.
+    """
+
+    def test_returns_module_param_and_buffer_ids(self) -> None:
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+                self.register_buffer("b", torch.zeros(2))
+
+        m = _M()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(m.w) in ids
+        assert id(m.b) in ids
+
+    def test_returns_dict_model_tensor_ids(self) -> None:
+        t1 = torch.zeros(4)
+        t2 = torch.zeros(8)
+        model = {"a": t1, "b": t2, "non_tensor": "ignored"}
+
+        ids = compute_reachable_tensor_ids(model)
+
+        assert ids == {id(t1), id(t2)}
+
+    def test_returns_empty_for_none(self) -> None:
+        assert compute_reachable_tensor_ids(None) == set()
+
+    def test_discovers_inner_field_tensors(self) -> None:
+        """Inner-field tensors (e.g. ``weight.scale``) are reachable too.
+
+        This is the case a hand-rolled
+        ``named_parameters``/``named_buffers`` walk would miss: a
+        quantised parameter that carries a sibling tensor as an instance
+        attribute. The :class:`TensorProcessor` traversal — inherited by
+        :class:`ReachableTensorIdsProcessor` — discovers these via the
+        standard ``map_inner_fields`` walk, so they participate in the
+        rescue's narrowing instead of being silently excluded.
+        """
+
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+                self.w.scale = torch.zeros(1)
+
+        m = _M()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(m.w) in ids
+        assert id(m.w.scale) in ids
+
+    def test_recurses_into_submodules(self) -> None:
+        """Submodule params and buffers are part of the reachable set."""
+
+        class _Inner(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(2))
+
+        class _Outer(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inner = _Inner()
+
+        m = _Outer()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(m.inner.w) in ids
+
+    def test_skips_meta_tensors(self) -> None:
+        """Meta tensors have no allocation backing their ``id()``.
+
+        Excluding them keeps the narrowing input aligned with what
+        :class:`TensorMappingProcessor` actually records into
+        ``tensors_map`` (CPU, non-meta tensors).
+        """
+
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+                self.register_buffer("meta_buf", torch.zeros(2, device="meta"))
+
+        m = _M()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(m.w) in ids
+        assert id(m.meta_buf) not in ids
+
+    def test_processor_does_not_mutate_attributes(self) -> None:
+        """Read-only walk: ``update_attributes=False`` keeps the model intact."""
+
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+
+        m = _M()
+        original_w = m.w
+        proc = ReachableTensorIdsProcessor()
+        proc.apply(m)
+
+        assert m.w is original_w
+        assert id(original_w) in proc.get_results()
 
 
 class TestMoveBuffersToGPUTensorProcessor:

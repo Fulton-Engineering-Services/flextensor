@@ -18,9 +18,9 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
-from flextensor.helpers import TrapNestingGuard
+from flextensor.helpers import ProfilingSuspender, TrapNestingGuard
 from flextensor.instrumentation import instrumentable
-from flextensor.layer_statistics_analyzer import LayerStatisticsAnalyzer
+from flextensor.layer_statistics_analyzer import report_profiling_quality
 from flextensor.loaders import (
     AllocationBlockController,
     PreallocatedBatchTransferTensorLoader,
@@ -64,6 +64,7 @@ from flextensor.tensor_processors import (
     BenchmarkTensorProcessor,
     MoveUnmappedTensorsToGPUProcessor,
     TensorReplacementProcessor,
+    compute_reachable_tensor_ids,
     create_model_with_shared_tensors,
     preprocess_model,
 )
@@ -236,8 +237,22 @@ def prepare_model(model, tensor_manager):
 
 
 def compute_layer_statistics(iterative_layer_statistics, tensor_statistics_map) -> list[LayerStatistics]:
+    """Convert iterative (collection-time) stats to strict (strategy-time) stats.
+
+    Entries whose ``duration`` is ``None`` — i.e. labels that were discovered
+    but never had a duration sample recorded — are dropped here. This is the
+    phase boundary where the collector's tolerant shape is narrowed down to
+    the strategy package's requirement that every ``LayerStatistics.duration``
+    is a real measurement.
+
+    Dropping is silent; which traps were untimed is reported by
+    :class:`flextensor.layer_statistics_analyzer.UntimedTrapsReport`.
+    """
     layers_stats = []
     for iterative_layer_stat in iterative_layer_statistics:
+        if iterative_layer_stat.duration is None:
+            continue
+
         tensors = []
         for tensor_id in iterative_layer_stat.tensor_ids:
             if tensor_id not in tensor_statistics_map:
@@ -254,6 +269,7 @@ def compute_layer_statistics(iterative_layer_statistics, tensor_statistics_map) 
             duration=iterative_layer_stat.duration,
         )
         layers_stats.append(layers_statistics)
+
     return layers_stats
 
 
@@ -376,6 +392,7 @@ class TensorManager:
         self.trap_start_event = torch.cuda.Event(enable_timing=True)
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
+        self._profiling_suspender = ProfilingSuspender()
 
     def build_parameters_mapping(self, model):
         self.tensor_id_to_name_map = {}
@@ -553,7 +570,6 @@ class TensorManager:
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
 
         self.trap_class = TrapDirect
-        self.layer_statistics_collector.clear_duration_measurements()
 
     def prepare_profile_mode(self):
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
@@ -581,7 +597,6 @@ class TensorManager:
         self.tensor_layer_loader = TensorLayerLoader(self.layer_stats, self.tensors_map, self.device_gpu)
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
         self.trap_class = Trap
-        self.layer_statistics_collector.clear_duration_measurements()
 
     def _select_infer_trap_class(self) -> type:
         """Select appropriate trap class for inference mode based on direct_enabled setting."""
@@ -616,6 +631,13 @@ class TensorManager:
 
         This method is called when tensor_manager_state has been loaded from a saved profile.
         It extracts LoaderInputData from the state and creates the appropriate loader.
+
+        Unlike :meth:`prepare_infer_mode`, this does not call
+        ``report_profiling_quality``: its untimed-trap signal lives in the
+        collector, which is dropped by :func:`compute_layer_statistics`
+        before state is serialized. The load-time equivalent is the
+        unconditional rescue warning in
+        :class:`flextensor.loaders.TensorStrategyLoader`.
         """
         self.load_strategy = self.tensor_manager_state.load_strategy
         self.stats = self.tensor_manager_state.stats
@@ -644,6 +666,7 @@ class TensorManager:
             self.device_gpu,
             self.release_tensors,
             self.transfer_stream_priority,
+            reachable_tensor_ids=compute_reachable_tensor_ids(self.model),
         )
 
         if prepare_state:
@@ -890,9 +913,7 @@ class TensorManager:
         This method is called after profiling to compute the load strategy and create
         the appropriate loader for inference.
         """
-        # Called for side effect: emits WARNING + the Layer Duration table on
-        # inconsistent measurements. Return value intentionally discarded.
-        LayerStatisticsAnalyzer(self.layer_statistics_collector).check_measurement_consistency()
+        report_profiling_quality(self.layer_statistics_collector, self.enable_diagnostics)
 
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
         # Remove tensors that are not parameters!
@@ -1070,6 +1091,76 @@ class TensorManager:
         state = self.load_state(profile_directory)
         self.restore_state(model, state)
 
+    def suspend_profiling(self) -> None:
+        """Suppress duration recording; see :class:`~flextensor.helpers.ProfilingSuspender`."""
+        self._profiling_suspender.suspend()
+
+    def resume_profiling(self) -> None:
+        """Release one outstanding :meth:`suspend_profiling` call."""
+        self._profiling_suspender.resume()
+
+    # See `flextensor.helpers.ProfilingSuspender.suspended` for the `-> Any` rationale
+    # (beartype + @contextmanager cross-version compatibility).
+    @contextmanager
+    def pause_profiling(self) -> Any:
+        """Context-manager form of :meth:`suspend_profiling` / :meth:`resume_profiling`.
+
+        Shares the refcount, so it nests freely with the raw methods.
+        """
+        with self._profiling_suspender.suspended():
+            yield
+
+    def is_profiling_suspended(self) -> bool:
+        """``True`` while any :meth:`suspend_profiling` call is outstanding."""
+        return self._profiling_suspender.is_suspended()
+
+    def clear_profiling_durations(self) -> None:
+        """Clear all accumulated duration measurements.
+
+        No-op if no collector is active.
+        """
+        if self.layer_statistics_collector is not None:
+            self.layer_statistics_collector.clear_duration_measurements()
+
+    def record_tensors(self, label: str, tensor_ids: list[int] | set[int]) -> None:
+        """Record tensor IDs for a DISCOVERY-phase trap exit.
+
+        Discovery captures only the tensor-to-layer mapping — ``WarmupTrap``
+        does not measure per-iteration durations, so there is no duration
+        sample to record here. Suspension is not consulted because the
+        mapping is a hard prerequisite for every later phase.
+
+        No-op if no collector is active.
+        """
+        if self.layer_statistics_collector is None:
+            return
+        self.layer_statistics_collector.add_tensors(label, tensor_ids)
+
+    def record_all(self, label: str, tensor_ids: list[int] | set[int], duration_ms: float) -> None:
+        """Record tensor IDs and duration for a PROFILING-phase trap exit.
+
+        No-op if no collector is active or profiling is suspended. Suspending
+        skips both the tensor IDs and the duration sample so a paused warmup
+        pass cannot widen per-layer tensor sets on data-dependent models
+        (MoE / conditional branches).
+        """
+        if self.layer_statistics_collector is None:
+            return
+        if self.is_profiling_suspended():
+            return
+        self.layer_statistics_collector.add_tensors(label, tensor_ids)
+        self.layer_statistics_collector.add_duration(label, duration_ms)
+
+    def record_duration(self, label: str, duration_ms: float) -> None:
+        """Record a duration sample unless profiling is suspended.
+
+        No-op if no collector is active or profiling is suspended.
+        """
+        if self.layer_statistics_collector is None:
+            return
+        if not self.is_profiling_suspended():
+            self.layer_statistics_collector.add_duration(label, duration_ms)
+
     def trap(self, name):
         return self.trap_class(self, name, self.device_gpu)
 
@@ -1170,7 +1261,13 @@ class TensorManager:
         move_to_gpu_processor = MoveUnmappedTensorsToGPUProcessor(self.device_gpu, tensor_id_to_view_map)
         move_to_gpu_processor.apply(model)
 
-        # Track GPU memory used by unmapped tensors (tensors moved to GPU that aren't in view_map)
+        # Tensors outside any per-layer block (embeddings, lm_head, top-level
+        # norms, etc.) are force-pinned to GPU here. This is the documented
+        # normal pattern, not a rescue: ``get_gpu_memory_usage()`` exposes the
+        # footprint via ``unmapped_tensors_bytes``, and profile-coverage gaps
+        # for *trapped* labels are surfaced upstream by
+        # ``report_profiling_quality`` (fresh runs) and the strategy-loader
+        # rescue warning (saved-state load).
         self._unmapped_tensors_bytes = move_to_gpu_processor.unmapped_gpu_bytes
 
         replace_tensor_processor = TensorReplacementProcessor(tensor_id_to_view_map)
