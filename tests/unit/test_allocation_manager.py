@@ -3,18 +3,19 @@
 import torch
 
 from flextensor.allocation_block import AllocationBlock, AllocationManager
+from flextensor.host_pinning import HostPinner
 
 
 class TestAllocationManager:
     def setup_method(self):
         """Set up test fixtures before each test method."""
-        self.manager = AllocationManager()
+        self.manager = AllocationManager(host_pinner=HostPinner())
         # Force CPU device for tests (MPS doesn't support float64)
         self.device = "cpu"
 
     def test_manager_initialization(self):
         """Test that AllocationManager initializes correctly."""
-        manager = AllocationManager()
+        manager = AllocationManager(host_pinner=HostPinner())
         assert isinstance(manager.blocks, list)
         assert len(manager.blocks) == 0
 
@@ -57,7 +58,7 @@ class TestMultipleBlockWorkflow:
 
     def setup_method(self):
         """Set up test fixtures before each test method."""
-        self.manager = AllocationManager()
+        self.manager = AllocationManager(host_pinner=HostPinner())
 
     def test_two_block_workflow(self):
         """Test the workflow with two separate blocks as shown in main code."""
@@ -136,7 +137,7 @@ class TestViewProjectionWorkflow:
 
     def setup_method(self):
         """Set up test fixtures before each test method."""
-        self.manager = AllocationManager()
+        self.manager = AllocationManager(host_pinner=HostPinner())
 
     def test_view_projection_workflow(self):
         """Test the complete view projection workflow from main code."""
@@ -182,7 +183,7 @@ class TestDataCopyingWorkflow:
 
     def setup_method(self):
         """Set up test fixtures before each test method."""
-        self.manager = AllocationManager()
+        self.manager = AllocationManager(host_pinner=HostPinner())
 
     def test_copy_to_workflow(self):
         """Test the copy_to workflow from main code."""
@@ -242,7 +243,7 @@ class TestComplexIntegrationWorkflow:
 
     def setup_method(self):
         """Set up test fixtures before each test method."""
-        self.manager = AllocationManager()
+        self.manager = AllocationManager(host_pinner=HostPinner())
 
     def test_full_main_workflow(self):
         """Test the complete workflow exactly as shown in main code."""

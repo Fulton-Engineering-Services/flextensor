@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import collections
+import logging
 import statistics
 import types
 from collections.abc import Callable
@@ -9,8 +10,11 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 import torch
 
 from flextensor.collectors import TensorStatistics
+from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.utils import calculate_tensor_size
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -458,49 +462,40 @@ class TensorProcessor:
 
 
 @instrumentable
-class MoveToPinMemoryTensorProcessorOld(TensorProcessor):
-    def __init__(self):
+class MoveToPinMemoryTensorProcessor(TensorProcessor):
+    """Pin CPU tensors via the configured :class:`HostPinner`.
+
+    Dispatches to ``tensor.pin_memory()`` (torch mode) or ``cudaHostRegister``
+    (host_register mode) based on the pinner's mode.
+
+    The cache is keyed by ``id(src)`` and skips ``pin`` on repeats of the same
+    Python object. Distinct objects that share storage (e.g. a tensor and its
+    view) miss the cache; in host_register mode the second ``pin`` call finds
+    the storage pointer already in the registry and returns without calling
+    ``cudaHostRegister`` again.
+    """
+
+    def __init__(self, host_pinner: HostPinner):
         super().__init__()
+        self.host_pinner = host_pinner
+        self.cache: dict[int, torch.Tensor] = {}
+
+    def cleanup(self):
         self.cache = {}
 
     def process(self, src):
         if not isinstance(src, torch.Tensor) or src.is_meta:
             return src
-
-        if isinstance(src, torch.Tensor):
-            if src.device != torch.device("cpu"):
-                return src
-            src_tensor_id = id(src)
-            if src_tensor_id in self.cache:
-                new_tensor = self.cache[src_tensor_id]
-            else:
-                new_tensor = src.pin_memory()
-                self.cache[src_tensor_id] = new_tensor
-            self._process_inner_fields(src, new_tensor)
-
-            return new_tensor
-        return src
-
-
-@instrumentable
-class MoveToPinMemoryTensorProcessor(TensorProcessor):
-    def __init__(self):
-        super().__init__()
-        self.cache = {}
-
-    def process(self, src):
-        if isinstance(src, torch.Tensor):
-            if src.device != torch.device("cpu"):
-                return src
-            src_tensor_id = id(src)
-            if src_tensor_id in self.cache:
-                pinned_tensor = self.cache[src_tensor_id]
-            else:
-                pinned_tensor = src.pin_memory()
-                self.cache[src_tensor_id] = pinned_tensor
-            self._process_inner_fields(src, pinned_tensor)
-            return pinned_tensor
-        return src
+        if src.device != torch.device("cpu"):
+            return src
+        src_tensor_id = id(src)
+        if src_tensor_id in self.cache:
+            pinned_tensor = self.cache[src_tensor_id]
+        else:
+            pinned_tensor = self.host_pinner.pin(src)
+            self.cache[src_tensor_id] = pinned_tensor
+        self._process_inner_fields(src, pinned_tensor)
+        return pinned_tensor
 
 
 @instrumentable
@@ -838,10 +833,12 @@ def preprocess_model(
     device_gpu,
     disable_gradient=True,
     pin_memory=False,
+    *,
+    host_pinner: HostPinner,
     move_top_level_buffers_to_gpu=True,
 ):
     if pin_memory:
-        move_to_pinned_memory = MoveToPinMemoryTensorProcessor()
+        move_to_pinned_memory = MoveToPinMemoryTensorProcessor(host_pinner)
         move_to_pinned_memory.apply(model)
     if disable_gradient:
         disable_grad = DisableRequiresGradTensorProcessor()

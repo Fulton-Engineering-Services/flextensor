@@ -39,6 +39,7 @@ class TestOffloadConfig:
         config = OffloadConfig()
         assert config.gpu_device == 0
         assert config.pinned_memory is True
+        assert config.pinned_memory_mode == "torch"
         assert config.shm_enabled is False
         assert config.discovery_iters == 1
         assert config.profiling_iters == 10
@@ -84,6 +85,20 @@ class TestOffloadConfig:
         """max_gpu_mem_fraction > 1.0 is rejected."""
         with pytest.raises(ValidationError):
             OffloadConfig(max_gpu_mem_fraction=1.1)
+
+    def test_pinned_memory_mode_default(self):
+        """Default pinned_memory_mode is 'torch'."""
+        assert OffloadConfig().pinned_memory_mode == "torch"
+
+    def test_pinned_memory_mode_host_register_accepted(self):
+        """'host_register' is a valid pinned_memory_mode."""
+        config = OffloadConfig(pinned_memory_mode="host_register")
+        assert config.pinned_memory_mode == "host_register"
+
+    def test_pinned_memory_mode_invalid_rejected(self):
+        """Unknown pinned_memory_mode values are rejected with a helpful message."""
+        with pytest.raises(ValidationError, match="pinned_memory_mode"):
+            OffloadConfig(pinned_memory_mode="cuda_alloc")
 
     def test_max_gpu_mem_bytes_deprecated_emits_warning(self):
         """Setting max_gpu_mem_bytes emits DeprecationWarning."""
@@ -483,6 +498,26 @@ class TestLoadConfigFromEnv:
         os.environ["FT_TRANSFER_MODE"] = "custom_transfer"
         config = load_config_from_env()
         assert config.transfer_mode == "custom_transfer"
+
+    def test_load_pinned_memory_mode_from_env(self):
+        """FT_PINNED_MEMORY_MODE is picked up from the environment."""
+        os.environ["FT_PINNED_MEMORY_MODE"] = "host_register"
+        config = load_config_from_env()
+        assert config.pinned_memory_mode == "host_register"
+
+    def test_load_pinned_memory_mode_from_env_rejects_invalid(self):
+        """Invalid FT_PINNED_MEMORY_MODE values must surface as a
+        ValidationError, not be silently dropped.
+
+        Regression guard for the ``Literal[...]`` field annotation: an earlier
+        revision of the env-var resolver classified Literal fields as
+        ``object`` and skipped them entirely, so a typo in the env var would
+        be ignored and the default would be used. Now the env var must reach
+        Pydantic and trip Literal validation.
+        """
+        os.environ["FT_PINNED_MEMORY_MODE"] = "cuda_alloc"
+        with pytest.raises(ValidationError, match="pinned_memory_mode"):
+            load_config_from_env()
 
     def test_load_multiple_fields(self):
         """Test loading multiple fields from environment."""
@@ -1094,6 +1129,37 @@ num_blocks = 8
         assert config.include_patterns == ["*"]
         assert config.exclude_patterns == ["lm_head", "*.scale"]
 
+    def test_pinned_memory_mode_round_trips_through_yaml(self, tmp_path):
+        """``pinned_memory_mode: host_register`` survives a YAML file load.
+
+        Locks in the documented behaviour from
+        ``docs/explanation/configuration.md`` that the mode field is a
+        first-class config option deployable via file. The Pydantic
+        ``Literal["torch", "host_register"]`` typing means a YAML string
+        passes through validation and lands on the model unchanged; this
+        test pins that contract for the new field.
+        """
+        config_file = tmp_path / "pin_mode.yaml"
+        config_file.write_text("""enabled: true
+pinned_memory: true
+pinned_memory_mode: host_register
+""")
+        config = load_config_from_file(config_file)
+        assert config.pinned_memory is True
+        assert config.pinned_memory_mode == "host_register"
+
+    def test_pinned_memory_mode_invalid_yaml_value_rejected(self, tmp_path):
+        """An unknown ``pinned_memory_mode`` in a YAML file must surface as
+        a ``ValidationError`` at load time, not silently fall through to
+        the default. Mirrors ``test_pinned_memory_mode_invalid_rejected``
+        for the construction path.
+        """
+        config_file = tmp_path / "bad_pin_mode.yaml"
+        config_file.write_text("""pinned_memory_mode: cuda_alloc
+""")
+        with pytest.raises(ValidationError, match="pinned_memory_mode"):
+            load_config_from_file(config_file)
+
 
 class TestGetFieldTypes:
     """Test _get_field_types helper function."""
@@ -1189,6 +1255,25 @@ discovery_iters: 5
         assert config.enabled is True  # from file
         assert config.gpu_device == 10  # from env (overrides file)
         assert config.discovery_iters == 5  # from file
+
+    def test_env_overrides_pinned_memory_mode_in_file(self, tmp_path):
+        """``FT_PINNED_MEMORY_MODE`` overrides the value set in a YAML file.
+
+        Documented precedence is kwargs > env > file. This pins that
+        ordering for the new ``pinned_memory_mode`` field — a deployment
+        that ships ``pinned_memory_mode: torch`` in its baseline YAML can
+        opt into ``host_register`` per-host via the env var.
+        """
+        config_file = tmp_path / "pin_mode.yaml"
+        config_file.write_text("""enabled: true
+pinned_memory: true
+pinned_memory_mode: torch
+""")
+        os.environ["FT_PINNED_MEMORY_MODE"] = "host_register"
+
+        config = load_config(config_path=config_file)
+        assert config.pinned_memory is True  # from file
+        assert config.pinned_memory_mode == "host_register"  # from env (overrides file)
 
     def test_kwargs_override_env_and_file(self, tmp_path):
         """Test that kwargs override both env and file values."""

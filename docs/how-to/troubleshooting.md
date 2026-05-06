@@ -129,6 +129,7 @@ The JSON file contains:
           "_module": "flextensor.strategy"
         },
         "pinned_memory": true,
+        "pinned_memory_mode": "torch",
         "loader_type": "allocation_block_transfer",
         "remove_layers_operations": [],
         "blocks": 4,
@@ -309,9 +310,39 @@ See [Step 2: Narrow the include patterns](#step-2-narrow-the-include-patterns) u
 
 **Why this helps:** Fewer trapped modules means fewer weights pinned in host RAM.
 
-### Step 3: Disable pinned memory as a last resort
+### Step 3: Switch to in-place pinning
 
-If host memory is still exhausted after narrowing patterns, disable pinned memory:
+The default `pin_memory()` path copies each weight into a fresh allocation from PyTorch's caching pinned allocator, which rounds up to the next power of two ([pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)) and briefly holds both the source and pinned copy in RAM. Switching to `host_register` mode pins the *existing* allocation in place via `cudaHostRegister` — no copy, no rounding doubling:
+
+```python
+config = OffloadConfig(
+    pinned_memory=True,
+    pinned_memory_mode="host_register",
+)
+```
+
+This keeps the performance benefit of pinned memory (non-blocking DMA) while removing the peak-RAM spike. On a CUDA host with a broken `cudart` binding, falls back to `"torch"` with a warning. On a CPU-only host, `pinned_memory=True` raises at `TensorManager` construction time — offloading without a GPU has no purpose, and silently degrading would mask the misconfiguration as a perf regression. Set `pinned_memory=False` on CPU-only hosts.
+
+!!! note "SHM segments are already pinned in place"
+    `pinned_memory_mode` only affects the non-SHM allocator path. When `shm_enabled=True`, the SHM segment itself is always registered in place via `cudaHostRegister` (regardless of mode), because POSIX shared-memory buffers can't be re-allocated through PyTorch's pinned allocator. Switching to `"host_register"` mode is what lets the *non-SHM* per-layer blocks avoid the doubling described above.
+
+!!! note "Pinning `RuntimeError` from `cudaHostRegister` or `tensor.pin_memory()`"
+    Pinning is strict at every site that pins host memory — model preparation (`preprocess_model`), warmup, profiling, and benchmark passes. The first failure aborts the offending phase with a `RuntimeError` that names the operation, pointer, size, and cudart rc. Common causes:
+
+    - `RLIMIT_MEMLOCK` exhaustion (most frequent in containers / unprivileged processes).
+    - Pinned-pool pressure (PyTorch's caching pinned allocator out of headroom).
+    - A non-zero `cudaHostRegister` rc (rare; usually surfaces as `cudaError… 712 / 717`).
+
+    Mitigations, in rough order of preference:
+
+    - Raise the lock budget — `ulimit -l unlimited` (or `LimitMEMLOCK=infinity` for systemd units, `--ulimit memlock=-1` for Docker).
+    - Reduce pinned footprint — narrow `include_patterns` (or add `exclude_patterns`) to offload fewer modules.
+    - Switch modes — `pinned_memory_mode="torch"` uses PyTorch's allocator instead of `cudaHostRegister`, but it still locks pages so it doesn't relieve `RLIMIT_MEMLOCK`; only worth trying when the failure is specific to in-place registration.
+    - Disable pinning entirely — `pinned_memory=False`. Loses non-blocking transfer overlap but lets the pipeline run.
+
+### Step 4: Disable pinned memory as a last resort
+
+If host memory is still exhausted, disable pinned memory entirely:
 
 ```python
 config = OffloadConfig(

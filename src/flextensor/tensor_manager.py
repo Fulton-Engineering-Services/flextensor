@@ -19,6 +19,7 @@ from flextensor.collectors import (
     TensorStatistics,
 )
 from flextensor.helpers import ProfilingSuspender, TrapNestingGuard
+from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
 from flextensor.instrumentation import instrumentable
 from flextensor.layer_statistics_analyzer import report_profiling_quality
 from flextensor.loaders import (
@@ -280,6 +281,7 @@ class TensorManager:
         device_gpu,
         tensor_manager_load_strategy,
         pinned_memory: bool = True,
+        pinned_memory_mode: PinnedMemoryMode = "torch",
         loader_type="allocation_block_transfer",
         remove_layers_operations=None,
         blocks=4,
@@ -306,6 +308,17 @@ class TensorManager:
                 Required for non-blocking transfers on a separate CUDA stream so that
                 weight copies can overlap with GPU computation. Increases host memory
                 pressure since pinned pages cannot be swapped. (default: True)
+            pinned_memory_mode: How to pin CPU tensors when ``pinned_memory=True``.
+                ``"torch"`` uses :meth:`torch.Tensor.pin_memory` (fresh pinned copy);
+                ``"host_register"`` uses ``cudaHostRegister`` to pin in place (no copy,
+                lower peak host RAM). On a CUDA host whose cudart binding is broken or
+                missing, the requested mode falls back to ``"torch"`` with a WARNING
+                log naming the cause. On a CPU-only host, ``pinned_memory=True``
+                raises ``RuntimeError`` at construction — set ``pinned_memory=False``
+                for CPU-only deployments. SHM segments built with
+                ``pinned_memory=True`` register in place regardless of this setting;
+                SHM segments built with ``pinned_memory=False`` are not registered.
+                (default: "torch")
             loader_type: Type of tensor loader to use. Options:
                 - "strategy": Uses TensorStrategyLoader
                 - "raw_block_transfer": Uses PreallocatedBatchTransferTensorLoader with RawBlockController
@@ -346,6 +359,7 @@ class TensorManager:
         self.tensor_manager_load_strategy = tensor_manager_load_strategy
         self.release_tensors = True
         self.pinned_memory = pinned_memory
+        self.host_pinner: HostPinner = make_host_pinner(pinned_memory, pinned_memory_mode)
         self._benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace if _use_trace_tensor else NoOpBenchmark
         self.direct_enabled = _direct_mode
         self.traced_tensors = set()
@@ -393,6 +407,22 @@ class TensorManager:
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
         self._profiling_suspender = ProfilingSuspender()
+
+    @property
+    def host_pin_registry(self) -> HostPinRegistry | None:
+        """The :class:`HostPinRegistry` backing host_register mode, or ``None`` in torch mode."""
+        return self.host_pinner.registry
+
+    def should_pin_in_preprocess(self) -> bool:
+        """Whether ``preprocess_model`` should pin during model preparation.
+
+        Block-loader paths (``allocation_block_transfer`` / ``raw_block_transfer``)
+        pin their own per-block buffers later, so preprocess pins nothing for
+        those loader types regardless of :attr:`pinned_memory`.
+        """
+        if self.loader_type in ("allocation_block_transfer", "raw_block_transfer"):
+            return False
+        return self.pinned_memory
 
     def build_parameters_mapping(self, model):
         self.tensor_id_to_name_map = {}
@@ -466,14 +496,12 @@ class TensorManager:
             return self.model
 
         if not self.use_trace_tensor:  # TODO: add support for trace tensor
-            pin_memory = self.pinned_memory
-            if self.loader_type in ["allocation_block_transfer", "raw_block_transfer"]:
-                pin_memory = False
             preprocess_model(
                 self.model,
                 self,
                 self.device_gpu,
-                pin_memory=pin_memory,
+                pin_memory=self.should_pin_in_preprocess(),
+                host_pinner=self.host_pinner,
                 move_top_level_buffers_to_gpu=self.move_top_level_buffers_to_gpu,
             )
             self._move_non_offloaded_tensors_to_gpu()
@@ -720,6 +748,7 @@ class TensorManager:
             self.tensors_map,
             self.load_strategy,
             label_to_block_id,
+            host_pinner=self.host_pinner,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -799,6 +828,7 @@ class TensorManager:
             use_shm=self.use_shm,
             shm_block_name_map=data.shm_block_name_map,
             block_name_fn=block_name_fn,
+            host_pinner=self.host_pinner,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -1169,8 +1199,19 @@ class TensorManager:
             self.tensor_layer_loader.release_memory()
 
     def shutdown(self):
-        if self.tensor_layer_loader is not None:
-            self.tensor_layer_loader.shutdown()
+        try:
+            if self.tensor_layer_loader is not None:
+                self.tensor_layer_loader.shutdown()
+        finally:
+            # Pins must be released even if loader teardown raises, but a
+            # release_all() exception inside this finally block would mask
+            # the original loader exception — log and swallow instead.
+            try:
+                self.host_pinner.release_all()
+            except Exception:
+                logger.exception(
+                    "host_pinner.release_all() raised during shutdown; remaining pins will leak until process exit"
+                )
 
     def get_gpu_memory_usage(self) -> GPUMemoryUsage:
         """Get GPU memory usage by FlexTensor in inference mode.
@@ -1245,6 +1286,7 @@ class TensorManager:
             device_gpu=self.device_gpu,
             pinned_memory=self.pinned_memory,
             iterations=iterations,
+            host_pinner=self.host_pinner,
         )
 
         with benchmark_instance as benchmark:
@@ -1262,7 +1304,7 @@ class TensorManager:
         move_to_gpu_processor.apply(model)
 
         # Tensors outside any per-layer block (embeddings, lm_head, top-level
-        # norms, etc.) are force-pinned to GPU here. This is the documented
+        # norms, etc.) are moved to GPU here (device copy). This is the documented
         # normal pattern, not a rescue: ``get_gpu_memory_usage()`` exposes the
         # footprint via ``unmapped_tensors_bytes``, and profile-coverage gaps
         # for *trapped* labels are surfaced upstream by

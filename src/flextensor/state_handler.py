@@ -61,8 +61,11 @@ class LoaderInputData:
 
 @dataclass
 class TensorManagerState:
-    """
-    State container for TensorManager that can be serialized/deserialized.
+    """State container for TensorManager that can be serialized/deserialized.
+
+    Note:
+        ``pinned_memory_mode`` is host-side policy, not part of the saved
+        plan — restored managers take it from their constructor argument.
     """
 
     # Schema version for serialization. Bump when the persisted structure changes.
@@ -511,14 +514,12 @@ class TensorManagerStateHandler:
         # Put model in the same state as the discovery path: disable grad, params/buffers on GPU,
         # pinned memory for strategy loader, and traced_tensors populated for inference traps.
         if not tm.use_trace_tensor:  # TODO: add support for trace tensor
-            pin_memory = tm.pinned_memory
-            if tm.loader_type in ["allocation_block_transfer", "raw_block_transfer"]:
-                pin_memory = False
             preprocess_model(
                 model,
                 tm,
                 tm.device_gpu,
-                pin_memory=pin_memory,
+                pin_memory=tm.should_pin_in_preprocess(),
+                host_pinner=tm.host_pinner,
                 move_top_level_buffers_to_gpu=tm.move_top_level_buffers_to_gpu,
             )
 

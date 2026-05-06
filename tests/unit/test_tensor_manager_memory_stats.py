@@ -3,9 +3,19 @@
 """Unit tests for TensorManager.get_memory_transfer_stats accessor."""
 
 import pytest
+import torch
 
 from flextensor.strategy import KnapsackStrategy
 from flextensor.tensor_manager import TensorManager
+
+
+@pytest.fixture(autouse=True)
+def _fake_cuda_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend CUDA is available so ``TensorManager(pinned_memory=True)``
+    construction doesn't raise on CPU-only CI hosts. These tests only
+    exercise the stats accessor; they don't need real CUDA.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
 
 class TestGetMemoryTransferStats:

@@ -18,7 +18,9 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from flextensor import state_handler as state_handler_module
 from flextensor.collectors import LayerStatistics, TensorStatistics
+from flextensor.host_pinning import HostPinner
 from flextensor.state_handler import (
     StateValidationResult,
     TensorManagerState,
@@ -407,3 +409,104 @@ class TestRestoreStateWithValidation:
         restored_state = self.mock_tm.tensor_manager_state
         assert "missing.view" not in restored_state.view_tensors_names
         assert "valid.view" not in restored_state.view_tensors_names
+
+
+class TestRestoreStateForwardsHostPinner:
+    """restore_state must forward the manager's HostPinner into preprocess_model.
+
+    Regression guard: the HostPinner registry is owned by TensorManager and must
+    be reused across the system. If restore_state ever constructs a fresh
+    HostPinner() instead of forwarding ``tm.host_pinner``, host_register-mode
+    pinnings would not be tracked by the manager's registry.
+    """
+
+    def setup_method(self):
+        self.model = SimpleModel()
+        self.model_tensor_names = [name for name, _ in self.model.named_parameters()]
+
+        self.host_pinner = HostPinner()
+        self.mock_tm = MagicMock()
+        self.mock_tm.use_trace_tensor = False  # exercise the preprocess_model branch
+        self.mock_tm.loader_type = "strategy"
+        self.mock_tm.pinned_memory = True
+        self.mock_tm.host_pinner = self.host_pinner
+        self.mock_tm.device_gpu = torch.device("cpu")
+        self.mock_tm.move_top_level_buffers_to_gpu = False
+
+        self.handler = TensorManagerStateHandler(self.mock_tm)
+
+    def _patch_preprocess_model(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_preprocess_model(model, tensor_manager, device_gpu, **kwargs):
+            captured["model"] = model
+            captured["tensor_manager"] = tensor_manager
+            captured["device_gpu"] = device_gpu
+            captured.update(kwargs)
+
+        monkeypatch.setattr(state_handler_module, "preprocess_model", fake_preprocess_model)
+        return captured
+
+    def test_restore_state_forwards_manager_host_pinner(self, monkeypatch):
+        captured = self._patch_preprocess_model(monkeypatch)
+        state = create_mock_state(self.model_tensor_names)
+
+        self.handler.restore_state(self.model, state, strict=True)
+
+        assert "host_pinner" in captured, "restore_state must pass host_pinner to preprocess_model"
+        assert captured["host_pinner"] is self.host_pinner, (
+            "restore_state must forward the same HostPinner instance owned by the manager, "
+            "not a freshly constructed default."
+        )
+
+    def test_restore_state_consults_should_pin_in_preprocess(self, monkeypatch):
+        """The pin_memory value forwarded to ``preprocess_model`` must come
+        from :meth:`TensorManager.should_pin_in_preprocess` — not be
+        re-derived inline. Pins the contract that block-loader semantics
+        live in one place.
+
+        The per-loader-type rule itself is covered by
+        :class:`TestShouldPinInPreprocess` in
+        ``test_tensor_manager_pinned_memory_mode.py``.
+        """
+        sentinel = object()
+        self.mock_tm.should_pin_in_preprocess.return_value = sentinel
+        captured = self._patch_preprocess_model(monkeypatch)
+        state = create_mock_state(self.model_tensor_names)
+
+        self.handler.restore_state(self.model, state, strict=True)
+
+        self.mock_tm.should_pin_in_preprocess.assert_called_once_with()
+        assert captured["pin_memory"] is sentinel, (
+            "state_handler must forward should_pin_in_preprocess()'s "
+            "return value verbatim, not re-derive the rule from tm.pinned_memory + "
+            "tm.loader_type"
+        )
+        assert captured["host_pinner"] is self.host_pinner
+
+
+class TestPinnedMemoryModeNotInSavedState:
+    """``pinned_memory_mode`` is a host-side resource policy, not part of
+    the discovered loader plan, and must not be carried by
+    :class:`TensorManagerState`. Pinning this contract prevents a silent
+    mismatch where a profile saved under one mode is later restored into a
+    manager with a different mode and the JSON looks authoritative."""
+
+    def test_pinned_memory_mode_not_a_field_of_state(self):
+        import dataclasses
+
+        field_names = {f.name for f in dataclasses.fields(TensorManagerState)}
+        assert "pinned_memory_mode" not in field_names, (
+            "pinned_memory_mode must not be a TensorManagerState field — see TensorManagerState docstring for rationale"
+        )
+
+    def test_to_dict_round_trip_does_not_carry_pinned_memory_mode(self):
+        state = create_mock_state(["layer.weight"])
+
+        as_dict = state.to_dict()
+
+        assert "pinned_memory_mode" not in as_dict, (
+            "to_dict() must not surface pinned_memory_mode — restored "
+            "managers must take their mode from the live constructor "
+            "argument, not from a serialized profile"
+        )

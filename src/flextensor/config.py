@@ -15,13 +15,14 @@ import types
 import warnings
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Union, get_args, get_origin
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 import yaml
 from pydantic import BaseModel, Field, WithJsonSchema, model_validator
 from typing_extensions import Self
 from typing_extensions import deprecated as _deprecated
 
+from flextensor.host_pinning import PinnedMemoryMode
 from flextensor.strategy import Strategy
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,36 @@ class OffloadConfig(BaseModel):
 
     pinned_memory: bool = Field(default=True)
     """Whether to use pinned (page-locked) memory for CPU tensors, enabling non-blocking GPU transfers."""
+
+    pinned_memory_mode: PinnedMemoryMode = Field(default="torch")
+    """How to pin CPU tensors when ``pinned_memory=True``.
+
+    - ``"torch"`` (default) — :meth:`torch.Tensor.pin_memory`: copies the
+      tensor into a fresh pinned allocation.
+    - ``"host_register"`` — ``cudaHostRegister``: pins the existing allocation
+      in place (no copy, lower peak host memory). Requires a loadable CUDA
+      runtime.
+
+    Has no effect when ``pinned_memory=False``.
+    Can also be set via the ``FT_PINNED_MEMORY_MODE`` env var.
+
+    .. note:: Only controls the non-SHM allocator path. When
+        ``shm_enabled=True`` *and* the SHM segment is built with
+        ``pinned_memory=True``, that segment is registered in place via
+        ``cudaHostRegister`` regardless of this mode.
+
+    .. note:: Records the requested value and never mutates. Two
+        construction-time outcomes can diverge from a naive read of this
+        field:
+
+        - **CUDA available, cudart binding broken/missing** —
+          :class:`~flextensor.tensor_manager.TensorManager` falls back from
+          ``"host_register"`` to ``"torch"`` and emits a ``WARNING``.
+        - **CUDA unavailable** — constructing
+          :class:`~flextensor.tensor_manager.TensorManager` with
+          ``pinned_memory=True`` raises ``RuntimeError``. Set
+          ``pinned_memory=False`` on CPU-only hosts.
+    """
 
     use_shared_memory: Annotated[bool, _deprecated(_USE_SHARED_MEMORY_MSG)] = Field(
         default=False, deprecated=_USE_SHARED_MEMORY_MSG
@@ -430,6 +461,50 @@ class OffloadConfig(BaseModel):
         return self.pre_inference_iters
 
 
+def _resolve_union_field_type(annotation: object) -> type:
+    """Pick the env-conversion type for a ``Union`` / PEP 604 annotation.
+
+    Returns the first non-``None`` arm, mapped to one of
+    ``bool``/``int``/``float``/``str``/``list``/``object`` so
+    :func:`_convert_env_value` knows how to coerce the env-var string.
+    """
+    args = [a for a in get_args(annotation) if a is not type(None)]
+    if not args:
+        return str
+    first_type = args[0]
+    if get_origin(first_type) is Union:
+        return object
+    if get_origin(first_type) is list:
+        return list
+    if isinstance(first_type, type) and first_type in (bool, int, float, str):
+        return first_type
+    return object
+
+
+def _resolve_field_type(annotation: object) -> type:
+    """Pick the env-conversion type for a single OffloadConfig field annotation."""
+    if annotation is None:
+        return str
+
+    origin = get_origin(annotation)
+    if origin is Union or origin is types.UnionType:
+        return _resolve_union_field_type(annotation)
+    if origin is list:
+        return list
+    if origin is Literal:
+        # Literal[...] members are always plain string/int values that
+        # round-trip through the env-var pipeline as their underlying
+        # type. Treat the annotation as the type of its first member so
+        # _convert_env_value coerces correctly; Pydantic then validates
+        # the coerced value against the Literal members.
+        members = get_args(annotation)
+        member_type = type(members[0]) if members else str
+        return member_type if member_type in (bool, int, float, str) else str
+    if isinstance(annotation, type) and annotation in (bool, int, float, str):
+        return annotation
+    return object
+
+
 def _get_field_types() -> dict[str, type]:
     """Get field names and their base types from OffloadConfig.
 
@@ -439,38 +514,7 @@ def _get_field_types() -> dict[str, type]:
         For list types (e.g., ``list[str]``), returns ``list``.
         For complex types (like strategies), returns object.
     """
-    field_types: dict[str, type] = {}
-    for name, field_info in OffloadConfig.model_fields.items():
-        annotation = field_info.annotation
-        if annotation is None:
-            field_types[name] = str
-            continue
-
-        # Handle Union types (typing.Union and PEP 604 `X | Y`)
-        origin = get_origin(annotation)
-        if origin is Union or origin is types.UnionType:
-            # Get first non-None type from Union
-            args = [a for a in get_args(annotation) if a is not type(None)]
-            if args:
-                first_type = args[0]
-                if get_origin(first_type) is Union:
-                    field_types[name] = object
-                elif get_origin(first_type) is list:
-                    field_types[name] = list
-                elif isinstance(first_type, type) and first_type in (bool, int, float, str):
-                    field_types[name] = first_type
-                else:
-                    field_types[name] = object
-            else:
-                field_types[name] = str
-        elif origin is list:
-            field_types[name] = list
-        elif isinstance(annotation, type) and annotation in (bool, int, float, str):
-            field_types[name] = annotation
-        else:
-            field_types[name] = object
-
-    return field_types
+    return {name: _resolve_field_type(field_info.annotation) for name, field_info in OffloadConfig.model_fields.items()}
 
 
 def _parse_bool(value: str) -> bool:

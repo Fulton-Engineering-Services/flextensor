@@ -9,11 +9,12 @@ from collections.abc import Callable, Mapping
 import torch
 
 from flextensor.allocation_block import AllocationBlock, AllocationManager
+from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.strategy_operations import find_transfers_for_preload
 
 from .collectors import IterativeLayerStatistics, LayerStatistics, TensorStatistics
-from .utils import calculate_tensor_size, clear_and_delete_tensor, delete_tensor, is_dense_layout
+from .utils import clear_and_delete_tensor, delete_tensor, is_dense_layout
 
 LOGGER = logging.getLogger(__name__)
 
@@ -82,7 +83,7 @@ def _compute_untimed_traced_preload(
     Note: ``TensorStrategyLoader`` further narrows this set against
     the model's reachable tensor IDs (passed via
     ``reachable_tensor_ids``) so that ``tensors_map`` entries from any
-    future non-model code path don't get force-pinned to GPU.
+    future non-model code path don't get moved to GPU as a side effect.
     """
     layer_tensor_ids: set[int] = set()
     for layer_stat in layer_stats:
@@ -304,8 +305,7 @@ class TensorStrategyLoader(Loader):
                 self.tensors_map[tid].numel() * self.tensors_map[tid].element_size() for tid in rescue_ids
             )
             LOGGER.warning(
-                "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) force-pinned to GPU. "
-                "Likely a profile-coverage gap.",
+                "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) moved to GPU. Likely a profile-coverage gap.",
                 len(rescue_ids),
                 rescue_bytes / (1024 * 1024),
             )
@@ -441,185 +441,26 @@ class TensorStrategyLoader(Loader):
         return _compute_peak_memory_from_strategy(self.strategy_map, self.release_strategy_map, self.layer_stats)
 
 
-def tensor_shape_to_string(shape) -> str:
-    """
-    Convert a tensor shape into a string representation of each dimension.
-
-    Args:
-        shape: The tensor shape as a tuple or torch.Size object
-
-    Returns:
-        A string representation of the shape dimensions
-
-    Examples:
-        >>> tensor_shape_to_string((2, 3, 4))
-        '2x3x4'
-        >>> tensor_shape_to_string(torch.Size([10, 20]))
-        '10x20'
-        >>> tensor_shape_to_string((1,))
-        '1'
-        >>> tensor_shape_to_string(())
-        ''
-    """
-    if not shape:
-        return ""
-
-    return "x".join(str(dim) for dim in shape)
-
-
-def sum_load_time_ms(tensor_statistics_list: list[TensorStatistics]) -> float:
-    """
-    Calculate the sum of load_time_ms from a list of TensorStatistics.
-
-    Args:
-        tensor_statistics_list: List of TensorStatistics objects
-
-    Returns:
-        float: Sum of all load_time_ms values
-    """
-    return sum(stat.load_time_ms for stat in tensor_statistics_list)
-
-
-def prepare_key(label, tensor_size, tensor_dtype):
-    return label + "_" + str(tensor_shape_to_string(tensor_size)) + "_" + str(tensor_dtype)
-
-
-def prepare_tensors_packed_strategy(strategy_map, tensors_map):
-    tensors_for_packed_strategy = {}
-    for label, strategy in strategy_map.items():
-        strategy.sort(key=lambda tensor_info: tensors_map[tensor_info.tensor_id].shape)
-        shape_to_tensor_info_mapping = {}
-        for tensor_info in strategy:
-            tensor = tensors_map[tensor_info.tensor_id]
-            tensor_shape = tensor.shape
-            tensor_dtype = tensor.dtype
-            key = prepare_key(label, tensor_shape, tensor_dtype)
-            if key not in shape_to_tensor_info_mapping:
-                shape_to_tensor_info_mapping[key] = []
-            shape_to_tensor_info_mapping[key].append(tensor_info)
-        tensors_for_packed_strategy[label] = shape_to_tensor_info_mapping
-    return tensors_for_packed_strategy
-
-
-def stack_tensors(tensors_map, tensors_info_list):
-    tensors_list = []
-    tensors_ids_list = []  # we need order!
-    for tensor_info in tensors_info_list:
-        tensor_id = tensor_info.tensor_id
-        tensor = tensors_map[tensor_id]
-        tensors_list.append(tensor)
-        tensors_ids_list.append(tensor_id)
-    stacked = torch.stack(tensors_list, dim=0)
-    stacked = stacked.pin_memory()
-
-    return stacked, tensors_ids_list
-
-
-def prepare_packed_tensors_maps(tensors_map, tensors_for_packed_strategy, stack_limit):
-    packed_tensors_map = {}
-    packed_tensors_to_unpacked_tensors_map = {}
-    packed_id_to_tensor_statistics_info_map = {}
-    packed_strategy_map = {}
-    for label, shape_to_tensor_info_mapping in tensors_for_packed_strategy.items():
-        strategy = []
-        for _key, tensors_info_list in shape_to_tensor_info_mapping.items():
-            if len(tensors_info_list) > stack_limit:
-                stacked, tensors_ids_list = stack_tensors(tensors_map, tensors_info_list)
-                stacked_id = id(stacked)
-                size_bytes = calculate_tensor_size(stacked)
-                load_time_ms = sum_load_time_ms(tensors_info_list)
-                stacked_tensor_info = TensorStatistics(
-                    tensor_id=stacked_id,
-                    name="stacked_tensor_"
-                    + str(len(tensors_info_list))
-                    + "_s_"
-                    + str(tensor_shape_to_string(stacked.shape))
-                    + "_d_"
-                    + str(stacked.dtype),
-                    size_bytes=size_bytes,
-                    load_time_ms=load_time_ms,
-                )
-                strategy.append(stacked_tensor_info)
-                packed_id_to_tensor_statistics_info_map[stacked_id] = stacked_tensor_info
-                packed_tensors_map[stacked_id] = stacked
-                packed_tensors_to_unpacked_tensors_map[stacked_id] = tensors_ids_list
-        if len(strategy) > 0:
-            packed_strategy_map[label] = strategy
-    return (
-        packed_tensors_map,
-        packed_tensors_to_unpacked_tensors_map,
-        packed_id_to_tensor_statistics_info_map,
-        packed_strategy_map,
-    )
-
-
-def remove_from_strategy(strategy, label, tensors_info_list):
-    if label not in strategy:
-        return
-    tensors_ids = set()
-    for tensor_info in tensors_info_list:
-        tensors_ids.add(tensor_info.tensor_id)
-
-    strategy_for_label = strategy[label]
-    updated_strategy_for_label = []
-    for tensor_info in strategy_for_label:
-        if tensor_info.tensor_id not in tensors_ids:
-            updated_strategy_for_label.append(tensor_info)
-    strategy[label] = updated_strategy_for_label
-
-
-def remove_from_tensors_map(tensors_map, tensors_info_list):
-    for tensor_info in tensors_info_list:
-        if tensor_info.tensor_id in tensors_map:
-            del tensors_map[tensor_info.tensor_id]
-
-
-def remove_packed_tensors_from_strategy(strategy_map, tensors_map, tensors_for_packed_strategy, stack_limit):
-    for label, shape_to_tensor_info_mapping in tensors_for_packed_strategy.items():
-        for _key, tensors_info_list in shape_to_tensor_info_mapping.items():
-            if len(tensors_info_list) > stack_limit:
-                remove_from_tensors_map(tensors_map, tensors_info_list)
-                remove_from_strategy(strategy_map, label, tensors_info_list)
-
-
-def prepare_updated_release_strategy(
-    release_strategy_map,
-    packed_tensors_to_unpacked_tensors_map,
-    packed_id_to_tensor_statistics_info_map,
-):
-    packed_release_strategy_map = {}
-    # Prepare release strategy
-    tensor_id_to_stacked_id_map = {}
-    for stacked_id, unpacked_tensors_list in packed_tensors_to_unpacked_tensors_map.items():
-        for tensor_id in unpacked_tensors_list:
-            tensor_id_to_stacked_id_map[tensor_id] = stacked_id
-    new_release_strategy = {}
-    for label, strategy in release_strategy_map.items():
-        new_strategy = []
-        packed_release_strategy_set = set()
-        for element in strategy:
-            if element.tensor_id in tensor_id_to_stacked_id_map:
-                stacked_tensor_id = tensor_id_to_stacked_id_map[element.tensor_id]
-                stacked_tensor_info = packed_id_to_tensor_statistics_info_map[stacked_tensor_id]
-                packed_release_strategy_set.add(stacked_tensor_info)
-            else:
-                new_strategy.append(element)
-        if len(packed_release_strategy_set) > 0:
-            packed_release_strategy_map[label] = list(packed_release_strategy_set)
-        if len(new_strategy) > 0:
-            new_release_strategy[label] = new_strategy
-    return new_release_strategy, packed_release_strategy_map
-
-
 @instrumentable
 class RawBlockController:
-    def __init__(self, label_to_size_map, block_sizes, device_gpu, tensors_map, strategy_map, label_to_block_id):
+    def __init__(
+        self,
+        label_to_size_map,
+        block_sizes,
+        device_gpu,
+        tensors_map,
+        strategy_map,
+        label_to_block_id,
+        *,
+        host_pinner: HostPinner,
+    ):
         self.block_map_cpu = {}
         self.block_map_cpu_sizes = {}
         self.block_map_gpu = {}
         self.device_cpu = "cpu"
         self.device_gpu = device_gpu
         self.label_to_block_id = label_to_block_id
+        self.host_pinner = host_pinner
 
         # Process each layer: allocate block, copy tensors, release tensors
         # This interleaved approach reduces peak memory compared to allocating all blocks upfront
@@ -629,9 +470,10 @@ class RawBlockController:
             if len(strategy) == 0:
                 continue
 
-            # Allocate CPU block for this layer
+            # Allocate CPU block for this layer.
             total_size = label_to_size_map[label]
-            block = torch.zeros(total_size, dtype=torch.uint8, device=self.device_cpu).pin_memory()
+            block = torch.zeros(total_size, dtype=torch.uint8, device=self.device_cpu)
+            block = self.host_pinner.pin(block)
             self.block_map_cpu[label] = block
             self.block_map_cpu_sizes[label] = block.size(0)
 
@@ -783,6 +625,8 @@ class AllocationBlockController:
         use_shm: bool = False,
         shm_block_name_map: dict[str, str] | None = None,
         block_name_fn: Callable[[int], str] | None = None,
+        *,
+        host_pinner: HostPinner,
     ) -> None:
         self.block_map_cpu = {}  # label to cpu block
         self.label_to_cpu_tensor_id_map = {}
@@ -795,6 +639,7 @@ class AllocationBlockController:
         self.load_model_from_shm = use_shm and shm_block_name_map is not None
         self.shm_block_name_map = shm_block_name_map or {}
         self._block_name_fn = block_name_fn or (lambda index: f"ft_{os.getpid()}_{index}")
+        self.host_pinner = host_pinner
 
         for index, (_block_id, layers) in enumerate(allocation_ordered.items()):
             shm_prefix = None
@@ -807,6 +652,7 @@ class AllocationBlockController:
                 shm_block_name_prefix=shm_prefix,
                 load_from_shm=self.load_model_from_shm,
                 pinned_memory=True,
+                host_pinner=self.host_pinner,
                 release_tensor_memory=True,
             )
             for label in layers:

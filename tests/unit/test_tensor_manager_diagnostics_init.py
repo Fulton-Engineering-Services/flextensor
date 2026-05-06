@@ -34,6 +34,15 @@ def _reset_diag_marker() -> None:
         setattr(diag, _DIAGNOSTICS_MARKER, had_marker)
 
 
+@pytest.fixture(autouse=True)
+def _fake_cuda_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend CUDA is available so ``TensorManager(pinned_memory=True)``
+    construction doesn't raise on CPU-only CI hosts. These tests only
+    exercise the diagnostics-logging wiring; they don't need real CUDA.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+
 def test_tensor_manager_calls_ensure_diagnostics_visible_when_enabled() -> None:
     device = torch.device("cpu")
     strategy = GreedyStrategy()

@@ -49,3 +49,21 @@ These are used internally by `OffloadManager` and exposed for users who need cus
     options:
       members:
         - get_results
+
+## Host Pinning
+
+Lower-level helpers for `pinned_memory_mode` dispatch and `cudaHostRegister`
+registrations. See [Configuration](../explanation/configuration.md#pinned-memory)
+for user-facing semantics and
+[Troubleshooting](../how-to/troubleshooting.md#step-3-switch-to-in-place-pinning)
+for when to switch modes.
+
+::: flextensor.host_pinning
+    options:
+      members:
+        - PinnedMemoryMode
+        - HostPinner
+        - HostPinRegistry
+        - NoOpHostPinner
+        - is_available
+        - make_host_pinner

@@ -24,6 +24,7 @@ except ImportError:
 # Internal implementation (kept for backward compatibility and advanced usage)
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, PreloadToDevice, TensorBenchmarkMode
 from flextensor.config import OffloadConfig, load_config, load_config_from_env, load_config_from_file
+from flextensor.host_pinning import PinnedMemoryMode
 from flextensor.lazy_model_init import load_model_from_profile
 from flextensor.offload_manager import (
     DEFAULT_MANAGER_NAME,
@@ -68,6 +69,7 @@ __all__ = [  # noqa: RUF022
     "GPUMemoryUsage",
     "OffloadConfig",
     "OffloadManager",
+    "PinnedMemoryMode",
     "clear_profiling_durations",
     "get_gpu_memory_usage",
     "get_offload_manager",

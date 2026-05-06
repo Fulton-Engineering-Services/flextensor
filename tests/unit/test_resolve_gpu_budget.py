@@ -26,6 +26,7 @@ class TestResolveGpuBudget:
                 device_gpu="cpu",
                 tensor_manager_load_strategy=strategy,
                 max_gpu_mem_fraction=max_gpu_mem_fraction,
+                pinned_memory=False,
             )
         return tm
 
@@ -69,6 +70,7 @@ class TestGpuBudgetCap:
                 device_gpu="cpu",
                 tensor_manager_load_strategy=strategy,
                 max_gpu_mem_fraction=max_gpu_mem_fraction,
+                pinned_memory=False,
             )
         return tm
 

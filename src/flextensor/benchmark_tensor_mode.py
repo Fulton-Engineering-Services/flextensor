@@ -10,6 +10,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from flextensor.collectors import TensorStatistics
+from flextensor.host_pinning import HostPinner
 from flextensor.tensor import wrap_trace_tensor
 from flextensor.utils import calculate_tensor_size
 
@@ -29,6 +30,7 @@ class TensorBenchmarkMode(TorchFunctionMode, ABC):
         pinned_memory: bool = True,
         iterations: int = 10,
         pinned_memory_limit_mb: float | None = None,
+        host_pinner: HostPinner | None = None,
     ) -> None:
         """
         Initialize tensor benchmarking mode.
@@ -38,6 +40,8 @@ class TensorBenchmarkMode(TorchFunctionMode, ABC):
             pinned_memory: Whether to use pinned memory for tensors
             iterations: Number of benchmark iterations
             pinned_memory_limit_mb: Maximum size of tensors that will be copied to pinned_memory
+            host_pinner: :class:`HostPinner` controlling how CPU tensors are pinned.
+                Defaults to torch mode (PyTorch's caching pinned allocator) when ``None``.
         """
 
     @abstractmethod
@@ -66,6 +70,8 @@ class BenchmarkReplace(TensorBenchmarkMode):
         pinned_memory: bool = True,
         iterations: int = 10,
         pinned_memory_limit_mb: float | None = None,
+        *,
+        host_pinner: HostPinner,
     ) -> None:
         """
         Initialize BenchmarkReplace for tensor benchmarking.
@@ -75,6 +81,12 @@ class BenchmarkReplace(TensorBenchmarkMode):
             pinned_memory: Whether to use pinned memory for tensors
             iterations: Number of benchmark iterations
             pinned_memory_limit_mb: Maximum size of tensors that will be copied to pinned_memory
+            host_pinner: :class:`HostPinner` controlling how CPU tensors are pinned.
+                Required (keyword-only) so profiling stats always reflect the
+                same pinning primitive that production transfers will use —
+                a silent fallback to ``HostPinner()`` would let
+                ``pinned_memory_mode="host_register"`` report ``"torch"``-mode
+                latencies.
         """
         self.iterations = iterations
         self.warmup_iterations = 5
@@ -83,6 +95,7 @@ class BenchmarkReplace(TensorBenchmarkMode):
         self.tensor_statistics_map = {}
         self.tensors_map = {}
         self.pinned_memory_limit_mb = pinned_memory_limit_mb
+        self.host_pinner = host_pinner
 
     def get_results(self) -> dict[str, Any]:
         """
@@ -136,10 +149,10 @@ class BenchmarkReplace(TensorBenchmarkMode):
         tensor_size_mb = tensor_size / 1024 / 1024
         if (
             self.pinned_memory
-            and not result_tensor.is_pinned()
+            and not self.host_pinner.is_pinned(result_tensor)
             and (self.pinned_memory_limit_mb is None or tensor_size_mb <= self.pinned_memory_limit_mb)
         ):
-            result_tensor = result_tensor.pin_memory()
+            result_tensor = self.host_pinner.pin(result_tensor)
 
         transfer_times = []
         for _ in range(self.warmup_iterations):
@@ -183,6 +196,7 @@ class PreloadToDevice(TensorBenchmarkMode):
         pinned_memory: bool = True,
         iterations: int = 10,
         pinned_memory_limit_mb: float | None = None,
+        host_pinner: HostPinner | None = None,
     ) -> None:
         """
         Initialize PreloadToDevice for simple tensor preloading.
@@ -192,6 +206,8 @@ class PreloadToDevice(TensorBenchmarkMode):
             pinned_memory: Whether to use pinned memory for tensors (ignored in this implementation)
             iterations: Number of benchmark iterations (ignored in this implementation)
             pinned_memory_limit_mb: Maximum size of tensors that will be copied to pinned_memory
+            host_pinner: Stored for interface compatibility but not used; kept so callers
+                like ``TensorManager.benchmark_context`` can pass it uniformly.
         """
         self.device_gpu = device_gpu
         self.pinned_memory = pinned_memory  # Stored for interface compatibility but not used
@@ -199,6 +215,7 @@ class PreloadToDevice(TensorBenchmarkMode):
         self.tensor_statistics_map = {}
         self.tensors_map = {}
         self.pinned_memory_limit_mb = pinned_memory_limit_mb
+        self.host_pinner = host_pinner  # accepted for ABC compatibility, not used
 
     def get_results(self) -> dict[str, Any]:
         """
@@ -261,6 +278,7 @@ class NoOpBenchmark(TensorBenchmarkMode):
         pinned_memory: bool = True,
         iterations: int = 10,
         pinned_memory_limit_mb: float | None = None,
+        host_pinner: HostPinner | None = None,
     ) -> None:
         self.device_gpu = device_gpu
         self.pinned_memory = pinned_memory  # Stored for interface compatibility but not used
@@ -268,6 +286,7 @@ class NoOpBenchmark(TensorBenchmarkMode):
         self.tensor_statistics_map = {}
         self.tensors_map = {}
         self.pinned_memory_limit_mb = pinned_memory_limit_mb
+        self.host_pinner = host_pinner  # accepted for ABC compatibility, not used
 
     def get_results(self) -> dict[str, Any]:
         """

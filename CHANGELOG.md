@@ -13,6 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New `pinned_memory_mode` option (config field, `FT_PINNED_MEMORY_MODE` env
+  var, and `TensorManager` constructor argument) to choose between PyTorch's
+  pinned allocator (`"torch"`, default) and pinning existing allocations
+  in place via `cudaHostRegister` (`"host_register"`). The new path avoids
+  PyTorch's peak-memory doubling for allocations that straddle a
+  power-of-two boundary
+  (see [pytorch/pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)).
+  Registrations are tracked by a `HostPinRegistry` owned by each
+  `TensorManager` and released on `shutdown()`.
 - Profiling data control API: `flextensor.clear_profiling_durations()`,
   `suspend_profiling()` / `resume_profiling()`, and the `pause_profiling()`
   context manager. Lets backends (e.g. vLLM) bracket mixed-batch warmup so
@@ -27,6 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `pinned_memory=True` on a CPU-only host now raises `RuntimeError` at
+  `TensorManager` construction (previously a silent no-op in
+  `AllocationBlock`). Set `pinned_memory=False` on hosts without CUDA.
 - `UntimedTrapsReport` is now emitted at `WARNING` whenever any trap has
   tensor IDs but no duration samples, regardless of `enable_diagnostics`.
   These labels are silently dropped from the strategy input; users need
@@ -37,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TensorManager.record_tensors(label, tensor_ids)` is the DISCOVERY-only
   recorder. Affects plugin authors who subclassed `WarmupTrap` or called
   the recorders directly.
+- `BenchmarkReplace.__init__` now requires a keyword-only `host_pinner`,
+  so profiling uses the same pinning primitive as production transfers.
 
 ### Fixed
 

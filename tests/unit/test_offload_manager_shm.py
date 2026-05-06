@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from flextensor.host_pinning import HostPinner
 from flextensor.loaders import AllocationBlockController
 from flextensor.offload_manager import OffloadManager, OffloadModelProxy, OffloadPhase
 
@@ -119,6 +120,7 @@ class TestBlockNameFn:
             strategy_map={},
             label_to_block_id={},
             use_shm=True,
+            host_pinner=HostPinner(),
         )
         expected = f"ft_{os.getpid()}_0"
         assert ctrl._block_name_fn(0) == expected
@@ -136,6 +138,7 @@ class TestBlockNameFn:
             strategy_map={},
             label_to_block_id={},
             use_shm=True,
+            host_pinner=HostPinner(),
             block_name_fn=custom_fn,
         )
         assert ctrl._block_name_fn(0) == "custom_block_0"
@@ -157,6 +160,7 @@ class TestBlockNameFn:
             strategy_map={},
             label_to_block_id={},
             use_shm=True,
+            host_pinner=HostPinner(),
             block_name_fn=ns_fn,
         )
         name = ctrl._block_name_fn(0)

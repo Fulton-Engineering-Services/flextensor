@@ -11,6 +11,7 @@ data to row-major, breaking downstream kernels that expect a specific layout.
 import torch
 
 from flextensor.allocation_block import AllocationBlock
+from flextensor.host_pinning import HostPinner
 from flextensor.loaders import RawBlockController
 from flextensor.utils import is_dense_layout
 
@@ -31,7 +32,7 @@ class TestAllocationBlockStridePreservation:
         assert tensor.is_contiguous(memory_format=torch.contiguous_format) is False
         original_strides = tensor.stride()
 
-        block = AllocationBlock(device="cpu")
+        block = AllocationBlock(device="cpu", host_pinner=HostPinner())
         block.add(tensor)
         views = block.allocate()
 
@@ -44,7 +45,7 @@ class TestAllocationBlockStridePreservation:
         original_data = tensor.clone()
         original_strides = tensor.stride()
 
-        block = AllocationBlock(device="cpu")
+        block = AllocationBlock(device="cpu", host_pinner=HostPinner())
         block.add(tensor)
         views = block.allocate()
 
@@ -74,7 +75,7 @@ class TestAllocationBlockStridePreservation:
         assert tensor.is_contiguous()
         original_strides = tensor.stride()
 
-        block = AllocationBlock(device="cpu")
+        block = AllocationBlock(device="cpu", host_pinner=HostPinner())
         block.add(tensor)
         views = block.allocate()
 
@@ -86,7 +87,7 @@ class TestAllocationBlockStridePreservation:
         c_tensor = torch.arange(6, dtype=torch.float32).reshape(2, 3)
         f_tensor = _make_fortran_contiguous(4, 3)
 
-        block = AllocationBlock(device="cpu")
+        block = AllocationBlock(device="cpu", host_pinner=HostPinner())
         block.add(c_tensor)
         block.add(f_tensor)
         views = block.allocate()
@@ -102,7 +103,7 @@ class TestAllocationBlockStridePreservation:
         sliced = base[:, ::2]  # shape (4, 3), stride (5, 2) — has gaps
         expected_data = sliced.clone()  # clone() produces C-contiguous copy
 
-        block = AllocationBlock(device="cpu")
+        block = AllocationBlock(device="cpu", host_pinner=HostPinner())
         block.add(sliced)
         views = block.allocate()
 

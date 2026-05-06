@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-import contextlib
+import logging
 
 import torch
 from typing_extensions import Self
 
+from flextensor.host_pinning import HostPinner
 from flextensor.shm import FlexibleSharedMemory, ProcessFileLock
 from flextensor.utils import is_dense_layout
+
+logger = logging.getLogger(__name__)
 
 
 class AllocationBlock:
@@ -21,6 +24,8 @@ class AllocationBlock:
         block_size=None,
         shm_block_name=None,
         lock_class=None,
+        *,
+        host_pinner: HostPinner,
         **config,
     ):
         self.manager = manager
@@ -33,6 +38,7 @@ class AllocationBlock:
         self.lock_class = lock_class if lock_class is not None else ProcessFileLock
         self.shm_block = None
         self.pinned_memory = config.get("pinned_memory", False)
+        self.host_pinner: HostPinner = host_pinner
         self.memory_alignment = config.get("memory_alignment", 128)
         self.release_tensor_memory = config.get("release_tensor_memory", False)
         if self.memory_alignment <= 0:
@@ -133,12 +139,8 @@ class AllocationBlock:
         # Use regular memory
         # Create tensor on specified device first
         tensor = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        # Pin memory separately if requested and device is CPU
-        # Only use pinned memory when CUDA is available (beneficial for GPU transfers)
-        # On macOS without CUDA, pin_memory() can cause segfaults
-        if pin_memory and device == "cpu" and torch.cuda.is_available() and not tensor.is_pinned():
-            with contextlib.suppress(RuntimeError):
-                tensor = tensor.pin_memory()
+        if pin_memory and device == "cpu":
+            tensor = self.host_pinner.pin(tensor)
         return tensor
 
     def _prepare_views(self):
@@ -186,6 +188,8 @@ class AllocationManager:
         shm_block_name_prefix: str | None = None,
         load_from_shm: bool = False,
         pinned_memory: bool = False,
+        *,
+        host_pinner: HostPinner,
         memory_alignment: int = 128,
         lock_class=None,
         release_tensor_memory: bool = False,
@@ -196,6 +200,7 @@ class AllocationManager:
         self.block_index = 0
         self.load_from_shm = load_from_shm
         self.pinned_memory = pinned_memory
+        self.host_pinner = host_pinner
         self.memory_alignment = memory_alignment
         self.lock_class = lock_class if lock_class is not None else ProcessFileLock
         self.release_tensor_memory = release_tensor_memory
@@ -213,6 +218,7 @@ class AllocationManager:
             lock_class=self.lock_class,
             load_from_shm=self.load_from_shm,
             pinned_memory=self.pinned_memory,
+            host_pinner=self.host_pinner,
             memory_alignment=self.memory_alignment,
             release_tensor_memory=self.release_tensor_memory,
         )
@@ -237,6 +243,7 @@ class AllocationManager:
             # Only propagate CPU-relevant flags when device is CPU
             load_from_shm=self.load_from_shm if device == "cpu" else False,
             pinned_memory=self.pinned_memory if device == "cpu" else False,
+            host_pinner=self.host_pinner,
         )
 
     def release(self):
@@ -247,7 +254,7 @@ class AllocationManager:
 
 
 if __name__ == "__main__":
-    manager = AllocationManager()
+    manager = AllocationManager(host_pinner=HostPinner())
 
     b = manager.block()
     t1 = torch.ones(12, dtype=torch.float32)

@@ -206,6 +206,7 @@ When `enabled=False`, FlexTensor passes through to normal PyTorch execution with
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `pinned_memory` | bool | `True` | Use pinned memory for CPU-resident weights |
+| `pinned_memory_mode` | `"torch" \| "host_register"` | `"torch"` | How to pin: `"torch"` (`tensor.pin_memory()`, copies into a fresh pinned buffer) or `"host_register"` (`cudaHostRegister`, pins existing storage in place — lower peak host RAM). Any other value is rejected at config-construction time. |
 | `shm_enabled` | bool | `False` | Enable cross-process weight sharing via POSIX shared memory |
 | `shm_namespace` | str \| None | `None` | Base namespace for SHM blocks (auto-derived if None) |
 | `shm_wait_timeout` | float | `0.0` | Hard timeout (seconds) for followers waiting on creator |
@@ -219,6 +220,33 @@ Pinned (page-locked) memory is required for non-blocking CPU→GPU transfers on 
 ```python
 config = OffloadConfig(pinned_memory=False)
 ```
+
+`pinned_memory_mode` controls *how* the pinning is done:
+
+- `"torch"` (default) — `tensor.pin_memory()`. Copies the tensor into a fresh pinned allocation from PyTorch's caching pinned allocator, which rounds the allocation up to the next power of two and can substantially inflate host memory usage.
+- `"host_register"` — `cudaHostRegister`. Pins the existing allocation in place; no copy, no power-of-two rounding. Requires CUDA; on a CUDA host with a broken `cudart` binding, falls back to `"torch"` with a warning. On a CPU-only host, `pinned_memory=True` raises `RuntimeError` at `OffloadManager`/`TensorManager` construction — set `pinned_memory=False` for CPU-only deployments. Use this when host RAM is the bottleneck.
+
+```python
+config = OffloadConfig(pinned_memory=True, pinned_memory_mode="host_register")
+```
+
+This option can also be set via the `FT_PINNED_MEMORY_MODE` environment variable:
+
+```bash
+FT_PINNED_MEMORY_MODE=host_register   # cudaHostRegister, lower peak host RAM
+FT_PINNED_MEMORY_MODE=torch            # PyTorch's pinned allocator (default)
+```
+
+!!! note "Scope of `pinned_memory_mode`"
+    `pinned_memory_mode` only controls how the **non-SHM allocator path** pins host memory. When `shm_enabled=True` and `pinned_memory=True`, the SHM segment itself is registered in place via `cudaHostRegister` regardless of the mode you choose — POSIX shared-memory buffers can't be re-allocated through PyTorch's pinned allocator. This is why `OffloadConfig(shm_enabled=True, pinned_memory=True, pinned_memory_mode="torch")` already gives you in-place pinning for the SHM segment.
+
+    The two paths use different flags: the SHM path registers with `cudaHostRegisterDefault` (flag=0, current-context-only) through the `cupy` runtime binding, while the non-SHM `host_register` path registers with `cudaHostRegisterPortable` (flag=1, visible across CUDA contexts) through `torch.cuda.cudart()`. Single-context inference is unaffected by the difference; multi-context setups should expect the SHM segment to be re-registered per process.
+
+!!! note "Resolved mode vs. requested mode"
+    `OffloadConfig.pinned_memory_mode` always reports the value you set; it never mutates. Two construction-time outcomes can differ from a naive read of the field:
+
+    - **CUDA available, cudart binding broken/missing** — `TensorManager` falls back from `"host_register"` to `"torch"` and emits a `WARNING` log naming the cause; pinning still happens via `torch.Tensor.pin_memory()`.
+    - **CUDA unavailable** — `pinned_memory=True` raises `RuntimeError` at `OffloadManager`/`TensorManager` construction. Offloading without a GPU has no purpose, and silently degrading to pageable transfers would mask the misconfiguration as a perf regression. Set `pinned_memory=False` on intentional CPU-only deployments.
 
 #### GPU Memory Limit
 

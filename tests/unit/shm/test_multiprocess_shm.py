@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent / ".." / ".." / ".."))
 
 # Import the classes directly from the file
 from flextensor.allocation_block import AllocationManager
+from flextensor.host_pinning import HostPinner
 
 
 def shm_owner_process(shm_name_prefix, ready_event, finished_event, pinned_memory):
@@ -33,6 +34,7 @@ def shm_owner_process(shm_name_prefix, ready_event, finished_event, pinned_memor
             shm_block_name_prefix=shm_name_prefix,
             load_from_shm=False,
             pinned_memory=pinned_memory,
+            host_pinner=HostPinner(),
             memory_alignment=128,
         )
 
@@ -77,6 +79,7 @@ def secondary_process_1(shm_name_prefix, ready_event, finished_event, pinned_mem
             shm_block_name_prefix=shm_name_prefix,
             load_from_shm=True,
             pinned_memory=pinned_memory,
+            host_pinner=HostPinner(),
             memory_alignment=128,
         )
 

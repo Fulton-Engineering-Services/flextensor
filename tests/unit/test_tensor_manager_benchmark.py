@@ -10,9 +10,20 @@ import torch
 
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, PreloadToDevice, TensorBenchmarkMode
 from flextensor.collectors import LayerStatistics, TensorStatistics
+from flextensor.host_pinning import HostPinner
 from flextensor.strategy import KnapsackStrategy
 from flextensor.tensor import TraceTensor
 from flextensor.tensor_manager import TensorManager
+
+
+@pytest.fixture(autouse=True)
+def _fake_cuda_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend CUDA is available so ``TensorManager(pinned_memory=True)``
+    construction doesn't raise on CPU-only CI hosts. ``make_host_pinner``
+    only inspects ``torch.cuda.is_available()`` for the torch-mode path
+    used here; no real cudart calls occur.
+    """
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
 
 class TestTensorManagerBenchmarkIntegration:
@@ -98,11 +109,56 @@ class TestTensorManagerBenchmarkIntegration:
         assert hasattr(tensor_manager, "benchmark_context")
         assert callable(tensor_manager.benchmark_context)
 
+    def test_benchmark_context_forwards_host_pinner(self) -> None:
+        """Wiring guard: :meth:`TensorManager.benchmark_context` must pass
+        ``host_pinner=self.host_pinner`` to ``self._benchmark_cls(...)``. A
+        regression that drops the kwarg leaves the benchmark with a default
+        :class:`HostPinner` (torch mode), so profiling stats are collected
+        with a different pinner than the one used at inference time —
+        :attr:`TensorStatistics.load_time_ms` then no longer represents
+        production transfer cost. CI stays green because every other
+        benchmark test only checks ``pinned_memory`` and ``iterations``.
+
+        Same regression class as the allocation_block_transfer / raw_block_transfer
+        / OffloadManager forwarding guards in
+        ``test_tensor_manager_pinned_memory_mode.py``.
+        """
+        captured: dict = {}
+
+        class CapturingBenchmark(TensorBenchmarkMode):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
+                captured["host_pinner"] = host_pinner
+                self.results = {"tensor_statistics_map": {}, "tensors_map": {}}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return None
+
+            def get_results(self):
+                return self.results
+
+        tensor_manager = TensorManager(
+            device_gpu=self.device_gpu,
+            tensor_manager_load_strategy=self.strategy,
+        )
+        tensor_manager._benchmark_cls = CapturingBenchmark
+
+        with tensor_manager.benchmark_context(iterations=1):
+            pass
+
+        assert captured["host_pinner"] is tensor_manager.host_pinner, (
+            "benchmark_context dropped host_pinner=self.host_pinner — profiling "
+            "would silently use a default HostPinner (torch mode) instead of the "
+            "configured pinner, so stats no longer reflect inference behavior."
+        )
+
     def test_benchmark_context_creates_benchmark_instance(self) -> None:
         """Test that benchmark_context creates benchmark instance with correct parameters."""
 
         class TestMockBenchmark(TensorBenchmarkMode):
-            def __init__(self, device_gpu, pinned_memory, iterations):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
                 self.device_gpu = device_gpu
                 self.pinned_memory = pinned_memory
                 self.iterations = iterations
@@ -133,7 +189,7 @@ class TestTensorManagerBenchmarkIntegration:
         """Test that benchmark_context uses default iterations parameter."""
 
         class TestMockBenchmark(TensorBenchmarkMode):
-            def __init__(self, device_gpu, pinned_memory, iterations):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
                 self.device_gpu = device_gpu
                 self.pinned_memory = pinned_memory
                 self.iterations = iterations
@@ -162,7 +218,7 @@ class TestTensorManagerBenchmarkIntegration:
         """Test that benchmark results are automatically integrated into TensorManager."""
 
         class TestMockBenchmark(TensorBenchmarkMode):
-            def __init__(self, device_gpu, pinned_memory, iterations):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
                 self.device_gpu = device_gpu
                 self.pinned_memory = pinned_memory
                 self.iterations = iterations
@@ -199,7 +255,7 @@ class TestTensorManagerBenchmarkIntegration:
         """Test that benchmark results replace existing TensorManager stats."""
 
         class TestMockBenchmark(TensorBenchmarkMode):
-            def __init__(self, device_gpu, pinned_memory, iterations):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
                 self.device_gpu = device_gpu
                 self.pinned_memory = pinned_memory
                 self.iterations = iterations
@@ -236,7 +292,7 @@ class TestTensorManagerBenchmarkIntegration:
         """Test that stats are still integrated even if exception occurs in context."""
 
         class TestMockBenchmark(TensorBenchmarkMode):
-            def __init__(self, device_gpu, pinned_memory, iterations):
+            def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
                 self.device_gpu = device_gpu
                 self.pinned_memory = pinned_memory
                 self.iterations = iterations
@@ -320,7 +376,7 @@ class TestTensorManagerBenchmarkIntegration:
 class MockBenchmarkReplace(TensorBenchmarkMode):
     """Mock benchmark class for testing."""
 
-    def __init__(self, device_gpu, pinned_memory, iterations):
+    def __init__(self, device_gpu, pinned_memory, iterations, host_pinner=None):
         self.device_gpu = device_gpu
         self.pinned_memory = pinned_memory
         self.iterations = iterations
@@ -369,7 +425,9 @@ class TestTensorManagerBenchmarkParametrization:
         assert issubclass(BenchmarkReplace, TensorBenchmarkMode)
         assert issubclass(PreloadToDevice, TensorBenchmarkMode)
 
-        benchmark_replace = BenchmarkReplace(self.device_gpu, pinned_memory=True, iterations=10)
+        benchmark_replace = BenchmarkReplace(
+            self.device_gpu, pinned_memory=True, iterations=10, host_pinner=HostPinner()
+        )
         preload_to_device = PreloadToDevice(self.device_gpu, pinned_memory=True, iterations=10)
 
         assert hasattr(benchmark_replace, "get_results")

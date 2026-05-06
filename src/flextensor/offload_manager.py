@@ -550,6 +550,7 @@ class OffloadManager:
                 device_gpu,
                 tensor_manager_load_strategy,
                 pinned_memory=self.config.pinned_memory,
+                pinned_memory_mode=self.config.pinned_memory_mode,
                 loader_type=self.config.transfer_mode,
                 blocks=self.config.num_blocks,
                 remove_layers_operations=[],
