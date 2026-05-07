@@ -5,36 +5,52 @@
 Tests the complete lifecycle of shared memory across multiple processes:
 - Creation and connection
 - Read/write operations across processes
-- Proper cleanup ordering (unlink before close)
+- Concurrent close ordering (P0 closes while siblings are alive)
+- Sequential cleanup with the last surviving process tearing down resources
 - Verification of no memory leaks
 """
 
+from __future__ import annotations
+
 import multiprocessing
 import os
-import time
+import traceback
 import uuid
+from typing import TYPE_CHECKING
 
 import pytest
+from conftest import EVENT_TIMEOUT, assert_clean_exit, drain_results, format_failed_results, wait_for_event
 
 from flextensor.shm import FlexibleSharedMemory, ProcessFileLock, SemaphoreLock
 
+if TYPE_CHECKING:
+    from multiprocessing.queues import Queue
+    from multiprocessing.synchronize import Event as EventType
+
 
 def lifecycle_process(
-    name, shm_size, process_id, duration, data_to_write, result_queue, lock_class, unlink_before_close
-):
+    name: str,
+    shm_size: int,
+    process_id: int,
+    data_to_write: bytes | None,
+    result_queue: Queue,
+    lock_class: type,
+    ready_event: EventType,
+    close_event: EventType,
+) -> None:
     """Helper process for lifecycle testing.
 
     Args:
         name: Shared memory name
         shm_size: Size of shared memory (>0 to create/connect, 0 to connect only)
         process_id: Identifier for this process
-        duration: How long to stay alive before closing
         data_to_write: Data to write at this process's offset, or None to skip writing
         result_queue: Queue for sending results back
         lock_class: Lock class to use
+        ready_event: Set after the process has attached and written its slot
+        close_event: Wait for this before closing (lifecycle tests require
+            deterministic close ordering, so the parent always supplies one)
     """
-    import traceback
-
     try:
         fsm = FlexibleSharedMemory(
             name=name,
@@ -43,24 +59,24 @@ def lifecycle_process(
             lock_class=lock_class,
         )
 
-        # Write data at offset based on process_id
         if data_to_write is not None:
-            offset = process_id * 32  # Each process writes at different offset
+            offset = process_id * 32
             fsm.block.buf[offset : offset + len(data_to_write)] = data_to_write
 
-        # Notify ready if creator
         if fsm.shm_creator:
             fsm.notify_ready()
         else:
             fsm.wait_for_ready()
 
-        # Read data written by process 0
         data_from_p0 = bytes(fsm.block.buf[0:14])
 
-        # Stay alive for specified duration
-        time.sleep(duration)
+        ready_event.set()
 
-        # Check if other processes are alive before cleanup
+        if not close_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to allow lifecycle close")
+
+        # Snapshot before close so the assertion observes the state we care about
+        # (was anyone else alive while *I* was still attached).
         others_alive = fsm.keep_alive.any_process_alive()
 
         fsm.close()
@@ -72,21 +88,19 @@ def lifecycle_process(
             "data_from_p0": data_from_p0,
             "others_alive_at_close": others_alive,
             "pid": os.getpid(),
-            "unlink_before_close": unlink_before_close,
         })
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put({
             "success": False,
             "error": f"{type(e).__name__}: {e}\n{traceback.format_exc()}",
             "process_id": process_id,
             "pid": os.getpid(),
-            "unlink_before_close": unlink_before_close,
         })
 
 
 @pytest.fixture(params=[SemaphoreLock, ProcessFileLock])
-def lock_class(request):
+def lock_class(request: pytest.FixtureRequest) -> type:
     """Parameterize tests with different lock implementations."""
     return request.param
 
@@ -94,46 +108,29 @@ def lock_class(request):
 class TestFlexibleSharedMemoryLifecycle:
     """Test complete lifecycle of FlexibleSharedMemory across multiple processes."""
 
-    def test_full_lifecycle_three_processes(self, lock_class):
-        """Test full lifecycle with three processes closing in sequence.
+    def test_concurrent_then_sequential_close_three_processes(self, lock_class: type) -> None:
+        """Three processes attach concurrently, then close in sequence.
 
         Scenario:
-        1. P0 creates shared memory and writes data
-        2. P1 connects and writes data
-        3. P2 connects and writes data
-        4. P0 closes first (others still alive - no unlink)
-        5. P1 closes second (P2 still alive - no unlink)
-        6. P2 closes last (unlinks shared memory)
-        7. Verify shared memory is properly cleaned up (no leak)
+        1. P0 creates shared memory and writes its slot
+        2. P1 and P2 connect concurrently while P0 is still alive (overlapping
+           init exercises the multi-attach path)
+        3. P0 is released first while P1 and P2 are still attached — verifies
+           that mid-cleanup of one process doesn't disturb live siblings
+        4. P1 then P2 close in turn; P2 (last out) tears down the shared memory
+        5. Verify the segment is unlinked (a fresh connect raises)
         """
         ctx = multiprocessing.get_context("fork")
         shm_name = f"lc_{uuid.uuid4().hex[:8]}"
         shm_size = 1024
         result_queue = ctx.Queue()
+        ready_events = [ctx.Event() for _ in range(3)]
+        close_events = [ctx.Event() for _ in range(3)]
 
-        # Process data and durations (processes close in order: P0, P1, P2)
         processes_config = [
-            {
-                "process_id": 0,
-                "shm_size": shm_size,
-                "duration": 0.4,
-                "data": b"Hello from P0!",
-                "unlink_before_close": False,
-            },
-            {
-                "process_id": 1,
-                "shm_size": shm_size,
-                "duration": 2.0,
-                "data": b"Hello from P1!",
-                "unlink_before_close": True,
-            },
-            {
-                "process_id": 2,
-                "shm_size": shm_size,
-                "duration": 1.0,
-                "data": b"Hello from P2!",
-                "unlink_before_close": False,
-            },
+            {"process_id": 0, "shm_size": shm_size, "data": b"Hello from P0!"},
+            {"process_id": 1, "shm_size": shm_size, "data": b"Hello from P1!"},
+            {"process_id": 2, "shm_size": shm_size, "data": b"Hello from P2!"},
         ]
 
         processes = []
@@ -144,65 +141,71 @@ class TestFlexibleSharedMemoryLifecycle:
                     shm_name,
                     config["shm_size"],
                     config["process_id"],
-                    config["duration"],
                     config["data"],
                     result_queue,
                     lock_class,
-                    config["unlink_before_close"],
                 ),
+                kwargs={
+                    "ready_event": ready_events[config["process_id"]],
+                    "close_event": close_events[config["process_id"]],
+                },
             )
             processes.append(proc)
 
         try:
-            # Start all processes with small delay between them
-            for proc in processes:
+            processes[0].start()
+            wait_for_event(ready_events[0], "lifecycle process 0 startup", proc=processes[0])
+
+            # Start P1 and P2 concurrently so their init races overlap with P0
+            # still attached.
+            for proc in processes[1:]:
                 proc.start()
-                time.sleep(0.3)
+            for i, event in enumerate(ready_events[1:], start=1):
+                wait_for_event(event, f"lifecycle process {i} startup", proc=processes[i])
 
-            # Wait for all to complete
-            for proc in processes:
-                proc.join(timeout=15)
+            # Release P0 while P1 and P2 are still alive — exercises
+            # cleanup-with-siblings-attached.
+            close_events[0].set()
+            processes[0].join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(processes[0], "P0")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            # Then sequential teardown of the rest.
+            close_events[1].set()
+            processes[1].join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(processes[1], "P1")
+            close_events[2].set()
+            processes[2].join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(processes[2], "P2")
 
-            # All should succeed
-            assert len(results) == 3, f"Expected 3 results, got {len(results)}"
-            for result in results:
-                assert result["success"], f"Process {result.get('process_id')} failed: {result.get('error')}"
+            results = drain_results(result_queue, expected_count=3)
+            assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
-            # Sort by process_id
             results_by_id = {r["process_id"]: r for r in results}
-
-            # P0 should have created the memory
             assert results_by_id[0]["shm_creator"] is True
-
-            # P1 and P2 should have connected (not created)
             assert results_by_id[1]["shm_creator"] is False
             assert results_by_id[2]["shm_creator"] is False
 
-            # All should have read P0's data
             for result in results:
                 assert result["data_from_p0"] == b"Hello from P0!", f"Process {result['process_id']} read wrong data"
 
-            # At least P0 (first to close) should have seen others alive
-            # Note: Due to slot allocation in KeepAliveDict, intermediate processes
-            # may not always see others alive correctly
-            assert results_by_id[0]["others_alive_at_close"] is True, "P0 should have seen others alive"
+            # P0 closes first while P1+P2 are alive — concurrent-close coverage.
+            assert results_by_id[0]["others_alive_at_close"] is True, "P0 should have observed P1/P2 alive at its close"
+            # P1 closes while P2 is alive — sibling-still-alive coverage.
+            assert results_by_id[1]["others_alive_at_close"] is True, "P1 should have observed P2 alive at its close"
 
-            # Verify no shared memory leak - attempting to connect should fail
+            # No leak: segment is gone.
             with pytest.raises(FileNotFoundError):
                 FlexibleSharedMemory(
                     name=shm_name,
-                    shm_size=0,  # Try to connect to non-existent memory
+                    shm_size=0,
                     pinned_memory=False,
                     lock_class=lock_class,
                 )
 
         finally:
+            for event in close_events:
+                event.set()
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)

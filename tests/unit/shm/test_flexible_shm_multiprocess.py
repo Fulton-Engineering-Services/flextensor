@@ -2,23 +2,46 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multiprocess unit tests for FlexibleSharedMemory class."""
 
+from __future__ import annotations
+
 import multiprocessing
 import os
 import time
+from typing import TYPE_CHECKING
 
 import pytest
+from conftest import (
+    EVENT_TIMEOUT,
+    POLL_INTERVAL,
+    assert_clean_exit,
+    drain_results,
+    format_failed_results,
+    unlink_semaphore_if_present,
+    unlink_shared_memory_if_present,
+    wait_for_event,
+)
 
 from flextensor.shm import FlexibleSharedMemory, ProcessFileLock, SemaphoreLock
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from multiprocessing.process import BaseProcess
+    from multiprocessing.queues import Queue
+    from multiprocessing.synchronize import Event as EventType
 
-def create_and_write_process(name, shm_size, data_to_write, notify_ready, result_queue, lock_class):
-    """Helper function to create FlexibleSharedMemory and write data.
 
-    Note: Keeps memory alive for 2 seconds by default to allow other processes to connect.
-    Pass keep_alive_time in data_to_write tuple format: (data, keep_alive_time) to customize.
-    """
-    # Handle optional keep_alive_time passed via tuple
-    keep_alive_time = 2  # Default
+def create_and_write_process(
+    name: str,
+    shm_size: int,
+    data_to_write: bytes | tuple[bytes, float],
+    notify_ready: bool,
+    result_queue: Queue,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    close_event: EventType | None = None,
+) -> None:
+    """Create FlexibleSharedMemory and write data; stay alive until released."""
+    keep_alive_time = 2.0
     if isinstance(data_to_write, tuple):
         data_to_write, keep_alive_time = data_to_write
 
@@ -26,18 +49,23 @@ def create_and_write_process(name, shm_size, data_to_write, notify_ready, result
         fsm = FlexibleSharedMemory(
             name=name,
             shm_size=shm_size,
-            pinned_memory=False,  # Avoid cupy dependency in tests
+            pinned_memory=False,
             lock_class=lock_class,
         )
 
-        # Write data to memory
         fsm.block.buf[: len(data_to_write)] = data_to_write
 
         if notify_ready:
             fsm.notify_ready()
 
-        # Keep memory alive for other processes to connect
-        time.sleep(keep_alive_time)
+        if ready_event is not None:
+            ready_event.set()
+
+        if close_event is not None:
+            if not close_event.wait(timeout=EVENT_TIMEOUT):
+                raise TimeoutError("Timed out waiting for parent to allow creator cleanup")
+        else:
+            time.sleep(keep_alive_time)
 
         fsm.close()
 
@@ -51,41 +79,48 @@ def create_and_write_process(name, shm_size, data_to_write, notify_ready, result
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "action": "create_and_write",
                 "pid": os.getpid(),
             },
         )
 
 
-def wait_and_read_process(name, expected_data_len, result_queue, keep_alive_time, lock_class):
-    """Helper function to wait for ready and read data.
-
-    Args:
-        keep_alive_time: How long to stay alive after reading before closing (default 0s)
-    """
+def wait_and_read_process(
+    name: str,
+    expected_data_len: int,
+    result_queue: Queue,
+    keep_alive_time: float,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    close_event: EventType | None = None,
+) -> None:
+    """Wait for ready, read data, optionally stay alive until released."""
     try:
         fsm = FlexibleSharedMemory(
             name=name,
-            shm_size=0,  # Size will be determined from existing memory
+            shm_size=0,
             pinned_memory=False,
             lock_class=lock_class,
         )
 
-        # Wait for ready
         start_time = time.time()
         fsm.wait_for_ready()
         wait_time = time.time() - start_time
 
-        # Read data
         read_data = bytes(fsm.block.buf[:expected_data_len])
 
-        # Keep alive to coordinate with other readers
-        if keep_alive_time > 0:
+        if ready_event is not None:
+            ready_event.set()
+
+        if close_event is not None:
+            if not close_event.wait(timeout=EVENT_TIMEOUT):
+                raise TimeoutError("Timed out waiting for parent to allow reader cleanup")
+        elif keep_alive_time > 0:
             time.sleep(keep_alive_time)
 
         fsm.close()
@@ -101,23 +136,29 @@ def wait_and_read_process(name, expected_data_len, result_queue, keep_alive_time
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "action": "wait_and_read",
                 "pid": os.getpid(),
             },
         )
 
 
-def concurrent_access_process(name, proc_id, operations, result_queue, lock_class):
-    """Helper function for concurrent access testing."""
+def concurrent_access_process(
+    name: str,
+    proc_id: int,
+    operations: int,
+    result_queue: Queue,
+    lock_class: type,
+) -> None:
+    """Increment a shared counter under the main lock."""
     try:
         fsm = FlexibleSharedMemory(
             name=name,
-            shm_size=0,  # Connect to existing
+            shm_size=0,
             pinned_memory=False,
             lock_class=lock_class,
         )
@@ -125,21 +166,14 @@ def concurrent_access_process(name, proc_id, operations, result_queue, lock_clas
         successful_ops = 0
         for _i in range(operations):
             with fsm.main_lock:
-                # Read current data
-                current_data = bytes(fsm.block.buf[:8])  # Read first 8 bytes as counter
-
-                # Interpret as integer counter (or initialize to 0)
                 try:
-                    counter = int.from_bytes(current_data[:4], "little")
+                    counter = int.from_bytes(bytes(fsm.block.buf[:4]), "little")
                 except (ValueError, TypeError):
                     counter = 0
-
-                # Increment and write back
                 counter += 1
                 fsm.block.buf[:4] = counter.to_bytes(4, "little")
-
                 successful_ops += 1
-                time.sleep(0.001)  # Small delay to increase chance of race conditions
+                time.sleep(0.001)
 
         fsm.close()
 
@@ -153,11 +187,11 @@ def concurrent_access_process(name, proc_id, operations, result_queue, lock_clas
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "action": "concurrent_access",
                 "proc_id": proc_id,
                 "pid": os.getpid(),
@@ -165,22 +199,31 @@ def concurrent_access_process(name, proc_id, operations, result_queue, lock_clas
         )
 
 
-def keep_alive_monitor_process(name, monitor_duration, result_queue, lock_class):
-    """Helper function to monitor keep alive functionality."""
+def keep_alive_monitor_process(
+    name: str,
+    monitor_duration: float,
+    result_queue: Queue,
+    lock_class: type,
+    ready_event: EventType | None = None,
+) -> None:
+    """Poll any_process_alive() while another process holds the slot."""
     try:
         fsm = FlexibleSharedMemory(
             name=name,
-            shm_size=0,  # Connect to existing
+            shm_size=0,
             pinned_memory=False,
             lock_class=lock_class,
         )
 
+        if ready_event is not None:
+            ready_event.set()
+
         alive_checks = []
-        start_time = time.time()
-        while time.time() - start_time < monitor_duration:
+        deadline = time.monotonic() + monitor_duration
+        while time.monotonic() < deadline:
             alive = fsm.keep_alive.any_process_alive()
             alive_checks.append(alive)
-            time.sleep(0.5)
+            time.sleep(POLL_INTERVAL)
 
         fsm.close()
 
@@ -194,19 +237,27 @@ def keep_alive_monitor_process(name, monitor_duration, result_queue, lock_class)
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "action": "keep_alive_monitor",
                 "pid": os.getpid(),
             },
         )
 
 
-def check_memory_size_process(name, expected_size, result_queue, create, wait_time, lock_class):
-    """Helper function to check memory size consistency across processes."""
+def check_memory_size_process(
+    name: str,
+    expected_size: int,
+    result_queue: Queue,
+    create: bool,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    close_event: EventType | None = None,
+) -> None:
+    """Attach (creating or connecting) and report observed segment size."""
     try:
         if create:
             fsm = FlexibleSharedMemory(name=name, shm_size=expected_size, pinned_memory=False, lock_class=lock_class)
@@ -215,9 +266,11 @@ def check_memory_size_process(name, expected_size, result_queue, create, wait_ti
 
         actual_size = fsm.block.size
 
-        # Wait to keep memory alive - creator waits longest, connectors wait briefly to coordinate
-        if wait_time > 0:
-            time.sleep(wait_time)
+        if ready_event is not None:
+            ready_event.set()
+
+        if close_event is not None and not close_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to allow memory size process cleanup")
 
         fsm.close()
 
@@ -232,19 +285,26 @@ def check_memory_size_process(name, expected_size, result_queue, create, wait_ti
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "create": create,
                 "pid": os.getpid(),
             },
         )
 
 
-def coordinated_cleanup_process(name, proc_id, duration, result_queue, lock_class):
-    """Helper function to test coordinated cleanup across processes."""
+def coordinated_cleanup_process(
+    name: str,
+    proc_id: int,
+    result_queue: Queue,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    close_event: EventType | None = None,
+) -> None:
+    """Attach, write a per-PID marker, then close on parent's signal."""
     try:
         fsm = FlexibleSharedMemory(
             name=name,
@@ -253,13 +313,15 @@ def coordinated_cleanup_process(name, proc_id, duration, result_queue, lock_clas
             lock_class=lock_class,
         )
 
-        # Do some work
         test_data = f"proc_{proc_id}_data".encode()
         fsm.block.buf[: len(test_data)] = test_data
 
-        time.sleep(duration)
+        if ready_event is not None:
+            ready_event.set()
 
-        # Check if other processes still alive before cleanup
+        if close_event is None or not close_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to allow coordinated cleanup")
+
         others_alive = fsm.keep_alive.any_process_alive()
 
         fsm.close()
@@ -273,67 +335,54 @@ def coordinated_cleanup_process(name, proc_id, duration, result_queue, lock_clas
             },
         )
 
-    except Exception as e:
+    except (FileNotFoundError, FileExistsError, OSError, ValueError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "proc_id": proc_id,
                 "pid": os.getpid(),
             },
         )
 
 
-def cleanup_flexible_shared_memory(name):
-    """Helper function to clean up test resources."""
-    # Cleanup various shared resources
-    # Based on compact naming in FlexibleSharedMemory.__init__:
-    # - Main: name
-    # - Keep alive dict: sm_name_kd (SharedMemoryDict adds sm_ prefix), name_km (metadata)
-    # - Condition: name_c
-    resource_names = [
-        name,  # Main shared memory
-        "sm_" + name + "_kd",  # KeepAliveDict SharedMemoryDict (sm_ prefix added internally)
-        name + "_km",  # KeepAliveDict SharedMemory (timestamps)
-        name + "_c",  # MultiprocessCondition
-    ]
+def run_coordinated_cleanup_processes(
+    processes: Sequence[BaseProcess],
+    ready_events: Sequence[EventType],
+    close_events: Sequence[EventType],
+) -> None:
+    """Start cleanup workers, then release them in deterministic close order.
 
-    for resource_name in resource_names:
-        try:
-            from multiprocessing.shared_memory import SharedMemory
+    Asserts each worker exits cleanly so a hung or crashed process is reported
+    here rather than as a downstream "missing result" assertion.
+    """
+    for proc in processes:
+        proc.start()
 
-            try:
-                shm = SharedMemory(name=resource_name)
-                shm.close()
-                shm.unlink()
-            except (FileNotFoundError, FileExistsError):
-                pass
-        except ImportError:
-            pass
+    for i, event in enumerate(ready_events):
+        wait_for_event(event, f"cleanup worker {i} startup", proc=processes[i])
 
-    # Cleanup semaphores / lock names
-    # Based on compact naming:
-    # - Main: name
-    # - Keep alive lock: name_ks
-    # - Condition lock: name_c
-    semaphore_names = [
-        name,  # Main lock
-        name + "_ks",  # Keep alive lock
-        name + "_c",  # Condition lock
-    ]
+    close_events[0].set()
+    processes[0].join(timeout=EVENT_TIMEOUT)
+    assert_clean_exit(processes[0], "cleanup worker 0")
 
-    for sem_name in semaphore_names:
-        try:
-            import posix_ipc
+    for event in close_events[1:]:
+        event.set()
+    for i, proc in enumerate(processes[1:], start=1):
+        proc.join(timeout=EVENT_TIMEOUT)
+        assert_clean_exit(proc, f"cleanup worker {i}")
 
-            try:
-                sem = posix_ipc.Semaphore(sem_name)
-                sem.close()
-                sem.unlink()
-            except (posix_ipc.ExistentialError, FileNotFoundError):
-                pass
-        except ImportError:
-            pass
+
+def cleanup_flexible_shared_memory(name: str) -> None:
+    """Best-effort removal of FlexibleSharedMemory's resources."""
+    # FlexibleSharedMemory naming:
+    # - Main shm: name; main lock semaphore: name
+    # - KeepAliveDict: sm_<name>_kd (shm), <name>_km (timestamps), <name>_ks (lock)
+    # - MultiprocessCondition: <name>_c (shm + semaphore lock)
+    for shm_name in (name, f"sm_{name}_kd", f"{name}_km", f"{name}_c"):
+        unlink_shared_memory_if_present(shm_name)
+    for sem_name in (name, f"{name}_ks", f"{name}_c"):
+        unlink_semaphore_if_present(sem_name)
 
 
 class TestFlexibleSharedMemoryMultiprocess:
@@ -342,8 +391,7 @@ class TestFlexibleSharedMemoryMultiprocess:
     def setup_method(self):
         """Setup test fixtures before each test method."""
         self.test_name = "fsm_mp"  # Short name to avoid POSIX name limits
-        self.test_size = 8192  # 8KB for tests
-        # Clean up any leftover resources from previous runs
+        self.test_size = 8192
         cleanup_flexible_shared_memory(self.test_name)
 
     def teardown_method(self):
@@ -355,14 +403,14 @@ class TestFlexibleSharedMemoryMultiprocess:
         """Test basic creation and connection across processes."""
         result_queue = multiprocessing.Queue()
         test_data = b"Hello from creator process!"
+        creator_ready = multiprocessing.Event()
+        creator_close = multiprocessing.Event()
 
-        # Creator process
         creator_proc = multiprocessing.Process(
             target=create_and_write_process,
             args=(self.test_name, self.test_size, test_data, True, result_queue, lock_class),
+            kwargs={"ready_event": creator_ready, "close_event": creator_close},
         )
-
-        # Reader process
         reader_proc = multiprocessing.Process(
             target=wait_and_read_process,
             args=(self.test_name, len(test_data), result_queue, 0, lock_class),
@@ -370,45 +418,35 @@ class TestFlexibleSharedMemoryMultiprocess:
 
         try:
             creator_proc.start()
-            time.sleep(0.5)  # Let creator establish memory
+            wait_for_event(creator_ready, "creator shared memory creation", proc=creator_proc)
             reader_proc.start()
 
-            creator_proc.join(timeout=15)
-            reader_proc.join(timeout=15)
+            reader_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(reader_proc, "reader")
+            creator_close.set()
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=2)
 
-            # Debug: print all results
-            print(f"\n[TEST] Collected {len(results)} results:")
-            for i, result in enumerate(results):
-                print(f"[TEST] Result {i}: {result}")
-
-            assert len(results) == 2
-
-            # Find creator and reader results
             creator_result = next(r for r in results if r.get("action") == "create_and_write")
             reader_result = next(r for r in results if r.get("action") == "wait_and_read")
 
-            # Both should succeed
-            assert creator_result["success"] is True, f"Creator failed: {creator_result.get('error', 'no error info')}"
-            assert reader_result["success"] is True, f"Reader failed: {reader_result.get('error', 'no error info')}"
+            assert creator_result["success"] is True, f"Creator failed: {creator_result.get('error')}"
+            assert reader_result["success"] is True, f"Reader failed: {reader_result.get('error')}"
 
-            # Creator should be the memory creator
             assert creator_result["shm_creator"] is True
-            assert reader_result["shm_creator"] is False  # Connected to existing
+            assert reader_result["shm_creator"] is False
 
-            # Data should match
             assert reader_result["data_read"] == test_data
-            assert reader_result["wait_time"] <= 3.0  # Should not wait too long
+            assert reader_result["wait_time"] <= 3.0
 
         finally:
+            creator_close.set()
             for proc in [creator_proc, reader_proc]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_multiple_readers(self, lock_class):
@@ -416,48 +454,42 @@ class TestFlexibleSharedMemoryMultiprocess:
         result_queue = multiprocessing.Queue()
         test_data = b"Shared data for multiple readers"
         num_readers = 3
+        creator_ready = multiprocessing.Event()
+        creator_close = multiprocessing.Event()
 
-        # Creator process - keep alive 4 seconds (readers coordinate their own cleanup)
         creator_proc = multiprocessing.Process(
             target=create_and_write_process,
-            args=(self.test_name, self.test_size, (test_data, 4), True, result_queue, lock_class),  # keep_alive_time=4
+            args=(self.test_name, self.test_size, test_data, True, result_queue, lock_class),
+            kwargs={"ready_event": creator_ready, "close_event": creator_close},
         )
 
-        # Multiple reader processes - each waits 1s after reading to ensure all connect
-        reader_procs = []
-        for _i in range(num_readers):
-            proc = multiprocessing.Process(
+        reader_procs = [
+            multiprocessing.Process(
                 target=wait_and_read_process,
-                args=(self.test_name, len(test_data), result_queue, 1, lock_class),  # keep_alive_time=1
+                args=(self.test_name, len(test_data), result_queue, 0, lock_class),
             )
-            reader_procs.append(proc)
+            for _ in range(num_readers)
+        ]
 
         try:
             creator_proc.start()
-            time.sleep(1)  # Let creator establish memory
+            wait_for_event(creator_ready, "creator shared memory creation", proc=creator_proc)
 
-            # Start all readers
             for proc in reader_procs:
                 proc.start()
-                time.sleep(0.1)  # Small stagger
 
-            # Wait for all - longer timeout to handle system load
-            creator_proc.join(timeout=30)
-            for proc in reader_procs:
-                proc.join(timeout=30)
+            for i, proc in enumerate(reader_procs):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"reader {i}")
+            creator_close.set()
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=num_readers + 1)
 
-            assert len(results) == num_readers + 1
-
-            # All should succeed
             for result in results:
-                assert result["success"] is True
+                assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
 
-            # Check reader results
             reader_results = [r for r in results if r.get("action") == "wait_and_read"]
             assert len(reader_results) == num_readers
 
@@ -466,11 +498,11 @@ class TestFlexibleSharedMemoryMultiprocess:
                 assert reader_result["wait_time"] <= 5.0
 
         finally:
-            all_procs = [creator_proc, *reader_procs]
-            for proc in all_procs:
+            creator_close.set()
+            for proc in [creator_proc, *reader_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_concurrent_access_with_semaphore(self, lock_class):
@@ -479,251 +511,207 @@ class TestFlexibleSharedMemoryMultiprocess:
         num_processes = 4
         operations_per_process = 10
 
-        # Create initial shared memory with counter initialized to 0
         init_data = (0).to_bytes(4, "little") + b"\x00" * (self.test_size - 4)
+        creator_ready = multiprocessing.Event()
+        creator_close = multiprocessing.Event()
 
         creator_proc = multiprocessing.Process(
             target=create_and_write_process,
             args=(self.test_name, self.test_size, init_data, False, result_queue, lock_class),
+            kwargs={"ready_event": creator_ready, "close_event": creator_close},
         )
 
-        # Create concurrent access processes
-        worker_procs = []
-        for i in range(num_processes):
-            proc = multiprocessing.Process(
+        worker_procs = [
+            multiprocessing.Process(
                 target=concurrent_access_process,
                 args=(self.test_name, i, operations_per_process, result_queue, lock_class),
             )
-            worker_procs.append(proc)
+            for i in range(num_processes)
+        ]
 
         try:
-            # Start creator
             creator_proc.start()
-            time.sleep(1)  # Let creator establish memory
+            wait_for_event(creator_ready, "creator shared memory creation", proc=creator_proc)
 
-            # Start all workers simultaneously
             for proc in worker_procs:
                 proc.start()
 
-            # Wait for all to complete
-            creator_proc.join(timeout=20)
-            for proc in worker_procs:
-                proc.join(timeout=20)
+            for i, proc in enumerate(worker_procs):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"worker {i}")
+            creator_close.set()
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=num_processes + 1)
 
-            # Creator should succeed
             creator_results = [r for r in results if r.get("action") == "create_and_write"]
             assert len(creator_results) == 1
             assert creator_results[0]["success"] is True
 
-            # Check worker results
             worker_results = [r for r in results if r.get("action") == "concurrent_access"]
-            successful_workers = [r for r in worker_results if r["success"]]
+            assert len(worker_results) == num_processes
+            # All workers must succeed — assert_clean_exit above already proved
+            # nothing crashed silently; surface any error message if a worker
+            # reported failure via the queue.
+            assert all(r["success"] for r in worker_results), (
+                f"Worker failures: {format_failed_results(worker_results)}"
+            )
 
-            # Most workers should succeed
-            assert len(successful_workers) >= num_processes // 2
-
-            # Total successful operations should be reasonable
-            total_ops = sum(r["successful_ops"] for r in successful_workers)
-            expected_total = len(successful_workers) * operations_per_process
+            total_ops = sum(r["successful_ops"] for r in worker_results)
+            expected_total = num_processes * operations_per_process
             assert total_ops == expected_total, f"Expected {expected_total} ops, got {total_ops}"
 
         finally:
-            all_procs = [creator_proc, *worker_procs]
-            for proc in all_procs:
+            creator_close.set()
+            for proc in [creator_proc, *worker_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_keep_alive_functionality(self, lock_class):
         """Test keep alive functionality across processes."""
         result_queue = multiprocessing.Queue()
+        long_running_ready = multiprocessing.Event()
+        long_running_close = multiprocessing.Event()
+        monitor_ready = multiprocessing.Event()
 
-        # Long-running process that will stay alive for 5 seconds (enough for monitor to complete 3s)
         long_running_proc = multiprocessing.Process(
             target=create_and_write_process,
             args=(
                 self.test_name,
                 self.test_size,
-                (b"keep_alive_test", 5),
+                b"keep_alive_test",
                 False,
                 result_queue,
                 lock_class,
-            ),  # keep_alive_time=5
+            ),
+            kwargs={"ready_event": long_running_ready, "close_event": long_running_close},
         )
 
-        # Monitor process that checks keep alive status
         monitor_proc = multiprocessing.Process(
             target=keep_alive_monitor_process,
-            args=(self.test_name, 3, result_queue, lock_class),
+            args=(self.test_name, 0.3, result_queue, lock_class),
+            kwargs={"ready_event": monitor_ready},
         )
 
         try:
-            print("\n[TEST] Starting long_running_proc")
             long_running_proc.start()
-            time.sleep(1)  # Let it establish
-            print("[TEST] Starting monitor_proc")
+            wait_for_event(long_running_ready, "long-running shared memory creation", proc=long_running_proc)
             monitor_proc.start()
+            wait_for_event(monitor_ready, "keep-alive monitor startup", proc=monitor_proc)
 
-            # Let monitor run while long process is alive
-            print("[TEST] Waiting for monitor_proc to complete")
-            monitor_proc.join(timeout=15)
-            print(f"[TEST] monitor_proc alive={monitor_proc.is_alive()}, exitcode={monitor_proc.exitcode}")
+            monitor_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(monitor_proc, "monitor")
 
-            # Stop long running process
-            print("[TEST] Waiting for long_running_proc to complete")
-            long_running_proc.join(timeout=10)
-            print(
-                f"[TEST] long_running_proc alive={long_running_proc.is_alive()}, exitcode={long_running_proc.exitcode}",
-            )
+            long_running_close.set()
+            long_running_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(long_running_proc, "long-running")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=2)
 
-            print(f"[TEST] Collected {len(results)} results:")
-            for i, result in enumerate(results):
-                print(f"[TEST] Result {i}: {result}")
-
-            # Both should succeed
             for result in results:
-                assert result["success"] is True, f"Result failed: {result.get('error', 'no error info')}"
+                assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
 
-            # Check monitor results
             monitor_results = [r for r in results if r.get("action") == "keep_alive_monitor"]
             assert len(monitor_results) == 1
 
-            monitor_result = monitor_results[0]
-            alive_checks = monitor_result["alive_checks"]
-
-            # Should have detected processes alive during monitoring
+            alive_checks = monitor_results[0]["alive_checks"]
             assert len(alive_checks) > 0
             assert any(alive_checks), "Should have detected alive processes"
 
         finally:
+            long_running_close.set()
             for proc in [long_running_proc, monitor_proc]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_memory_size_consistency(self, lock_class):
         """Test that memory size is consistent across processes."""
         result_queue = multiprocessing.Queue()
+        creator_ready = multiprocessing.Event()
+        creator_close = multiprocessing.Event()
 
-        # Creator process - keep alive for 5 seconds to allow connectors to access and close
         creator_proc = multiprocessing.Process(
             target=check_memory_size_process,
-            args=(self.test_name, self.test_size, result_queue, True, 5, lock_class),  # wait_time=5
+            args=(self.test_name, self.test_size, result_queue, True, lock_class),
+            kwargs={"ready_event": creator_ready, "close_event": creator_close},
         )
 
-        # Connector processes - wait 1 second before closing to ensure all connect
-        connector_procs = []
-        for _i in range(2):
-            proc = multiprocessing.Process(
+        connector_procs = [
+            multiprocessing.Process(
                 target=check_memory_size_process,
-                args=(self.test_name, self.test_size, result_queue, False, 1, lock_class),  # wait_time=1
+                args=(self.test_name, self.test_size, result_queue, False, lock_class),
             )
-            connector_procs.append(proc)
+            for _ in range(2)
+        ]
 
         try:
-            print("\n[TEST] Starting creator_proc")
             creator_proc.start()
-            time.sleep(0.5)  # Let creator establish resources
-            print(f"[TEST] creator_proc alive={creator_proc.is_alive()}, exitcode={creator_proc.exitcode}")
+            wait_for_event(creator_ready, "creator shared memory creation", proc=creator_proc)
 
-            # Start connectors while creator is alive
-            print("[TEST] Starting connector_procs")
-            for i, proc in enumerate(connector_procs):
-                print(f"[TEST] Starting connector {i}")
+            for proc in connector_procs:
                 proc.start()
-                time.sleep(0.2)
 
-            print("[TEST] Waiting for connector_procs to complete")
             for i, proc in enumerate(connector_procs):
-                proc.join(timeout=10)
-                print(f"[TEST] connector {i} alive={proc.is_alive()}, exitcode={proc.exitcode}")
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"connector {i}")
 
-            print("[TEST] Waiting for creator_proc to complete")
-            creator_proc.join(timeout=10)
-            print(f"[TEST] creator_proc done: alive={creator_proc.is_alive()}, exitcode={creator_proc.exitcode}")
+            creator_close.set()
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=3)
 
-            print(f"[TEST] Collected {len(results)} results:")
-            for i, result in enumerate(results):
-                print(f"[TEST] Result {i}: {result}")
-
-            # All should succeed
             for result in results:
-                assert result["success"] is True, f"Result failed: {result.get('error', 'no error info')}"
+                assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
 
-            # All should see the same memory size (may be rounded up to page size)
             sizes = [r["actual_size"] for r in results]
             assert len(set(sizes)) == 1, f"All processes should see the same size, got {sizes}"
-            # Size should be at least what we requested
             assert sizes[0] >= self.test_size, f"Memory size should be at least {self.test_size}, got {sizes[0]}"
 
         finally:
-            all_procs = [creator_proc, *connector_procs]
-            for proc in all_procs:
+            creator_close.set()
+            for proc in [creator_proc, *connector_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_cleanup_coordination(self, lock_class):
         """Test coordinated cleanup across processes."""
         result_queue = multiprocessing.Queue()
+        num_workers = 4
 
-        processes = []
-        durations = [1, 2, 3, 4]  # Staggered durations
+        ready_events = [multiprocessing.Event() for _ in range(num_workers)]
+        close_events = [multiprocessing.Event() for _ in range(num_workers)]
 
-        for i, duration in enumerate(durations):
-            proc = multiprocessing.Process(
+        processes = [
+            multiprocessing.Process(
                 target=coordinated_cleanup_process,
-                args=(self.test_name, i, duration, result_queue, lock_class),
+                args=(self.test_name, i, result_queue, lock_class),
+                kwargs={"ready_event": ready_events[i], "close_event": close_events[i]},
             )
-            processes.append(proc)
+            for i in range(num_workers)
+        ]
 
         try:
-            # Start all processes
-            for proc in processes:
-                proc.start()
-                time.sleep(0.1)
+            run_coordinated_cleanup_processes(processes, ready_events, close_events)
 
-            # Wait for all to complete
-            for proc in processes:
-                proc.join(timeout=20)
+            results = drain_results(result_queue, expected_count=num_workers)
+            assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
-
-            # All should succeed
-            successful_results = [r for r in results if r["success"]]
-            assert len(successful_results) >= len(durations) // 2
-
-            # Earlier processes should have seen others alive
-            # Later processes might not see others alive
-            results_by_id = {r["proc_id"]: r for r in successful_results}
-
-            # At least the first process should have seen others alive
-            if 0 in results_by_id:
-                assert results_by_id[0]["others_alive_at_close"] is True
+            results_by_id = {r["proc_id"]: r for r in results}
+            # P0 closes first while siblings are still attached.
+            assert results_by_id[0]["others_alive_at_close"] is True
 
         finally:
+            for event in close_events:
+                event.set()
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)

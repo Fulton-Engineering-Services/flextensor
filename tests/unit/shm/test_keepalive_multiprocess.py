@@ -2,66 +2,99 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multiprocess unit tests for KeepAlive class."""
 
+from __future__ import annotations
+
 import multiprocessing
 import os
 import time
-from multiprocessing.shared_memory import SharedMemory
+from typing import TYPE_CHECKING
 
 import posix_ipc
 import pytest
+from conftest import (
+    EVENT_TIMEOUT,
+    POLL_INTERVAL,
+    assert_clean_exit,
+    drain_results,
+    format_failed_results,
+    unlink_semaphore_if_present,
+    unlink_shared_memory_if_present,
+    wait_for_event,
+)
 
 from flextensor.shm import KeepAlive, ProcessFileLock, SemaphoreLock
 
+if TYPE_CHECKING:
+    from multiprocessing.queues import Queue
+    from multiprocessing.synchronize import Event as EventType
+
 
 def create_keepalive_process(
-    name,
-    label,
-    keep_alive_seconds,
-    create_semaphore,
-    result_queue,
-    duration,
-    lock_class,
-):
+    name: str,
+    label: str,
+    keep_alive_seconds: float,
+    create_semaphore: bool,
+    result_queue: Queue,
+    duration: float,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    stop_event: EventType | None = None,
+) -> None:
     """Helper function to create KeepAlive in a separate process."""
     try:
         keep_alive = KeepAlive(
             name=name,
-            process_id=os.getpid(),  # Use actual integer PID
+            process_id=os.getpid(),
             keep_alive_seconds=keep_alive_seconds,
             is_creator=create_semaphore,
             lock_class=lock_class,
         )
 
-        # Let it run for specified duration
-        start_time = time.time()
-        while time.time() - start_time < duration:
-            time.sleep(0.5)
+        if ready_event is not None:
+            ready_event.set()
+
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                break
+            time.sleep(POLL_INTERVAL)
             if not keep_alive.any_process_alive():
                 break
 
         keep_alive.close(any_process_alive=True)
         result_queue.put({"success": True, "process_id": label})
 
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-        result_queue.put({"success": False, "error": str(e), "process_id": label})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "process_id": label})
 
 
-def monitor_keepalive_process(name, label, keep_alive_seconds, result_queue, monitor_duration, lock_class):
-    """Helper function to monitor an existing KeepAlive in a separate process."""
+def monitor_keepalive_process(
+    name: str,
+    label: str,
+    keep_alive_seconds: float,
+    result_queue: Queue,
+    monitor_duration: float,
+    lock_class: type,
+    ready_event: EventType | None = None,
+) -> None:
+    """Monitor an existing KeepAlive in a separate process."""
     try:
         keep_alive = KeepAlive(
             name=name,
-            process_id=os.getpid(),  # Use actual integer PID
+            process_id=os.getpid(),
             keep_alive_seconds=keep_alive_seconds,
-            is_creator=False,  # Connect to existing
+            is_creator=False,
             lock_class=lock_class,
         )
 
+        if ready_event is not None:
+            ready_event.set()
+
         alive_checks = []
-        start_time = time.time()
-        while time.time() - start_time < monitor_duration:
+        deadline = time.monotonic() + monitor_duration
+        while time.monotonic() < deadline:
             alive_checks.append(keep_alive.any_process_alive())
-            time.sleep(0.5)
+            time.sleep(POLL_INTERVAL)
 
         keep_alive.close(any_process_alive=True)
         result_queue.put(
@@ -72,102 +105,84 @@ def monitor_keepalive_process(name, label, keep_alive_seconds, result_queue, mon
             },
         )
 
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-        result_queue.put({"success": False, "error": str(e), "process_id": label})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "process_id": label})
 
 
-def cleanup_resources(name):
-    """Helper function to clean up test resources."""
-    # Give time for any background processes to finish cleanup
-    time.sleep(0.5)
+def cleanup_resources(name: str) -> None:
+    """Best-effort removal of KeepAlive's shared resources between tests.
 
-    # Clean up semaphore (name) - retry multiple times if busy
-    for _ in range(3):
-        try:
-            sem = posix_ipc.Semaphore(name)
-            sem.close()
-            sem.unlink()
-            break
-        except (posix_ipc.ExistentialError, FileNotFoundError):
-            break
-        except (posix_ipc.BusyError, OSError):
-            time.sleep(0.3)
-            continue
+    KeepAlive naming:
+    - Main lock semaphore: ``name``;  internal-state semaphore: ``name``_s
+    - SharedMemoryDict-backed state: ``<dict_name>``_d (data) + ``<dict_name>``_m (mutex),
+      where ``<dict_name>`` is either ``name``_dict or ``name`` depending on which
+      KeepAlive variant created the segment.
 
-    # Clean up KeepAliveDict shared memory resources
-    dict_name = f"{name}_dict"
+    Both ``unlink_*_if_present`` helpers retry internally with the same backoff,
+    so we don't need an additional outer ``time.sleep`` — that was redundant.
+    """
+    for sem_name in (name, f"{name}_s"):
+        unlink_semaphore_if_present(sem_name)
 
-    # Clean up _d (SharedMemoryDict) - retry if needed
-    for _ in range(3):
-        try:
-            shm_d = SharedMemory(name=f"{dict_name}_d")
-            shm_d.close()
-            shm_d.unlink()
-            break
-        except FileNotFoundError:
-            break
-        except (OSError, Exception):  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-            time.sleep(0.1)
-            continue
-
-    # Clean up _m (SharedMemory) - retry if needed
-    for _ in range(3):
-        try:
-            shm_m = SharedMemory(name=f"{dict_name}_m")
-            shm_m.close()
-            shm_m.unlink()
-            break
-        except FileNotFoundError:
-            break
-        except (OSError, Exception):  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-            time.sleep(0.1)
-            continue
-
-    # Give time for OS to fully release resources
-    time.sleep(0.5)
+    for dict_name in (f"{name}_dict", name):
+        unlink_shared_memory_if_present(f"{dict_name}_d")
+        unlink_shared_memory_if_present(f"{dict_name}_m")
 
 
-def quick_cleanup_process(name, label, result_queue, lock_class, is_creator=False):
+def quick_cleanup_process(
+    name: str,
+    label: str,
+    result_queue: Queue,
+    lock_class: type,
+    is_creator: bool = False,
+    ready_event: EventType | None = None,
+) -> None:
     """Process that quickly creates and cleans up KeepAlive."""
     try:
         keep_alive = KeepAlive(
             name=name,
-            process_id=os.getpid(),  # Use actual integer PID
+            process_id=os.getpid(),
             keep_alive_seconds=1,
             is_creator=is_creator,
             lock_class=lock_class,
         )
-        time.sleep(0.5)  # Brief operation
-        keep_alive.close(any_process_alive=False)  # Force cleanup
+        if ready_event is not None:
+            ready_event.set()
+        time.sleep(POLL_INTERVAL)
+        keep_alive.close(any_process_alive=False)
         result_queue.put({"success": True, "process_id": label})
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-        result_queue.put({"success": False, "error": str(e), "process_id": label})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "process_id": label})
 
 
-def long_holding_process(name, label, result_queue, lock_class):
-    """Process that holds semaphore for a longer time."""
+def long_holding_process(
+    name: str,
+    label: str,
+    result_queue: Queue,
+    lock_class: type,
+    hold_time: float = 0.2,
+) -> None:
+    """Process that holds the keep-alive lock for a while, then queries liveness."""
     try:
         keep_alive = KeepAlive(
             name=name,
-            process_id=os.getpid(),  # Use actual integer PID
+            process_id=os.getpid(),
             keep_alive_seconds=1,
             is_creator=True,
             lock_class=lock_class,
         )
 
-        # Hold semaphore for longer time
         with keep_alive.lock:
-            time.sleep(2)  # Hold for 2 seconds
-            # Do some work while holding semaphore (but don't call any_process_alive
-            # here as it would try to acquire the semaphore again, causing deadlock)
+            time.sleep(hold_time)
+            # Don't call any_process_alive() under the lock — it would re-enter
+            # the same lock and deadlock.
 
-        # Check alive status after releasing the semaphore
         alive = keep_alive.any_process_alive()
 
         keep_alive.close(any_process_alive=False)
         result_queue.put({"success": True, "process_id": label, "alive": alive})
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional to tolerate transient IPC failures
-        result_queue.put({"success": False, "error": str(e), "process_id": label})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "process_id": label})
 
 
 class TestKeepAliveMultiprocess:
@@ -176,8 +191,10 @@ class TestKeepAliveMultiprocess:
     def setup_method(self):
         """Setup test fixtures before each test method."""
         self.test_name = "ka_mp"  # Short name to avoid POSIX name limits
-        self.keep_alive_seconds = 2
-        # Clean up any leftover resources from previous runs
+        # Floor at 1.0s so the heartbeat thread (fires every keep_alive_seconds/2)
+        # tolerates fork+import latency on shared CI runners — values below ~0.5s
+        # can mark a freshly-spawned worker as stale before it has registered.
+        self.keep_alive_seconds = 1.0
         cleanup_resources(self.test_name)
 
     def teardown_method(self):
@@ -188,99 +205,99 @@ class TestKeepAliveMultiprocess:
     def test_multiprocess_keepalive_basic(self, lock_class):
         """Test basic multiprocess KeepAlive functionality."""
         result_queue = multiprocessing.Queue()
+        process1_ready = multiprocessing.Event()
 
-        # Start two processes with KeepAlive
         process1 = multiprocessing.Process(
             target=create_keepalive_process,
-            args=(self.test_name, "proc1", self.keep_alive_seconds, True, result_queue, 3, lock_class),
+            args=(self.test_name, "proc1", self.keep_alive_seconds, True, result_queue, 0.4, lock_class),
+            kwargs={"ready_event": process1_ready},
         )
         process2 = multiprocessing.Process(
             target=create_keepalive_process,
-            args=(self.test_name, "proc2", self.keep_alive_seconds, False, result_queue, 3, lock_class),
+            args=(self.test_name, "proc2", self.keep_alive_seconds, False, result_queue, 0.4, lock_class),
         )
 
         try:
             process1.start()
-            time.sleep(0.5)  # Let first process create semaphore
+            wait_for_event(process1_ready, "creator KeepAlive initialization", proc=process1)
             process2.start()
 
-            # Wait for both processes to complete
-            process1.join(timeout=10)
-            process2.join(timeout=10)
+            process1.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(process1, "proc1")
+            process2.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(process2, "proc2")
 
-            # Check results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=2)
 
-            assert len(results) == 2
             for result in results:
                 assert result["success"] is True, (
                     f"Process {result['process_id']} failed: {result.get('error', 'Unknown error')}"
                 )
 
         finally:
-            # Cleanup processes
             for proc in [process1, process2]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_process_detection_and_cleanup(self, lock_class):
         """Test that processes can detect each other and cleanup dead processes."""
         result_queue = multiprocessing.Queue()
+        creator_ready = multiprocessing.Event()
+        monitor_ready = multiprocessing.Event()
 
-        # Create first process (will be the creator)
         creator_proc = multiprocessing.Process(
             target=create_keepalive_process,
-            args=(self.test_name, "creator", self.keep_alive_seconds, True, result_queue, 6, lock_class),
+            args=(self.test_name, "creator", self.keep_alive_seconds, True, result_queue, 0.8, lock_class),
+            kwargs={"ready_event": creator_ready},
         )
 
-        # Create monitor process that will check for other processes
         monitor_proc = multiprocessing.Process(
             target=monitor_keepalive_process,
-            args=(self.test_name, "monitor", self.keep_alive_seconds, result_queue, 4, lock_class),
+            args=(self.test_name, "monitor", self.keep_alive_seconds, result_queue, 0.3, lock_class),
+            kwargs={"ready_event": monitor_ready},
         )
 
         try:
             creator_proc.start()
-            time.sleep(1)  # Let creator establish itself
+            wait_for_event(creator_ready, "creator KeepAlive initialization", proc=creator_proc)
             monitor_proc.start()
+            wait_for_event(monitor_ready, "monitor KeepAlive initialization", proc=monitor_proc)
 
-            # Wait for monitor to complete first
-            monitor_proc.join(timeout=10)
-            creator_proc.join(timeout=10)
+            monitor_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(monitor_proc, "monitor")
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Check results
-            results = {}
-            while not result_queue.empty():
-                result = result_queue.get()
-                results[result["process_id"]] = result
+            results = drain_results(result_queue, expected_count=2)
+            results_by_id = {r["process_id"]: r for r in results}
+            assert results_by_id["creator"]["success"] is True
+            assert results_by_id["monitor"]["success"] is True
 
-            assert len(results) == 2
-            assert results["creator"]["success"] is True
-            assert results["monitor"]["success"] is True
-
-            # Monitor should have detected other processes alive
-            alive_checks = results["monitor"]["alive_checks"]
+            alive_checks = results_by_id["monitor"]["alive_checks"]
             assert any(alive_checks), "Monitor should have detected other processes alive"
 
         finally:
             for proc in [creator_proc, monitor_proc]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_race_condition_protection(self, lock_class):
-        """Test that semaphores protect against race conditions."""
+        """Test that semaphores protect against race conditions when many processes
+        race to create/connect to KeepAlive concurrently."""
         result_queue = multiprocessing.Queue()
+        num_processes = 4
+        # Workers must outlive the staleness threshold so a slow-to-register peer
+        # isn't seen as stale by the others — derive from keep_alive_seconds so
+        # raising the staleness floor in setup_method keeps this test meaningful.
+        worker_duration = self.keep_alive_seconds
         processes = []
 
-        # Start multiple processes simultaneously
-        for i in range(4):
-            create_semaphore = i == 0  # Only first process creates semaphore
+        for i in range(num_processes):
+            create_semaphore = i == 0
             proc = multiprocessing.Process(
                 target=create_keepalive_process,
                 args=(
@@ -289,59 +306,54 @@ class TestKeepAliveMultiprocess:
                     self.keep_alive_seconds,
                     create_semaphore,
                     result_queue,
-                    3,
+                    worker_duration,
                     lock_class,
                 ),
             )
             processes.append(proc)
 
         try:
-            # Start all processes quickly to test race conditions
             for proc in processes:
                 proc.start()
-                time.sleep(0.1)  # Small delay to avoid overwhelming
+                time.sleep(0.02)
 
-            # Wait for all processes
-            for proc in processes:
-                proc.join(timeout=15)
+            for i, proc in enumerate(processes):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"proc_{i}")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=num_processes)
 
-            assert len(results) == 4
-            success_count = sum(1 for r in results if r["success"])
-
-            # At least the creator should succeed, others might fail due to timing
-            assert success_count >= 1, f"At least one process should succeed, got {success_count} successes"
-
-            # Check for any specific errors that indicate race conditions
+            # Acceptable failure modes are race-induced IPC errors. Match by
+            # exception type name (workers format errors as ``f"{type(e).__name__}: {e}"``)
+            # rather than free-form message text, which can change with locale or
+            # embedded paths and silently let unrelated failures slip through.
+            allowed_error_prefixes = (
+                "ExistentialError:",
+                "FileNotFoundError:",
+                "FileExistsError:",
+            )
             for result in results:
                 if not result["success"]:
                     error = result.get("error", "")
-                    # These are acceptable errors due to cleanup timing
-                    assert any(
-                        acceptable in error.lower()
-                        for acceptable in [
-                            "existential",
-                            "not found",
-                            "no such file",
-                            "already exists",
-                        ]
-                    ), f"Unexpected error that might indicate race condition: {error}"
+                    assert error.startswith(allowed_error_prefixes), f"Unexpected (non-race) error: {error}"
+
+            # At minimum the creator must have succeeded; surface any unexpected
+            # failure list with full detail.
+            success_count = sum(1 for r in results if r["success"])
+            assert success_count >= 1, f"No worker succeeded; failures: {format_failed_results(results)}"
 
         finally:
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_no_deadlock_on_cleanup(self, lock_class):
         """Test that cleanup operations don't cause deadlocks."""
         result_queue = multiprocessing.Queue()
 
+        creator_ready = multiprocessing.Event()
         processes = []
         for i in range(3):
             label = "creator" if i == 0 else f"proc_{i}"
@@ -349,38 +361,36 @@ class TestKeepAliveMultiprocess:
             proc = multiprocessing.Process(
                 target=quick_cleanup_process,
                 args=(self.test_name, label, result_queue, lock_class, is_creator),
+                kwargs={"ready_event": creator_ready if is_creator else None},
             )
             processes.append(proc)
 
         try:
-            # Start processes with small delays
             for i, proc in enumerate(processes):
                 proc.start()
                 if i == 0:
-                    time.sleep(0.2)  # Let creator establish first
+                    wait_for_event(creator_ready, "creator KeepAlive initialization", proc=proc)
 
-            # All should complete within reasonable time (no deadlocks)
-            for proc in processes:
-                proc.join(timeout=10)
-                assert not proc.is_alive(), "Process should have completed (no deadlock)"
+            for i, proc in enumerate(processes):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"process {i}")
 
-            # Check results - at least creator should succeed
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
-
-            success_count = sum(1 for r in results if r["success"])
-            assert success_count >= 1, "At least creator process should succeed"
+            results = drain_results(result_queue, expected_count=len(processes))
+            # All workers must have completed cleanly; queue payloads carry
+            # any IPC-error context we want to surface.
+            assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
         finally:
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
-    def test_semaphore_timeout_behavior(self, lock_class):
-        """Test semaphore behavior under timeout conditions."""
+    def test_long_lock_hold_does_not_block_liveness(self, lock_class):
+        """Verify holding the keep-alive lock then releasing it leaves the
+        liveness check working — i.e. a long critical section doesn't poison
+        subsequent any_process_alive() calls."""
         result_queue = multiprocessing.Queue()
 
         process = multiprocessing.Process(
@@ -390,17 +400,15 @@ class TestKeepAliveMultiprocess:
 
         try:
             process.start()
-            process.join(timeout=15)  # Give enough time but not infinite
+            process.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(process, "holder")
 
-            assert not process.is_alive(), "Process should complete without hanging"
-
-            # Check result
-            assert not result_queue.empty()
-            result = result_queue.get()
-            assert result["success"] is True
+            results = drain_results(result_queue, expected_count=1)
+            result = results[0]
+            assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
             assert result["alive"] is True
 
         finally:
             if process.is_alive():
                 process.terminate()
-                process.join(timeout=5)
+                process.join(timeout=EVENT_TIMEOUT)

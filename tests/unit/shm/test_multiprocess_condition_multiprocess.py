@@ -2,47 +2,88 @@
 # SPDX-License-Identifier: Apache-2.0
 """Multiprocess unit tests for MultiprocessCondition class."""
 
+from __future__ import annotations
+
 import multiprocessing
 import os
 import time
+from typing import TYPE_CHECKING
 
+import posix_ipc
 import pytest
+from conftest import (
+    EVENT_TIMEOUT,
+    POLL_INTERVAL,
+    assert_clean_exit,
+    drain_results,
+    format_failed_results,
+    unlink_semaphore_if_present,
+    unlink_shared_memory_if_present,
+    wait_for_event,
+)
 
 from flextensor.shm import MultiprocessCondition, ProcessFileLock, SemaphoreLock
 
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+    from multiprocessing.queues import Queue
+    from multiprocessing.synchronize import Event as EventType
+    from multiprocessing.synchronize import Lock as LockType
 
-def wait_for_ready_process(name, _timeout, result_queue, init_lock, lock_class):
-    """Helper function to wait for condition to be ready in a separate process."""
-    import sys
 
-    pid = os.getpid()
-    print(f"[WAITER {pid}] Starting wait_for_ready_process for '{name}'", flush=True)
-    sys.stdout.flush()
+def wait_for_waiters_registered(
+    name: str,
+    waiter_pids: Iterable[int],
+    lock_class: type,
+    *,
+    timeout: float = EVENT_TIMEOUT,
+) -> None:
+    """Block until ``waiter_pids`` have appended their PIDs to the notification list.
+
+    Opens a temporary handle to the existing notification list/lock so the helper
+    can synchronize on observable state instead of a wall clock. Does *not* call
+    ``close_lock()`` because this helper runs in the test parent and is about to
+    return; the parent will exit shortly after, and reclaiming handles eagerly
+    here adds no value.
+    """
+    deadline = time.monotonic() + timeout
+    condition = MultiprocessCondition(name=name, is_creator=False, lock_class=lock_class)
+    expected_pids = {str(pid) for pid in waiter_pids}
+    registered_pids: set[str] = set()
     try:
-        print(f"[WAITER {pid}] Acquiring init_lock", flush=True)
+        while time.monotonic() < deadline:
+            with condition.lock:
+                registered_pids = set(condition.notification_list.get_list())
+            if expected_pids <= registered_pids:
+                return
+            time.sleep(POLL_INTERVAL)
+    finally:
+        condition.close()
+
+    msg = (
+        f"Timed out waiting for waiters to register: expected {sorted(expected_pids)}, "
+        f"got {sorted(registered_pids)} after {timeout}s"
+    )
+    raise AssertionError(msg)
+
+
+def wait_for_ready_process(name, result_queue, init_lock, lock_class):
+    """Process that connects, waits for ready, returns observed state."""
+    pid = os.getpid()
+    try:
         with init_lock:
-            print(f"[WAITER {pid}] Lock acquired, creating MultiprocessCondition with create=False", flush=True)
-            sys.stdout.flush()
             condition = MultiprocessCondition(name=name, is_creator=False, lock_class=lock_class)
-            print(f"[WAITER {pid}] MultiprocessCondition created successfully", flush=True)
-        print(f"[WAITER {pid}] Released init_lock", flush=True)
 
         start_time = time.time()
-        print(f"[WAITER {pid}] Calling wait_for_ready()", flush=True)
         condition.wait_for_ready()
         wait_time = time.time() - start_time
-        print(f"[WAITER {pid}] wait_for_ready() returned after {wait_time:.2f}s", flush=True)
 
-        # Get final state
         is_ready = condition.notification_list.is_ready()
         pid_list = condition.notification_list.get_list()
-        print(f"[WAITER {pid}] is_ready={is_ready}, pid_list={pid_list}", flush=True)
 
-        print(f"[WAITER {pid}] Closing condition", flush=True)
         condition.close()
         condition.close_lock()
 
-        print(f"[WAITER {pid}] Putting result in queue", flush=True)
         result_queue.put(
             {
                 "success": True,
@@ -52,52 +93,47 @@ def wait_for_ready_process(name, _timeout, result_queue, init_lock, lock_class):
                 "pid": pid,
             },
         )
-        print(f"[WAITER {pid}] Result queued successfully", flush=True)
 
-    except Exception as e:  # broad Exception intentional; errors sent via result_queue
-        print(f"[WAITER {pid}] ERROR: {e}", flush=True)
-        import traceback
-
-        traceback.print_exc()
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "pid": pid,
             },
         )
-        print(f"[WAITER {pid}] Error result queued", flush=True)
 
 
-def notify_ready_process(name, delay, result_queue, init_lock, lock_class):
-    """Helper function to notify ready after a delay in a separate process."""
+def notify_ready_process(
+    name: str,
+    result_queue: Queue,
+    init_lock: LockType,
+    lock_class: type,
+    ready_event: EventType | None = None,
+    notify_event: EventType | None = None,
+    close_event: EventType | None = None,
+) -> None:
+    """Process that creates a condition then signals readiness on demand."""
     pid = os.getpid()
-    print(f"[NOTIFIER {pid}] Starting notify_ready_process for '{name}'")
     try:
-        print(f"[NOTIFIER {pid}] Acquiring init_lock")
         with init_lock:
-            print(f"[NOTIFIER {pid}] Lock acquired, creating MultiprocessCondition with create=True")
             condition = MultiprocessCondition(name=name, is_creator=True, lock_class=lock_class)
-            print(f"[NOTIFIER {pid}] MultiprocessCondition created successfully")
-        print(f"[NOTIFIER {pid}] Released init_lock")
 
-        if delay > 0:
-            print(f"[NOTIFIER {pid}] Sleeping for {delay}s before notify")
-            time.sleep(delay)
+        if ready_event is not None:
+            ready_event.set()
 
-        print(f"[NOTIFIER {pid}] Calling notify_ready()")
+        if notify_event is not None and not notify_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to allow notify_ready()")
+
         condition.notify_ready()
-        print(f"[NOTIFIER {pid}] notify_ready() completed")
 
-        print(f"[NOTIFIER {pid}] Closing condition")
-
-        time.sleep(2.0)
+        if close_event is not None and not close_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to allow condition cleanup")
 
         condition.close()
         condition.unlink()
         condition.close_lock()
 
-        print(f"[NOTIFIER {pid}] Putting result in queue")
         result_queue.put(
             {
                 "success": True,
@@ -105,36 +141,28 @@ def notify_ready_process(name, delay, result_queue, init_lock, lock_class):
                 "pid": pid,
             },
         )
-        print(f"[NOTIFIER {pid}] Result queued successfully")
 
-    except Exception as e:  # broad Exception intentional; errors sent via result_queue
-        print(f"[NOTIFIER {pid}] ERROR: {e}")
-        import traceback
-
-        traceback.print_exc()
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "action": "notify_ready",
                 "pid": pid,
             },
         )
-        print(f"[NOTIFIER {pid}] Error result queued")
 
 
 def concurrent_wait_and_modify_process(name, proc_id, result_queue, init_lock, lock_class):
-    """Helper function to test concurrent waiting and modification."""
+    """Process that waits for ready then appends a marker."""
     try:
         with init_lock:
             condition = MultiprocessCondition(name=name, is_creator=False, lock_class=lock_class)
 
-        # Add process ID to wait queue
         start_time = time.time()
         condition.wait_for_ready()
         wait_time = time.time() - start_time
 
-        # After ready, try to add more data
         with condition.lock:
             condition.notification_list.append(f"post_ready_{proc_id}")
 
@@ -153,11 +181,11 @@ def concurrent_wait_and_modify_process(name, proc_id, result_queue, init_lock, l
             },
         )
 
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional; errors sent via result_queue
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "proc_id": proc_id,
                 "pid": os.getpid(),
             },
@@ -165,17 +193,16 @@ def concurrent_wait_and_modify_process(name, proc_id, result_queue, init_lock, l
 
 
 def stress_test_process(name, proc_id, operations, result_queue, lock_class):
-    """Helper function for stress testing semaphore operations."""
+    """Stress the lock: repeatedly enter the critical section and append."""
     try:
         condition = MultiprocessCondition(name=name, is_creator=False, lock_class=lock_class)
 
         operations_completed = 0
         for i in range(operations):
             with condition.lock:
-                # Simulate some work under semaphore protection
                 condition.notification_list.get_list()
                 condition.notification_list.append(f"proc{proc_id}_op{i}")
-                time.sleep(0.001)  # Very small delay to increase chance of conflicts
+                time.sleep(0.001)
                 operations_completed += 1
 
         condition.close()
@@ -189,11 +216,11 @@ def stress_test_process(name, proc_id, operations, result_queue, lock_class):
             },
         )
 
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional; errors sent via result_queue
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
         result_queue.put(
             {
                 "success": False,
-                "error": str(e),
+                "error": f"{type(e).__name__}: {e}",
                 "proc_id": proc_id,
                 "pid": os.getpid(),
             },
@@ -201,51 +228,24 @@ def stress_test_process(name, proc_id, operations, result_queue, lock_class):
 
 
 def cleanup_multiprocess_condition(name):
-    """Helper function to clean up test resources."""
-    # MultiprocessCondition creates:
-    # 1. A SharedMemory with name=name (via SharedMultiString)
-    # 2. A Semaphore with name=name
-
-    # Cleanup semaphore
-    try:
-        import posix_ipc
-
-        try:
-            sem = posix_ipc.Semaphore(name)
-            sem.close()
-            sem.unlink()
-        except (posix_ipc.ExistentialError, FileNotFoundError):
-            pass
-    except ImportError:
-        pass
-
-    # Cleanup shared memory
-    try:
-        from multiprocessing.shared_memory import SharedMemory
-
-        try:
-            shm = SharedMemory(name=name)
-            shm.close()
-            shm.unlink()
-        except (FileNotFoundError, FileExistsError):
-            pass
-    except ImportError:
-        pass
+    """Remove the SharedMemory + Semaphore that MultiprocessCondition allocates."""
+    unlink_semaphore_if_present(name)
+    unlink_shared_memory_if_present(name)
 
 
 def create_condition_process(name, result_queue, lock_class):
-    """Helper function to create a condition with initial data for stress testing."""
+    """Create a condition with initial data for stress testing, then exit."""
     try:
         condition = MultiprocessCondition(name=name, is_creator=True, lock_class=lock_class)
         condition.notification_list.append("initial_data")
         condition.close()
         result_queue.put({"success": True, "action": "create"})
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional; errors sent via result_queue
-        result_queue.put({"success": False, "error": str(e), "action": "create"})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "action": "create"})
 
 
 def quick_lifecycle_process(name, proc_id, result_queue, lock_class):
-    """Helper function to test quick lifecycle and cleanup operations."""
+    """Quick lifecycle: creator notifies after a short delay; followers wait then close."""
     try:
         if proc_id == 0:
             condition = MultiprocessCondition(name=name, is_creator=True, lock_class=lock_class)
@@ -255,14 +255,14 @@ def quick_lifecycle_process(name, proc_id, result_queue, lock_class):
             condition.close()
             condition.unlink()
         else:
-            time.sleep(0.1 * proc_id)  # Stagger starts
+            time.sleep(0.1 * proc_id)
             condition = MultiprocessCondition(name=name, is_creator=False, lock_class=lock_class)
             condition.wait_for_ready()
             condition.close()
 
         result_queue.put({"success": True, "proc_id": proc_id})
-    except Exception as e:  # noqa: BLE001  # broad Exception intentional; errors sent via result_queue
-        result_queue.put({"success": False, "error": str(e), "proc_id": proc_id})
+    except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
+        result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "proc_id": proc_id})
 
 
 class TestMultiprocessConditionMultiprocess:
@@ -271,6 +271,7 @@ class TestMultiprocessConditionMultiprocess:
     def setup_method(self):
         """Setup test fixtures before each test method."""
         self.test_name = "mpc_mp"  # Short name to avoid POSIX name limits
+        cleanup_multiprocess_condition(self.test_name)
 
     def teardown_method(self):
         """Cleanup after each test method."""
@@ -279,72 +280,61 @@ class TestMultiprocessConditionMultiprocess:
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_basic_wait_and_notify(self, lock_class):
         """Test basic wait and notify across processes."""
-
-        cleanup_multiprocess_condition(self.test_name)
         result_queue = multiprocessing.Queue()
         init_lock = multiprocessing.Lock()
+        notifier_ready = multiprocessing.Event()
+        notify_now = multiprocessing.Event()
+        close_notifier = multiprocessing.Event()
 
-        # Process that will notify ready after delay
         notifier_proc = multiprocessing.Process(
             target=notify_ready_process,
-            args=(self.test_name, 5.0, result_queue, init_lock, lock_class),
+            args=(self.test_name, result_queue, init_lock, lock_class),
+            kwargs={
+                "ready_event": notifier_ready,
+                "notify_event": notify_now,
+                "close_event": close_notifier,
+            },
         )
 
-        # Process that will wait for ready
         waiter_proc = multiprocessing.Process(
             target=wait_for_ready_process,
-            args=(self.test_name, 10, result_queue, init_lock, lock_class),
+            args=(self.test_name, result_queue, init_lock, lock_class),
         )
 
         try:
-            # Start notifier first to create the condition
             notifier_proc.start()
-            time.sleep(1.0)  # Let it create resources
+            wait_for_event(notifier_ready, "notifier condition creation", proc=notifier_proc)
 
-            # Start waiter
             waiter_proc.start()
+            wait_for_waiters_registered(self.test_name, [waiter_proc.pid], lock_class)
+            notify_now.set()
 
-            # Wait for both to complete
-            notifier_proc.join(timeout=15)
-            waiter_proc.join(timeout=15)
+            waiter_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(waiter_proc, "waiter")
+            close_notifier.set()
+            notifier_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(notifier_proc, "notifier")
 
-            # Debug: Check if processes are still alive
-            print(f"[TEST] Notifier alive: {notifier_proc.is_alive()}, exitcode: {notifier_proc.exitcode}")
-            print(f"[TEST] Waiter alive: {waiter_proc.is_alive()}, exitcode: {waiter_proc.exitcode}")
+            results = drain_results(result_queue, expected_count=2)
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
-
-            print(f"[TEST] Collected {len(results)} results")
-            for i, result in enumerate(results):
-                print(f"[TEST] Result {i}: {result}")
-
-            assert len(results) == 2
-
-            # Find waiter and notifier results
             waiter_result = next(r for r in results if "wait_time" in r)
             notifier_result = next(r for r in results if r.get("action") == "notify_ready")
 
-            # Both should succeed
             assert waiter_result["success"] is True
             assert notifier_result["success"] is True
 
-            # Waiter should have waited approximately the delay time (4-5 seconds with some tolerance)
-            assert 3.5 <= waiter_result["wait_time"] <= 6.0
+            # Waiter should return promptly once notify_now is set.
+            assert waiter_result["wait_time"] <= 2.0
             assert waiter_result["is_ready"] is True
-
-            # Should contain data from notifier
-            # Instead of checking for data_from_{notifier_result['pid']} in final_strings,
-            # check if waiter_result['pid'] (the waiter process id) is present in the notification list (final_strings)
             assert str(waiter_result["pid"]) in waiter_result["pid_list"]
 
         finally:
+            notify_now.set()
+            close_notifier.set()
             for proc in [waiter_proc, notifier_proc]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_multiple_waiters_single_notifier(self, lock_class):
@@ -352,117 +342,115 @@ class TestMultiprocessConditionMultiprocess:
         result_queue = multiprocessing.Queue()
         init_lock = multiprocessing.Lock()
         num_waiters = 4
+        notifier_ready = multiprocessing.Event()
+        notify_now = multiprocessing.Event()
+        close_notifier = multiprocessing.Event()
 
-        # Create notifier process
         notifier_proc = multiprocessing.Process(
             target=notify_ready_process,
-            args=(self.test_name, 3.0, result_queue, init_lock, lock_class),  # 3 second delay
+            args=(self.test_name, result_queue, init_lock, lock_class),
+            kwargs={
+                "ready_event": notifier_ready,
+                "notify_event": notify_now,
+                "close_event": close_notifier,
+            },
         )
 
-        # Create multiple waiter processes
-        waiter_procs = []
-        for _i in range(num_waiters):
-            proc = multiprocessing.Process(
+        waiter_procs = [
+            multiprocessing.Process(
                 target=wait_for_ready_process,
-                args=(self.test_name, 15, result_queue, init_lock, lock_class),
+                args=(self.test_name, result_queue, init_lock, lock_class),
             )
-            waiter_procs.append(proc)
+            for _ in range(num_waiters)
+        ]
 
         try:
-            # Start notifier first
             notifier_proc.start()
-            time.sleep(0.5)
+            wait_for_event(notifier_ready, "notifier condition creation", proc=notifier_proc)
 
-            # Start all waiters
             for proc in waiter_procs:
                 proc.start()
-                time.sleep(0.1)  # Small stagger
+            wait_for_waiters_registered(self.test_name, [proc.pid for proc in waiter_procs], lock_class)
+            notify_now.set()
 
-            # Wait for all to complete
-            notifier_proc.join(timeout=20)
-            for proc in waiter_procs:
-                proc.join(timeout=20)
+            for i, proc in enumerate(waiter_procs):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"waiter {i}")
+            close_notifier.set()
+            notifier_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(notifier_proc, "notifier")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=num_waiters + 1)
 
-            assert len(results) == num_waiters + 1
-
-            # All should succeed
             for result in results:
-                assert result["success"] is True
+                assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
 
-            # Check waiter results
             waiter_results = [r for r in results if "wait_time" in r]
             assert len(waiter_results) == num_waiters
 
             for waiter_result in waiter_results:
-                # All waiters should have waited approximately the same time (around 3 seconds with tolerance)
-                assert 2.0 <= waiter_result["wait_time"] <= 5.0
+                assert waiter_result["wait_time"] <= 2.0
                 assert waiter_result["is_ready"] is True
 
         finally:
-            all_procs = [notifier_proc, *waiter_procs]
-            for proc in all_procs:
+            notify_now.set()
+            close_notifier.set()
+            for proc in [notifier_proc, *waiter_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_concurrent_access_no_race_conditions(self, lock_class):
         """Test concurrent access to condition doesn't cause race conditions."""
         result_queue = multiprocessing.Queue()
         init_lock = multiprocessing.Lock()
+        creator_ready = multiprocessing.Event()
+        notify_now = multiprocessing.Event()
+        close_creator = multiprocessing.Event()
 
-        # Create condition first
-        # Use longer delay (3.0s) to ensure all workers have time to start and call wait_for_ready()
-        # before the notification is sent. Workers serialize on init_lock, so they need enough time.
         creator_proc = multiprocessing.Process(
             target=notify_ready_process,
-            args=(self.test_name, 3.0, result_queue, init_lock, lock_class),
+            args=(self.test_name, result_queue, init_lock, lock_class),
+            kwargs={
+                "ready_event": creator_ready,
+                "notify_event": notify_now,
+                "close_event": close_creator,
+            },
         )
 
-        # Create multiple processes that will wait and then modify
-        worker_procs = []
-        for i in range(3):
-            proc = multiprocessing.Process(
+        worker_procs = [
+            multiprocessing.Process(
                 target=concurrent_wait_and_modify_process,
                 args=(self.test_name, i, result_queue, init_lock, lock_class),
             )
-            worker_procs.append(proc)
+            for i in range(3)
+        ]
 
         try:
-            # Start creator
             creator_proc.start()
-            time.sleep(0.3)
+            wait_for_event(creator_ready, "creator condition creation", proc=creator_proc)
 
-            # Start all workers quickly so they can begin waiting
             for proc in worker_procs:
                 proc.start()
-                time.sleep(0.05)
+            wait_for_waiters_registered(self.test_name, [proc.pid for proc in worker_procs], lock_class)
+            notify_now.set()
 
-            # Wait for all to complete
-            creator_proc.join(timeout=15)
-            for proc in worker_procs:
-                proc.join(timeout=15)
+            for i, proc in enumerate(worker_procs):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"worker {i}")
+            close_creator.set()
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=4)
 
-            # Should have results from creator + all workers
             worker_results = [r for r in results if "proc_id" in r]
             assert len(worker_results) == 3
-
-            # All workers should succeed
             for result in worker_results:
-                assert result["success"] is True
-                assert result["wait_time"] <= 5.0  # Should not wait too long (notifier delays 3s)
+                assert result["success"] is True, f"Failed: {result.get('error', 'unknown')}"
+                assert result["wait_time"] <= 2.0
 
-            # Check that all post-ready modifications are present
             all_pid_list_items = set()
             for result in worker_results:
                 all_pid_list_items.update(result["pid_list"])
@@ -474,11 +462,12 @@ class TestMultiprocessConditionMultiprocess:
                 )
 
         finally:
-            all_procs = [creator_proc, *worker_procs]
-            for proc in all_procs:
+            notify_now.set()
+            close_creator.set()
+            for proc in [creator_proc, *worker_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_semaphore_stress_test(self, lock_class):
@@ -487,105 +476,87 @@ class TestMultiprocessConditionMultiprocess:
         num_processes = 4
         operations_per_process = 20
 
-        # Create initial condition
         creator_proc = multiprocessing.Process(
             target=create_condition_process,
             args=(self.test_name, result_queue, lock_class),
         )
 
-        # Create stress test processes
-        stress_procs = []
-        for i in range(num_processes):
-            proc = multiprocessing.Process(
+        stress_procs = [
+            multiprocessing.Process(
                 target=stress_test_process,
                 args=(self.test_name, i, operations_per_process, result_queue, lock_class),
             )
-            stress_procs.append(proc)
+            for i in range(num_processes)
+        ]
 
         try:
-            # Start creator
             creator_proc.start()
-            creator_proc.join(timeout=10)
+            creator_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(creator_proc, "creator")
 
-            # Start all stress processes simultaneously
             for proc in stress_procs:
                 proc.start()
 
-            # Wait for all to complete
-            for proc in stress_procs:
-                proc.join(timeout=30)
+            for i, proc in enumerate(stress_procs):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"stress {i}")
 
-            # Collect results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
+            results = drain_results(result_queue, expected_count=num_processes + 1)
 
-            # Check creator succeeded
             creator_results = [r for r in results if r.get("action") == "create"]
             assert len(creator_results) == 1
             assert creator_results[0]["success"] is True
 
-            # Check stress test results
             stress_results = [r for r in results if "operations_completed" in r]
             assert len(stress_results) == num_processes
+            assert all(r["success"] for r in stress_results), (
+                f"Stress workers failed: {format_failed_results(stress_results)}"
+            )
 
-            # All processes should succeed
-            successful_procs = [r for r in stress_results if r["success"]]
-            assert len(successful_procs) >= num_processes // 2, "At least half of stress processes should succeed"
-
-            # Check total operations completed
-            total_operations = sum(r["operations_completed"] for r in successful_procs)
-            assert total_operations > 0, "Some operations should have been completed"
+            total_operations = sum(r["operations_completed"] for r in stress_results)
+            expected_total = num_processes * operations_per_process
+            assert total_operations == expected_total, f"Expected {expected_total} ops, got {total_operations}"
 
         finally:
-            all_procs = [creator_proc, *stress_procs]
-            for proc in all_procs:
+            for proc in [creator_proc, *stress_procs]:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
 
-            # Final cleanup
             try:
                 condition = MultiprocessCondition(name=self.test_name, is_creator=False, lock_class=lock_class)
                 condition.close()
                 condition.unlink()
-            except Exception:  # noqa: S110
+            except (posix_ipc.ExistentialError, FileNotFoundError, OSError):
                 pass
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_cleanup_no_deadlock(self, lock_class):
         """Test that cleanup operations don't cause deadlocks."""
         result_queue = multiprocessing.Queue()
+        num_workers = 4
 
-        processes = []
-        for i in range(4):
-            proc = multiprocessing.Process(
+        processes = [
+            multiprocessing.Process(
                 target=quick_lifecycle_process,
                 args=(self.test_name, i, result_queue, lock_class),
             )
-            processes.append(proc)
+            for i in range(num_workers)
+        ]
 
         try:
-            # Start all processes
             for proc in processes:
                 proc.start()
 
-            # All should complete quickly without deadlocks
-            for proc in processes:
-                proc.join(timeout=15)
-                assert not proc.is_alive(), "Process should complete without deadlock"
+            for i, proc in enumerate(processes):
+                proc.join(timeout=EVENT_TIMEOUT)
+                assert_clean_exit(proc, f"process {i}")
 
-            # Check results
-            results = []
-            while not result_queue.empty():
-                results.append(result_queue.get())
-
-            # At least the creator should succeed
-            successful_count = sum(1 for r in results if r["success"])
-            assert successful_count >= 1, "At least creator should succeed"
+            results = drain_results(result_queue, expected_count=num_workers)
+            assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
         finally:
             for proc in processes:
                 if proc.is_alive():
                     proc.terminate()
-                    proc.join(timeout=5)
+                    proc.join(timeout=EVENT_TIMEOUT)
