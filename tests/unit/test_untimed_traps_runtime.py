@@ -374,6 +374,25 @@ class TestStrategyLoaderUntimedRescue:
             "this preserves the contract for callers that opt out of the narrowing"
         )
 
+    def test_rescue_emits_warning_with_count_bytes_and_ids(self, caplog) -> None:
+        """The rescue's WARNING is the ONLY signal that profile coverage is
+        incomplete — pin its content so a future refactor that drops the
+        warning, lowers the level, or omits the byte/ID hint can't ship green.
+        """
+        untimed = torch.zeros(8, dtype=torch.float32)
+
+        with caplog.at_level("WARNING", logger="flextensor.loaders"):
+            self._make_loader_without_untimed(untimed)
+
+        rescue_records = [r for r in caplog.records if "Untimed-trap rescue activated" in r.getMessage()]
+        assert rescue_records, f"rescue must emit a WARNING; got: {[r.getMessage() for r in caplog.records]}"
+        msg = rescue_records[0].getMessage()
+        assert "1 tensor(s)" in msg, f"warning must report rescued count: {msg}"
+        assert "MiB" in msg, f"warning must report rescued bytes: {msg}"
+        assert str(id(untimed)) in msg, (
+            f"warning must include the rescued tensor id ({id(untimed)}) for cross-reference: {msg}"
+        )
+
     def test_property_getter_falls_through_when_loader_returns_none(self) -> None:
         """Contract: direct-mode getter falls through to ``tensor_ref`` on ``None``.
 

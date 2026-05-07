@@ -24,6 +24,7 @@ Hooks are essential for:
 - Advanced training techniques
 """
 
+import warnings
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -790,19 +791,22 @@ class TestHooksAcrossStateTransitions:
 
         handle = proxy_model.register_forward_hook(forward_hook)
 
-        # Run forward passes through state transitions
+        # Run forward passes through state transitions.  The internal state-update
+        # hook (installed by offload()) is registered before user hooks, so it
+        # fires first and advances the phase before the user hook reads it.  User
+        # hooks therefore observe the post-transition phase.
         x = torch.randn(4, 10)
         with torch.no_grad():
-            _ = proxy_model(x)  # DISCOVERY (count=1, >= 1, transition after)
+            _ = proxy_model(x)  # count=1 -> transition -> PROFILING observed
             _ = proxy_model(x)  # PROFILING (count=1)
-            _ = proxy_model(x)  # PROFILING (count=2, >= 2, transition after)
+            _ = proxy_model(x)  # count=2 -> transition -> INFERENCE observed
             _ = proxy_model(x)  # INFERENCE
             _ = proxy_model(x)  # INFERENCE
 
         # With explicit delegation and hook transfer, hooks should work and persist
         assert len(hook_calls) == 5, f"Hook should be called 5 times, got {len(hook_calls)}"
-        assert hook_calls == ["DISCOVERY", "PROFILING", "PROFILING", "INFERENCE", "INFERENCE"], (
-            f"Hook should be called in all states, got {hook_calls}"
+        assert hook_calls == ["PROFILING", "PROFILING", "INFERENCE", "INFERENCE", "INFERENCE"], (
+            f"Hook should observe post-transition phase, got {hook_calls}"
         )
 
         handle.remove()
@@ -963,6 +967,318 @@ class TestHooksAcrossStateTransitions:
         )
 
         handle.remove()
+
+
+def _tagged_state_hooks(module: nn.Module) -> list:
+    """Return the list of state-update hooks installed on ``module``."""
+    return [h for h in module._forward_hooks.values() if getattr(h, "_ft_state_update_hook", False)]
+
+
+class TestStateUpdateHookLifecycle:
+    """Direct invariants of ``OffloadManager._install_state_update_hook``."""
+
+    def test_install_is_idempotent(self):
+        """Calling _install_state_update_hook twice leaves exactly one tagged hook."""
+        om = OffloadManager("test_install_idempotent")
+        model = SimpleHookModel()
+        om._model = model
+
+        om._install_state_update_hook()
+        first_handle = om._state_hook_handle
+        assert first_handle is not None
+        assert len(_tagged_state_hooks(model)) == 1
+
+        om._install_state_update_hook()
+        second_handle = om._state_hook_handle
+
+        assert second_handle is not None
+        assert second_handle is not first_handle
+        assert len(_tagged_state_hooks(model)) == 1
+
+    def test_install_no_op_when_model_is_none(self):
+        """If self._model is None the hook is not installed."""
+        om = OffloadManager("test_install_no_model")
+        om._model = None
+
+        om._install_state_update_hook()
+
+        assert om._state_hook_handle is None
+
+    def test_release_clears_handle(self):
+        """release() removes the tagged hook and clears self._state_hook_handle."""
+        om = OffloadManager("test_release_clears")
+        model = SimpleHookModel()
+        om._model = model
+        om._install_state_update_hook()
+        assert len(_tagged_state_hooks(model)) == 1
+
+        om.release()
+
+        assert om._state_hook_handle is None
+        assert _tagged_state_hooks(model) == []
+
+    def test_transfer_hooks_skips_state_update_hook(self):
+        """_transfer_hooks copies user hooks but never the internal state-update hook."""
+        om = OffloadManager("test_transfer_skip")
+        old_model = SimpleHookModel()
+        new_model = SimpleHookModel()
+        om._model = old_model
+
+        # Install the state-update hook on old_model.
+        om._install_state_update_hook()
+        # Register a regular user hook on the same submodule we'll inspect on the new model.
+        user_hook = lambda _m, _i, _o: None  # noqa: E731
+        old_model.register_forward_hook(user_hook)
+
+        om._transfer_hooks(old_model, new_model)
+
+        new_hooks = list(new_model._forward_hooks.values())
+        assert user_hook in new_hooks, "user hook must be transferred"
+        assert _tagged_state_hooks(new_model) == [], "state-update hook must NOT be transferred"
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_transitions_keep_handle_on_current_model(self, _strategy_cls, mock_tensor_manager_cls):
+        """After each transition, the state-update hook is on the live model only."""
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        warmup_model = SimpleHookModel()
+        profile_model = SimpleHookModel()
+        inference_model = SimpleHookModel()
+        profile_model.load_state_dict(warmup_model.state_dict())
+        inference_model.load_state_dict(warmup_model.state_dict())
+
+        mock_tensor_manager.initialize_warmup.return_value = warmup_model
+        mock_tensor_manager.initialize_profile.return_value = profile_model
+        mock_tensor_manager.initialize_inference.return_value = inference_model
+
+        om = OffloadManager("test_transition_handle")
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        proxy = om.offload(warmup_model, config=config)
+
+        assert om._model is warmup_model
+        assert len(_tagged_state_hooks(warmup_model)) == 1
+        assert om._state_hook_handle is not None
+
+        x = torch.randn(4, 10)
+        with torch.no_grad():
+            proxy(x)  # discovery -> profile transition
+
+        assert om._model is profile_model
+        assert len(_tagged_state_hooks(profile_model)) == 1
+        assert _tagged_state_hooks(warmup_model) == []
+
+        with torch.no_grad():
+            proxy(x)  # profile -> inference transition
+
+        assert om._model is inference_model
+        assert len(_tagged_state_hooks(inference_model)) == 1
+        assert _tagged_state_hooks(profile_model) == []
+
+
+class TestStateUpdateHookSafeRemoval:
+    """The install/release paths must tolerate a stale handle without aborting."""
+
+    @staticmethod
+    def _break_handle(handle, exc: Exception) -> None:
+        """Replace the handle's ``remove`` with one that raises ``exc``."""
+        handle.remove = MagicMock(side_effect=exc)
+
+    def test_install_warns_and_continues_when_old_handle_remove_raises(self, caplog):
+        om = OffloadManager("test_install_remove_raises")
+        model = SimpleHookModel()
+        om._model = model
+        om._install_state_update_hook()
+        first_handle = om._state_hook_handle
+        self._break_handle(first_handle, RuntimeError("hook dict mutated"))
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._install_state_update_hook()
+
+        assert om._state_hook_handle is not first_handle, (
+            "new handle must be installed even when old handle removal fails"
+        )
+        # Old hook is leaked (we logged it instead of raising); the WARNING
+        # is the user-actionable signal so a future debugger can see it.
+        assert any("state-update hook handle removal failed" in r.getMessage() for r in caplog.records), (
+            f"expected WARNING about handle removal; got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_release_warns_and_continues_when_handle_remove_raises(self, caplog):
+        om = OffloadManager("test_release_remove_raises")
+        model = SimpleHookModel()
+        om._model = model
+        om._install_state_update_hook()
+        self._break_handle(om._state_hook_handle, KeyError("already removed"))
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om.release()
+
+        assert om._state_hook_handle is None, "handle must be cleared even when remove() raises"
+        assert any("state-update hook handle removal failed" in r.getMessage() for r in caplog.records), (
+            f"expected WARNING about handle removal during release(); got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+
+class TestCompileWrappedTransitionWarning:
+    """Phase transitions warn when an OptimizedModule wraps the proxy."""
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_transition_warns_when_proxy_is_wrapped_by_torch_compile(self, _strategy_cls, mock_tensor_manager_cls):
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        warmup_model = SimpleHookModel()
+        profile_model = SimpleHookModel()
+        inference_model = SimpleHookModel()
+        profile_model.load_state_dict(warmup_model.state_dict())
+        inference_model.load_state_dict(warmup_model.state_dict())
+
+        mock_tensor_manager.initialize_warmup.return_value = warmup_model
+        mock_tensor_manager.initialize_profile.return_value = profile_model
+        mock_tensor_manager.initialize_inference.return_value = inference_model
+
+        om = OffloadManager("test_compile_wrap_warn")
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        proxy = om.offload(warmup_model, config=config)
+
+        # Wrap the proxy with torch.compile (no actual call → no tracing) so
+        # OptimizedModule references the proxy.
+        compiled = torch.compile(proxy)
+        del compiled  # only need the referrer to live; pytest holds it via warns
+
+        x = torch.randn(4, 10)
+        with torch.no_grad(), pytest.warns(RuntimeWarning, match="phase transition to PROFILING"):
+            # Re-establish the OptimizedModule referrer for the duration of the call.
+            wrapper = torch.compile(proxy)  # noqa: F841 — kept alive by local ref
+            proxy(x)
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_transition_does_not_warn_without_compile_wrapper(self, _strategy_cls, mock_tensor_manager_cls):
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        warmup_model = SimpleHookModel()
+        profile_model = SimpleHookModel()
+        inference_model = SimpleHookModel()
+        profile_model.load_state_dict(warmup_model.state_dict())
+        inference_model.load_state_dict(warmup_model.state_dict())
+
+        mock_tensor_manager.initialize_warmup.return_value = warmup_model
+        mock_tensor_manager.initialize_profile.return_value = profile_model
+        mock_tensor_manager.initialize_inference.return_value = inference_model
+
+        om = OffloadManager("test_compile_wrap_no_warn")
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        proxy = om.offload(warmup_model, config=config)
+
+        x = torch.randn(4, 10)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            with torch.no_grad():
+                proxy(x)
+                proxy(x)
+
+        compile_warnings = [w for w in caught if "torch.compile" in str(w.message).lower()]
+        assert compile_warnings == [], (
+            f"no compile-wrap warning expected for un-wrapped proxy; got: {[str(w.message) for w in compile_warnings]}"
+        )
+
+
+class TestTransitionRollback:
+    """A failed transition restores the manager to its pre-transition snapshot."""
+
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_install_hook_failure_rolls_back_model_and_phase(self, _strategy_cls, mock_tensor_manager_cls):
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        warmup_model = SimpleHookModel()
+        profile_model = SimpleHookModel()
+        profile_model.load_state_dict(warmup_model.state_dict())
+
+        mock_tensor_manager.initialize_warmup.return_value = warmup_model
+        mock_tensor_manager.initialize_profile.return_value = profile_model
+
+        om = OffloadManager("test_rollback")
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        proxy = om.offload(warmup_model, config=config)
+
+        assert om._model is warmup_model
+        pre_phase = om._current_phase
+        pre_handle = om._state_hook_handle
+
+        with (
+            patch.object(
+                OffloadManager, "_install_state_update_hook", side_effect=RuntimeError("simulated install failure")
+            ),
+            pytest.raises(RuntimeError, match="simulated install failure"),
+        ):
+            om._transition_to_profile()
+
+        assert om._model is warmup_model, "_model must roll back to the pre-transition model"
+        assert om._current_phase is pre_phase, "phase must roll back"
+        assert om._state_hook_handle is pre_handle, "state hook handle must roll back"
+        assert om._model_proxy.__subject__ is warmup_model, "proxy subject must roll back"
+        # Sanity: forward still works after rollback.
+        with torch.no_grad():
+            proxy(torch.randn(4, 10))
+
+
+class TestStateUpdateHookPrependOrdering:
+    """The internal state-update hook must be the *first* entry in
+    ``_forward_hooks`` regardless of when the user registered theirs.
+
+    This is the invariant the migration note depends on ("user-registered
+    forward hooks observe the post-transition phase").  Indirect tests
+    via observed phase sequences would still pass if a future refactor
+    swapped to ``prepend=False`` — this pins the structural ordering.
+    """
+
+    def test_internal_hook_is_first_entry_after_user_hook_registered_first(self):
+        om = OffloadManager("test_prepend_order_user_first")
+        model = SimpleHookModel()
+
+        # User registers a hook BEFORE FlexTensor takes over.
+        user_hook = lambda _m, _i, _o: None  # noqa: E731
+        model.register_forward_hook(user_hook)
+
+        om._model = model
+        om._install_state_update_hook()
+
+        first_hook = next(iter(model._forward_hooks.values()))
+        assert getattr(first_hook, "_ft_state_update_hook", False), (
+            f"prepend=True is broken: first hook in iteration order should be the FT internal hook, got {first_hook!r}"
+        )
+
+    def test_internal_hook_is_first_entry_after_user_hook_registered_after(self):
+        om = OffloadManager("test_prepend_order_user_after")
+        model = SimpleHookModel()
+
+        om._model = model
+        om._install_state_update_hook()
+
+        # User registers a hook AFTER FlexTensor — must still observe post-transition phase.
+        user_hook = lambda _m, _i, _o: None  # noqa: E731
+        model.register_forward_hook(user_hook)
+
+        first_hook = next(iter(model._forward_hooks.values()))
+        assert getattr(first_hook, "_ft_state_update_hook", False), (
+            f"prepend=True is broken: first hook should remain FT internal even after user hook is added, "
+            f"got {first_hook!r}"
+        )
 
 
 if __name__ == "__main__":

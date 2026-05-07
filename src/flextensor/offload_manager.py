@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import logging
 import os
 import threading
@@ -21,6 +22,12 @@ import psutil
 import torch
 from proxytypes3 import ObjectWrapper
 from torch import nn
+from torch.utils.hooks import RemovableHandle  # noqa: TC002 — beartype on @decorated __init__ evaluates this at runtime
+
+try:
+    import torch._dynamo as _dynamo
+except ImportError:  # pragma: no cover - torch built without dynamo
+    _dynamo = None  # type: ignore[assignment]
 
 from flextensor.benchmark_tensor_mode import PreloadToDevice
 from flextensor.config import OffloadConfig
@@ -291,6 +298,61 @@ OFFLOAD_MANAGER_MAP = {}
 _MANAGER_MAP_LOCK = threading.Lock()
 
 
+def _find_optimized_module_wrapping(target: object) -> object | None:
+    """Return any ``torch._dynamo.eval_frame.OptimizedModule`` whose
+    ``_orig_mod`` is ``target``, or ``None`` if no compile wrapper has been
+    built around it.
+
+    Used by ``OffloadManager._transition_to_*`` to detect the documented
+    "torch.compile(proxy) does not survive a phase transition" failure mode:
+    ``OptimizedModule`` caches per-graph state against the proxy at
+    construction time; a subsequent transition swaps the proxy's
+    ``__subject__`` and the cached graph silently desyncs.
+
+    Implementation: walks ``gc.get_objects()`` rather than
+    ``gc.get_referrers(target)`` because ``OptimizedModule`` references
+    ``target`` indirectly through its ``_modules`` dict, which the referrer
+    graph does not surface in a single hop.  Phase transitions are rare, so
+    the linear scan cost is acceptable.
+    """
+    if _dynamo is None:
+        return None
+    eval_frame = getattr(_dynamo, "eval_frame", None)
+    optimized_cls = getattr(eval_frame, "OptimizedModule", None) if eval_frame is not None else None
+    if optimized_cls is None:
+        return None
+    for obj in gc.get_objects():
+        if type(obj) is not optimized_cls:
+            continue
+        try:
+            orig = obj._orig_mod  # noqa: SLF001 — Dynamo's OptimizedModule exposes the wrapped module here
+        except Exception:  # noqa: S112 — Dynamo internals may raise on partial init; skip those objects
+            continue
+        if orig is target:
+            return obj
+    return None
+
+
+def _safe_remove_hook_handle(handle: RemovableHandle, *, context: str) -> None:
+    """Remove a hook handle, logging at WARNING if removal raises.
+
+    A handle becomes stale when its target module's ``_forward_hooks`` is
+    mutated externally (model replacement, GC race, monkey-patching).  Letting
+    the resulting ``KeyError`` / ``RuntimeError`` propagate would abort phase
+    transitions and ``release()`` for what is at worst a leaked reference.
+    """
+    try:
+        handle.remove()
+    except Exception as exc:
+        LOGGER.warning(
+            "OffloadManager: state-update hook handle removal failed during %s (%s: %s); "
+            "the previous hook may remain installed on its original module.",
+            context,
+            type(exc).__name__,
+            exc,
+        )
+
+
 class OffloadModelProxy(ObjectWrapper):
     """Proxy that delegates to the current model version during offload phase transitions."""
 
@@ -310,23 +372,12 @@ class OffloadModelProxy(ObjectWrapper):
         return model
 
     def __call__(self, *args, **kwargs):
-        """Intercept calls to handle state transitions."""
-        return self._forward_impl(*args, **kwargs)
+        """Invoke the underlying model; phase transitions fire via a forward hook."""
+        return self._get_model()(*args, **kwargs)
 
     def forward(self, *args, **kwargs):
-        """Handle state transitions and delegate to current model."""
-        return self._forward_impl(*args, **kwargs)
-
-    def _forward_impl(self, *args, **kwargs):
-        """Handle state transitions and delegate to current model."""
-        # Get the current active model
-        model = self._get_model()
-        res = model(*args, **kwargs)
-        # Call update_state to handle automatic state transitions
-        # Access offload_manager directly from proxy, bypassing ObjectWrapper delegation
-        offload_manager = object.__getattribute__(self, "offload_manager")
-        offload_manager.update_state()
-        return res
+        """Invoke the underlying model; phase transitions fire via a forward hook."""
+        return self._get_model()(*args, **kwargs)
 
     # Special methods that need explicit delegation (not handled by __getattr__)
     # These are required for proper proxy behavior:
@@ -381,6 +432,7 @@ class OffloadManager:
         self._model = None
         self._model_proxy = None
         self._patched_modules: list[nn.Module] = []
+        self._state_hook_handle: RemovableHandle | None = None
 
     def set_config(self, config: OffloadConfig):
         """Set configuration for the offload manager.
@@ -582,9 +634,14 @@ class OffloadManager:
 
             new_module = new_modules[module_name]
 
-            # Transfer forward hooks (create list copy to avoid mutation during iteration)
+            # Transfer forward hooks (create list copy to avoid mutation during iteration).
+            # Skip our internal state-update hook: the manager re-installs it explicitly
+            # on each phase transition so ``self._state_hook_handle`` tracks the live
+            # hook and ``release()`` can remove it correctly.
             if forward_hooks := getattr(old_module, "_forward_hooks", None):
                 for _, hook_fn in list(forward_hooks.items()):
+                    if getattr(hook_fn, "_ft_state_update_hook", False):
+                        continue
                     new_module.register_forward_hook(hook_fn)
 
             # Transfer forward pre-hooks (create list copy to avoid mutation during iteration)
@@ -628,7 +685,6 @@ class OffloadManager:
         def patched_forward(self_module, *args, **kwargs):
             try:
                 with offload_manager.offload_block(offload_name):
-                    # Call the unbound forward function with self_module explicitly
                     return original_forward_func(self_module, *args, **kwargs)
             except Exception:
                 _log_diagnostic_snapshot(f"forward({offload_name})", offload_manager)
@@ -684,26 +740,76 @@ class OffloadManager:
             delattr(module, "_ft_original_forward_func")
             delattr(module, "_ft_offload_name")
 
+    def _warn_if_compile_wrapped(self, target_phase: str) -> None:
+        """Warn the user when a phase transition fires while ``OffloadModelProxy``
+        is wrapped by ``torch.compile``.
+
+        ``OptimizedModule`` binds to the proxy at construction time and caches
+        the wrapped reference; a transition that follows silently invalidates
+        the cached graph.  See ``docs/how-to/torch-compile.md`` for supported
+        flows.
+        """
+        if self._model_proxy is None:
+            return
+        wrapper = _find_optimized_module_wrapping(self._model_proxy)
+        if wrapper is None:
+            return
+        warnings.warn(
+            f"OffloadManager: phase transition to {target_phase} fired while the offload "
+            "proxy is wrapped by torch.compile. The compiled graph captured a stale model "
+            "reference and may produce incorrect results on subsequent calls. See "
+            "docs/how-to/torch-compile.md for supported flows; either complete the eager "
+            "lifecycle before torch.compile(proxy), or rebuild the OptimizedModule after "
+            "the final transition.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+
+    def _swap_to_new_model(self, new_model: nn.Module, target_phase: OffloadPhase) -> None:
+        """Atomically swap ``self._model`` to ``new_model`` and advance to
+        ``target_phase``.
+
+        Runs the side-effecting steps (transfer hooks, install state hook,
+        rebind proxy, update phase) and rolls back to the prior consistent
+        snapshot if any step raises, so the manager never observes a
+        half-transitioned state.
+        """
+        old_model = self._model
+        saved_handle = self._state_hook_handle
+        saved_phase = self._current_phase
+        saved_iter = self._iteration_count
+
+        self._model = new_model
+        try:
+            self._transfer_hooks(old_model, new_model)
+            self._install_state_update_hook()
+            if self._model_proxy is not None:
+                self._model_proxy.__subject__ = new_model
+            self._current_phase = target_phase
+            self._iteration_count = 0
+        except Exception:
+            self._model = old_model
+            self._state_hook_handle = saved_handle
+            self._current_phase = saved_phase
+            self._iteration_count = saved_iter
+            if self._model_proxy is not None:
+                self._model_proxy.__subject__ = old_model
+            LOGGER.exception(
+                "OffloadManager: transition to %s failed; rolled back to %s.",
+                target_phase.name,
+                saved_phase.name,
+            )
+            raise
+
     @_error_boundary
     def _transition_to_warmup(self):
         """Transition to discovery phase.
 
         Method name kept to align with ``TensorManager.initialize_warmup()``.
         """
-
         self._tensor_manager.set_model(self._model)
-        old_model = self._model
-        self._model = self._tensor_manager.initialize_warmup()
-
-        # Transfer hooks from old model to new model (if re-initializing)
-        self._transfer_hooks(old_model, self._model)
-
-        # Update proxy to point to new discovery-phase model (if proxy already exists)
-        if self._model_proxy is not None:
-            self._model_proxy.__subject__ = self._model
-
-        self._current_phase = OffloadPhase.DISCOVERY
-        self._iteration_count = 0
+        new_model = self._tensor_manager.initialize_warmup()
+        self._swap_to_new_model(new_model, OffloadPhase.DISCOVERY)
 
     @_error_boundary
     def _transition_to_profile(self):
@@ -714,15 +820,9 @@ class OffloadManager:
         if self._tensor_manager is None:
             return
 
-        old_model = self._model
-        self._model = self._tensor_manager.initialize_profile()
-
-        # Transfer hooks from old model to new model
-        self._transfer_hooks(old_model, self._model)
-
-        self._model_proxy.__subject__ = self._model
-        self._current_phase = OffloadPhase.PROFILING
-        self._iteration_count = 0
+        self._warn_if_compile_wrapped("PROFILING")
+        new_model = self._tensor_manager.initialize_profile()
+        self._swap_to_new_model(new_model, OffloadPhase.PROFILING)
 
     @_error_boundary
     def _transition_to_inference(self):
@@ -731,15 +831,9 @@ class OffloadManager:
             if self._tensor_manager is None:
                 return
 
-            old_model = self._model
-            self._model = self._tensor_manager.initialize_inference()
-
-            # Transfer hooks from old model to new model
-            self._transfer_hooks(old_model, self._model)
-
-            self._model_proxy.__subject__ = self._model
-            self._current_phase = OffloadPhase.INFERENCE
-            self._iteration_count = 0
+            self._warn_if_compile_wrapped("INFERENCE")
+            new_model = self._tensor_manager.initialize_inference()
+            self._swap_to_new_model(new_model, OffloadPhase.INFERENCE)
         finally:
             # Dump instrumentation data if enabled and output directory is configured
             if (
@@ -807,10 +901,34 @@ class OffloadManager:
             A wrapper around the model that tracks state transitions
 
         Examples:
-            >>> model = MyModel()
-            >>> om = get_offload_manager()
-            >>> config = OffloadConfig(include_patterns=["embed", "layers.*", "head"])
-            >>> model = om.offload(model, config)
+            Basic eager offload (see ``docs/quick-start.md`` for a runnable
+            end-to-end example)::
+
+                import torch
+                import flextensor as ft
+
+                model = MyModel().to("cpu").eval()
+                config = ft.OffloadConfig(include_patterns=["embed", "layers.*", "head"])
+                proxy = ft.offload(model, config)
+
+                x = torch.randn(batch, seq, dim, device="cuda", dtype=torch.bfloat16)
+                with torch.no_grad():
+                    for _ in range(config.discovery_iters + config.profiling_iters + 1):
+                        proxy(x)   # drives discovery -> profile -> inference
+
+            Combine with ``torch.compile`` — discovery must stay eager;
+            compile after it (``docs/how-to/torch-compile.md`` covers the
+            full two-process save / restore flow and why)::
+
+                proxy = ft.offload(model, config)
+                with torch.no_grad():
+                    for _ in range(config.discovery_iters):
+                        proxy(x)                       # discovery eager
+
+                    compiled = torch.compile(proxy)
+                    for _ in range(config.profiling_iters):
+                        compiled(x)                    # profile under compile
+                    compiled(x)                        # inference under compile
         """
         self.init(config)
 
@@ -833,6 +951,57 @@ class OffloadManager:
         self._transition_to_warmup()
 
         return self._model_proxy
+
+    def _install_state_update_hook(self) -> None:
+        """Register a Dynamo-disabled forward hook on ``self._model`` that
+        advances phase state.
+
+        ``@torch._dynamo.disable`` makes Dynamo emit a graph break at the hook's
+        call-site and run the body eagerly, so ``update_state`` fires reliably
+        even when ``OptimizedModule`` bypasses ``OffloadModelProxy.__call__``
+        under ``torch.compile(proxy)``.
+
+        ``prepend=True`` ensures user-registered top-level forward hooks see the
+        post-transition phase regardless of registration order.
+
+        Idempotent: any previously installed state-update hook is removed once
+        the new one is in place.  No-op when ``self._model is None`` (any
+        existing handle is removed first).
+        """
+        old_handle = self._state_hook_handle
+
+        if self._model is None:
+            if old_handle is not None:
+                _safe_remove_hook_handle(old_handle, context="install (model=None)")
+                self._state_hook_handle = None
+            return
+
+        om = self
+
+        # ``@_dynamo.disable`` causes Dynamo to emit a graph break at this
+        # hook's call-site and run the body eagerly.  On a torch build
+        # without Dynamo (``_dynamo is None``) the decorator is a no-op;
+        # the hook body still runs correctly in the eager interpreter
+        # because ``torch.compile`` also cannot be used in that setting.
+        dynamo_disable = _dynamo.disable if _dynamo is not None else (lambda f: f)
+
+        @dynamo_disable
+        def _update_state_hook(_module: nn.Module, _inputs: Any, _output: Any) -> None:
+            om.update_state()
+
+        # Tag the closure so ``_transfer_hooks`` can identify and skip it.
+        _update_state_hook._ft_state_update_hook = True  # type: ignore[attr-defined]  # noqa: SLF001
+
+        # Register the new hook *before* removing the old one, so a failure here
+        # leaves the old handle intact (still cleanable via ``release()``).
+        new_handle = self._model.register_forward_hook(_update_state_hook, prepend=True)
+        self._state_hook_handle = new_handle
+        if old_handle is not None:
+            # Tolerate a stale handle (model already replaced, hook dict
+            # mutated externally): the new hook is installed, the old one is
+            # untracked, and a hard raise here would fail the transition for
+            # what is at worst a one-time stale reference.
+            _safe_remove_hook_handle(old_handle, context="install (replacing previous handle)")
 
     def offload_block(self, name: str) -> Any:
         """Create an offload block context manager.
@@ -896,6 +1065,15 @@ class OffloadManager:
         if self._model_proxy is None:
             self._model_proxy = OffloadModelProxy(self._model, self)
         self._model_proxy.__subject__ = self._model
+
+        # Install the state-update hook for symmetry with ``offload()`` so the
+        # manager invariant "every live manager has a state hook" holds
+        # regardless of entry path.  ``update_state()`` short-circuits in
+        # INFERENCE, so the hook is effectively a no-op for followers — but
+        # ``release()`` can uniformly remove ``self._state_hook_handle``
+        # without needing a path-specific check.
+        self._install_state_update_hook()
+
         return self._model_proxy
 
     def clear_profiling_durations(self) -> None:
@@ -1011,6 +1189,9 @@ class OffloadManager:
         self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._model_proxy = None
         self._model = None
+        if self._state_hook_handle is not None:
+            _safe_remove_hook_handle(self._state_hook_handle, context="release()")
+            self._state_hook_handle = None
 
     def _offload_modules(self, model: nn.Module, patterns: list[str]) -> None:
         """Patch modules matching include patterns, skipping those with patched ancestors.

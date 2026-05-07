@@ -372,3 +372,91 @@ class TestWarmupAndProfileModelCallContract:
             f"warmup_and_profile_model must complete despite {type(exc).__name__} from psutil.virtual_memory; "
             f"expected trailing two _dummy_run({max_num_tokens}, skip_eplb=True) calls but got {actual}"
         )
+
+
+class TestResolveCudaGraphWrapper:
+    """Pins the import-fallback contract for ``_resolve_cuda_graph_wrapper``."""
+
+    @staticmethod
+    def _stub_modules(stubs: dict[str, types.ModuleType]) -> dict:
+        previous = {name: sys.modules.get(name) for name in stubs}
+        sys.modules.update(stubs)
+        return previous
+
+    @staticmethod
+    def _restore_modules(previous: dict) -> None:
+        for name, mod in previous.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+    def test_returns_primary_path_class_and_logs_info(self, worker_module, caplog):
+        worker_module._CUDA_GRAPH_WRAPPER_LOGGED = False
+
+        class _PrimaryWrapper:
+            pass
+
+        prim = types.ModuleType("vllm.compilation.wrapper")
+        prim.CUDAGraphWrapper = _PrimaryWrapper
+        comp = types.ModuleType("vllm.compilation")
+        previous = self._stub_modules({"vllm.compilation": comp, "vllm.compilation.wrapper": prim})
+
+        try:
+            with caplog.at_level("INFO", logger="flextensor.contrib.vllm.worker"):
+                resolved = worker_module._resolve_cuda_graph_wrapper()
+        finally:
+            self._restore_modules(previous)
+
+        assert resolved is _PrimaryWrapper
+        assert any("primary path" in r.getMessage() for r in caplog.records), (
+            f"expected INFO logging the primary path; got: {[r.getMessage() for r in caplog.records]}"
+        )
+
+    def test_falls_back_when_primary_path_missing_and_chains_primary_error(self, worker_module, caplog):
+        worker_module._CUDA_GRAPH_WRAPPER_LOGGED = False
+
+        class _FallbackWrapper:
+            pass
+
+        # Primary path must raise ImportError. Stub the package without the
+        # ``wrapper`` submodule so ``from vllm.compilation.wrapper import ...`` fails.
+        comp = types.ModuleType("vllm.compilation")
+        cg = types.ModuleType("vllm.compilation.cuda_graph")
+        cg.CUDAGraphWrapper = _FallbackWrapper
+        previous = self._stub_modules({"vllm.compilation": comp, "vllm.compilation.cuda_graph": cg})
+        # Belt-and-braces: forget any cached wrapper module so the import really fails.
+        sys.modules.pop("vllm.compilation.wrapper", None)
+
+        try:
+            with caplog.at_level("INFO", logger="flextensor.contrib.vllm.worker"):
+                resolved = worker_module._resolve_cuda_graph_wrapper()
+        finally:
+            self._restore_modules(previous)
+
+        assert resolved is _FallbackWrapper
+        assert any("fallback path" in r.getMessage() for r in caplog.records), (
+            f"expected INFO logging the fallback path; got: {[r.getMessage() for r in caplog.records]}"
+        )
+        assert any("primary import failed" in r.getMessage() for r in caplog.records), (
+            "fallback log must reference the primary failure for triage"
+        )
+
+    def test_returns_none_and_warns_when_both_paths_missing(self, worker_module, caplog):
+        worker_module._CUDA_GRAPH_WRAPPER_LOGGED = False
+
+        comp = types.ModuleType("vllm.compilation")
+        previous = self._stub_modules({"vllm.compilation": comp})
+        sys.modules.pop("vllm.compilation.wrapper", None)
+        sys.modules.pop("vllm.compilation.cuda_graph", None)
+
+        try:
+            with caplog.at_level("WARNING", logger="flextensor.contrib.vllm.worker"):
+                resolved = worker_module._resolve_cuda_graph_wrapper()
+        finally:
+            self._restore_modules(previous)
+
+        assert resolved is None
+        assert any("CUDAGraphWrapper not importable" in r.getMessage() for r in caplog.records), (
+            "double-failure must surface a WARNING citing both failed paths"
+        )

@@ -41,6 +41,7 @@ nav:
       - Troubleshooting: how-to/troubleshooting.md
       - Configure for Common Scenarios: how-to/configure-for-common-scenarios.md
       - Exclude Patterns: how-to/exclude-patterns.md
+      - torch.compile: how-to/torch-compile.md
   - Reference:
       - Overview: api/index.md
       - Glossary: api/glossary.md

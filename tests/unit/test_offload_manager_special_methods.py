@@ -356,6 +356,8 @@ class TestOffloadProxyContextManager:
 
         model = ContextManagerModel()
         mock_tensor_manager.initialize_warmup.return_value = model
+        mock_tensor_manager.initialize_profile.return_value = model
+        mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
         config = OffloadConfig(enabled=True)

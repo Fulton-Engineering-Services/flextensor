@@ -8,6 +8,7 @@ from typing import Any
 
 from torch.overrides import TorchFunctionMode
 
+from flextensor.trap_tensor_mode import _graph_break
 from flextensor.types import GPUMemoryUsage
 
 
@@ -106,9 +107,11 @@ class NoOpTrap:
         pass
 
     def __enter__(self):
+        _graph_break()
         return self
 
     def __exit__(self, _type, _value, _traceback):
+        _graph_break()
         return False
 
 
@@ -117,10 +120,12 @@ class EmptyFunctionModeTrap(TorchFunctionMode):
         pass
 
     def __enter__(self):
+        _graph_break()
         return super().__enter__()
 
     def __exit__(self, _type, _value, _traceback):
-        super().__exit__(_type, _value, _traceback)
+        _graph_break()
+        return super().__exit__(_type, _value, _traceback)
 
     def __torch_function__(self, func, _types, args, kwargs=None):
         return func(*args, **(kwargs or {}))

@@ -412,3 +412,42 @@ class TestNestingGuard:
         assert tm.trap_nesting_guard._active is False
         assert tm.trap_start_event.record.call_count == 3
         assert tm.trap_end_event.record.call_count == 3
+
+
+class TestGraphBreakDynamoFallback:
+    """Pin the ``_graph_break()`` no-op path used on torch builds without Dynamo."""
+
+    DEVICE: ClassVar[torch.device] = torch.device("cpu")
+
+    def test_graph_break_is_noop_when_dynamo_is_none(self, monkeypatch):
+        """When ``_dynamo is None``, ``_graph_break`` returns silently."""
+        from flextensor import trap_tensor_mode  # noqa: PLC0415
+
+        monkeypatch.setattr(trap_tensor_mode, "_dynamo", None)
+        # Must not raise.
+        trap_tensor_mode._graph_break()
+
+    def test_traps_still_work_when_dynamo_is_none(self, monkeypatch):
+        """Trap enter/exit cycles complete normally on a no-Dynamo torch build."""
+        from flextensor import trap_tensor_mode  # noqa: PLC0415
+
+        monkeypatch.setattr(trap_tensor_mode, "_dynamo", None)
+
+        tm = _make_mock_tensor_manager()
+        trap = TrapDirect(tm, "layer.0", self.DEVICE)
+        trap.__enter__()
+        trap.__exit__(None, None, None)
+
+        assert tm.trap_nesting_guard._active is False
+        assert tm.trap_start_event.record.call_count == 1
+
+    def test_graph_break_failure_surfaces(self, monkeypatch):
+        """A failure from ``_dynamo.graph_break`` is deliberately not caught."""
+        from flextensor import trap_tensor_mode  # noqa: PLC0415
+
+        broken_dynamo = Mock()
+        broken_dynamo.graph_break.side_effect = RuntimeError("graph_break is gone")
+        monkeypatch.setattr(trap_tensor_mode, "_dynamo", broken_dynamo)
+
+        with pytest.raises(RuntimeError, match="graph_break is gone"):
+            trap_tensor_mode._graph_break()

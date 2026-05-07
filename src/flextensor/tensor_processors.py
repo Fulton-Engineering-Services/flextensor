@@ -14,7 +14,7 @@ from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.utils import calculate_tensor_size
 
-logger = logging.getLogger(__name__)
+LOGGER = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -366,8 +366,15 @@ class TensorProcessor:
         self.process_dict = process_dict
         self.force_update_nn_parameters = force_update_nn_parameters
         self._custom_type_handlers: list[TypeHandler] = list(type_handlers or [])
+        # Cycle/dup guard: OptimizedModule._orig_mod re-exposes the original
+        # model as a child, producing self-references during recursion.  Also
+        # initialised here so direct ``_process_module`` callers (subclasses
+        # / tests) don't hit AttributeError before ``apply()`` runs.
+        self._visited: set[int] = set()
 
     def apply(self, model):
+        # Reset between applications so each call starts with a clean slate.
+        self._visited = set()
         if isinstance(model, dict):
             self._process_dict(model, "model")
         else:
@@ -439,6 +446,14 @@ class TensorProcessor:
                 dict_model[attr_name] = attr_value
 
     def _process_module(self, module, _name):
+        # Cycle/dup guard (see TensorProcessor.__init__): identity-keyed so
+        # weight-shared modules reachable via two parents are processed once.
+        module_id = id(module)
+        if module_id in self._visited:
+            LOGGER.debug("TensorProcessor: skipping already-visited module %s (id=%d)", _name, module_id)
+            return module
+        self._visited.add(module_id)
+
         # Extend the current module
         self._apply_on(module)
 
@@ -588,6 +603,13 @@ class MoveBuffersToGPUTensorProcessor(TensorProcessor):
         self.move_to_gpu.cleanup()
 
     def _process_module(self, module, _name):
+        # Cycle/dup guard: see TensorProcessor.__init__.
+        module_id = id(module)
+        if module_id in self._visited:
+            LOGGER.debug("MoveBuffersToGPUTensorProcessor: skipping already-visited module %s", _name)
+            return module
+        self._visited.add(module_id)
+
         # Move all buffers in this module to GPU
         for buffer_name, buffer in module.named_buffers(recurse=False):
             new_buffer = self.move_to_gpu.process(buffer)

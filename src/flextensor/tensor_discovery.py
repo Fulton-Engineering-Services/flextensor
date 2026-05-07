@@ -68,18 +68,29 @@ class ModuleTracker:
         if self._registered:
             return
 
-        self._register_hooks_recursive(model)
+        self._register_hooks_recursive(model, set())
         self._registered = True
 
-    def _register_hooks_recursive(self, module: torch.nn.Module) -> None:
-        """Recursively register hooks on module and all children."""
-        # Only register on modules that have parameters (leaf modules with weights)
+    def _register_hooks_recursive(self, module: torch.nn.Module, visited: set[int]) -> None:
+        """Recursively register hooks on module and all children.
+
+        ``visited`` is identity-keyed and prevents infinite recursion when the
+        module graph contains cycles — most commonly ``OptimizedModule`` from
+        ``torch.compile`` re-exposes ``_orig_mod`` as a child that already
+        appears elsewhere in the tree, but weight-shared submodules also trip
+        this path.
+        """
+        module_id = id(module)
+        if module_id in visited:
+            return
+        visited.add(module_id)
+
         if any(True for _ in module.parameters(recurse=False)):
             handle = module.register_forward_hook(self._forward_hook)
             self._hooks.append(handle)
 
         for child in module.children():
-            self._register_hooks_recursive(child)
+            self._register_hooks_recursive(child, visited)
 
     def _forward_hook(
         self,
@@ -474,10 +485,14 @@ def get_offload_module_tensor_ids(
 # subclasses. ``hasattr`` / ``getattr(..., default)`` only catch
 # ``AttributeError``; anything else escapes and crashes FT mid-traversal.
 # ``KeyError`` covers vLLM 0.18.x ``StageMissingLayer``;
-# ``TypeError`` / ``RuntimeError`` cover wrapped / quantised / lazy-tensor
-# descriptors seen in the wild. Safe here because each guarded call is a
-# pure read — do not widen the ``try`` scope over real work.
-_PROBE_EXCEPTIONS: tuple[type[BaseException], ...] = (AttributeError, KeyError, TypeError, RuntimeError)
+# ``TypeError`` covers wrapped / quantised descriptors seen in the wild.
+# ``RuntimeError`` is intentionally NOT swallowed — it's also raised by
+# CUDA OOM during a side-effecting ``__getattr__`` (e.g. lazy GPU
+# allocation), and silently marking such a module "not patched" hides a
+# real failure that the caller deserves to see. Safe here because each
+# guarded call is a pure read — do not widen the ``try`` scope over real
+# work.
+_PROBE_EXCEPTIONS: tuple[type[BaseException], ...] = (AttributeError, KeyError, TypeError)
 
 
 def _log_probe_swallowed(module: torch.nn.Module, attr: str, exc: BaseException) -> None:

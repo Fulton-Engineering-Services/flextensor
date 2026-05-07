@@ -1002,3 +1002,87 @@ class TestCUDAGraphForkJoin:
             assert_before(
                 recorder, join_idx, fork_idx, f"{loader_cls.__name__}: join must come before fork across iterations"
             )
+
+
+class TestEventMapClearing:
+    """Cross-iteration event-map state hygiene.
+
+    Pins last-layer exit() and first-layer enter() clears that prevent stale
+    events from a prior iteration from leaking into the next iteration's
+    waits, which under torch.compile / CUDA-graph capture surfaces as
+    cudaErrorStreamCaptureIsolation.
+    """
+
+    @pytest.mark.parametrize(
+        "loader_cls",
+        [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+    )
+    def test_last_layer_exit_clears_event_maps(self, loader_cls):
+        labels = ["embed", "L0", "L1"]
+        layer_stats = _make_layer_stats(labels)
+        transfer_to_compute_map = {"embed": "L0", "L0": "L1"}
+        label_to_block_id = {"embed": 0, "L0": 1}
+        recorder = SyncRecorder()
+
+        with _create_loader(loader_cls, layer_stats, label_to_block_id, transfer_to_compute_map, recorder) as loader:
+            _run_inference(loader, labels, recorder)
+            assert loader.compute_events_map == {}, (
+                f"compute_events_map should be empty after last-layer exit; got {loader.compute_events_map}"
+            )
+            assert loader.last_block_id_to_label_map == {}, (
+                "last_block_id_to_label_map should be empty after last-layer exit; got "
+                f"{loader.last_block_id_to_label_map}"
+            )
+
+    @pytest.mark.parametrize(
+        "loader_cls",
+        [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+    )
+    def test_first_layer_enter_clears_stale_event_maps(self, loader_cls, caplog):
+        labels = ["embed", "L0", "L1"]
+        layer_stats = _make_layer_stats(labels)
+        transfer_to_compute_map = {"embed": "L0", "L0": "L1"}
+        label_to_block_id = {"embed": 0, "L0": 1}
+        recorder = SyncRecorder()
+
+        with _create_loader(loader_cls, layer_stats, label_to_block_id, transfer_to_compute_map, recorder) as loader:
+            # Simulate aborted mid-iteration: stale entries left in both maps.
+            sentinel_event = MockEvent(name="stale_event", completed=True)
+            loader.compute_events_map["stale"] = sentinel_event
+            loader.last_block_id_to_label_map[7] = "stale"
+
+            with caplog.at_level("DEBUG", logger="flextensor.loaders"):
+                loader.enter("embed")
+
+            assert "stale" not in loader.compute_events_map, (
+                "first-layer enter() must clear stale compute_events_map entries"
+            )
+            assert 7 not in loader.last_block_id_to_label_map, (
+                "first-layer enter() must clear stale last_block_id_to_label_map entries"
+            )
+            stale_log_records = [r for r in caplog.records if "stale" in r.getMessage().lower()]
+            assert stale_log_records, (
+                f"first-layer enter() must DEBUG-log the safety-net clear; got: "
+                f"{[r.getMessage() for r in caplog.records]}"
+            )
+
+    @pytest.mark.parametrize(
+        "loader_cls",
+        [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+    )
+    def test_first_layer_enter_silent_when_maps_already_empty(self, loader_cls, caplog):
+        labels = ["embed", "L0", "L1"]
+        layer_stats = _make_layer_stats(labels)
+        transfer_to_compute_map = {"embed": "L0", "L0": "L1"}
+        label_to_block_id = {"embed": 0, "L0": 1}
+        recorder = SyncRecorder()
+
+        with _create_loader(loader_cls, layer_stats, label_to_block_id, transfer_to_compute_map, recorder) as loader:
+            assert loader.compute_events_map == {} and loader.last_block_id_to_label_map == {}
+
+            with caplog.at_level("DEBUG", logger="flextensor.loaders"):
+                loader.enter("embed")
+
+            assert all("stale" not in r.getMessage().lower() for r in caplog.records), (
+                "no safety-net log should fire when maps are already empty"
+            )

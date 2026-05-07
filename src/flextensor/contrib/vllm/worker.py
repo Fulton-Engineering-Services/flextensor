@@ -47,6 +47,53 @@ def _GiB(b: int) -> float:  # noqa: N802
     return b / GiB_bytes
 
 
+_CUDA_GRAPH_WRAPPER_LOGGED = False
+
+
+def _resolve_cuda_graph_wrapper() -> type | None:
+    """Locate vLLM's ``CUDAGraphWrapper`` class.
+
+    The class moved from ``vllm.compilation.wrapper`` (older vLLM) to
+    ``vllm.compilation.cuda_graph`` (newer vLLM).  Logs which path won the
+    first time it succeeds so a user diagnosing version drift can tell from
+    the worker's startup log which class their ``isinstance`` check actually
+    matches.  If both paths fail we return ``None`` and warn — callers must
+    treat the wrapper as absent rather than crash.
+    """
+    global _CUDA_GRAPH_WRAPPER_LOGGED
+    primary_exc: ImportError | None = None
+    try:
+        from vllm.compilation.wrapper import CUDAGraphWrapper
+
+        if not _CUDA_GRAPH_WRAPPER_LOGGED:
+            LOGGER.info("FlexTensor: using CUDAGraphWrapper from vllm.compilation.wrapper (primary path)")
+            _CUDA_GRAPH_WRAPPER_LOGGED = True
+        return CUDAGraphWrapper
+    except ImportError as exc:
+        primary_exc = exc
+
+    try:
+        from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+        if not _CUDA_GRAPH_WRAPPER_LOGGED:
+            LOGGER.info(
+                "FlexTensor: using CUDAGraphWrapper from vllm.compilation.cuda_graph (fallback path; "
+                "primary import failed: %s)",
+                primary_exc,
+            )
+            _CUDA_GRAPH_WRAPPER_LOGGED = True
+        return CUDAGraphWrapper
+    except ImportError as exc:
+        LOGGER.warning(
+            "FlexTensor: CUDAGraphWrapper not importable from either vllm.compilation.wrapper "
+            "(%s) or vllm.compilation.cuda_graph (%s); CUDA-graph wrapping is unavailable in "
+            "this vLLM version",
+            primary_exc,
+            exc,
+        )
+        return None
+
+
 @contextmanager
 def vllm_model_context(model_runner: Any) -> Generator[list[Any], None, None]:
     """Context manager for unwrapping/re-wrapping vLLM model wrappers.
@@ -82,14 +129,11 @@ def vllm_model_context(model_runner: Any) -> Generator[list[Any], None, None]:
     except ImportError:
         pass
 
-    try:
-        from vllm.compilation.wrapper import CUDAGraphWrapper
+    CUDAGraphWrapper = _resolve_cuda_graph_wrapper()  # noqa: N806 — class returned from helper, used as isinstance target
 
-        if isinstance(model_or_wrapper, CUDAGraphWrapper):
-            actual_model = model_or_wrapper.model
-            wrapper_attrs.append("model")
-    except ImportError:
-        pass
+    if CUDAGraphWrapper is not None and isinstance(model_or_wrapper, CUDAGraphWrapper):
+        actual_model = model_or_wrapper.model
+        wrapper_attrs.append("model")
 
     model_container = [actual_model]
     yield model_container
@@ -211,10 +255,18 @@ class FlexTensorOffloadWorker(Worker):
                     free_gib,
                 )
         except (OSError, AttributeError, psutil.Error) as exc:
-            LOGGER.debug(
-                "FlexTensor: host-memory pre-check failed (%s); continuing without low-mem warning",
-                exc,
-            )
+            # First probe failure goes out at WARNING so an operator on a
+            # locked-down container learns FlexTensor cannot pre-check OOM
+            # risk; subsequent failures are demoted to DEBUG to avoid noise.
+            if not getattr(self, "_ft_host_mem_probe_warned", False):
+                LOGGER.warning(
+                    "FlexTensor: host-memory pre-check failed (%s) — unable to warn about OOM risk "
+                    "before inference transition; further probe failures will be logged at DEBUG",
+                    exc,
+                )
+                self._ft_host_mem_probe_warned = True
+            else:
+                LOGGER.debug("FlexTensor: host-memory pre-check failed again (%s)", exc)
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
         self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
 

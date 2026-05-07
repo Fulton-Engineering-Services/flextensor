@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profiling_iters` budget. Suspensions are reference-counted, so
   independent callers can nest without stepping on each other. See
   [Profiling Data Control](docs/explanation/phases.md#profiling-data-control).
+- `torch.compile` support for offloaded models. Profile and inference can
+  run under `torch.compile(proxy)`; discovery must stay eager. See
+  `docs/how-to/torch-compile.md` for the supported flows (single-process
+  and two-process save / restore) and the discovery-must-stay-eager
+  constraint.
 
 ### Changed
 
@@ -51,6 +56,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the recorders directly.
 - `BenchmarkReplace.__init__` now requires a keyword-only `host_pinner`,
   so profiling uses the same pinning primitive as production transfers.
+- User-registered forward hooks *on the top-level offloaded model* now
+  observe the **post-transition** phase. FlexTensor installs an internal
+  state-update hook with `prepend=True` on the top-level model so it
+  always fires first, advancing the phase before user hooks read it.
+  Previously this was order-dependent: hooks registered before `offload()`
+  observed the pre-transition phase; hooks registered after observed the
+  post-transition phase. Sub-module hooks are unaffected — they fire
+  during the sub-module's own forward, before the top-level state-update
+  hook.
 
 ### Fixed
 

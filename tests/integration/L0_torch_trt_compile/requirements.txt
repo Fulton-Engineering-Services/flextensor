@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Integration test requirements for L0_torch_trt_compile
+# These are in addition to the flex-tensor[test] dependencies
+# torch-tensorrt is pre-installed in nvcr.io/nvidia/pytorch containers
+
+numpy~=2.0

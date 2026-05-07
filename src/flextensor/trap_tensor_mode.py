@@ -4,6 +4,30 @@
 import torch
 from torch.overrides import TorchFunctionMode
 
+try:
+    import torch._dynamo as _dynamo
+except ImportError:  # pragma: no cover - torch built without dynamo
+    _dynamo = None  # type: ignore[assignment]
+
+
+def _graph_break() -> None:
+    """Insert a Dynamo graph break at a trap boundary.
+
+    Called from each trap's ``__enter__`` and ``__exit__`` so that
+    ``torch.compile`` splits its graph at offload-block boundaries.  The
+    tensor ops *between* traps compile into subgraphs; the loader's eager
+    tensor movement runs in the resume functions Dynamo emits between
+    subgraphs.
+
+    No-op when ``torch._dynamo`` is not importable (e.g. a torch build
+    without Dynamo support).  Any future failure from ``graph_break()``
+    is deliberately not caught — real failures from Dynamo should surface
+    rather than silently degrade trap isolation.
+    """
+    if _dynamo is None:
+        return
+    _dynamo.graph_break()
+
 
 class Trap(TorchFunctionMode):
     def __init__(self, tensor_manager, trace_id, device_gpu):
@@ -17,11 +41,18 @@ class Trap(TorchFunctionMode):
         self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
-        self._nesting_guard.acquire(self.current_trace_id)
-        self.tensor_layer_loader.enter(self.current_trace_id)
-        self.start_event.record()
-
-        return super().__enter__()
+        _graph_break()
+        try:
+            self._nesting_guard.acquire(self.current_trace_id)
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            self.start_event.record()
+            return super().__enter__()
+        except BaseException:
+            # Pair the enter-side break: if __enter__ raises, __exit__ never
+            # runs, so we emit the matching exit-side break here to keep
+            # Dynamo from waiting on a continuation that will never arrive.
+            _graph_break()
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         self.end_event.record()
@@ -33,6 +64,7 @@ class Trap(TorchFunctionMode):
         self.tensor_manager.record_all(self.current_trace_id, self.tensors_ids, duration_ms)
         self._nesting_guard.release()
 
+        _graph_break()
         super().__exit__(_type, _value, _traceback)
 
     def __torch_function__(self, func, _types, args, kwargs=None):
@@ -75,16 +107,23 @@ class WarmupTrap(TorchFunctionMode):
         self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
-        self._nesting_guard.acquire(self.current_trace_id)
-        if self.tensor_manager.module_tracker is not None:
-            self.tensor_manager.module_tracker.enter_trap(self.current_trace_id)
-        return super().__enter__()
+        _graph_break()
+        try:
+            self._nesting_guard.acquire(self.current_trace_id)
+            if self.tensor_manager.module_tracker is not None:
+                self.tensor_manager.module_tracker.enter_trap(self.current_trace_id)
+            return super().__enter__()
+        except BaseException:
+            # See Trap.__enter__: pair the graph break on the failure path.
+            _graph_break()
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         if self.tensor_manager.module_tracker is not None:
             self.tensor_manager.module_tracker.exit_trap(self.current_trace_id)
         self.tensor_manager.record_tensors(self.current_trace_id, self.tensors_ids)
         self._nesting_guard.release()
+        _graph_break()
         super().__exit__(_type, _value, _traceback)
 
     def _update_tensors_ids(self, args, kwargs):
@@ -140,11 +179,18 @@ class TrapInfer(TorchFunctionMode):
         self.tensor_manager = tensor_manager
 
     def __enter__(self):
-        self.tensor_layer_loader.enter(self.current_trace_id)
-        return super().__enter__()
+        _graph_break()
+        try:
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            return super().__enter__()
+        except BaseException:
+            # See Trap.__enter__: pair the graph break on the failure path.
+            _graph_break()
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         self.tensor_layer_loader.exit(self.current_trace_id)
+        _graph_break()
         super().__exit__(_type, _value, _traceback)
 
     def __torch_function__(self, func, types, args, kwargs=None):
@@ -184,11 +230,16 @@ class TrapDirect:
         self._nesting_guard = tensor_manager.trap_nesting_guard
 
     def __enter__(self):
-        self._nesting_guard.acquire(self.current_trace_id)
-        self.tensor_layer_loader.enter(self.current_trace_id)
-        self.start_event.record()
-
-        return self
+        _graph_break()
+        try:
+            self._nesting_guard.acquire(self.current_trace_id)
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            self.start_event.record()
+            return self
+        except BaseException:
+            # See Trap.__enter__: pair the graph break on the failure path.
+            _graph_break()
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         self.end_event.record()
@@ -198,6 +249,7 @@ class TrapDirect:
 
         self.tensor_layer_loader.exit(self.current_trace_id)
         self._nesting_guard.release()
+        _graph_break()
 
 
 class TrapInferDirect:
@@ -208,8 +260,15 @@ class TrapInferDirect:
         self.tensor_manager = tensor_manager
 
     def __enter__(self):
-        self.tensor_layer_loader.enter(self.current_trace_id)
-        return self
+        _graph_break()
+        try:
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            return self
+        except BaseException:
+            # See Trap.__enter__: pair the graph break on the failure path.
+            _graph_break()
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         self.tensor_layer_loader.exit(self.current_trace_id)
+        _graph_break()

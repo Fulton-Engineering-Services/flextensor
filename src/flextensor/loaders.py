@@ -304,10 +304,21 @@ class TensorStrategyLoader(Loader):
             rescue_bytes = sum(
                 self.tensors_map[tid].numel() * self.tensors_map[tid].element_size() for tid in rescue_ids
             )
+            # Untimed-rescued tensors aren't in any layer_stat (that's *why*
+            # they're rescued), so layer-name lookup isn't possible here.
+            # Surface the sorted tensor IDs (truncated) so a user grepping a
+            # profile dump can cross-reference which trapped tensors lost
+            # their duration sample.
+            sorted_ids = sorted(rescue_ids)
+            id_hint = ", ".join(str(tid) for tid in sorted_ids[:8])
+            if len(sorted_ids) > 8:
+                id_hint += f", ... ({len(sorted_ids) - 8} more)"
             LOGGER.warning(
-                "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) moved to GPU. Likely a profile-coverage gap.",
+                "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) force-pinned to GPU "
+                "[ids: %s]. Likely a profile-coverage gap.",
                 len(rescue_ids),
                 rescue_bytes / (1024 * 1024),
+                id_hint,
             )
         self.preload_ids |= rescue_ids
         for tensor_id, tensor in self.tensors_map.items():
@@ -878,6 +889,21 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
 
     def enter(self, label):
         if label == self.first_layer_label:
+            # Safety net: a previous iteration that aborted before reaching
+            # last_layer's exit() leaves stale entries in these maps; the
+            # next iteration's lookups would then wait on events recorded
+            # in the aborted iteration and produce cross-capture violations
+            # under torch.compile / CUDA graph capture. Clear-on-entry costs
+            # one dict.clear() per forward and unblocks recovery.
+            if self.compute_events_map or self.last_block_id_to_label_map:
+                LOGGER.debug(
+                    "PreallocatedBatchTransferTensorLoader: clearing %d stale event-map "
+                    "entries from aborted previous iteration",
+                    len(self.compute_events_map),
+                )
+                self.compute_events_map.clear()
+                self.last_block_id_to_label_map.clear()
+
             # Fork: bring transfer stream into CUDA graph capture scope.
             # Once forked, the transfer stream stays captured for the entire graph.
             fork_event = torch.cuda.current_stream().record_event()
@@ -916,6 +942,15 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         if label == self.last_layer_label:
             self.last_iteration_event = self.transfer_stream.record_event()
             torch.cuda.current_stream().wait_event(self.last_iteration_event)
+
+            # Clear stale cross-iteration events so the next iteration starts
+            # fresh.  Required for CUDA graph capture: without it, the next
+            # iteration's enter() would wait on events recorded *before*
+            # capture, violating stream-capture isolation rules
+            # (cudaErrorStreamCaptureIsolation). Paired with the safety-net
+            # clear at first-layer enter() for aborted-mid-iteration recovery.
+            self.compute_events_map.clear()
+            self.last_block_id_to_label_map.clear()
 
     def release_memory(self):
         pass
@@ -976,6 +1011,17 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
     def enter(self, label):
         if label == self.first_layer_label:
+            # Safety net: see PreallocatedBatchTransferTensorLoader.enter for
+            # the aborted-iteration rationale.
+            if self.compute_events_map or self.last_block_id_to_label_map:
+                LOGGER.debug(
+                    "PreallocatedBatchTransferTensorLoaderReordered: clearing %d stale "
+                    "event-map entries from aborted previous iteration",
+                    len(self.compute_events_map),
+                )
+                self.compute_events_map.clear()
+                self.last_block_id_to_label_map.clear()
+
             # Fork: bring transfer stream into CUDA graph capture scope.
             # Once forked, the transfer stream stays captured for the entire graph.
             fork_event = torch.cuda.current_stream().record_event()
@@ -1015,6 +1061,11 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         if label == self.last_layer_label:
             last_event = self.transfer_stream.record_event()
             torch.cuda.current_stream().wait_event(last_event)
+
+            # Clear stale cross-iteration events (see comment in
+            # PreallocatedBatchTransferTensorLoader.exit for rationale).
+            self.compute_events_map.clear()
+            self.last_block_id_to_label_map.clear()
 
     def release_memory(self):
         pass

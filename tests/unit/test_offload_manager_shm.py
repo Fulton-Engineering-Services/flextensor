@@ -106,6 +106,13 @@ class TestInitializeFromShm:
         mock_tm.initialize_inference.assert_called_once()
         mock_offload.assert_called_once_with(model, manager.config.include_patterns)
         mock_exclude.assert_called_once_with(model, manager.config.exclude_patterns)
+        # Follower installs the state-update hook for symmetry with offload();
+        # update_state is a no-op in INFERENCE, but release() needs a handle
+        # to uniformly clean up regardless of entry path.
+        assert manager._model is model, "hook must be installed on the same model the test owns"
+        assert manager._state_hook_handle is not None
+        tagged = [h for h in model._forward_hooks.values() if getattr(h, "_ft_state_update_hook", False)]
+        assert len(tagged) == 1, f"expected exactly one tagged state-update hook on the model, found {len(tagged)}"
 
 
 class TestBlockNameFn:

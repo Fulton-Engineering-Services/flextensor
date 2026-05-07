@@ -85,15 +85,23 @@ def install_flextensor_logging_bridge() -> None:
 
 
 def safely_install_flextensor_logging_bridge() -> None:
-    """Call :func:`install_flextensor_logging_bridge`, swallowing any exception.
+    """Call :func:`install_flextensor_logging_bridge`, swallowing the narrow
+    set of failures the bridge can plausibly emit.
 
     For module-level use in ``loader.py`` / ``worker.py`` / ``snapshot.py`` —
     diagnostic logging must never block class registration. Failures are
     written to ``sys.stderr`` and logged.
+
+    Only the documented failure modes (broken ``vllm.logger`` import,
+    partial vLLM install, mis-shaped logger ancestry) are absorbed.  Any
+    other exception (e.g. a circular import inside ``flextensor._logging``
+    itself) propagates so the real bug crashes loudly at import time
+    rather than turning into an invisible logging-bridge degradation
+    hours later.
     """
     try:
         install_flextensor_logging_bridge()
-    except Exception:
+    except (ImportError, AttributeError, RuntimeError):
         # stderr is the only sink guaranteed when the stdlib handler chain
         # (which this bridge was meant to populate) is unreachable.
         msg = "FlexTensor logging bridge install failed; diagnostic tables may be invisible."
