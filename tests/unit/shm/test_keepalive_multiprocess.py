@@ -136,8 +136,18 @@ def quick_cleanup_process(
     lock_class: type,
     is_creator: bool = False,
     ready_event: EventType | None = None,
+    close_event: EventType | None = None,
 ) -> None:
-    """Process that quickly creates and cleans up KeepAlive."""
+    """Attach to KeepAlive, signal ready, wait for close signal, then close.
+
+    Closes with ``any_process_alive=True`` — without an outer mutex, multiple
+    workers calling ``any_process_alive=False`` race to ``unlink()`` the same
+    POSIX shared resources; only the first wins, the rest hit ``FileNotFoundError``.
+    Production code (``FlexibleSharedMemory._cleanup_with_coordination``) avoids
+    that by serializing close() under a main_lock and recomputing
+    ``any_process_alive()`` under the lock; the test's ``teardown_method`` does
+    the eventual unlink instead.
+    """
     try:
         keep_alive = KeepAlive(
             name=name,
@@ -148,8 +158,13 @@ def quick_cleanup_process(
         )
         if ready_event is not None:
             ready_event.set()
-        time.sleep(POLL_INTERVAL)
-        keep_alive.close(any_process_alive=False)
+        if close_event is not None:
+            if not close_event.wait(timeout=EVENT_TIMEOUT):
+                msg = f"[{label}] Timed out waiting for parent to allow close after {EVENT_TIMEOUT}s"
+                raise TimeoutError(msg)
+        else:
+            time.sleep(POLL_INTERVAL)
+        keep_alive.close(any_process_alive=True)
         result_queue.put({"success": True, "process_id": label})
     except (posix_ipc.ExistentialError, posix_ipc.BusyError, FileNotFoundError, FileExistsError, OSError) as e:
         result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "process_id": label})
@@ -350,10 +365,20 @@ class TestKeepAliveMultiprocess:
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_no_deadlock_on_cleanup(self, lock_class):
-        """Test that cleanup operations don't cause deadlocks."""
+        """Concurrent close() across three processes must not deadlock.
+
+        All three workers attach (handshake via per-process ``ready_event``),
+        then the parent fires every ``close_event`` simultaneously so the
+        close()s actually overlap. Without the per-process ready handshake,
+        the creator could finish its ``POLL_INTERVAL`` and ``unlink()`` the
+        shared segments before later-spawned workers (which pay fork+import
+        latency on busy CI runners) finish their ``KeepAlive(is_creator=False)``
+        attach — surfaces as ``FileNotFoundError: '/ka_mp_m'``.
+        """
         result_queue = multiprocessing.Queue()
 
-        creator_ready = multiprocessing.Event()
+        ready_events = [multiprocessing.Event() for _ in range(3)]
+        close_events = [multiprocessing.Event() for _ in range(3)]
         processes = []
         for i in range(3):
             label = "creator" if i == 0 else f"proc_{i}"
@@ -361,23 +386,32 @@ class TestKeepAliveMultiprocess:
             proc = multiprocessing.Process(
                 target=quick_cleanup_process,
                 args=(self.test_name, label, result_queue, lock_class, is_creator),
-                kwargs={"ready_event": creator_ready if is_creator else None},
+                kwargs={"ready_event": ready_events[i], "close_event": close_events[i]},
             )
             processes.append(proc)
 
         try:
-            for i, proc in enumerate(processes):
+            # Creator must finish creating the resources before non-creators try
+            # to attach — otherwise their ``is_creator=False`` connect races against
+            # the missing shared segment.
+            processes[0].start()
+            wait_for_event(ready_events[0], "creator KeepAlive initialization", proc=processes[0])
+
+            for proc in processes[1:]:
                 proc.start()
-                if i == 0:
-                    wait_for_event(creator_ready, "creator KeepAlive initialization", proc=proc)
+            for i, ev in enumerate(ready_events[1:], start=1):
+                wait_for_event(ev, f"process {i} KeepAlive initialization", proc=processes[i])
+
+            # All three are now attached — release them concurrently to actually
+            # exercise the no-deadlock-on-overlapping-close path.
+            for ev in close_events:
+                ev.set()
 
             for i, proc in enumerate(processes):
                 proc.join(timeout=EVENT_TIMEOUT)
                 assert_clean_exit(proc, f"process {i}")
 
             results = drain_results(result_queue, expected_count=len(processes))
-            # All workers must have completed cleanly; queue payloads carry
-            # any IPC-error context we want to surface.
             assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
         finally:

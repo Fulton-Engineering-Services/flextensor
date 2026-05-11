@@ -36,6 +36,8 @@ calling offload_from_profile().  Multi-process variant is left to a future
 L1 test suite.
 """
 
+import subprocess  # noqa: S404 - subprocess isolates a torch.compile call that can segfault
+import sys
 import time
 import uuid
 from collections.abc import Callable
@@ -151,15 +153,43 @@ def _capture_cuda_graph(
 
 def _has_torch_2_10_weakref_bug() -> bool:
     """Whether the running torch is the 2.10 build that trips the
-    ``reset_user_object_tracking`` weakref-eviction bug during compilation
-    of counting-backend traces.
+    ``graph_bytecode_inputs`` external-object weakref-eviction bug.
 
-    The bug manifests as either an ``AssertionError("Index not registered in
-    index_to_user_object_weakref")`` or a process-level segfault — the
-    segfault path can't be probed in-process (a runtime probe would crash
+    Canonical reference for the workaround applied at every call site of this
+    function — skip reasons should cite this docstring rather than restate it.
+
+    Bug
+    ---
+    On torch 2.10, the compiled artifact for FlexTensor's loader methods
+    holds an index into ``torch._dynamo.graph_bytecode_inputs.index_to_external_object_weakref``
+    whose entry is evicted before the bytecode runs. The eviction surfaces
+    in two ways depending on which torch path observes it:
+
+    - ``AssertionError("Index not registered in index_to_user_object_weakref")``
+      raised from ``get_external_object_by_index`` when the compiled bytecode
+      runs (the assertion message is a torch-internal misnomer — the dict is
+      actually named ``..._external_object_weakref``).
+    - A process-level segfault inside ``reset_user_object_tracking`` when
+      Dynamo subsequently invalidates frames that referenced the evicted entry.
+
+    The segfault path can't be probed in-process (the probe itself would crash
     the worker), so we gate on the torch version that ships the affected
-    Dynamo build.  Tracked in NV/torch-internal issue; remove this guard
-    once ``pyproject.toml`` raises the minimum torch to a fixed release.
+    Dynamo build. Fixed upstream in torch 2.11.
+
+    Cleanup checklist when minimum torch is bumped past 2.10
+    --------------------------------------------------------
+    Raise the minimum torch in ``pyproject.toml`` to ``>= 2.11``; then:
+
+    - delete this helper.
+    - drop every ``skipif(_has_torch_2_10_weakref_bug(), ...)`` site
+      (``TestGraphStructureInspection``, ``TestPerformanceComparison``).
+    - drop the ``except AssertionError`` workaround in
+      ``_count_dynamo_subgraphs`` that tolerates the assertion-path manifestation.
+    - revisit ``_fullgraph_subprocess.py`` and the ``noqa: S404`` rationale on
+      the ``import subprocess`` line: subprocess isolation was motivated by
+      the segfault path; with the bug gone, the test could move back in-process.
+
+    Tracked in an NV/torch-internal issue.
     """
     return torch.__version__.startswith("2.10")
 
@@ -195,23 +225,15 @@ def _count_dynamo_subgraphs(model: nn.Module, x: torch.Tensor) -> int:
             try:
                 compiled(x)
             except AssertionError as exc:
-                # torch 2.10 NGC container (v25.12) has a Dynamo bug where the
-                # compiled artifact for FlexTensor's loader methods references
-                # an external-object weakref whose table entry is evicted
-                # before the bytecode runs: `torch._dynamo.graph_bytecode_inputs
-                # .get_external_object_by_index` asserts "Index not registered
-                # in index_to_user_object_weakref". Fixed upstream in torch 2.11.
-                # The counting_backend has already fired once per subgraph
-                # during tracing, so graph_count is accurate by the time this
-                # runtime assertion surfaces.  Swallow only on 2.10, only for
-                # that specific assertion, and only if tracing actually
-                # produced subgraphs — otherwise the exception indicates a
-                # real tracing failure we must not hide.
-                # Remove this workaround once pyproject's minimum torch is
-                # bumped to >= 2.11 (see `dependencies` in pyproject.toml).
-                if not (
-                    torch.__version__.startswith("2.10") and "Index not registered" in str(exc) and graph_count[0] > 0
-                ):
+                # Tolerate the assertion-path manifestation of the torch 2.10
+                # weakref-eviction bug — see ``_has_torch_2_10_weakref_bug``
+                # for the full description. The counting_backend has already
+                # fired once per subgraph during tracing, so graph_count is
+                # accurate by the time this runtime assertion surfaces; only
+                # swallow on 2.10, only for that specific assertion, and only
+                # if tracing actually produced subgraphs — otherwise the
+                # exception indicates a real tracing failure we must not hide.
+                if not (_has_torch_2_10_weakref_bug() and "Index not registered" in str(exc) and graph_count[0] > 0):
                     raise
     finally:
         torch._dynamo.reset()
@@ -897,14 +919,9 @@ class TestCompileWrappedProxy:
 @pytest.mark.skipif(
     _has_torch_2_10_weakref_bug(),
     reason=(
-        "torch 2.10 trips the `reset_user_object_tracking` weakref-eviction "
-        "bug during compilation of these counting-backend tests — the "
-        "failure manifests as either an AssertionError ('Index not "
-        "registered in index_to_user_object_weakref') or a segfault, so a "
-        "runtime probe can't reliably detect it. Skip until pyproject's "
-        "minimum torch is raised to a fixed release. User-facing "
-        "correctness of graph-break behavior is verified by "
-        "TestCompileWrappedProxy (numerical match against eager reference)."
+        "torch 2.10 reset_user_object_tracking bug — see _has_torch_2_10_weakref_bug. "
+        "User-facing graph-break correctness is covered by TestCompileWrappedProxy "
+        "(numerical match against eager reference)."
     ),
 )
 class TestGraphStructureInspection:
@@ -1006,39 +1023,43 @@ class TestFullgraphMode:
     fullgraph=True instructs Dynamo to raise an error on any graph break,
     so this combination is fundamentally incompatible.
 
-    This test documents that limitation and ensures the failure is explicit
-    and informative rather than silent or incorrect.
+    The compile attempt runs in a subprocess so a fatal signal cannot crash
+    the pytest worker — see ``_has_torch_2_10_weakref_bug`` for the
+    underlying issue. Any non-zero subprocess exit — exception or fatal
+    signal — satisfies the contract that fullgraph=True must not silently
+    succeed.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=Exception,
-        reason=(
-            "torch.compile(fullgraph=True) is incompatible with FlexTensor: "
-            "dynamo.graph_break() calls inside TrapInfer.__enter__ and __exit__ "
-            "cause Dynamo to raise torch._dynamo.exc.Unsupported (or similar) "
-            "when fullgraph=True is set.  Use the default fullgraph=False instead."
-        ),
-    )
     def test_fullgraph_fails_with_offloaded_model(self, device: torch.device) -> None:
         """fullgraph=True must raise on a model with FlexTensor trap graph breaks."""
-        config = _make_offload_config()
-        manager_name = f"test_fg_{uuid.uuid4().hex[:8]}"
-        om = get_offload_manager(manager_name)
-        model = _create_model(device, on_cpu=True)
-        proxy = om.offload(model, config)
-        x = _make_input(device)
-        try:
-            _run_offload_lifecycle(proxy, x)
-            assert om._current_phase == OffloadPhase.INFERENCE
-
-            torch._dynamo.reset()
-            compiled = torch.compile(model, fullgraph=True)
-            with torch.no_grad():
-                compiled(x)  # Must raise: graph break encountered in TrapInfer
-        finally:
-            om.release()
-            torch._dynamo.reset()
+        helper = Path(__file__).parent / "_fullgraph_subprocess.py"
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, str(helper)],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert "REACHED_COMPILE" in result.stderr, (
+            "Subprocess stderr lacks the REACHED_COMPILE sentinel — either it "
+            "failed before reaching torch.compile, or it crashed before flushing "
+            f"stderr. This run cannot verify fullgraph behavior. exit={result.returncode}\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+        # The decisive assertion: a non-zero exit alone is not sufficient because
+        # a post-compile crash (e.g. inside ``om.release()`` in ``finally``) would
+        # mask a silent fullgraph success that printed UNEXPECTED_SUCCESS just
+        # before crashing.
+        assert "UNEXPECTED_SUCCESS" not in result.stderr, (
+            "torch.compile(fullgraph=True) silently succeeded on an offloaded model — "
+            "FlexTensor's dynamo.graph_break() calls must force Dynamo to raise.\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
+        assert result.returncode != 0, (
+            "Subprocess exited 0 without printing UNEXPECTED_SUCCESS — likely a "
+            "harness bug: neither the compile-failed nor the silent-success path "
+            f"was taken. exit={result.returncode}\n"
+            f"--- stdout ---\n{result.stdout}\n--- stderr ---\n{result.stderr}"
+        )
 
 
 # ===========================================================================
@@ -1046,6 +1067,14 @@ class TestFullgraphMode:
 # ===========================================================================
 
 
+@pytest.mark.skipif(
+    _has_torch_2_10_weakref_bug(),
+    reason=(
+        "torch 2.10 reset_user_object_tracking bug — see _has_torch_2_10_weakref_bug. "
+        "Informational performance test with no FlexTensor-specific assertions, so "
+        "no FlexTensor coverage is lost on 2.10."
+    ),
+)
 class TestPerformanceComparison:
     """Wall-time comparison for four compile/device scenarios (no timing assertions).
 
