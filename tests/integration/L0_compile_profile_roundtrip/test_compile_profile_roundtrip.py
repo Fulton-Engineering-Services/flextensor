@@ -60,7 +60,7 @@ from tests.integration._compile_helpers import (
 )
 
 # Models in this suite are small (20-layer dim=256 bfloat16) — 24g tier is ample.
-pytestmark = pytest.mark.gpu_mem_24g
+pytestmark = pytest.mark.gpu_vram_24g
 
 # ---------------------------------------------------------------------------
 # Tolerances

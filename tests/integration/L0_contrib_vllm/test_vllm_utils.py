@@ -10,7 +10,7 @@ from vllm_utils import parse_block_assignment_layers, parse_log_level
 # Piggyback on the GPU-memory tier the rest of this integration directory
 # already requests so these fast string-parsing tests share the runner instead
 # of defaulting to the highest-tier unmarked runner.
-pytestmark = pytest.mark.gpu_mem_40g
+pytestmark = pytest.mark.gpu_vram_40g
 
 
 def test_parse_log_level_info() -> None:

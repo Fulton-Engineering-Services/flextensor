@@ -204,7 +204,7 @@ class TestContribVLLM:
 
         return memory_metrics, result_metrics, log_lines
 
-    @pytest.mark.gpu_mem_40g
+    @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
         "model_name, cli_args",
         [
@@ -314,7 +314,7 @@ class TestContribVLLM:
 
         print(f"\nCombined metrics saved to: {metrics_file}")
 
-    @pytest.mark.gpu_mem_40g
+    @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
         "model_name, cli_args",
         [
@@ -406,7 +406,7 @@ class TestContribVLLM:
         print(f"\nPer-layer trap check passed: {len(layer_entries)} layer traps found")
         print(f"Weights memory: {offload_memory.weights_memory_gib:.2f} GiB")
 
-    @pytest.mark.gpu_mem_40g
+    @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
         "model_name, cli_args",
         [
@@ -460,7 +460,7 @@ class TestContribVLLM:
             f"{block_assignment_headers}"
         )
 
-    @pytest.mark.gpu_mem_40g
+    @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
         "model_name, cli_args",
         [

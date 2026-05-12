@@ -95,11 +95,24 @@ addopts = [
 ]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "gpu_mem_24g: Test requires 24GB GPU memory",
-    "gpu_mem_40g: Test requires 40GB GPU memory",
-    "gpu_mem_48g: Test requires 48GB GPU memory",
-    "gpu_mem_80g: Test requires 80GB GPU memory",
-    "gpu_mem_96g: Test requires 96GB GPU memory",
+    "gpu_vram_24g: Test requires exact 24GB GPU VRAM runner",
+    "gpu_vram_40g: Test requires exact 40GB GPU VRAM runner",
+    "gpu_vram_48g: Test requires exact 48GB GPU VRAM runner",
+    "gpu_vram_80g: Test requires exact 80GB GPU VRAM runner",
+    "gpu_vram_96g: Test requires exact 96GB GPU VRAM runner",
+    "gpu_vram_min_24g: Test requires at least 24GB GPU VRAM",
+    "gpu_vram_min_40g: Test requires at least 40GB GPU VRAM",
+    "gpu_vram_min_48g: Test requires at least 48GB GPU VRAM",
+    "gpu_vram_min_80g: Test requires at least 80GB GPU VRAM",
+    "gpu_vram_min_96g: Test requires at least 96GB GPU VRAM",
+    "gpu_sm_80: Test requires exact sm_80 runner",
+    "gpu_sm_89: Test requires exact sm_89 runner",
+    "gpu_sm_90: Test requires exact sm_90 runner",
+    "gpu_sm_120: Test requires exact sm_120 runner",
+    "gpu_sm_min_80: Test requires at least sm_80",
+    "gpu_sm_min_89: Test requires at least sm_89",
+    "gpu_sm_min_90: Test requires at least sm_90",
+    "gpu_sm_min_120: Test requires at least sm_120",
 ]
 filterwarnings = [
     # Fail on beartype decorator warnings - these indicate type hint issues

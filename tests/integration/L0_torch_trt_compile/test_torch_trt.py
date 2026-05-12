@@ -39,7 +39,7 @@ from tests.integration._compile_helpers import (
 )
 
 pytestmark = [
-    pytest.mark.gpu_mem_24g,
+    pytest.mark.gpu_vram_24g,
     pytest.mark.skipif(not HAS_TORCH_TRT, reason="torch_tensorrt not installed"),
 ]
 

@@ -8,7 +8,7 @@
 
 Structure: `integration/L{0,1,2}_<name>/` — each directory contains `.dockerimages`, `requirements.txt`, `test.sh`.
 
-**GPU memory markers**: `@pytest.mark.gpu_mem_{24g,40g,48g,80g,96g}` — CI auto-generates jobs per tier; unmarked → highest-tier runner.
+**GPU runner markers**: use `gpu_vram_*`, `gpu_vram_min_*`, `gpu_sm_*`, or `gpu_sm_min_*`; CI maps them to available runners.
 
 ### test.sh Pattern
 

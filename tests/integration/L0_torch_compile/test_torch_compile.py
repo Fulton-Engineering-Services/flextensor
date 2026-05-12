@@ -35,7 +35,7 @@ from tests.integration._compile_helpers import (
 )
 
 # Small models; 24g tier is ample.
-pytestmark = pytest.mark.gpu_mem_24g
+pytestmark = pytest.mark.gpu_vram_24g
 
 # ---------------------------------------------------------------------------
 # Tolerances and suite constants

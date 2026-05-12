@@ -44,7 +44,7 @@ from tests.integration._compile_helpers import (
 )
 
 # Small MoE-style models; 24g tier is ample for CUDA graph capture.
-pytestmark = pytest.mark.gpu_mem_24g
+pytestmark = pytest.mark.gpu_vram_24g
 
 # ---------------------------------------------------------------------------
 # Suite constants

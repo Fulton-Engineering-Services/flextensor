@@ -202,7 +202,7 @@ class TestExampleVLLM:
 
         return log_lines
 
-    @pytest.mark.gpu_mem_24g
+    @pytest.mark.gpu_vram_24g
     def test_example_scripts_end_to_end(self) -> None:
         """Test that serve.sh starts a working server and client.sh gets valid responses.
 
@@ -217,7 +217,7 @@ class TestExampleVLLM:
         """
         self._run_serve_and_validate()
 
-    @pytest.mark.gpu_mem_24g
+    @pytest.mark.gpu_vram_24g
     def test_env_var_passthrough(self) -> None:
         """Test that FT_* environment variables pass through to FlexTensor.
 
