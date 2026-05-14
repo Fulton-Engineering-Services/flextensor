@@ -68,6 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Include pattern derivation now skips unmatched sibling module patterns
+  instead of truncating them to broad ancestors, preserving per-layer traps on
+  wrapper models such as Nemotron-H.
 - `FlexTensorOffloadWorker` now pushes the speculative-decoding drafter
   (e.g. MTP / Eagle) to GPU before `flextensor.offload()` runs, so drafter
   weights don't remain on CPU where FT's loader leaves them. This resolves

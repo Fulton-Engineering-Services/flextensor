@@ -96,6 +96,46 @@ def _find_matched_patterns(
     return matched
 
 
+def _matching_parameter_paths(model: nn.Module, pattern: str) -> list[str]:
+    """Return parameter paths matched by *pattern* using runtime include semantics."""
+    return [
+        param_path
+        for param_path, _ in model.named_parameters()
+        if matches_any_pattern(param_path, [pattern], recursive_star=True)
+    ]
+
+
+def _derive_truncated_module_pattern(
+    pattern: str,
+    module_paths: list[str],
+    model: nn.Module | None,
+) -> tuple[str | None, bool]:
+    """Find a module prefix by truncating *pattern* from the right.
+
+    Returns ``(candidate, suppress_fallback)``:
+
+    * ``(candidate, True)`` — a module prefix of *pattern* matches a real
+      module path; the caller should patch ``candidate``.
+    * ``(None, True)`` — a module prefix matched but the original pattern
+      owns no parameters (e.g. ``model.norm`` on a model whose only norm
+      module is ``model.norm_f``). The per-parameter fallback must not run,
+      otherwise the unmatched name would still collapse to an ancestor.
+    * ``(None, False)`` — no module prefix of *pattern* matches anything.
+      The caller may try the per-parameter fallback.
+    """
+    parts = pattern.split(".")
+    for length in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:length])
+        if length < len(parts) and candidate == "*":
+            continue
+        if not any_path_matches_pattern(module_paths, candidate, recursive_star=False):
+            continue
+        if length < len(parts) and model is not None and not _matching_parameter_paths(model, pattern):
+            return None, True
+        return candidate, True
+    return None, False
+
+
 def _derive_module_patterns(
     patterns: list[str],
     module_paths: list[str],
@@ -103,15 +143,24 @@ def _derive_module_patterns(
 ) -> list[str]:
     """Derive module-level patterns from potentially parameter-level include patterns.
 
-    For patterns that don't directly match any module path (e.g., ``layers.*.weight``),
-    progressively truncates from the right until a match is found (e.g., ``layers.*``).
-    This allows parameter-level patterns to implicitly determine which modules to patch.
+    A pattern that directly names a module path (e.g. ``model.norm_f``) or
+    contains a wildcard that matches at least one module (e.g. ``layers.*``) is
+    used verbatim. Otherwise the function truncates the pattern from the right
+    looking for a module ancestor (e.g. ``layers.*.weight`` → ``layers.*``);
+    that truncation is rejected when the *original* pattern matches no parameter
+    on *model*, which prevents misspelled sibling names like ``model.norm`` from
+    collapsing to the wrapper ``model`` and patching the whole decoder as one
+    offload unit.
 
     A bare ``*`` produced by truncation is rejected because it would match every
     top-level module and collapse the model into a single offload unit (via the
-    ancestor guard).  When truncation fails and *model* is provided, the function
-    falls back to finding all parameters that match the original pattern and
-    collecting their owning module paths.
+    ancestor guard). When truncation gives no candidate and *model* is provided,
+    the function falls back to finding all parameters that match the original
+    pattern and collecting their owning module paths.
+
+    Unmatched patterns are dropped silently; the aggregate warning in
+    ``_offload_modules`` reports them so the user sees one message per pattern,
+    not several.
 
     Args:
         patterns: Original include patterns (may target modules or parameters).
@@ -124,33 +173,23 @@ def _derive_module_patterns(
     result: set[str] = set()
     module_paths_set = set(module_paths)
     for pattern in patterns:
-        parts = pattern.split(".")
-        found = False
-        for length in range(len(parts), 0, -1):
-            candidate = ".".join(parts[:length])
-            # A bare ``*`` produced by truncation would match every top-level
-            # module, collapsing the whole model into one offload unit.  Skip it
-            # so that the per-parameter fallback below can derive precise targets.
-            if length < len(parts) and candidate == "*":
-                continue
-            if any_path_matches_pattern(module_paths, candidate, recursive_star=False):
-                result.add(candidate)
-                found = True
-                break
-        if not found and model is not None:
+        module_pattern, suppress_fallback = _derive_truncated_module_pattern(pattern, module_paths, model)
+        if module_pattern is not None:
+            result.add(module_pattern)
+            continue
+        if suppress_fallback:
+            continue
+
+        if model is not None:
             # TODO: On large models this produces O(params) exact paths (e.g. 80
             # literal entries for an 80-layer model).  A post-processing step
             # could collapse sibling paths into compact wildcards (e.g.
             # layers.*.attn.q_proj), but the heuristics are non-trivial and the
             # current approach is correct.  Revisit if init time becomes an issue.
-            for param_path, _ in model.named_parameters():
-                if matches_any_pattern(param_path, [pattern], recursive_star=True):
-                    parent = ".".join(param_path.split(".")[:-1])
-                    if parent in module_paths_set:
-                        result.add(parent)
-                        found = True
-        if not found:
-            LOGGER.warning("No module-level prefix found for pattern '%s'; skipping.", pattern)
+            for param_path in _matching_parameter_paths(model, pattern):
+                parent = ".".join(param_path.split(".")[:-1])
+                if parent in module_paths_set:
+                    result.add(parent)
     return list(result)
 
 
@@ -729,16 +768,19 @@ class OffloadManager:
     def _restore_module_forward(self, module: nn.Module) -> None:
         """Restore module's original forward method.
 
+        Operates strictly on ``module.__dict__`` so that we don't trip over
+        custom ``__getattr__`` implementations (e.g. vLLM's ``StageMissingLayer``,
+        which is the reason ``tensor_discovery.is_offload_patched_module`` exists)
+        and so that cleanup never aborts mid-loop on a half-patched module.
+
         Args:
             module: The module to restore
         """
-        if hasattr(module, "_ft_original_forward_func"):
-            # Restore by removing the patched forward from __dict__,
-            # allowing the class method to be used again
-            if "forward" in module.__dict__:
-                del module.__dict__["forward"]
-            delattr(module, "_ft_original_forward_func")
-            delattr(module, "_ft_offload_name")
+        if "_ft_original_forward_func" not in module.__dict__:
+            return
+        module.__dict__.pop("forward", None)
+        module.__dict__.pop("_ft_original_forward_func", None)
+        module.__dict__.pop("_ft_offload_name", None)
 
     def _warn_if_compile_wrapped(self, target_phase: str) -> None:
         """Warn the user when a phase transition fires while ``OffloadModelProxy``

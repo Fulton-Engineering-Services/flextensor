@@ -509,7 +509,7 @@ class TestAncestorGuard:
         assert not om._has_patched_ancestor(model, "layers.1.attn")
 
         # Clean up
-        delattr(model.layers[0], "_ft_original_forward_func")
+        del model.layers[0]._ft_original_forward_func
 
 
 class TestPatternMatchWarnings:
@@ -751,6 +751,32 @@ class TestDeriveModulePatterns:
         assert "*" not in result, "*.bias must not collapse to *"
         assert "model.head" in result, "model.head owns bias params"
 
+    def test_unmatched_sibling_module_pattern_does_not_collapse_to_ancestor(self):
+        """Unmatched sibling module names must not derive a broad ancestor.
+
+        Nemotron-H has ``model.norm_f`` but not ``model.norm``.  The unmatched
+        ``model.norm`` default must be skipped, not truncated to ``model``,
+        because patching ``model`` turns the whole decoder into one offload unit.
+        """
+        from flextensor.offload_manager import _derive_module_patterns
+        from flextensor.utils import get_module_paths
+
+        model = WrappedNestedModel()
+        model.model.norm_f = nn.LayerNorm(10)
+        module_paths = get_module_paths(model)
+        result = set(
+            _derive_module_patterns(
+                ["model.layers.*", "model.norm", "model.norm_f", "model.head"],
+                module_paths,
+                model,
+            )
+        )
+
+        assert "model.layers.*" in result
+        assert "model.norm_f" in result
+        assert "model.head" in result
+        assert "model" not in result
+
 
 class TestFindMatchedPatterns:
     """Direct tests for _find_matched_patterns with split recursive_star."""
@@ -866,6 +892,21 @@ class TestParameterLevelIncludePatching:
         assert not hasattr(model.model, "_ft_original_forward_func"), (
             "top-level wrapper child 'model' should not be patched as a single unit"
         )
+        om.release()
+
+    def test_unmatched_sibling_module_pattern_does_not_patch_top_level_model(self):
+        """model.norm must not collapse wrapper models into a single model trap."""
+        model = WrappedNestedModel()
+        om = OffloadManager("test_unmatched_sibling_no_ancestor")
+
+        om._offload_modules(model, ["model.layers.*", "model.norm", "model.head"])
+
+        offload_names = {module._ft_offload_name for module in om._patched_modules}
+        assert "model" not in offload_names
+        assert "model.layers.0" in offload_names
+        assert "model.layers.1" in offload_names
+        assert "model.head" in offload_names
+        assert not hasattr(model.model, "_ft_original_forward_func")
         om.release()
 
 
