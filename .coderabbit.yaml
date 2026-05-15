@@ -1,5 +1,143 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+# Keep review comments high-signal: correctness, reliability, performance, and missing tests matter more than style.
+tone_instructions: |
+  Be direct and technical. Report only critical or important issues by default.
+  Prioritize correctness, performance, reliability, and missing tests over style nits.
+  Avoid low-confidence suggestions, compliments, poems, and speculative comments.
+
 reviews:
+  # Start with a lighter profile while the repo measures review signal/noise.
+  profile: chill
+
+  # Keep the summary in CodeRabbit's walkthrough instead of rewriting the MR description.
   high_level_summary: false
   high_level_summary_in_walkthrough: true
+  high_level_summary_instructions: |
+    Summarize reviewer-relevant behavior changes, risk areas, and tests run or missing.
+    Do not write release notes unless the MR explicitly asks for them.
+
+  # Nudge generated titles toward the repo's conventional-commit style when title generation is requested.
+  auto_title_instructions: |
+    Generate concise conventional-commit-style titles with a FlexTensor scope when possible.
+    Example: "fix(strategy): handle empty tensor candidates".
+
+  # Keep MR metadata checks advisory while nudging title/description toward repo conventions.
+  pre_merge_checks:
+    title:
+      mode: warning
+      requirements: |
+        Title should follow the MR title convention in CLAUDE.md.
+    description:
+      mode: warning
+    custom_checks:
+      - name: "MR metadata convention"
+        mode: warning
+        instructions: |
+          Check that the MR description follows the reviewer-facing summary and validation guidance in CLAUDE.md.
+
+  # Keep CodeRabbit advisory: it should comment on risks, not block merge or own GitLab status checks.
+  request_changes_workflow: false
+  review_status: false
+  commit_status: false
+
+  # Follow the Dynamo-style low-noise auto-review behavior: review ready MRs, but avoid draft and commit spam.
+  auto_review:
+    enabled: true
+    drafts: false
+    auto_incremental_review: false
+    ignore_title_keywords:
+      - "[WIP]"
+
+  # Keep the walkthrough expanded, but remove low-signal generated sections from the visible review comment.
+  review_details: false
+  collapse_walkthrough: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+
+  # Avoid speculative cross-linking unless reviewers explicitly ask CodeRabbit for issue or MR context.
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+
+  # Avoid automatic metadata changes until FlexTensor has a deliberate label and reviewer-routing policy.
+  suggested_labels: false
+  suggested_reviewers: false
+  auto_apply_labels: false
+
+  # Disable non-review content and AI-agent handoff snippets that add noise to GitLab discussions.
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: false
+
+  # Do not ask CodeRabbit to generate docstrings or unit tests; review findings should identify real gaps.
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+
+  # Route review attention to the repo-specific risk areas instead of using one generic reviewer prompt.
+  path_instructions:
+    - path: "src/flextensor/**/*.py"
+      instructions: |
+        Review for correctness of the tensor offload lifecycle, memory ownership, and public API compatibility.
+        Check that changes preserve the NOT_INITIALIZED -> DISCOVERY -> PROFILING -> INFERENCE state flow.
+        Flag hidden GPU synchronization, unnecessary CPU/GPU transfer churn, and missing error handling.
+        For public API or user-visible behavior changes, apply the documentation and changelog rules in CLAUDE.md.
+    - path: "src/flextensor/{__init__.py,offload_manager.py,tensor_manager.py,config.py}"
+      instructions: |
+        Treat these as public API and configuration surfaces. Apply the public API, documentation, changelog,
+        deprecation, and migration guidance from CLAUDE.md and src/flextensor/CLAUDE.md.
+    - path: "src/flextensor/strategy/**/*.py"
+      instructions: |
+        Review strategy changes for algorithmic correctness, deterministic behavior where expected, and clear handling
+        of memory budget constraints. Pay attention to empty candidates, tied scores, incompatible devices, and
+        impossible offload requests.
+    - path: "src/flextensor/shm/**/*.py"
+      instructions: |
+        Treat shared-memory changes as high risk.
+        Review cleanup on failure, process-safety, resource leaks, stale handles, and clear producer/consumer ownership.
+    - path: "src/flextensor/contrib/vllm/**/*.py"
+      instructions: |
+        Review vLLM integration changes for compatibility boundaries, worker lifecycle assumptions, and fallback
+        behavior when optional vLLM features or model runners are unavailable.
+        Flag changes that tightly couple FlexTensor internals to a single vLLM version without a guard or test.
+    - path: "tests/**/*.py"
+      instructions: |
+        Check that tests cover the changed success and failure paths.
+        For integration tests, prefer feedback on coverage gaps, command accuracy, GPU assumptions, and cleanup
+        behavior over style-only comments.
+    - path: "tests/integration/**"
+      instructions: |
+        Review integration harness changes for GPU assumptions, runner markers, .dockerimages, requirements.txt,
+        test.sh behavior, timeout handling, cleanup, and whether the test level matches the cost and coverage
+        of the scenario.
+    - path: "docs/**"
+      instructions: |
+        Review documentation against docs/CLAUDE.md and the Diataxis structure used by this repo.
+        Check for accurate commands, prerequisites, terminology, and behavioral caveats.
+        Flag claims that are not supported by code, tests, or the documented FlexTensor state model.
+    - path: "examples/**"
+      instructions: |
+        Treat examples as user-facing workflows.
+        Check that commands are runnable, requirements are explicit, and failure or cleanup behavior is clear.
+    - path: "{pyproject.toml,.pre-commit-config.yaml,mkdocs.yml,yamllint.yml}"
+      instructions: |
+        Review tooling and project configuration changes for consistency with documented setup, lint, type-check,
+        test, docs, and packaging commands.
+
+knowledge_base:
+  # Keep feedback learnings local to FlexTensor instead of teaching repo-specific rules globally.
+  learnings:
+    scope: local
+
+  # Use tracked CLAUDE.md files and the review guide as durable review standards.
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "**/CLAUDE.md"
+      - "REVIEW_GUIDE.md"

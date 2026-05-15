@@ -88,11 +88,15 @@ uv pip install -e ".[test]"
 
 **Commits**: `feat(scope):` / `fix(scope):` / `docs:` / `test:` / `refactor:` / `chore:` — `feat!:` / `fix!:` for breaking changes, `BREAKING CHANGE:` footer for details
 
+**MRs**: Use Conventional Commits style for titles; include a concise summary and validation.
+
 **Branches**: `###-feature-name` or `username/feature-name`
 
 **Pull/merge requests**: One topic per PR/MR — don't mix unrelated fixes into the same branch.
 
 **Changelog**: Update `CHANGELOG.md` under `## [Unreleased]` for user-visible changes. Follows [Keep a Changelog](https://keepachangelog.com/).
+
+**Public API/user-visible changes**: Update docs/examples/changelog as needed; add migration/deprecation guidance.
 
 ---
 
