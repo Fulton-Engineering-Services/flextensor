@@ -5,12 +5,10 @@
 set -xeo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../gpu_diagnostics.sh"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-if ! nvidia-smi >/dev/null 2>&1; then
-  echo "ERROR: NVIDIA GPU not detected. These tests require a GPU."
-  exit 1
-fi
+require_nvidia_gpu
 
 # Install test-specific requirements if not in CI (CI installs with flextensor for proper dependency resolution)
 if [ -z "${CI:-}" ] && [ -f "$SCRIPT_DIR/requirements.txt" ]; then

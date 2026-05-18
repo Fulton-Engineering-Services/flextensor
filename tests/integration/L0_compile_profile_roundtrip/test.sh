@@ -12,12 +12,10 @@
 set -xeo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../gpu_diagnostics.sh"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-nvidia-smi >/dev/null 2>&1 || {
-  echo "ERROR: No GPU detected. These tests require CUDA."
-  exit 1
-}
+require_nvidia_gpu
 
 # Install test-specific requirements if not in CI.
 if [ -z "${CI:-}" ] && [ -f "$SCRIPT_DIR/requirements.txt" ]; then

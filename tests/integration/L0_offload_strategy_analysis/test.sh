@@ -16,6 +16,10 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../gpu_diagnostics.sh"
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
+require_nvidia_gpu
 
 # Default parameters
 GPU_MEM=50
