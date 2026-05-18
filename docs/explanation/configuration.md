@@ -134,12 +134,20 @@ config = load_config(
 |--------|------|---------|-------------|
 | `enabled` | bool | `True` | Master switch for offloading |
 | `gpu_device` | int | `0` | GPU device index to use |
-| `include_patterns` | list[str] | `["*"]` | Module or parameter path patterns to include for offloading (supports `*` and `?` wildcards). Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
-| `exclude_patterns` | list[str] | `[]` | Module/parameter path patterns to exclude from offloading (supports wildcards). Applied after `include_patterns`. |
+| `include_patterns` | list[str] | `["*"]` | Patterns to include for offloading. Each entry is a `<glob>` (module / parameter path), an explicit `name:<glob>`, or a `class:<glob>` matching on the module's class. Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
+| `exclude_patterns` | list[str] | `[]` | Patterns to exclude from offloading (same three forms as `include_patterns`). Applied after `include_patterns`. |
 
 #### Include / Exclude Patterns
 
-The `include_patterns` option specifies which modules in the model to offload. Patterns support `*` (match any sequence) and `?` (match a single character) wildcards:
+The `include_patterns` option specifies which modules in the model to offload. Each entry has one of three forms:
+
+| Form | Selects on | Example |
+|------|-----------|---------|
+| `<glob>` | Module / parameter path (default) | `layers.*`, `*.weight` |
+| `name:<glob>` | Module / parameter path (explicit) | `name:layers.*` |
+| `class:<glob>` | Module's class (short name or FQCN) | `class:SharedExpertMLP`, `class:torch.nn.*.Linear` |
+
+Bare patterns behave like `name:`. Globs support `*` (match any sequence) and `?` (match a single character).
 
 ```python
 config = OffloadConfig(
@@ -148,7 +156,7 @@ config = OffloadConfig(
 model = offload(model, config=config)
 ```
 
-Patterns can also target individual parameters instead of entire modules. This is useful when you want to offload only specific weight tensors (e.g., large linear weights) while keeping others (e.g., small biases or normalization scales) on GPU:
+Name patterns can also target individual parameters instead of entire modules. This is useful when you want to offload only specific weight tensors (e.g., large linear weights) while keeping others (e.g., small biases or normalization scales) on GPU:
 
 ```python
 config = OffloadConfig(
@@ -161,20 +169,36 @@ config = OffloadConfig(
 )
 ```
 
-To exclude specific modules or parameters, use `exclude_patterns`:
+The `class:` form matches on the module's Python class, so it is robust against path renames across upstream model revisions. Each pattern is tested against both `type(module).__name__` and the fully-qualified class name (`f"{cls.__module__}.{cls.__qualname__}"`); a match on either wins. Class patterns are module-level only — a `class:` match cascades to every parameter of the matched module.
+
+```python
+# Offload every SharedExpertMLP module regardless of where it sits in the tree
+config = OffloadConfig(
+    include_patterns=["class:SharedExpertMLP"],
+)
+
+# Disambiguate when multiple packages define a class with the same short name
+config = OffloadConfig(
+    include_patterns=["class:torch.nn.*.Linear"],
+)
+```
+
+To exclude specific modules or parameters, use `exclude_patterns`. Exclude entries accept the same three forms:
 
 ```python
 config = OffloadConfig(
     include_patterns=["layers.*", "embed", "head"],
-    exclude_patterns=["head", "*.norm"],
+    exclude_patterns=["head", "*.norm", "class:MoELayer"],
 )
 ```
 
-Patterns can also be set via environment variables as comma-separated lists:
+Patterns can also be set via environment variables as comma-separated lists. The `class:` / `name:` prefixes work in env vars too:
 
 ```bash
-FT_INCLUDE_PATTERNS="layers.*,embed,head" FT_EXCLUDE_PATTERNS="head,*.norm" python my_script.py
+FT_INCLUDE_PATTERNS="layers.*,embed,head" FT_EXCLUDE_PATTERNS="class:MoELayer,*.norm" python my_script.py
 ```
+
+See [Pattern Matching](pattern-matching.md) for the full matching semantics, including parameter-level vs. module-level matching, FQCN globs, and the dict-model caveats for `class:` patterns.
 
 !!! tip "vLLM worker default patterns"
     The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_INCLUDE_PATTERNS` is set. They are designed for decoder-only transformer layouts as served by vLLM:

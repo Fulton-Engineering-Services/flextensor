@@ -57,29 +57,33 @@ for batch in dataloader:
 
 ## Include Patterns
 
-The `include_patterns` field in `OffloadConfig` specifies which modules to offload using path patterns:
+The `include_patterns` field in `OffloadConfig` specifies which modules to offload. Each entry is one of three forms:
 
 | Pattern | Matches |
 |---------|---------|
-| `"layers.*"` | All modules under `model.layers` |
+| `"layers.*"` | All modules under `model.layers` (name-based) |
 | `"encoder.block_*"` | `encoder.block_0`, `encoder.block_1`, etc. |
 | `"attention.?"` | Single-character suffixes like `attention.q` |
+| `"class:SharedExpertMLP"` | Every module whose class is `SharedExpertMLP`, regardless of its path |
 
 ```python
 config = OffloadConfig(
     include_patterns=[
-        "embed",           # Exact match
-        "layers.*",        # Wildcard
+        "embed",                    # Exact match (name)
+        "layers.*",                 # Wildcard (name)
+        "class:SharedExpertMLP",    # Class-based — useful for hybrid architectures
         "head",
     ],
 )
 model = flextensor.offload(model, config=config)
 ```
 
+`exclude_patterns` accepts the same three forms and removes matching modules or parameters from the offload set — see [Exclude Patterns](how-to/exclude-patterns.md).
+
 Include patterns can also be set via the `FT_INCLUDE_PATTERNS` environment variable as a comma-separated list:
 
 ```bash
-FT_INCLUDE_PATTERNS="layers.*,embed,head" python my_script.py
+FT_INCLUDE_PATTERNS="layers.*,embed,head,class:SharedExpertMLP" python my_script.py
 ```
 
 ## Key Configuration Options

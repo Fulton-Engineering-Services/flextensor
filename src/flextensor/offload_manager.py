@@ -9,7 +9,7 @@ import os
 import threading
 import types
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
@@ -34,9 +34,16 @@ from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
-from flextensor.tensor_discovery import is_offload_patched_module
+from flextensor.tensor_discovery import has_patched_ancestor, is_offload_patched_module
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
-from flextensor.utils import any_path_matches_pattern, get_module_paths, matches_any_pattern
+from flextensor.utils import (
+    any_path_matches_pattern,
+    get_class_matched_module_paths,
+    get_module_paths,
+    matches_any_class_pattern,
+    matches_any_pattern,
+    partition_patterns,
+)
 
 LOGGER = logging.getLogger(__name__)
 _GiB = 1 << 30
@@ -46,13 +53,48 @@ def _collect_matches(
     paths: list[str],
     remaining: set[str],
     matched: set[str],
+    name_bodies: Mapping[str, str],
     *,
     recursive_star: bool,
 ) -> None:
-    """Move patterns from *remaining* to *matched* when they match any path."""
+    """Move name patterns from *remaining* to *matched* when they match any path.
+
+    Class patterns are absent from *name_bodies* and skipped here.
+    """
     for path in paths:
         for pattern in list(remaining):
-            if matches_any_pattern(path, [pattern], recursive_star=recursive_star):
+            body = name_bodies.get(pattern)
+            if body is None:
+                continue
+            if matches_any_pattern(path, [body], recursive_star=recursive_star):
+                matched.add(pattern)
+                remaining.discard(pattern)
+        if not remaining:
+            return
+
+
+def _collect_class_matches(
+    model: nn.Module,
+    remaining: set[str],
+    matched: set[str],
+    class_bodies: Mapping[str, str],
+) -> None:
+    """Move ``class:`` patterns from *remaining* to *matched* by walking modules.
+
+    Only patterns present in *class_bodies* are considered; non-class patterns
+    are left untouched.
+    """
+    if not class_bodies or not remaining & class_bodies.keys():
+        return
+    for path, module in model.named_modules():
+        if not path:
+            continue
+        cls = type(module)
+        for pattern in list(remaining):
+            body = class_bodies.get(pattern)
+            if body is None:
+                continue
+            if matches_any_class_pattern(cls, [body]):
                 matched.add(pattern)
                 remaining.discard(pattern)
         if not remaining:
@@ -68,11 +110,16 @@ def _find_matched_patterns(
     param_recursive_star: bool | None = None,
     include_parameters: bool = False,
 ) -> set[str]:
-    """Return the subset of *patterns* that match at least one module (or parameter) path.
+    """Return the subset of *patterns* that match at least one module or parameter.
+
+    Accepts raw (optionally prefixed) patterns.  ``class:<body>`` patterns are
+    matched against both the short class name and the fully-qualified class
+    name (see :func:`flextensor.utils.matches_any_class_pattern`); name
+    patterns behave as before.
 
     Args:
         model: Model to check paths against.
-        patterns: Patterns to test.
+        patterns: Raw patterns to test (may carry ``class:`` / ``name:`` prefixes).
         module_paths: Non-root module paths (e.g. from ``named_modules()``).
         recursive_star: Passed through to ``matches_any_pattern`` for module paths.
         param_recursive_star: Passed through to ``matches_any_pattern`` for parameter
@@ -84,14 +131,17 @@ def _find_matched_patterns(
     if param_recursive_star is None:
         param_recursive_star = recursive_star
 
+    partitioned = partition_patterns(patterns)
     remaining = set(patterns)
     matched: set[str] = set()
 
-    _collect_matches(module_paths, remaining, matched, recursive_star=recursive_star)
+    _collect_matches(module_paths, remaining, matched, partitioned.name_bodies, recursive_star=recursive_star)
 
-    if include_parameters and remaining:
+    if include_parameters and remaining & partitioned.name_bodies.keys():
         param_paths = [p for p, _ in model.named_parameters()]
-        _collect_matches(param_paths, remaining, matched, recursive_star=param_recursive_star)
+        _collect_matches(param_paths, remaining, matched, partitioned.name_bodies, recursive_star=param_recursive_star)
+
+    _collect_class_matches(model, remaining, matched, partitioned.class_bodies)
 
     return matched
 
@@ -743,28 +793,6 @@ class OffloadManager:
         # Track patched module for cleanup
         self._patched_modules.append(module)
 
-    def _has_patched_ancestor(self, model: nn.Module, module_path: str) -> bool:
-        """Check if any ancestor of the given module path is already patched.
-
-        Args:
-            model: The root model to resolve ancestor paths against.
-            module_path: Dot-separated path of the module to check.
-
-        Returns:
-            True if any ancestor module has ``_ft_original_forward_func``.
-        """
-        parts = module_path.split(".")
-        for i in range(1, len(parts)):
-            ancestor_path = ".".join(parts[:i])
-            try:
-                ancestor = model.get_submodule(ancestor_path)
-            except AttributeError:
-                LOGGER.warning("Ancestor path '%s' not found in model; skipping ancestor check.", ancestor_path)
-                return False
-            if is_offload_patched_module(ancestor):
-                return True
-        return False
-
     def _restore_module_forward(self, module: nn.Module) -> None:
         """Restore module's original forward method.
 
@@ -1238,11 +1266,18 @@ class OffloadManager:
     def _offload_modules(self, model: nn.Module, patterns: list[str]) -> None:
         """Patch modules matching include patterns, skipping those with patched ancestors.
 
-        Uses flat ``named_modules()`` iteration with ``matches_any_pattern(recursive_star=False)``
-        to preserve existing single-segment ``*`` semantics (``layers.*`` matches direct children only).
+        Name patterns use flat ``named_modules()`` iteration with
+        ``matches_any_pattern(recursive_star=False)`` to preserve existing
+        single-segment ``*`` semantics (``layers.*`` matches direct children
+        only).  Parameter-level patterns (e.g., ``layers.*.weight``) are
+        auto-truncated to derive module-level patterns (e.g., ``layers.*``) via
+        ``_derive_module_patterns``.
 
-        Parameter-level patterns (e.g., ``layers.*.weight``) are auto-truncated to derive
-        module-level patterns (e.g., ``layers.*``) via ``_derive_module_patterns``.
+        Class patterns (``class:<glob>``) match against both
+        ``type(module).__name__`` and the fully-qualified class name, letting
+        hybrid architectures select modules without relying on fragile
+        upstream name conventions while still supporting disambiguation via
+        FQCN globs such as ``class:torch.nn.*.Linear``.
 
         Validation uses ``recursive_star=False`` for module paths but
         ``recursive_star=True`` for parameter paths, matching the runtime
@@ -1254,10 +1289,12 @@ class OffloadManager:
 
         Args:
             model: The model whose sub-modules to patch.
-            patterns: Include patterns to match against module paths.
+            patterns: Include patterns (name-based and/or ``class:`` prefixed).
         """
         module_paths = get_module_paths(model)
-        module_patterns = _derive_module_patterns(patterns, module_paths, model)
+        name_patterns, class_patterns = partition_patterns(patterns)
+        module_patterns = _derive_module_patterns(name_patterns, module_paths, model)
+        class_matched_paths = get_class_matched_module_paths(model, class_patterns)
         matched_patterns = _find_matched_patterns(
             model,
             patterns,
@@ -1269,8 +1306,10 @@ class OffloadManager:
         for module_path, module in model.named_modules():
             if not module_path:  # skip root
                 continue
-            if matches_any_pattern(module_path, module_patterns, recursive_star=False):
-                if self._has_patched_ancestor(model, module_path):
+            matched_by_name = matches_any_pattern(module_path, module_patterns, recursive_star=False)
+            matched_by_class = module_path in class_matched_paths
+            if matched_by_name or matched_by_class:
+                if has_patched_ancestor(model, module_path):
                     continue
                 self._patch_module_forward(module, module_path)
         for pattern in patterns:
@@ -1278,24 +1317,23 @@ class OffloadManager:
                 LOGGER.warning("Include pattern '%s' did not match any modules or parameters.", pattern)
 
     def _exclude_modules(self, model: nn.Module, patterns: list[str]) -> None:
-        """Un-patch modules matching any exclude pattern.
+        """Un-patch offload units matching any exclude pattern.
 
-        Uses ``matches_any_pattern(recursive_star=True)`` (default) so that
-        ``foo.*`` matches all descendants.
-
-        Only offload units (modules without patched ancestors) are ever patched,
-        so this method naturally operates only on offload units. Exclude patterns
-        targeting descendants within an offload unit are no-ops at the module level;
-        parameter-level exclusion for those is handled in ``tensor_discovery.py``.
+        Name patterns use ``matches_any_pattern(recursive_star=True)`` so
+        ``foo.*`` matches all descendants. Class patterns (``class:<glob>``)
+        un-patch every module whose class name matches, regardless of
+        position in the tree.
 
         Args:
             model: The model whose sub-modules to un-patch.
-            patterns: Exclude patterns to match against module paths.
+            patterns: Exclude patterns (name-based and/or ``class:`` prefixed).
         """
         if not patterns:
             return
         patched_before = len(self._patched_modules)
         module_paths = get_module_paths(model)
+        name_patterns, class_patterns = partition_patterns(patterns)
+        class_matched_paths = get_class_matched_module_paths(model, class_patterns)
         matched_patterns = _find_matched_patterns(
             model,
             patterns,
@@ -1306,7 +1344,9 @@ class OffloadManager:
         for module_path, module in model.named_modules():
             if not is_offload_patched_module(module):
                 continue
-            if matches_any_pattern(module_path, patterns, recursive_star=True):
+            matched_by_name = matches_any_pattern(module_path, name_patterns, recursive_star=True)
+            matched_by_class = module_path in class_matched_paths
+            if matched_by_name or matched_by_class:
                 self._restore_module_forward(module)
                 if module in self._patched_modules:
                     self._patched_modules.remove(module)

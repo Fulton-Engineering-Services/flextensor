@@ -34,6 +34,31 @@ config = OffloadConfig(
 )
 ```
 
+## Keep specific module classes on GPU
+
+A `class:<glob>` exclude pattern excludes every module whose class matches from offloading, regardless of where it sits in the tree. Matching modules stay on GPU throughout discovery, profiling, and inference. This is the recommended way to keep hybrid-architecture sub-modules on GPU without having to enumerate their paths.
+
+```python
+config = OffloadConfig(
+    include_patterns=["layers.*"],
+    exclude_patterns=["class:SharedExpertMLP", "class:MoELayer"],
+)
+```
+
+Each `class:` pattern is tested against both the short class name (`type(module).__name__`) and the fully-qualified class name (`f"{cls.__module__}.{cls.__qualname__}"`). Use an FQCN glob to disambiguate when multiple packages define a class with the same short name:
+
+```python
+# Match only torch.nn.Linear, not a user-defined Linear
+config = OffloadConfig(
+    include_patterns=["layers.*"],
+    exclude_patterns=["class:torch.nn.*.Linear"],
+)
+```
+
+Class patterns are module-level only — a match cascades to every parameter of the matched module. For parameter-level filtering (e.g. only `*.scale`), use a name pattern.
+
+See [Pattern Matching](../explanation/pattern-matching.md#class-patterns) for the full semantics.
+
 ## Combine include and exclude patterns
 
 Include patterns select which modules to offload. Exclude patterns then remove specific modules or parameters from that set.

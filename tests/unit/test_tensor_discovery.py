@@ -1637,3 +1637,346 @@ class TestEmptyIncludePatterns:
         with caplog.at_level(logging.WARNING, logger="flextensor.tensor_discovery"):
             validate_include_patterns(None)
         assert "include_patterns is an empty list" not in caplog.text
+
+
+# =============================================================================
+# Tests for class:<name> pattern support
+# =============================================================================
+
+
+class _ClassPatternSharedExpertMLP(torch.nn.Module):
+    """Standalone expert module used to exercise class-based matching."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(4, 4))
+        self.bias = torch.nn.Parameter(torch.randn(4))
+
+
+class _ClassPatternMoELayer(torch.nn.Module):
+    """MoE layer containing a shared expert and a router, used for cascade tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.shared = _ClassPatternSharedExpertMLP()
+        self.gate = torch.nn.Linear(4, 2)
+
+
+class _ClassPatternModel(torch.nn.Module):
+    """Small model with a mix of MoE and dense layers for class-pattern tests."""
+
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList([_ClassPatternMoELayer(), _ClassPatternMoELayer()])
+        self.dense = torch.nn.Linear(4, 4)
+
+
+def test_should_offload_param_class_include_via_ancestor():
+    """Class-based include cascades to all parameters under a matching ancestor."""
+    paths = {"layers.0.shared"}
+    assert _should_offload_param(
+        "layers.0.shared.weight",
+        [],
+        [],
+        include_class_paths=paths,
+    )
+    # Parameter under a non-matching ancestor is still excluded.
+    assert not _should_offload_param(
+        "layers.0.gate.weight",
+        [],
+        [],
+        include_class_paths=paths,
+    )
+
+
+def test_should_offload_param_class_exclude_via_ancestor():
+    """Class-based exclude cascades to all parameters under a matching ancestor."""
+    paths = {"layers.0.shared"}
+    assert not _should_offload_param(
+        "layers.0.shared.weight",
+        ["*"],
+        [],
+        exclude_class_paths=paths,
+    )
+    # Other parameters unaffected.
+    assert _should_offload_param(
+        "layers.0.gate.weight",
+        ["*"],
+        [],
+        exclude_class_paths=paths,
+    )
+
+
+def test_should_offload_param_name_and_class_include_union():
+    """Inclusion is the union of name-based and class-based matches."""
+    # Name pattern alone is sufficient when no class includes are configured.
+    assert _should_offload_param(
+        "layers.0.shared.weight",
+        ["layers.*"],
+        [],
+        include_class_paths=set(),
+    )
+    # Class-based inclusion can rescue a path not matched by names.
+    assert _should_offload_param(
+        "dense.weight",
+        ["layers.*"],
+        [],
+        include_class_paths={"dense"},
+    )
+
+
+def test_get_non_offloaded_class_exclude_keeps_subtree_on_gpu():
+    """Excluding ``class:_ClassPatternSharedExpertMLP`` keeps its params on GPU."""
+    model = _ClassPatternModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    non_offloaded = get_non_offloaded_tensor_ids(
+        model,
+        tensors_map,
+        include_patterns=["*"],
+        exclude_patterns=["class:_ClassPatternSharedExpertMLP"],
+    )
+
+    expected = {
+        id(model.layers[0].shared.weight),
+        id(model.layers[0].shared.bias),
+        id(model.layers[1].shared.weight),
+        id(model.layers[1].shared.bias),
+    }
+    assert non_offloaded == expected
+
+
+def test_get_non_offloaded_class_include_limits_to_matched_modules():
+    """Class-only includes offload exactly the matched modules' parameters."""
+    model = _ClassPatternModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    non_offloaded = get_non_offloaded_tensor_ids(
+        model,
+        tensors_map,
+        include_patterns=["class:_ClassPatternSharedExpertMLP"],
+    )
+
+    offloaded_expected = {
+        id(model.layers[0].shared.weight),
+        id(model.layers[0].shared.bias),
+        id(model.layers[1].shared.weight),
+        id(model.layers[1].shared.bias),
+    }
+    offloaded = set(tensors_map) - non_offloaded
+    assert offloaded == offloaded_expected
+
+
+def test_get_non_offloaded_class_glob_pattern():
+    """Wildcards inside a ``class:`` pattern match multiple class names."""
+    model = _ClassPatternModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    non_offloaded = get_non_offloaded_tensor_ids(
+        model,
+        tensors_map,
+        include_patterns=["*"],
+        exclude_patterns=["class:*MoELayer*"],
+    )
+
+    # Entire MoE layer subtree stays on GPU.
+    expected = {
+        id(model.layers[0].shared.weight),
+        id(model.layers[0].shared.bias),
+        id(model.layers[0].gate.weight),
+        id(model.layers[0].gate.bias),
+        id(model.layers[1].shared.weight),
+        id(model.layers[1].shared.bias),
+        id(model.layers[1].gate.weight),
+        id(model.layers[1].gate.bias),
+    }
+    assert non_offloaded == expected
+
+
+def test_get_non_offloaded_mixed_class_pattern_dict_model_warns(caplog):
+    """Mixed name + ``class:`` includes degrade to a warning on dict-typed models.
+
+    The all-class case is a hard error (see
+    ``test_dict_model_class_only_includes_raises``); this test covers the
+    surviving-name-pattern path where offloading can still proceed.
+    """
+    import logging
+
+    t1 = torch.randn(4)
+    model_dict = {"layers.0.weight": t1}
+    tensors_map = {id(t1): t1}
+
+    with caplog.at_level(logging.WARNING, logger="flextensor.tensor_discovery"):
+        non_offloaded = get_non_offloaded_tensor_ids(
+            model_dict,
+            tensors_map,
+            include_patterns=["embed.*", "class:Foo"],
+        )
+
+    # ``embed.*`` doesn't match ``layers.0.weight``, so it ends up non-offloaded.
+    assert non_offloaded == {id(t1)}
+    assert "Ignoring class: patterns" in caplog.text
+
+
+def test_dict_model_warning_echoes_dropped_patterns(caplog):
+    """Warning must list which class: patterns were dropped, not just ``patterns``.
+
+    A user with both include and exclude class patterns needs to see exactly
+    which were ignored — otherwise they have to inspect their config to infer.
+    """
+    import logging
+
+    t1 = torch.randn(4)
+    model_dict = {"layers.0.weight": t1}
+    tensors_map = {id(t1): t1}
+
+    with caplog.at_level(logging.WARNING, logger="flextensor.tensor_discovery"):
+        get_non_offloaded_tensor_ids(
+            model_dict,
+            tensors_map,
+            include_patterns=["embed.*", "class:Linear", "class:Conv2d"],
+            exclude_patterns=["class:LayerNorm"],
+        )
+
+    # Bodies (post-prefix-strip) are echoed, grouped by include/exclude.
+    assert "include=['Linear', 'Conv2d']" in caplog.text
+    assert "exclude=['LayerNorm']" in caplog.text
+
+
+def test_dict_model_class_only_includes_raises():
+    """When ALL include_patterns are class:, dict-typed model raises ``ValueError``.
+
+    Dict models have no module hierarchy, so ``class:`` patterns cannot
+    resolve under any circumstance — this is a structural config bug, not
+    a runtime fallback condition. Distinct from
+    ``OffloadManager._check_no_modules_patched`` (which logs ERROR and
+    continues for module models): there the patterns *could* match a
+    differently-versioned upstream, here they provably cannot.
+    """
+    t1 = torch.randn(4)
+    model_dict = {"layers.0.weight": t1}
+    tensors_map = {id(t1): t1}
+
+    with pytest.raises(ValueError, match=r"All include_patterns are class: patterns.*dict-typed"):
+        get_non_offloaded_tensor_ids(
+            model_dict,
+            tensors_map,
+            include_patterns=["class:Linear"],
+        )
+
+
+def test_dict_model_no_op_warning_silent_when_name_includes_remain(caplog):
+    """If at least one name include survives, the no-op warning does NOT fire."""
+    import logging
+
+    t1 = torch.randn(4)
+    model_dict = {"layers.0.weight": t1}
+    tensors_map = {id(t1): t1}
+
+    with caplog.at_level(logging.WARNING, logger="flextensor.tensor_discovery"):
+        get_non_offloaded_tensor_ids(
+            model_dict,
+            tensors_map,
+            include_patterns=["embed.*", "class:Linear"],  # name include survives
+        )
+
+    # The echo-warning still fires (class pattern was dropped), but the
+    # no-op-trap warning must not — name-based offloading still works.
+    assert "Ignoring class: patterns" in caplog.text
+    assert "no parameters will be offloaded" not in caplog.text
+
+
+def test_get_offload_module_tensor_ids_class_filter():
+    """Patched modules still honour ``class:`` exclusion at parameter-collection time."""
+    model = _ClassPatternModel()
+    # Mark the first MoE layer as patched (simulating forward-patching).
+    # Use the UNBOUND class function — production stores ``type(module).forward``
+    # (see offload_manager._patch_module_forward); a bound method here would
+    # silently pass today's ``hasattr``-only probe but break any future
+    # tightening of patched-module detection.
+    patched = model.layers[0]
+    patched._ft_original_forward_func = type(patched).forward  # noqa: SLF001
+    patched._ft_offload_name = "layers.0"  # noqa: SLF001
+
+    tensors_map = {id(p): p for p in model.parameters()}
+    per_trap = get_offload_module_tensor_ids(
+        model,
+        tensors_map,
+        include_patterns=["*"],
+        exclude_patterns=["class:_ClassPatternSharedExpertMLP"],
+    )
+
+    assert per_trap["layers.0"] == {id(patched.gate.weight), id(patched.gate.bias)}
+
+
+def test_discover_with_class_exclude_pattern():
+    """E2E: ``class:`` exclusion in the pre-filter blocks shared-expert tensors
+    from being auto-discovered into a patched layer's tensor set.
+
+    Mirrors :func:`test_discover_with_forward_patching` but exercises the
+    pre-filter → strategy hand-off in ``discover_untraced_tensors_for_layers``
+    with a ``class:`` exclude pattern. Verifies the contract that
+    parameters whose owning module class matches the exclude pattern are
+    removed from the untraced pool *before* the forward-patching strategy
+    assigns them to the patched layer's offload unit.
+    """
+    model = _ClassPatternModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+    tensor_id_to_name_map = {id(p): name for name, p in model.named_parameters()}
+
+    # Patch layers[0] using the UNBOUND class function (production pattern;
+    # see offload_manager._patch_module_forward).
+    patched = model.layers[0]
+    patched._ft_original_forward_func = type(patched).forward  # noqa: SLF001
+    patched._ft_offload_name = "layers.0"  # noqa: SLF001
+
+    layer_stats = [
+        IterativeLayerStatistics(label="layers.0", tensor_ids=set(), duration=0.1),
+    ]
+
+    result = discover_untraced_tensors_for_layers(
+        layer_stats,
+        tensors_map,
+        model,
+        tensor_id_to_name_map,
+        exclude_patterns=["class:_ClassPatternSharedExpertMLP"],
+    )
+
+    # Shared-expert params are filtered out in the pre-filter; only the
+    # gate (Linear) params end up assigned to the patched layer.
+    expected = {id(model.layers[0].gate.weight), id(model.layers[0].gate.bias)}
+    assert result[0].tensor_ids == expected, (
+        f"shared-expert tensors leaked into discovered set; got {result[0].tensor_ids}, expected {expected}"
+    )
+
+
+def test_discover_with_class_exclude_pattern_no_filter_baseline():
+    """Positive control for :func:`test_discover_with_class_exclude_pattern`.
+
+    Without the class exclude, the same setup discovers ALL of the patched
+    layer's parameters (shared + gate). Demonstrates that the exclusion in
+    the previous test is what's removing the shared-expert tensors, not
+    some other discovery quirk.
+    """
+    model = _ClassPatternModel()
+    tensors_map = {id(p): p for p in model.parameters()}
+    tensor_id_to_name_map = {id(p): name for name, p in model.named_parameters()}
+
+    patched = model.layers[0]
+    patched._ft_original_forward_func = type(patched).forward  # noqa: SLF001
+    patched._ft_offload_name = "layers.0"  # noqa: SLF001
+
+    layer_stats = [
+        IterativeLayerStatistics(label="layers.0", tensor_ids=set(), duration=0.1),
+    ]
+
+    result = discover_untraced_tensors_for_layers(
+        layer_stats,
+        tensors_map,
+        model,
+        tensor_id_to_name_map,
+        # No exclude_patterns — shared-expert params should be discovered.
+    )
+
+    expected = {id(p) for p in model.layers[0].parameters()}
+    assert result[0].tensor_ids == expected

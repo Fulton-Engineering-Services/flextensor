@@ -12,11 +12,15 @@ import pytest
 import torch
 
 from flextensor.utils import (
+    PartitionedPatterns,
     _compile_segment_regex,
     any_path_matches_pattern,
     atomic_write_json,
     calculate_tensor_size,
+    get_class_matched_module_paths,
+    matches_any_class_pattern,
     matches_any_pattern,
+    partition_patterns,
 )
 
 
@@ -468,3 +472,243 @@ class TestAnyPathMatchesPattern:
                 expected = any(matches_any_pattern(p, [pattern], recursive_star=rs) for p in paths)
                 actual = any_path_matches_pattern(paths, pattern, recursive_star=rs)
                 assert actual == expected, f"Mismatch for pattern={pattern!r}, recursive_star={rs}"
+
+
+class TestPartitionPatterns:
+    """Tests for partition_patterns: prefix parsing of ``name:`` / ``class:``."""
+
+    def test_bare_patterns_treated_as_name(self):
+        names, classes = partition_patterns(["layers.*", "lm_head"])
+        assert names == ["layers.*", "lm_head"]
+        assert classes == []
+
+    def test_explicit_name_prefix_stripped(self):
+        names, classes = partition_patterns(["name:layers.*", "name:lm_head"])
+        assert names == ["layers.*", "lm_head"]
+        assert classes == []
+
+    def test_class_prefix_collected(self):
+        names, classes = partition_patterns(["class:MoELayer", "class:*Expert*"])
+        assert names == []
+        assert classes == ["MoELayer", "*Expert*"]
+
+    def test_mixed_prefixes_preserved(self):
+        names, classes = partition_patterns(["layers.*", "name:embed", "class:SharedExpertMLP", "class:Linear"])
+        assert names == ["layers.*", "embed"]
+        assert classes == ["SharedExpertMLP", "Linear"]
+
+    def test_empty_class_body_raises(self):
+        with pytest.raises(ValueError, match="empty body"):
+            partition_patterns(["class:"])
+
+    def test_empty_name_body_raises(self):
+        with pytest.raises(ValueError, match="empty body"):
+            partition_patterns(["name:"])
+
+    @pytest.mark.parametrize("body", [" ", "  ", "\t", "\n"])
+    def test_whitespace_only_class_body_raises(self, body):
+        with pytest.raises(ValueError, match="empty body"):
+            partition_patterns([f"class:{body}"])
+
+    @pytest.mark.parametrize("body", [" ", "  ", "\t", "\n"])
+    def test_whitespace_only_name_body_raises(self, body):
+        with pytest.raises(ValueError, match="empty body"):
+            partition_patterns([f"name:{body}"])
+
+    def test_order_preserved(self):
+        raw = ["a", "class:Foo", "b", "name:c", "class:Bar"]
+        names, classes = partition_patterns(raw)
+        assert names == ["a", "b", "c"]
+        assert classes == ["Foo", "Bar"]
+
+    def test_empty_input(self):
+        names, classes = partition_patterns([])
+        assert names == []
+        assert classes == []
+
+    def test_returns_partitioned_patterns_dataclass(self):
+        # Public surface for callers that need raw → body mappings (e.g. for
+        # diagnostics that echo the user's exact configuration).
+        result = partition_patterns(["layers.*", "name:embed", "class:MoELayer"])
+        assert isinstance(result, PartitionedPatterns)
+        assert result.name_bodies == {"layers.*": "layers.*", "name:embed": "embed"}
+        assert result.class_bodies == {"class:MoELayer": "MoELayer"}
+        assert result.name_patterns == ["layers.*", "embed"]
+        assert result.class_patterns == ["MoELayer"]
+
+    def test_dataclass_unpacks_to_body_lists(self):
+        # Back-compat: `names, classes = partition_patterns(...)` keeps working.
+        names, classes = partition_patterns(["a", "class:Foo"])
+        assert names == ["a"]
+        assert classes == ["Foo"]
+
+    def test_raw_keys_preserve_user_text(self):
+        # Diagnostic warnings in offload_manager echo the raw pattern; the
+        # raw-keyed dicts must keep the prefix the user wrote.
+        result = partition_patterns(["class:MoELayer", "name:embed", "bare"])
+        assert "class:MoELayer" in result.class_bodies
+        assert "name:embed" in result.name_bodies
+        assert "bare" in result.name_bodies
+
+    def test_bodies_are_immutable(self):
+        # ``frozen=True`` on the dataclass blocks field rebinding; the
+        # ``MappingProxyType`` wrap extends that to dict contents so the
+        # immutability promise isn't leaky. Without the wrap, a caller could
+        # mutate ``result.name_bodies["x"] = "y"`` behind the dataclass's back.
+        result = partition_patterns(["layers.*", "class:MoELayer"])
+        with pytest.raises(TypeError):
+            result.name_bodies["new"] = "value"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            result.class_bodies["new"] = "value"  # type: ignore[index]
+
+    def test_bodies_isolated_from_source_dict_mutation(self):
+        # The dataclass defensively copies the source dict before wrapping,
+        # so callers that retain a reference to the pre-construction dict
+        # can't leak mutations through the MappingProxyType view.
+        source = {"layers.*": "layers.*"}
+        result = PartitionedPatterns(name_bodies=source)
+        source["sneaky"] = "injected"
+        assert "sneaky" not in result.name_bodies
+
+
+def _make_synthetic_class(short_name: str, module: str = "tests.synthetic") -> type:
+    """Build a class whose ``__name__`` and ``__module__`` are controlled.
+
+    Used to exercise :func:`matches_any_class_pattern` which tests both the
+    short class name and the fully-qualified class name.
+    """
+    cls = type(short_name, (), {})
+    cls.__module__ = module
+    return cls
+
+
+class TestMatchesAnyClassPattern:
+    """Tests for the class-name glob matcher (short name + FQCN)."""
+
+    def test_exact_match(self):
+        assert matches_any_class_pattern(_make_synthetic_class("Linear"), ["Linear"])
+        assert not matches_any_class_pattern(_make_synthetic_class("Conv2d"), ["Linear"])
+
+    def test_star_wildcard(self):
+        assert matches_any_class_pattern(_make_synthetic_class("SharedExpertMLP"), ["*Expert*"])
+        assert matches_any_class_pattern(_make_synthetic_class("GatedMLP"), ["*MLP"])
+        assert not matches_any_class_pattern(_make_synthetic_class("LayerNorm"), ["*MLP"])
+
+    def test_question_mark(self):
+        assert matches_any_class_pattern(_make_synthetic_class("MoE"), ["Mo?"])
+        assert not matches_any_class_pattern(_make_synthetic_class("MoELayer"), ["Mo?"])
+
+    def test_multiple_patterns_or(self):
+        assert matches_any_class_pattern(_make_synthetic_class("Linear"), ["MoELayer", "Linear"])
+        assert not matches_any_class_pattern(_make_synthetic_class("LayerNorm"), ["MoELayer", "Linear"])
+
+    def test_empty_patterns_is_false(self):
+        assert not matches_any_class_pattern(_make_synthetic_class("Linear"), [])
+
+    def test_fqcn_exact_match(self):
+        """A dotted pattern can match the fully-qualified class name."""
+        cls = _make_synthetic_class("Linear", module="torch.nn.modules.linear")
+        assert matches_any_class_pattern(cls, ["torch.nn.modules.linear.Linear"])
+        assert not matches_any_class_pattern(cls, ["other.pkg.Linear"])
+
+    def test_fqcn_glob_disambiguates_short_name_collision(self):
+        """Users can target a specific package when two classes share a short name."""
+        torch_linear = _make_synthetic_class("Linear", module="torch.nn.modules.linear")
+        user_linear = _make_synthetic_class("Linear", module="myapp.layers")
+
+        patterns = ["torch.nn.*.Linear"]
+        assert matches_any_class_pattern(torch_linear, patterns)
+        # Short-name ``Linear`` does not match ``torch.nn.*.Linear`` (no dot-split
+        # semantics), and the user's FQCN lives in a different namespace.
+        assert not matches_any_class_pattern(user_linear, patterns)
+
+    def test_fqcn_star_spans_dots(self):
+        """In class patterns ``*`` is atomic over the whole string, so it spans dots."""
+        cls = _make_synthetic_class("SharedExpertMLP", module="vllm.model_executor.layers.moe")
+        assert matches_any_class_pattern(cls, ["*.SharedExpertMLP"])
+        assert matches_any_class_pattern(cls, ["vllm.*"])
+
+    def test_short_name_still_wins_when_pattern_is_unqualified(self):
+        """A pattern without dots is matched against the short name (backward compat)."""
+        cls = _make_synthetic_class("MoELayer", module="some.deep.nested.module")
+        assert matches_any_class_pattern(cls, ["MoELayer"])
+        assert matches_any_class_pattern(cls, ["*Layer"])
+
+
+class _MockLinear(torch.nn.Linear):
+    """Distinct subclass used to exercise class-name matching in the tests."""
+
+
+class _MockMoELayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate = torch.nn.Linear(4, 4)
+
+
+class TestGetClassMatchedModulePaths:
+    """Tests for walking a model and collecting paths by class-name match."""
+
+    def _make_model(self):
+        model = torch.nn.Module()
+        model.linear = _MockLinear(4, 4)
+        model.moe = _MockMoELayer()
+        model.norm = torch.nn.LayerNorm(4)
+        return model
+
+    def test_empty_patterns_returns_empty_set(self):
+        model = self._make_model()
+        assert get_class_matched_module_paths(model, []) == set()
+
+    def test_exact_class_name_match(self):
+        model = self._make_model()
+        paths = get_class_matched_module_paths(model, ["_MockLinear"])
+        assert paths == {"linear"}
+
+    def test_glob_class_name_match(self):
+        model = self._make_model()
+        paths = get_class_matched_module_paths(model, ["*MoE*"])
+        assert paths == {"moe"}
+
+    def test_includes_nested_matches(self):
+        model = self._make_model()
+        # moe.gate is Linear (base class), not _MockLinear.
+        paths = get_class_matched_module_paths(model, ["Linear"])
+        assert paths == {"moe.gate"}
+
+    def test_empty_patterns_on_non_module_short_circuits(self):
+        # No patterns means no work to do; model walkability is irrelevant.
+        assert get_class_matched_module_paths({"a": 1}, []) == set()
+
+    def test_non_module_with_patterns_raises(self):
+        # Class matching against a non-walkable model is a configuration bug,
+        # not "no match"; the function must surface it instead of silently
+        # returning an empty set.
+        with pytest.raises(TypeError, match="named_modules"):
+            get_class_matched_module_paths({"a": 1}, ["Foo"])
+
+    def test_root_module_excluded(self):
+        """Root module (empty path) is never returned even if its class matches."""
+        model = self._make_model()
+        # Match the root's class name (``Module``).
+        paths = get_class_matched_module_paths(model, ["Module"])
+        # Only submodules (non-empty path) may be returned.
+        assert "" not in paths
+
+    def test_fqcn_pattern_disambiguates_across_modules(self):
+        """FQCN globs can target a specific package even when short names collide."""
+        model = torch.nn.Module()
+        model.torch_linear = torch.nn.Linear(4, 4)
+        # Build a throw-away class with the same short name but a different module.
+        synthetic_linear_cls = type("Linear", (torch.nn.Module,), {})
+        synthetic_linear_cls.__module__ = "tests.synthetic"
+        model.user_linear = synthetic_linear_cls()
+
+        paths = get_class_matched_module_paths(model, ["torch.nn.*.Linear"])
+        assert paths == {"torch_linear"}
+
+        paths = get_class_matched_module_paths(model, ["tests.synthetic.Linear"])
+        assert paths == {"user_linear"}
+
+        # Bare short-name pattern still matches both.
+        paths = get_class_matched_module_paths(model, ["Linear"])
+        assert paths == {"torch_linear", "user_linear"}

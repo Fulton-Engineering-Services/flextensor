@@ -20,7 +20,11 @@ from typing import Any
 import torch
 
 from flextensor.collectors import IterativeLayerStatistics
-from flextensor.utils import matches_any_pattern
+from flextensor.utils import (
+    get_class_matched_module_paths,
+    matches_any_pattern,
+    partition_patterns,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -302,30 +306,69 @@ def _any_prefix_matches(full_param_path: str, patterns: list[str]) -> bool:
     return False
 
 
+def _any_prefix_in_set(full_param_path: str, module_paths: set[str]) -> bool:
+    """Check if any prefix of *full_param_path* (including itself) is in *module_paths*.
+
+    Used for ``class:`` pattern cascading: once a module's class matches a
+    class pattern, every parameter underneath that module inherits the match.
+
+    Args:
+        full_param_path: Dot-separated parameter path (e.g. ``layers.0.weight``).
+        module_paths: Set of module paths (from
+            :func:`~flextensor.utils.get_class_matched_module_paths`).
+
+    Returns:
+        ``True`` if any prefix of *full_param_path* equals an entry in
+        *module_paths*.
+    """
+    if not module_paths:
+        return False
+    parts = full_param_path.split(".")
+    return any(".".join(parts[: i + 1]) in module_paths for i in range(len(parts)))
+
+
 def _should_offload_param(
     full_param_path: str,
     include_patterns: list[str],
     exclude_patterns: list[str],
+    *,
+    include_class_paths: set[str] | None = None,
+    exclude_class_paths: set[str] | None = None,
 ) -> bool:
     """Check if a parameter should be offloaded based on include/exclude patterns.
 
-    A parameter is offloaded only if it is included AND not excluded.
+    A parameter is offloaded only if it is included AND not excluded.  Both
+    name-based and class-based matches contribute: a parameter is included
+    when any name pattern matches one of its prefixes *or* any of its ancestor
+    module paths matches a class pattern (passed via *include_class_paths*).
+    The same disjunction applies to exclusion.
 
     Args:
         full_param_path: Full dot-separated parameter path.
-        include_patterns: Wildcard patterns checked against every prefix of the
-            parameter path, so a module-level pattern like ``layers.*``
-            cascades to all parameters underneath that module.
-        exclude_patterns: Wildcard patterns applied the same way; a parameter
-            that matches any exclude pattern is NOT offloaded even if it
-            was included.
+        include_patterns: Name-based wildcard patterns, checked against every
+            prefix of the parameter path so that module-level patterns like
+            ``layers.*`` cascade to all parameters underneath that module.
+        exclude_patterns: Name-based exclusion patterns, applied the same way.
+        include_class_paths: Module paths whose class matched an include
+            ``class:`` pattern (from
+            :func:`~flextensor.utils.get_class_matched_module_paths`).  When
+            any ancestor of the parameter lies in this set, the parameter is
+            considered included.
+        exclude_class_paths: Module paths whose class matched an exclude
+            ``class:`` pattern.  When any ancestor of the parameter lies in
+            this set, the parameter is excluded.
 
     Returns:
         True if the parameter should participate in CPU/GPU offloading.
     """
-    if not _any_prefix_matches(full_param_path, include_patterns):
+    included_by_name = _any_prefix_matches(full_param_path, include_patterns)
+    included_by_class = _any_prefix_in_set(full_param_path, include_class_paths or set())
+    if not (included_by_name or included_by_class):
         return False
-    return not (exclude_patterns and _any_prefix_matches(full_param_path, exclude_patterns))
+
+    excluded_by_name = bool(exclude_patterns) and _any_prefix_matches(full_param_path, exclude_patterns)
+    excluded_by_class = _any_prefix_in_set(full_param_path, exclude_class_paths or set())
+    return not (excluded_by_name or excluded_by_class)
 
 
 def _collect_non_offloaded_ids(
@@ -333,22 +376,37 @@ def _collect_non_offloaded_ids(
     include_patterns: list[str],
     exclude_patterns: list[str],
     all_tensor_ids: set[int],
+    *,
+    include_class_paths: set[str] | None = None,
+    exclude_class_paths: set[str] | None = None,
 ) -> set[int]:
     """Collect tensor IDs that should NOT be offloaded (excluded or not included).
 
     Args:
         named_tensors: Iterator of (name, tensor) pairs. Names use dot-separated
             paths (e.g. ``layers.0.attn.weight``).
-        include_patterns: Include patterns — parameters not matching are kept on GPU.
-        exclude_patterns: Exclude patterns — matching parameters are kept on GPU.
+        include_patterns: Name-based include patterns — parameters not matching
+            (either by name or by ancestor ``class:`` match) are kept on GPU.
+        exclude_patterns: Name-based exclude patterns — matching parameters are
+            kept on GPU.
         all_tensor_ids: Known tensor IDs to filter against.
+        include_class_paths: Module paths whose class matched an include
+            ``class:`` pattern (pre-computed from the owning model).
+        exclude_class_paths: Module paths whose class matched an exclude
+            ``class:`` pattern.
 
     Returns:
         Set of non-offloaded tensor IDs (including inner fields).
     """
     non_offloaded_ids: set[int] = set()
     for name, tensor in named_tensors:
-        if not _should_offload_param(name, include_patterns, exclude_patterns):
+        if not _should_offload_param(
+            name,
+            include_patterns,
+            exclude_patterns,
+            include_class_paths=include_class_paths,
+            exclude_class_paths=exclude_class_paths,
+        ):
             tensor_id = id(tensor)
             if tensor_id in all_tensor_ids:
                 non_offloaded_ids.add(tensor_id)
@@ -365,6 +423,45 @@ def validate_include_patterns(include_patterns: list[str] | None) -> None:
             "include_patterns is an empty list; pattern-based parameter filtering is disabled. "
             "Use offload_block() for manual tensor management, or include_patterns=['*'] to include all."
         )
+
+
+def _validate_dict_model_class_patterns(
+    include_classes: list[str],
+    exclude_classes: list[str],
+    include_names: list[str],
+) -> None:
+    """Validate ``class:`` patterns against a dict-typed model.
+
+    Dict models have no module hierarchy so ``class:`` patterns cannot
+    resolve. Two outcomes:
+
+    1. Mixed include (some ``class:``, some name): warn and echo the dropped
+       patterns, grouped by include/exclude. Name patterns still apply, so
+       offloading proceeds in a degraded but functional state.
+    2. All-class include: structurally impossible to match any parameter —
+       offloading would degenerate to zero work. Raise ``ValueError``
+       because this is a config bug, not a runtime fallback (a dict export
+       cannot satisfy ``class:`` patterns under any circumstance).
+    """
+    if not (include_classes or exclude_classes):
+        return
+
+    if include_classes and not include_names:
+        raise ValueError(
+            f"All include_patterns are class: patterns ({include_classes}) but the model is dict-typed. "
+            "Dict models have no module hierarchy, so class: patterns cannot resolve and no parameters "
+            "would be offloaded. Use name-based patterns (e.g. ['layers.*.weight']) for dict models."
+        )
+
+    ignored_parts: list[str] = []
+    if include_classes:
+        ignored_parts.append(f"include={include_classes}")
+    if exclude_classes:
+        ignored_parts.append(f"exclude={exclude_classes}")
+    logger.warning(
+        "Ignoring class: patterns on dict-typed model (no module hierarchy to resolve classes against): %s.",
+        "; ".join(ignored_parts),
+    )
 
 
 def resolve_include_patterns(include_patterns: list[str] | None) -> list[str]:
@@ -397,6 +494,12 @@ def get_non_offloaded_tensor_ids(
     Returns:
         Set of tensor IDs that should stay on GPU permanently.
 
+    Raises:
+        ValueError: If ``model`` is a ``dict`` and every entry in
+            ``include_patterns`` is a ``class:`` pattern. Class patterns
+            cannot resolve against dict models (no module hierarchy), so
+            this is treated as a config bug rather than a silent no-op.
+
     Note:
         When ``include_patterns`` resolves to an empty list, returns an
         empty set (no tensors are excluded) to preserve ``tensors_map``
@@ -411,15 +514,34 @@ def get_non_offloaded_tensor_ids(
     if not active_includes:
         return set()
 
-    if active_includes == ["*"] and not active_excludes:
+    include_names, include_classes = partition_patterns(active_includes)
+    exclude_names, exclude_classes = partition_patterns(active_excludes)
+
+    # Fast path: bare ``["*"]`` include with no other patterns on either side.
+    # Bypassed when any ``class:`` pattern is present (needs a full
+    # ``named_modules()`` walk to resolve).
+    if include_names == ["*"] and not include_classes and not exclude_names and not exclude_classes:
         return set()
 
     all_tensor_ids = set(tensors_map.keys())
 
     if isinstance(model, dict):
-        return _collect_non_offloaded_ids(model.items(), active_includes, active_excludes, all_tensor_ids)
+        # Dict models have no module hierarchy, so ``class:`` patterns cannot
+        # resolve ancestor classes. Fall back to name-based matching only.
+        _validate_dict_model_class_patterns(include_classes, exclude_classes, include_names)
+        return _collect_non_offloaded_ids(model.items(), include_names, exclude_names, all_tensor_ids)
 
-    return _collect_non_offloaded_ids(model.named_parameters(), active_includes, active_excludes, all_tensor_ids)
+    include_class_paths = get_class_matched_module_paths(model, include_classes)
+    exclude_class_paths = get_class_matched_module_paths(model, exclude_classes)
+
+    return _collect_non_offloaded_ids(
+        model.named_parameters(),
+        include_names,
+        exclude_names,
+        all_tensor_ids,
+        include_class_paths=include_class_paths,
+        exclude_class_paths=exclude_class_paths,
+    )
 
 
 def get_offload_module_tensor_ids(
@@ -456,6 +578,12 @@ def get_offload_module_tensor_ids(
     active_includes = resolve_include_patterns(include_patterns)
     active_excludes = exclude_patterns or []
 
+    include_names, include_classes = partition_patterns(active_includes)
+    exclude_names, exclude_classes = partition_patterns(active_excludes)
+
+    include_class_paths = get_class_matched_module_paths(model, include_classes)
+    exclude_class_paths = get_class_matched_module_paths(model, exclude_classes)
+
     for module_path, module in model.named_modules():
         if is_offload_patched_module(module):
             label = get_offload_name(module)
@@ -465,7 +593,13 @@ def get_offload_module_tensor_ids(
 
             for param_name, param in module.named_parameters():
                 full_param_path = f"{module_path}.{param_name}" if module_path else param_name
-                if not _should_offload_param(full_param_path, active_includes, active_excludes):
+                if not _should_offload_param(
+                    full_param_path,
+                    include_names,
+                    exclude_names,
+                    include_class_paths=include_class_paths,
+                    exclude_class_paths=exclude_class_paths,
+                ):
                     continue
                 param_id = id(param)
                 if param_id in all_tensor_ids:
@@ -491,8 +625,14 @@ def get_offload_module_tensor_ids(
 # allocation), and silently marking such a module "not patched" hides a
 # real failure that the caller deserves to see. Safe here because each
 # guarded call is a pure read — do not widen the ``try`` scope over real
-# work.
+# work (``get_submodule``, ``named_parameters``) — use
+# ``_SUBMODULE_PROBE_EXCEPTIONS`` there instead.
 _PROBE_EXCEPTIONS: tuple[type[BaseException], ...] = (AttributeError, KeyError, TypeError)
+
+# Narrow tuple for ``get_submodule`` walks: only swallow the documented
+# missing-attribute failures. ``RuntimeError`` / ``TypeError`` from real
+# traversal work (CUDA-OOM, lazy-init breakage) must propagate.
+_SUBMODULE_PROBE_EXCEPTIONS: tuple[type[Exception], ...] = (AttributeError, KeyError)
 
 
 def _log_probe_swallowed(module: torch.nn.Module, attr: str, exc: BaseException) -> None:
@@ -529,6 +669,42 @@ def is_offload_patched_module(module: torch.nn.Module) -> bool:
     except _PROBE_EXCEPTIONS as exc:
         _log_probe_swallowed(module, "_ft_original_forward_func", exc)
         return False
+
+
+def has_patched_ancestor(model: torch.nn.Module, module_path: str) -> bool:
+    """Check if any ancestor of the given module path is already patched.
+
+    Args:
+        model: The root model to resolve ancestor paths against.
+        module_path: Dot-separated path of the module to check.
+
+    Returns:
+        True if any ancestor has ``_ft_original_forward_func``, or
+        (fail-closed) if ``get_submodule`` raises a
+        ``_SUBMODULE_PROBE_EXCEPTIONS`` member. Other exceptions
+        (``RuntimeError``, ``TypeError``) propagate; see
+        ``_SUBMODULE_PROBE_EXCEPTIONS``.
+    """
+    parts = module_path.split(".")
+    for i in range(1, len(parts)):
+        ancestor_path = ".".join(parts[:i])
+        try:
+            ancestor = model.get_submodule(ancestor_path)
+        except _SUBMODULE_PROBE_EXCEPTIONS as exc:
+            # Fail-closed on misbehaving wrappers (e.g. vLLM
+            # StageMissingLayer raises KeyError, not AttributeError):
+            # skip the patch rather than risk nested patching.
+            logger.error(
+                "Could not resolve ancestor '%s' of '%s' (%s: %s); skipping patch to avoid potential nested patching.",
+                ancestor_path,
+                module_path,
+                type(exc).__name__,
+                exc,
+            )
+            return True
+        if is_offload_patched_module(ancestor):
+            return True
+    return False
 
 
 def get_offload_name(module: torch.nn.Module) -> str | None:

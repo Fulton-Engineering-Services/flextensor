@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/how-to/torch-compile.md` for the supported flows (single-process
   and two-process save / restore) and the discovery-must-stay-eager
   constraint.
+- `include_patterns` / `exclude_patterns` now accept a ``class:<glob>`` prefix
+  that matches on the module's class instead of the module path. Patterns are
+  tested against both the short class name (``type(module).__name__``) and the
+  fully-qualified class name (``f"{cls.__module__}.{cls.__qualname__}"``), so
+  ``class:SharedExpertMLP`` and ``class:*.SharedExpertMLP`` both work, and
+  globs like ``class:torch.nn.*.Linear`` disambiguate classes that share a
+  short name. This makes it possible to keep hybrid-architecture sub-modules
+  (e.g. Nemotron-H ``SharedExpertMLP`` / ``MoELayer``) on GPU without long,
+  upstream-version-specific path patterns. A ``name:<glob>`` prefix is also
+  recognised for symmetry; bare patterns continue to behave as name-based as
+  before. Dict-typed models reject all-``class:`` include sets with
+  ``ValueError`` (no module hierarchy to resolve classes against); mixed
+  include sets warn and fall back to the surviving name patterns.
 
 ### Changed
 
@@ -65,7 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-transition phase. Sub-module hooks are unaffected — they fire
   during the sub-module's own forward, before the top-level state-update
   hook.
-
+- `OffloadConfig.include_patterns` / `exclude_patterns` now reject
+  non-string entries, empty / whitespace-only entries, empty-body
+  `class:` / `name:` prefixes, and typo prefixes (`clas:`, `Class:`,
+  anything containing `:` without a known prefix) at construction
+  (`ValueError`). Whitespace around entries and bodies is stripped, so
+  `"class: Linear "` is stored as `"class:Linear"`.
 ### Fixed
 
 - Include pattern derivation now skips unmatched sibling module patterns

@@ -13,6 +13,7 @@ from torch import nn
 
 from flextensor.config import OffloadConfig
 from flextensor.offload_manager import OffloadManager
+from flextensor.tensor_discovery import has_patched_ancestor
 
 
 class SimpleLayer(nn.Module):
@@ -487,29 +488,96 @@ class TestAncestorGuard:
         assert model.layers[0] not in om._patched_modules
 
     def test_has_patched_ancestor_directly(self):
-        """Unit test _has_patched_ancestor helper without CUDA."""
+        """Unit test has_patched_ancestor helper without CUDA."""
         model = NestedModel()
-        om = OffloadManager("test_has_patched_ancestor")
 
-        # Nothing patched yet
-        assert not om._has_patched_ancestor(model, "layers.0.attn")
-        assert not om._has_patched_ancestor(model, "layers.0")
+        assert not has_patched_ancestor(model, "layers.0.attn")
+        assert not has_patched_ancestor(model, "layers.0")
 
-        # Simulate patching layers.0
         model.layers[0]._ft_original_forward_func = type(model.layers[0]).forward
 
-        # Now layers.0.attn should detect its ancestor is patched
-        assert om._has_patched_ancestor(model, "layers.0.attn")
-        assert om._has_patched_ancestor(model, "layers.0.attn.q_proj")
+        assert has_patched_ancestor(model, "layers.0.attn")
+        assert has_patched_ancestor(model, "layers.0.attn.q_proj")
 
         # layers.0 itself should not (we only check strict ancestors)
-        assert not om._has_patched_ancestor(model, "layers.0")
+        assert not has_patched_ancestor(model, "layers.0")
 
-        # layers.1 and its descendants should not be affected
-        assert not om._has_patched_ancestor(model, "layers.1.attn")
+        assert not has_patched_ancestor(model, "layers.1.attn")
 
-        # Clean up
-        del model.layers[0]._ft_original_forward_func
+        delattr(model.layers[0], "_ft_original_forward_func")
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            AttributeError("wrapper hides this path"),
+            KeyError("missing __dict__ entry"),  # vLLM StageMissingLayer
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_has_patched_ancestor_fails_closed_on_submodule_probe_exception(self, exc, caplog):
+        """When ancestor resolution raises a documented "missing-attribute"
+        failure (``AttributeError`` or ``KeyError``), return True
+        (fail-closed) and log at ERROR.
+
+        ``module_path`` originates from ``model.named_modules()``, so on a
+        well-formed model ancestors always resolve. Reaching this branch
+        means a wrapper hides the path: PyTorch's own
+        ``get_submodule`` raises ``AttributeError`` for missing children,
+        and vLLM ``StageMissingLayer.__getattr__`` raises ``KeyError`` when
+        its internal ``__dict__["module"]`` entry is absent. Both are
+        "this submodule does not exist", and the safe response is to skip
+        the patch (rather than risk nested patching on an ancestor we
+        cannot inspect).
+
+        Parametrisation mirrors ``_SUBMODULE_PROBE_EXCEPTIONS`` in
+        production; the sibling test exercises the propagation half.
+        """
+        import logging
+        from unittest.mock import MagicMock
+
+        model = MagicMock(spec=nn.Module)
+        model.get_submodule.side_effect = exc
+
+        with caplog.at_level(logging.ERROR, logger="flextensor.tensor_discovery"):
+            result = has_patched_ancestor(model, "outer.middle.leaf")
+
+        assert result is True, f"{type(exc).__name__} must fail-closed to prevent nested patching"
+        assert "Could not resolve ancestor" in caplog.text
+        assert "outer.middle.leaf" in caplog.text
+        assert type(exc).__name__ in caplog.text  # log identifies the exception type
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            TypeError("descriptor misbehaved"),
+            RuntimeError("CUDA error: no CUDA GPUs are available"),
+        ],
+        ids=lambda e: type(e).__name__,
+    )
+    def test_has_patched_ancestor_propagates_unexpected_exception(self, exc):
+        """``RuntimeError`` / ``TypeError`` from ``get_submodule`` must
+        propagate; they signal genuine breakage, not a wrapper quirk.
+
+        ``get_submodule`` is real traversal work, not a cheap probe — it
+        descends ``_modules`` and dispatches into user ``__getattr__``.
+        ``RuntimeError`` here is PyTorch's signal for CUDA-OOM,
+        device-mismatch, "CUDA not available", and lazy-init failures from
+        wrappers (``RuntimeError("not initialized yet")``); ``TypeError``
+        comes out of misbehaving descriptors. Swallowing these as
+        "fail-closed, ancestor patched, skip" would silently turn an
+        environmental failure into a partially-patched model — only a
+        DEBUG/ERROR log would distinguish that from a deliberate skip,
+        and ``_check_no_modules_patched`` only fires when zero modules
+        patch (it cannot catch "12/80 layers silently dropped"). Letting
+        the exception escape surfaces the real failure to the user.
+        """
+        from unittest.mock import MagicMock
+
+        model = MagicMock(spec=nn.Module)
+        model.get_submodule.side_effect = exc
+
+        with pytest.raises(type(exc), match=str(exc.args[0]) if exc.args else ".*"):
+            has_patched_ancestor(model, "outer.middle.leaf")
 
 
 class TestPatternMatchWarnings:
@@ -948,6 +1016,27 @@ class TestAggregatePatternWarnings:
 
         assert any("Offloading is effectively disabled" in m for m in caplog.messages)
 
+    def test_empty_include_patterns_manual_trap_mode_no_error(self, caplog):
+        """Lock in: ``include_patterns=[]`` is the legitimate manual-trap mode.
+
+        Users who plan to drive offloading via ``offload_block()`` directly
+        configure ``include_patterns=[]`` so the auto-discovery pipeline
+        skips path-based patching. ``_check_no_modules_patched`` must not
+        treat this as a misconfiguration (the ``and self.config.include_patterns``
+        guard exists exactly for this case). Without this test, a future
+        "always error if zero patched" tightening would silently break
+        ``offload_block()`` workflows.
+        """
+        om = OffloadManager("test_agg_empty_includes")
+        om.config = OffloadConfig(include_patterns=[])
+
+        with caplog.at_level("ERROR", logger="flextensor.offload_manager"):
+            om._check_no_modules_patched()
+
+        assert not any("Offloading is effectively disabled" in m for m in caplog.messages), (
+            f"manual-trap mode (include_patterns=[]) must not log the aggregate error; got: {caplog.messages!r}"
+        )
+
     def test_all_excluded_logs_error(self, caplog):
         """Excluding all included modules emits an ERROR log."""
         model = NestedModel()
@@ -1226,6 +1315,174 @@ class TestInnerFieldPatterns:
             )
 
         om.release()
+
+
+class _HybridExpertMLP(nn.Module):
+    """Standalone MLP used to exercise ``class:<Name>`` patterns."""
+
+    def __init__(self, dim: int = 10):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(dim, dim))
+
+    def forward(self, x):
+        return x @ self.weight
+
+
+class _HybridMoELayer(nn.Module):
+    """Hybrid MoE layer mirroring the Nemotron-H shape that motivated class patterns."""
+
+    def __init__(self, dim: int = 10):
+        super().__init__()
+        self.shared = _HybridExpertMLP(dim)
+        self.gate = nn.Linear(dim, 2)
+
+    def forward(self, x):
+        return self.shared(x) + self.gate(x).sum(-1, keepdim=True)
+
+
+class _HybridModel(nn.Module):
+    """Small hybrid model with MoE and dense layers for class-pattern patching tests."""
+
+    def __init__(self, dim: int = 10):
+        super().__init__()
+        self.layers = nn.ModuleList([_HybridMoELayer(dim), _HybridMoELayer(dim)])
+        self.dense = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return self.dense(x)
+
+
+class TestClassPatternPatching:
+    """Offload-manager behaviour for ``class:<glob>`` include/exclude patterns.
+
+    These tests only exercise the patching pipeline, which runs on CPU and
+    doesn't need a CUDA device.  ``OffloadManager`` is never taken through
+    ``offload()`` (which would initialise the tensor manager and require GPU);
+    we call ``_offload_modules`` / ``_exclude_modules`` directly.
+    """
+
+    def test_class_include_patches_all_matching_modules(self):
+        model = _HybridModel()
+        om = OffloadManager("test_class_include")
+
+        om._offload_modules(model, ["class:_HybridExpertMLP"])
+
+        expected = {model.layers[0].shared, model.layers[1].shared}
+        assert set(om._patched_modules) == expected
+
+    def test_class_include_glob(self):
+        model = _HybridModel()
+        om = OffloadManager("test_class_include_glob")
+
+        om._offload_modules(model, ["class:*MoELayer*"])
+
+        # Glob matches both MoE layers; no inner module's class matches.
+        expected = {model.layers[0], model.layers[1]}
+        assert set(om._patched_modules) == expected
+
+    def test_class_pattern_respects_ancestor_guard(self):
+        """When both a parent and child class match, only the parent is patched."""
+        model = _HybridModel()
+        om = OffloadManager("test_class_ancestor")
+
+        om._offload_modules(model, ["class:_HybridMoELayer", "class:_HybridExpertMLP"])
+
+        # Parent MoE layers are patched; the shared expert is a descendant of
+        # an already-patched parent and must be skipped.
+        assert model.layers[0] in om._patched_modules
+        assert model.layers[0].shared not in om._patched_modules
+        assert model.layers[1] in om._patched_modules
+        assert model.layers[1].shared not in om._patched_modules
+
+    def test_class_exclude_unpatches_matching_modules(self):
+        model = _HybridModel()
+        om = OffloadManager("test_class_exclude")
+
+        om._offload_modules(model, ["layers.*.shared", "dense"])
+        assert model.layers[0].shared in om._patched_modules
+        assert model.dense in om._patched_modules
+
+        om._exclude_modules(model, ["class:_HybridExpertMLP"])
+
+        assert model.layers[0].shared not in om._patched_modules
+        assert model.layers[1].shared not in om._patched_modules
+        # Dense layer (different class) stays patched.
+        assert model.dense in om._patched_modules
+
+    def test_mixed_name_and_class_patterns(self):
+        """Name and class patterns compose as a union at the module level."""
+        model = _HybridModel()
+        om = OffloadManager("test_class_mixed")
+
+        om._offload_modules(model, ["dense", "class:_HybridExpertMLP"])
+
+        expected = {model.dense, model.layers[0].shared, model.layers[1].shared}
+        assert set(om._patched_modules) == expected
+
+    def test_unmatched_class_pattern_warns(self, caplog):
+        model = _HybridModel()
+        om = OffloadManager("test_class_unmatched_warn")
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._offload_modules(model, ["class:DoesNotExist"])
+
+        assert any("Include pattern 'class:DoesNotExist' did not match" in m for m in caplog.messages)
+
+    def test_matched_class_pattern_no_warning(self, caplog):
+        model = _HybridModel()
+        om = OffloadManager("test_class_matched_no_warn")
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._offload_modules(model, ["class:_HybridExpertMLP"])
+
+        assert not any("did not match" in m for m in caplog.messages)
+
+    def test_class_pattern_matching_only_root_warns(self, caplog):
+        """Regression: ``class:`` pattern that only matches the root must warn.
+
+        The root module is excluded from patching by both
+        ``get_class_matched_module_paths`` and the patching loop in
+        ``_offload_modules``.  ``_collect_class_matches`` (used to build the
+        per-pattern "matched" diagnostic set) must apply the same exclusion;
+        otherwise a pattern like ``class:_HybridModel`` -- whose only match is
+        ``type(model)`` itself -- is silently recorded as matched, suppressing
+        the "did not match any modules or parameters" warning while zero
+        modules are actually patched.
+        """
+        model = _HybridModel()
+        om = OffloadManager("test_class_root_only_warns")
+
+        # Sanity: only the root has class _HybridModel; no submodule does.
+        for path, module in model.named_modules():
+            if path:
+                assert type(module).__name__ != "_HybridModel"
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._offload_modules(model, ["class:_HybridModel"])
+
+        assert om._patched_modules == [], f"expected no modules patched (root is excluded), got {om._patched_modules!r}"
+        assert any("Include pattern 'class:_HybridModel' did not match" in m for m in caplog.messages), (
+            f"expected 'did not match' warning for class:_HybridModel; got warnings: {caplog.messages!r}"
+        )
+
+    def test_class_pattern_exclude_only_root_warns(self, caplog):
+        """Exclude-side mirror of ``test_class_pattern_matching_only_root_warns``.
+
+        Same root-exclusion rule must hold in ``_exclude_modules`` so a pattern
+        like ``class:_HybridModel`` -- whose only match is ``type(model)`` --
+        produces a "did not match" warning instead of a silent zero-effect run.
+        """
+        model = _HybridModel()
+        om = OffloadManager("test_class_root_only_exclude_warns")
+
+        with caplog.at_level("WARNING", logger="flextensor.offload_manager"):
+            om._exclude_modules(model, ["class:_HybridModel"])
+
+        assert any("Exclude pattern 'class:_HybridModel' did not match" in m for m in caplog.messages), (
+            f"expected 'did not match' warning for exclude class:_HybridModel; got warnings: {caplog.messages!r}"
+        )
 
 
 if __name__ == "__main__":

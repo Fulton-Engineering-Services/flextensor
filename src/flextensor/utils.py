@@ -6,6 +6,9 @@ import logging
 import pathlib
 import re
 import tempfile
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any
 
 import torch
@@ -18,11 +21,29 @@ __all__ = [
     "calculate_tensor_size",
     "clear_and_delete_tensor",
     "delete_tensor",
+    "get_class_matched_module_paths",
     "get_module_paths",
     "is_dense_layout",
+    "matches_any_class_pattern",
     "matches_any_pattern",
     "resolve_gpu_mem_bytes",
 ]
+
+# Prefix marker for class-based matching in include/exclude patterns.
+# Example: ``class:SharedExpertMLP`` matches any module whose class name equals
+# ``SharedExpertMLP``.  Patterns are tested against both the short class name
+# (``type(m).__name__``) and the fully-qualified class name
+# (``f"{cls.__module__}.{cls.__qualname__}"``) — a match on either succeeds.
+# Glob wildcards (``*``, ``?``) are supported inside the class pattern body; a
+# dot in the body effectively opts into FQCN matching since short class names
+# never contain dots.
+CLASS_PATTERN_PREFIX = "class:"
+
+# Prefix marker for name-based matching.  Optional — a pattern without any prefix
+# is also treated as a name pattern.  The explicit ``name:`` form exists for
+# symmetry with ``class:`` and to disambiguate a literal module path that starts
+# with ``class:`` (unlikely, but possible in principle).
+NAME_PATTERN_PREFIX = "name:"
 
 
 def _compile_segment_regex(segment: str) -> re.Pattern[str]:
@@ -85,6 +106,173 @@ def any_path_matches_pattern(paths: list[str], pattern: str, *, recursive_star: 
         if pp not in regex_cache:
             regex_cache[pp] = _compile_segment_regex(pp)
     return any(_match_parts(path.split("."), pattern_parts, regex_cache, recursive_star) for path in paths)
+
+
+@dataclass(frozen=True, slots=True)
+class PartitionedPatterns:
+    """Result of splitting raw patterns by ``class:`` / ``name:`` prefix.
+
+    ``*_bodies`` map raw pattern → body (prefix stripped); keys preserve
+    the original pattern text.
+
+    Supports tuple-style unpacking for back-compat:
+    ``names, classes = partition_patterns(...)`` yields the body lists.
+    """
+
+    name_bodies: Mapping[str, str] = field(default_factory=dict)
+    class_bodies: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # ``frozen=True`` only blocks attribute *rebinding*; without these
+        # wraps a caller could still do ``p.name_bodies["x"] = "y"``.
+        # Defensively copy first so external mutation of the source dict
+        # can't leak through the proxy.
+        object.__setattr__(self, "name_bodies", MappingProxyType(dict(self.name_bodies)))
+        object.__setattr__(self, "class_bodies", MappingProxyType(dict(self.class_bodies)))
+
+    @property
+    def name_patterns(self) -> list[str]:
+        return list(self.name_bodies.values())
+
+    @property
+    def class_patterns(self) -> list[str]:
+        return list(self.class_bodies.values())
+
+    def __iter__(self) -> Iterator[list[str]]:
+        yield self.name_patterns
+        yield self.class_patterns
+
+
+def partition_patterns(patterns: list[str]) -> PartitionedPatterns:
+    """Split *patterns* by ``class:`` / ``name:`` prefix.
+
+    Internal helper; full pattern validation (typo prefixes, whitespace,
+    type guards) lives at the ``OffloadConfig`` boundary. Empty bodies
+    (``"class:"`` / ``"name:"``) raise :class:`ValueError` defensively here
+    so direct test callers don't get silent zero-match patterns.
+
+    Args:
+        patterns: Raw patterns as stored in ``OffloadConfig.include_patterns`` /
+            ``exclude_patterns``.
+
+    Returns:
+        :class:`PartitionedPatterns`. Tuple-unpackable as ``(name_patterns,
+        class_patterns)`` of body strings for back-compat.
+
+    Raises:
+        ValueError: If any pattern uses the ``class:`` or ``name:`` prefix with
+            an empty (or whitespace-only) body.
+
+    Example:
+        >>> names, classes = partition_patterns(["layers.*", "name:embed", "class:MoELayer"])
+        >>> names, classes
+        (['layers.*', 'embed'], ['MoELayer'])
+    """
+    name_bodies: dict[str, str] = {}
+    class_bodies: dict[str, str] = {}
+    for pattern in patterns:
+        if pattern.startswith(CLASS_PATTERN_PREFIX):
+            body = pattern[len(CLASS_PATTERN_PREFIX) :]
+            if not body.strip():
+                raise ValueError(
+                    f"pattern {pattern!r} has an empty body; use {CLASS_PATTERN_PREFIX}<glob> or remove the entry"
+                )
+            class_bodies[pattern] = body
+        elif pattern.startswith(NAME_PATTERN_PREFIX):
+            body = pattern[len(NAME_PATTERN_PREFIX) :]
+            if not body.strip():
+                raise ValueError(
+                    f"pattern {pattern!r} has an empty body; use {NAME_PATTERN_PREFIX}<glob> or remove the entry"
+                )
+            name_bodies[pattern] = body
+        else:
+            name_bodies[pattern] = pattern
+    return PartitionedPatterns(name_bodies=name_bodies, class_bodies=class_bodies)
+
+
+def _class_fqcn(cls: type) -> str:
+    """Return ``f"{cls.__module__}.{cls.__qualname__}"`` (the fully-qualified class name).
+
+    Used as a secondary haystack for ``class:`` patterns so that users can
+    disambiguate classes with the same short name across packages, e.g.
+    ``class:torch.nn.modules.linear.Linear`` vs. a user-defined ``Linear``.
+    """
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def matches_any_class_pattern(cls: type, class_patterns: list[str]) -> bool:
+    """Check if *cls* matches any glob pattern in *class_patterns*.
+
+    Each pattern is tested against both the short class name
+    (``cls.__name__``) *and* the fully-qualified class name
+    (``f"{cls.__module__}.{cls.__qualname__}"``).  A match on either haystack
+    is sufficient.  Class names are treated as atomic for the short-name
+    check (no dot-split semantics); the FQCN check also treats the pattern as
+    a single segment — so ``*`` spans dots.  This lets users write ergonomic
+    patterns like::
+
+        class:MoELayer            # short name
+        class:*Expert*            # short-name glob
+        class:torch.nn.*.Linear   # FQCN glob (disambiguates user ``Linear``)
+
+    Since Python class short names never contain dots, a pattern containing
+    a dot can only match via the FQCN haystack — in effect an opt-in escape
+    hatch for name collisions without introducing new syntax.
+
+    Args:
+        cls: The class to test (typically ``type(module)``).
+        class_patterns: Class patterns with the ``class:`` prefix already
+            stripped (as produced by :func:`partition_patterns`).
+
+    Returns:
+        ``True`` if at least one pattern matches the short name or FQCN.
+    """
+    if not class_patterns:
+        return False
+    short_name = cls.__name__
+    fqcn = _class_fqcn(cls)
+    for pattern in class_patterns:
+        regex = _compile_segment_regex(pattern)
+        if regex.fullmatch(short_name) or regex.fullmatch(fqcn):
+            return True
+    return False
+
+
+def get_class_matched_module_paths(model: Any, class_patterns: list[str]) -> set[str]:
+    """Return dot-separated paths of modules whose class matches *class_patterns*.
+
+    Walks ``model.named_modules()`` and collects paths whose owning module's
+    class matches any of the patterns.  Matching uses
+    :func:`matches_any_class_pattern`, which tests both the short class name
+    and the fully-qualified class name.  The root module (empty path) is
+    excluded for consistency with :func:`get_module_paths`.
+
+    Args:
+        model: A ``torch.nn.Module`` (or any object exposing
+            ``named_modules()``).
+        class_patterns: Class patterns with the ``class:`` prefix already
+            stripped.
+
+    Returns:
+        Set of module paths whose class matches at least one pattern.  Empty
+        set when ``class_patterns`` is empty.
+
+    Raises:
+        TypeError: If ``class_patterns`` is non-empty and ``model`` lacks a
+            callable ``named_modules``.
+    """
+    if not class_patterns:
+        return set()
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        raise TypeError(f"class: patterns require a model exposing named_modules(); got {type(model).__name__}.")
+    matched: set[str] = set()
+    for path, module in named_modules():
+        if not path:
+            continue
+        if matches_any_class_pattern(type(module), class_patterns):
+            matched.add(path)
+    return matched
 
 
 def _match_parts(

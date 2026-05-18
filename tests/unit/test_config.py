@@ -285,6 +285,120 @@ class TestOffloadConfig:
         config = OffloadConfig(exclude_patterns=[])
         assert config.exclude_patterns == []
 
+    def test_include_patterns_accepts_all_three_forms(self):
+        # Valid: bare glob, name-prefixed, class-prefixed.
+        config = OffloadConfig(include_patterns=["bare", "name:embed", "class:MoELayer"])
+        assert config.include_patterns == ["bare", "name:embed", "class:MoELayer"]
+
+    def test_include_patterns_rejects_bare_class_prefix(self):
+        # Empty body is almost always a typo for ``class:<Glob>``.
+        with pytest.raises(ValidationError, match="empty body"):
+            OffloadConfig(include_patterns=["class:"])
+
+    def test_include_patterns_rejects_bare_name_prefix(self):
+        with pytest.raises(ValidationError, match="empty body"):
+            OffloadConfig(include_patterns=["name:"])
+
+    def test_exclude_patterns_rejects_bare_class_prefix(self):
+        # Same validator applies symmetrically to exclude_patterns.
+        with pytest.raises(ValidationError, match="empty body"):
+            OffloadConfig(exclude_patterns=["class:"])
+
+    @pytest.mark.parametrize("entry", ["class: ", "class:\t", "class:  \n", "name: ", "name:\t"])
+    def test_pattern_validator_rejects_whitespace_only_body(self, entry):
+        # Trailing-whitespace bodies are typos; bare-prefix check must not
+        # rely on exact equality with ``"class:"`` / ``"name:"``.
+        with pytest.raises(ValidationError, match="empty body"):
+            OffloadConfig(include_patterns=[entry])
+
+    def test_include_patterns_rejects_non_string_entries(self):
+        # Pydantic's default ``list[str]`` coercion would silently turn 42
+        # into "42"; the validator catches it before coercion.
+        with pytest.raises(ValidationError, match="must be strings"):
+            OffloadConfig(include_patterns=[42])
+
+    def test_exclude_patterns_rejects_non_string_entries(self):
+        with pytest.raises(ValidationError, match="must be strings"):
+            OffloadConfig(exclude_patterns=[None])
+
+    def test_pattern_validator_error_identifies_index(self):
+        # Surfacing the index helps users locate the bad entry in long lists.
+        with pytest.raises(ValidationError, match="index 1"):
+            OffloadConfig(include_patterns=["layers.*", "class:", "head"])
+
+    def test_include_patterns_valid_tuple_accepted(self):
+        # Tuples are coerced to ``list[str]`` by pydantic; the validator
+        # must let valid sequence-like inputs through unchanged.
+        config = OffloadConfig(include_patterns=("layers.*", "head"))
+        assert config.include_patterns == ["layers.*", "head"]
+
+    def test_include_patterns_tuple_with_empty_body_rejected(self):
+        # Regression: ``isinstance(v, list)`` previously let tuples bypass the
+        # body-emptiness check, so ``OffloadConfig(include_patterns=("class:",))``
+        # constructed successfully and only blew up at the first
+        # ``partition_patterns(...)`` call inside ``offload()``.  The validator
+        # now treats any non-str/bytes ``Sequence`` symmetrically with ``list``.
+        with pytest.raises(ValidationError, match="empty body"):
+            OffloadConfig(include_patterns=("class:",))
+
+    def test_exclude_patterns_tuple_with_non_string_entry_rejected(self):
+        # Symmetric coverage for the non-string branch on tuple inputs.
+        with pytest.raises(ValidationError, match="must be strings"):
+            OffloadConfig(exclude_patterns=("layers.*", 42))
+
+    @pytest.mark.parametrize(
+        "raw,normalized",
+        [
+            ("class: Linear", "class:Linear"),
+            ("class:Linear ", "class:Linear"),
+            ("class: Linear ", "class:Linear"),
+            ("  class: Linear  ", "class:Linear"),
+            (" class:Linear", "class:Linear"),
+            ("name: embed", "name:embed"),
+            ("name:embed ", "name:embed"),
+            ("  layers.0  ", "layers.0"),
+        ],
+    )
+    def test_pattern_validator_normalizes_whitespace(self, raw, normalized):
+        # Regression: pre-fix, ``OffloadConfig(include_patterns=["class: Linear"])`` constructed
+        # successfully and stored the body verbatim as ``" Linear"``, which never matched any
+        # ``cls.__name__``.  The validator now strips leading/trailing whitespace from both the
+        # entry and (for prefix patterns) the body before storage.
+        config = OffloadConfig(include_patterns=[raw])
+        assert config.include_patterns == [normalized]
+
+    @pytest.mark.parametrize("entry", ["clas:Linear", "Class:Linear", "klass:Linear", "weird:thing"])
+    def test_pattern_validator_rejects_typo_prefixes(self, entry):
+        # Regression: pre-fix, ``"clas:Foo"`` / ``"Class:Foo"`` silently routed to
+        # ``name_bodies`` (since they don't start with ``class:``) and matched
+        # nothing.  Patterns that contain ``:`` but lack a recognised prefix are
+        # rejected loudly so the user fixes the typo at construction.
+        with pytest.raises(ValidationError, match="contains ':' but doesn't start with"):
+            OffloadConfig(include_patterns=[entry])
+
+    def test_pattern_validator_typo_message_suggests_class_prefix(self):
+        # The "did you mean class:<glob>?" hint helps users recover from the
+        # most common typo (``clas:`` / ``Class:``).
+        with pytest.raises(ValidationError, match="did you mean class:<glob>"):
+            OffloadConfig(include_patterns=["clas:Linear"])
+
+    @pytest.mark.parametrize("entry", ["", " ", "\t", "\n", "   \t  "])
+    def test_pattern_validator_rejects_empty_entries(self, entry):
+        # Empty / whitespace-only entries previously stripped to ``""`` and
+        # were stored verbatim, producing a generic "did not match" warning
+        # at offload time. Reject at construction for parity with ``"class:"``.
+        with pytest.raises(ValidationError, match="empty or whitespace-only"):
+            OffloadConfig(include_patterns=[entry])
+
+    def test_deprecated_module_patterns_routes_through_validator(self):
+        # ``module_patterns`` is mapped to ``include_patterns`` by a model
+        # validator; the field validator on ``include_patterns`` then runs
+        # and catches malformed entries from the deprecated path too.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            with pytest.raises(ValidationError, match="empty body"):
+                OffloadConfig(module_patterns=["class:"])
+
     def test_json_schema_has_field_descriptions(self):
         """All OffloadConfig fields must have descriptions in JSON Schema."""
         schema = OffloadConfig.model_json_schema()

@@ -13,17 +13,18 @@ import logging
 import os
 import types
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 import yaml
-from pydantic import BaseModel, Field, WithJsonSchema, model_validator
+from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
 from typing_extensions import Self
 from typing_extensions import deprecated as _deprecated
 
 from flextensor.host_pinning import PinnedMemoryMode
 from flextensor.strategy import Strategy
+from flextensor.utils import CLASS_PATTERN_PREFIX, NAME_PATTERN_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -253,10 +254,25 @@ class OffloadConfig(BaseModel):
     """Instrumentation output directory."""
 
     include_patterns: list[str] = Field(default_factory=lambda: ["*"])
-    """Module or parameter path patterns to include for offloading (supports ``*`` and ``?`` wildcards).
+    """Module or parameter patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
-    Patterns are matched against both module paths (from ``model.named_modules()``) and
-    parameter paths (from ``model.named_parameters()``).
+    Each entry is one of three forms:
+
+    * ``<glob>`` — name-based (module or parameter path), existing behaviour.
+    * ``name:<glob>`` — name-based, explicit form.  Equivalent to ``<glob>``.
+    * ``class:<glob>`` — class-based; matches modules whose class name matches
+      the glob.  Each pattern is tested against both the short class name
+      (``type(m).__name__``) and the fully-qualified class name
+      (``f"{cls.__module__}.{cls.__qualname__}"``); a match on either wins.
+      Useful for hybrid architectures where a single Python class (e.g.
+      ``SharedExpertMLP``) appears at varying paths and renames across
+      upstream versions.  FQCN globs such as ``class:torch.nn.*.Linear``
+      provide an escape hatch when the same short name is used by multiple
+      classes.
+
+    Name patterns are matched against both module paths (from
+    ``model.named_modules()``) and parameter paths (from
+    ``model.named_parameters()``).
 
     **Module-level patterns** (e.g., ``layers.*``) patch matching modules and offload
     all their parameters.
@@ -264,6 +280,10 @@ class OffloadConfig(BaseModel):
     **Parameter-level patterns** (e.g., ``layers.*.weight``) automatically derive the
     module-level pattern (``layers.*``) for patching, but only offload parameters that
     match the full pattern. Non-matching parameters stay on GPU permanently.
+
+    **Class patterns** patch every module of a matching class; all of that
+    module's parameters are offloaded.  Class patterns are module-level only —
+    ``class:*Expert*`` covers every descendant parameter of any matching module.
 
     Can also be set via the ``FT_INCLUDE_PATTERNS`` env var as a comma-separated list.
 
@@ -274,15 +294,37 @@ class OffloadConfig(BaseModel):
           ``layers.*`` matches ``layers.0`` but not ``layers.0.attn``.
         * **Parameter filtering** — ``*`` matches one or more segments.
           ``*.weight`` matches both ``linear.weight`` and ``layers.0.attn.weight``.
+        * **Class matching** — ``*`` is a single-segment glob spanning the
+          whole class-name string.  Short class names have no dots, so
+          ``class:*Expert*`` behaves as a simple substring glob.  Patterns
+          containing dots only match against the fully-qualified class name
+          (e.g., ``class:*.SharedExpertMLP``).
+
+    Validated at construction; assignment / in-place mutation bypasses validation.
     """
 
     exclude_patterns: list[str] = Field(default_factory=list)
-    """Module/parameter path patterns to exclude from offloading (supports wildcards).
+    """Module/parameter patterns to exclude from offloading (supports wildcards).
+
+    Accepts the same three forms as :attr:`include_patterns`: bare ``<glob>``,
+    ``name:<glob>``, or ``class:<glob>``.  Class patterns match against both
+    the short class name and the fully-qualified class name (see
+    :attr:`include_patterns`).
 
     Applied after include_patterns: targets matching both include and exclude are NOT offloaded.
     Standalone ``*`` matches one or more segments in both module selection and parameter
-    filtering, so ``foo.*`` excludes all descendants of ``foo``.
+    filtering, so ``foo.*`` excludes all descendants of ``foo``.  A ``class:`` match
+    cascades to every descendant parameter of the matched module.
+
     Can also be set via the ``FT_EXCLUDE_PATTERNS`` env var as a comma-separated list.
+
+    Example:
+        Keeping Nemotron-H MoE routers and shared-expert MLPs on GPU while
+        offloading the rest of each layer::
+
+            exclude_patterns = ["class:SharedExpertMLP", "class:MoELayer", "*.norm"]
+
+    Validated at construction; assignment / in-place mutation bypasses validation.
     """
 
     module_patterns: Annotated[list[str] | None, _deprecated(_MODULE_PATTERNS_MSG)] = Field(
@@ -400,6 +442,57 @@ class OffloadConfig(BaseModel):
                 msg = "Cannot set both `knapsack_scale` (deprecated) and `transfer_budget_scale`."
                 raise ValueError(msg)
         return data
+
+    @field_validator("include_patterns", "exclude_patterns", mode="before")
+    @classmethod
+    def _validate_pattern_entries(cls, v: Any) -> list[str] | Any:
+        """Validate, normalize, and reject malformed pattern entries.
+
+        Catches at construction (instead of at first ``offload()`` call):
+
+        - Non-string entries: pydantic's default ``list[str]`` coercion would
+          silently turn ``42`` into ``"42"``.
+        - Empty / whitespace-only entries — whether the whole entry
+          (``""``, ``"  "``) or the body after a ``class:`` / ``name:``
+          prefix (``"class:"``, ``"name: "``).
+        - Typo prefixes (``clas:Foo``, ``Class:Foo``): patterns containing
+          ``:`` that don't start with a known prefix would otherwise route
+          to ``name_bodies`` and silently never match.
+
+        Whitespace around the entry and around the body is stripped so
+        ``"class: Linear "`` is stored as ``"class:Linear"``; otherwise the
+        padded body would never match ``cls.__name__``.
+
+        ``str`` / ``bytes`` are excluded since they're sequences of characters,
+        not pattern lists; non-sequence inputs fall through to pydantic.
+        """
+        if not isinstance(v, Sequence) or isinstance(v, (str, bytes)):
+            return v
+        normalized: list[str] = []
+        for i, entry in enumerate(v):
+            if not isinstance(entry, str):
+                raise ValueError(f"pattern entries must be strings; got {type(entry).__name__} at index {i}: {entry!r}")
+            entry = entry.strip()
+            if not entry:
+                raise ValueError(f"pattern entry at index {i} is empty or whitespace-only; remove it")
+            for prefix in (CLASS_PATTERN_PREFIX, NAME_PATTERN_PREFIX):
+                if entry.startswith(prefix):
+                    body = entry[len(prefix) :].strip()
+                    if not body:
+                        raise ValueError(
+                            f"pattern {entry!r} at index {i} has an empty body; use {prefix}<glob> or remove the entry"
+                        )
+                    entry = f"{prefix}{body}"
+                    break
+            else:
+                if ":" in entry:
+                    raise ValueError(
+                        f"pattern {entry!r} at index {i} contains ':' but doesn't start "
+                        f"with {CLASS_PATTERN_PREFIX!r} or {NAME_PATTERN_PREFIX!r}; "
+                        f"did you mean {CLASS_PATTERN_PREFIX}<glob>?"
+                    )
+            normalized.append(entry)
+        return normalized
 
     @model_validator(mode="before")
     @classmethod
