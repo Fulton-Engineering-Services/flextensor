@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Integration test requirements for L0_contrib_vllm_quantization
+vllm>=0.20.2
+requests~=2.32

@@ -42,14 +42,15 @@ HuggingFace Models and Datasets
 The following models are downloaded from https://huggingface.co during
 integration tests and examples.
 
-  Model ID                              License               Used In
-  ------------------------------------  --------------------  -------------------------
-  TinyLlama/TinyLlama_v1.1             Apache 2.0            Integration tests
-  Qwen/Qwen3-0.6B                      Apache 2.0            Integration tests
-  Qwen/Qwen2.5-0.5B-Instruct           Apache 2.0            Integration tests
-  Qwen/Qwen2.5-7B-Instruct             Apache 2.0            Integration tests
-  Qwen/Qwen2.5-72B-Instruct            Qwen License          Examples
-  Wan-AI/Wan2.2-T2V-A14B-Diffusers     Apache 2.0            Examples
+  Model ID                                   License                                      Used In
+  -----------------------------------------  -------------------------------------------  -------------------------
+  TinyLlama/TinyLlama_v1.1                  Apache 2.0                                   Integration tests
+  Qwen/Qwen3-0.6B                           Apache 2.0                                   Integration tests
+  Qwen/Qwen3-32B                            Apache 2.0                                   Integration tests
+  Qwen/Qwen2.5-0.5B-Instruct                Apache 2.0                                   Integration tests
+  Qwen/Qwen2.5-7B-Instruct                  Apache 2.0                                   Integration tests
+  Qwen/Qwen2.5-72B-Instruct                 Qwen License                                 Examples
+  Wan-AI/Wan2.2-T2V-A14B-Diffusers          Apache 2.0                                   Examples
 
 ================================================================================
 

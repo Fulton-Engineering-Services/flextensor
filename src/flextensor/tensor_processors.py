@@ -917,9 +917,11 @@ def create_model_with_shared_tensors(source_model: torch.nn.Module) -> torch.nn.
     # Create new instance without calling __init__
     new_model = model_class.__new__(model_class)
 
-    # Copy non-tensor attributes
+    # Copy plain attributes. Parameters/modules are handled by the recursive
+    # copy below; plain tensor attributes are operational state and should
+    # remain shared with the source model.
     for name, value in source_model.__dict__.items():
-        if not isinstance(value, torch.Tensor | torch.nn.Parameter | torch.nn.Module):
+        if not isinstance(value, torch.nn.Parameter | torch.nn.Module):
             setattr(new_model, name, value)
 
     # Initialize the module properly
@@ -934,7 +936,9 @@ def create_model_with_shared_tensors(source_model: torch.nn.Module) -> torch.nn.
 def _copy_modules_with_shared_tensors(source_module: torch.nn.Module, target_module: torch.nn.Module):
     """Recursively copy modules with shared tensors."""
 
-    # Copy non-tensor attributes, rebinding bound methods to target module
+    # Copy plain attributes, rebinding bound methods to target module.
+    # Parameters/modules are handled separately below; unregistered runtime
+    # tensor attributes must be preserved.
     # Skip _modules as it should be managed separately (child modules are handled below)
 
     skipped_attrs = {"_modules", "_parameters", "_buffers"}  # PyTorch internal dicts
@@ -942,7 +946,7 @@ def _copy_modules_with_shared_tensors(source_module: torch.nn.Module, target_mod
         if name in skipped_attrs:
             # These are managed by PyTorch's __setattr__ when we set children/params/buffers
             continue
-        if not isinstance(value, torch.Tensor | torch.nn.Parameter | torch.nn.Module):
+        if not isinstance(value, torch.nn.Parameter | torch.nn.Module):
             # Rebind bound methods that are bound to the source module
             if isinstance(value, types.MethodType) and value.__self__ is source_module:
                 value = types.MethodType(value.__func__, target_module)

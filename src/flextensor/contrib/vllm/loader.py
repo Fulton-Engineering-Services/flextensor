@@ -9,7 +9,9 @@ management. Automatically used by FlexTensorOffloadWorker.
 """
 
 import logging
-from contextlib import suppress
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from typing import Any
 
 import torch
 from torch import nn
@@ -28,6 +30,61 @@ from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_b
 safely_install_flextensor_logging_bridge()
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_model_weight_processing_methods(model: nn.Module) -> Iterator[Any]:
+    """Yield unique model quantization methods that process weights after loading."""
+    seen: set[int] = set()
+    for module in model.modules():
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None or not hasattr(quant_method, "process_weights_after_loading"):
+            continue
+
+        method_id = id(quant_method)
+        if method_id in seen:
+            continue
+        seen.add(method_id)
+        yield quant_method
+
+
+def _defer_vllm_cuda_weight_processing_impl(model: nn.Module) -> Iterator[None]:
+    """Defer vLLM weight processing while FlexTensor loads on CPU.
+
+    vLLM can call ``process_weights_after_loading`` as checkpoint shards finish
+    loading. FlexTensor intentionally performs Phase 1 on CPU, so processing
+    waits until Phase 2, where this loader moves one layer at a time to the
+    target GPU.
+    """
+    patched_methods: list[tuple[Any, bool, Any]] = []
+
+    def _deferred_process_weights_after_loading(_layer: Any) -> None:
+        pass
+
+    for quant_method in _iter_model_weight_processing_methods(model):
+        method_attrs = getattr(quant_method, "__dict__", {})
+        had_instance_method = "process_weights_after_loading" in method_attrs
+        original_method = method_attrs.get("process_weights_after_loading")
+        patched_methods.append((quant_method, had_instance_method, original_method))
+        quant_method.process_weights_after_loading = _deferred_process_weights_after_loading
+
+    if patched_methods:
+        logger.info(
+            "FlexTensorModelLoader: Deferring vLLM weight processing for %d quantization method "
+            "instance(s) until Phase 2; matching modules are processed layer-by-layer on GPU",
+            len(patched_methods),
+        )
+
+    try:
+        yield
+    finally:
+        for quant_method, had_instance_method, original_method in patched_methods:
+            if had_instance_method:
+                quant_method.process_weights_after_loading = original_method
+            else:
+                del quant_method.process_weights_after_loading
+
+
+defer_vllm_cuda_weight_processing = contextmanager(_defer_vllm_cuda_weight_processing_impl)
 
 
 @register_model_loader("flextensor")
@@ -65,7 +122,8 @@ class FlexTensorModelLoader(DefaultModelLoader):
                 torch.set_default_device("cpu")
             with set_default_torch_dtype(model_config.dtype):
                 model = initialize_model(vllm_config=vllm_config, model_config=model_config, **kwargs)
-                self.load_weights(model, model_config)
+                with defer_vllm_cuda_weight_processing(model):
+                    self.load_weights(model, model_config)
         finally:
             current_platform.device_type = original_platform_device_type
             with suppress(Exception):
@@ -123,6 +181,7 @@ class FlexTensorModelLoader(DefaultModelLoader):
         for layer_name, layer_module in layers_to_process.items():
             try:
                 layer_module.to(gpu_device)
+                self._materialize_parameter_subclasses(layer_module)
                 self._process_layer_weights(layer_module, model_config, gpu_device)
                 layer_module.to(cpu_device)
                 torch.cuda.empty_cache()
@@ -134,6 +193,21 @@ class FlexTensorModelLoader(DefaultModelLoader):
                 raise
 
         logger.info("FlexTensorModelLoader: Processed %d layers", processed_count)
+
+    def _materialize_parameter_subclasses(self, layer: nn.Module) -> None:
+        """Replace loaded vLLM parameter wrappers with plain Parameters.
+
+        vLLM's online quantization loaders register ``BasevLLMParameter``
+        subclasses while weights are being loaded. After loading, their loader
+        metadata is no longer needed. Keeping the subclasses through deferred
+        GPU processing can make compiled quantization helpers recurse through
+        ``__torch_function__`` on some online schemes.
+        """
+        for module in layer.modules():
+            for name, param in list(module.named_parameters(recurse=False)):
+                if type(param) is nn.Parameter:
+                    continue
+                setattr(module, name, nn.Parameter(param.detach(), requires_grad=param.requires_grad))
 
     def _find_processing_unit(self, module_name: str) -> str | None:
         """Find parent decoder layer for module (e.g., 'model.layers.0' for 'model.layers.0.attn')."""

@@ -661,6 +661,22 @@ class TestCreateModelWithSharedTensors:
         assert hasattr(copied.linear2, "bias"), "Copied linear2 should have bias attribute"
         assert copied.linear2.bias is not None, "Copied linear2 bias should not be None"
 
+    def test_unregistered_tensor_attribute_is_preserved(self) -> None:
+        """Unregistered tensor attributes must survive copy."""
+
+        class LinearWithWorkspace(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(torch.randn(4, 4))
+                self.workspace = torch.empty(8)
+
+        original = nn.Sequential(LinearWithWorkspace())
+
+        copied = create_model_with_shared_tensors(original)
+
+        assert hasattr(copied[0], "workspace")
+        assert copied[0].workspace is original[0].workspace
+
 
 class FrozenDict(collections.OrderedDict):
     """Minimal FrozenDict for testing — mirrors diffusers' FrozenDict behaviour.

@@ -87,6 +87,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Diagnostic tables (block assignment, memory transfer) now appear under
   vLLM and standalone when `FT_ENABLE_DIAGNOSTICS=1`, regardless of the
   host application's log level.
+- vLLM online quantization loading now works with FlexTensor's CPU-first loader
+  for models whose BF16 checkpoint is larger than the target GPU memory by
+  deferring vLLM's CUDA-only weight processing until FlexTensor's
+  layer-by-layer GPU phase and preserving runtime tensor attributes in
+  profile-model copies.
 
 ## [0.2.0] — 2026-04-16
 

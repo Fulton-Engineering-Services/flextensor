@@ -1,0 +1,292 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Unit tests for FlexTensor's vLLM model loader."""
+
+from __future__ import annotations
+
+import sys
+import types
+from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+
+@pytest.fixture()
+def loader_module():  # noqa: C901 - local vLLM stub graph is intentionally compact
+    """Import ``flextensor.contrib.vllm.loader`` with minimal vLLM stubs."""
+    stubs: dict[str, types.ModuleType] = {}
+
+    def _stub(name: str, **attrs) -> types.ModuleType:
+        mod = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(mod, key, value)
+        stubs[name] = mod
+        return mod
+
+    class _DefaultModelLoader:
+        def _prepare_weights(self, *args, **kwargs):
+            return ("", [], False)
+
+        def load_weights(self, model, model_config):
+            raise AssertionError("test must patch load_weights")
+
+    def _register_model_loader(_name: str):
+        def _decorator(cls):
+            return cls
+
+        return _decorator
+
+    @contextmanager
+    def _set_default_torch_dtype(dtype):
+        old_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(dtype)
+        try:
+            yield
+        finally:
+            torch.set_default_dtype(old_dtype)
+
+    def _initialize_online_processing(module):
+        module._vllm_online_processing_enabled = True
+
+    _stub("vllm")
+    _stub("vllm.config", ModelConfig=object, VllmConfig=object)
+    _stub("vllm.logger", init_logger=lambda name: __import__("logging").getLogger(name))
+    _stub("vllm.model_executor")
+    _stub("vllm.model_executor.layers")
+    _stub("vllm.model_executor.layers.attention_layer_base", AttentionLayerBase=type("AttentionLayerBase", (), {}))
+    quantization_mod = _stub("vllm.model_executor.layers.quantization")
+    quantization_mod.__path__ = []
+    online_mod = _stub("vllm.model_executor.layers.quantization.online")
+    online_mod.__path__ = []
+    _stub(
+        "vllm.model_executor.layers.quantization.fp8",
+        initialize_online_processing=_initialize_online_processing,
+        Fp8OnlineLinearMethod=_FakeLegacyFp8OnlineLinearMethod,
+        Fp8LinearMethod=_FakeLegacyFp8LinearMethod,
+        Fp8OnlineMoEMethod=_FakeLegacyFp8OnlineMoEMethod,
+        Fp8MoEMethod=_FakeLegacyFp8MoEMethod,
+    )
+    _stub(
+        "vllm.model_executor.layers.quantization.mxfp8",
+        Mxfp8OnlineLinearMethod=_FakeLegacyMxfp8OnlineLinearMethod,
+        Mxfp8OnlineMoEMethod=_FakeLegacyMxfp8OnlineMoEMethod,
+    )
+    _stub(
+        "vllm.model_executor.layers.quantization.online.fp8",
+        Fp8PerTensorOnlineLinearMethod=_FakeFp8PerTensorOnlineLinearMethod,
+        Fp8PerBlockOnlineLinearMethod=_FakeFp8PerBlockOnlineLinearMethod,
+        Fp8PerTensorOnlineMoEMethod=_FakeFp8PerTensorOnlineMoEMethod,
+        Fp8PerBlockOnlineMoEMethod=_FakeFp8PerBlockOnlineMoEMethod,
+    )
+    _stub(
+        "vllm.model_executor.layers.quantization.online.mxfp8",
+        Mxfp8OnlineLinearMethod=_FakeMxfp8OnlineLinearMethod,
+        Mxfp8OnlineMoEMethod=_FakeMxfp8OnlineMoEMethod,
+    )
+    _stub("vllm.model_executor.model_loader", register_model_loader=_register_model_loader)
+    _stub("vllm.model_executor.model_loader.default_loader", DefaultModelLoader=_DefaultModelLoader)
+    _stub("vllm.model_executor.model_loader.utils", initialize_model=lambda **_kwargs: None)
+    _stub("vllm.platforms", current_platform=SimpleNamespace(device_type="cuda"))
+    _stub("vllm.utils")
+    _stub("vllm.utils.torch_utils", set_default_torch_dtype=_set_default_torch_dtype)
+
+    previous = {name: sys.modules.get(name) for name in stubs}
+    previous["flextensor.contrib.vllm.loader"] = sys.modules.pop("flextensor.contrib.vllm.loader", None)
+    sys.modules.update(stubs)
+
+    try:
+        import flextensor.contrib.vllm.loader as loader
+
+        yield loader
+    finally:
+        for name, mod in previous.items():
+            if mod is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = mod
+
+
+class _FakeQuantMethod:
+    def __init__(self):
+        self.processed_devices: list[str] = []
+
+    def process_weights_after_loading(self, module):
+        device = getattr(module, "_fake_device", "cpu")
+        if device == "cpu":
+            raise AssertionError("FP8 online processing ran during CPU-first load")
+        self.processed_devices.append(device)
+
+
+class _FakeVllmParameter(nn.Parameter):
+    pass
+
+
+class _FakeLegacyFp8OnlineLinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeLegacyFp8LinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeLegacyFp8OnlineMoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeLegacyFp8MoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeLegacyMxfp8OnlineLinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeLegacyMxfp8OnlineMoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeFp8PerTensorOnlineLinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeFp8PerBlockOnlineLinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeFp8PerTensorOnlineMoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeFp8PerBlockOnlineMoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeMxfp8OnlineLinearMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeMxfp8OnlineMoEMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakeFutureQuantMethod(_FakeQuantMethod):
+    pass
+
+
+class _FakePlainParameterRequiredMethod(_FakeFp8PerBlockOnlineLinearMethod):
+    def process_weights_after_loading(self, module):
+        assert type(module.weight) is nn.Parameter
+        super().process_weights_after_loading(module)
+
+
+class _FakeQuantLinear(nn.Module):
+    def __init__(self, quant_method):
+        super().__init__()
+        self.quant_method = quant_method
+        self._fake_device = "cpu"
+
+
+class _FakeQuantLinearWithVllmParameter(_FakeQuantLinear):
+    def __init__(self, quant_method):
+        super().__init__(quant_method)
+        self.weight = _FakeVllmParameter(torch.ones(2, 2), requires_grad=False)
+
+
+class _FakeDecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.quant_linears = nn.ModuleList([
+            _FakeQuantLinear(_FakeLegacyFp8OnlineLinearMethod()),
+            _FakeQuantLinear(_FakeLegacyFp8LinearMethod()),
+            _FakeQuantLinear(_FakeLegacyFp8OnlineMoEMethod()),
+            _FakeQuantLinear(_FakeLegacyFp8MoEMethod()),
+            _FakeQuantLinear(_FakeLegacyMxfp8OnlineLinearMethod()),
+            _FakeQuantLinear(_FakeLegacyMxfp8OnlineMoEMethod()),
+            _FakeQuantLinear(_FakeFp8PerTensorOnlineLinearMethod()),
+            _FakeQuantLinear(_FakeFp8PerBlockOnlineLinearMethod()),
+            _FakeQuantLinear(_FakeFp8PerTensorOnlineMoEMethod()),
+            _FakeQuantLinear(_FakeFp8PerBlockOnlineMoEMethod()),
+            _FakeQuantLinear(_FakeMxfp8OnlineLinearMethod()),
+            _FakeQuantLinear(_FakeMxfp8OnlineMoEMethod()),
+            _FakeQuantLinear(_FakeFutureQuantMethod()),
+        ])
+        self._fake_device = "cpu"
+
+    def to(self, device):  # noqa: ANN001 - mirrors torch API
+        device_name = str(device)
+        self._fake_device = device_name
+        for module in self.modules():
+            module._fake_device = device_name
+        return self
+
+
+class _FakeModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_FakeDecoderLayer()])
+
+
+class TestFlexTensorModelLoader:
+    def test_cpu_first_load_defers_vllm_online_quant_processing_until_gpu_phase(
+        self,
+        loader_module,
+        monkeypatch,
+    ):
+        """vLLM online quant hooks must not process weights while FlexTensor loads on CPU."""
+        model = _FakeModel()
+        quant_linears = list(model.model.layers[0].quant_linears)
+
+        def _initialize_model(*, vllm_config, model_config, **kwargs):
+            # Simulate online quant create_weights() installing the
+            # vLLM online-processing loader during model construction.
+            for linear in quant_linears:
+                sys.modules["vllm.model_executor.layers.quantization.fp8"].initialize_online_processing(
+                    linear,
+                )
+            return model
+
+        def _load_weights(self, loaded_model, model_config):
+            assert loaded_model is model
+            for linear in quant_linears:
+                if getattr(linear, "_vllm_online_processing_enabled", False):
+                    linear.quant_method.process_weights_after_loading(linear)
+
+        monkeypatch.setattr(loader_module, "initialize_model", _initialize_model)
+        monkeypatch.setattr(loader_module.FlexTensorModelLoader, "load_weights", _load_weights)
+
+        loader = loader_module.FlexTensorModelLoader.__new__(loader_module.FlexTensorModelLoader)
+        vllm_config = SimpleNamespace(device_config=SimpleNamespace(device=torch.device("cuda", 0)))
+        model_config = SimpleNamespace(dtype=torch.float32)
+
+        loaded = loader.load_model(vllm_config, model_config)
+
+        assert loaded is model
+        assert [linear.quant_method.processed_devices for linear in quant_linears] == [["cuda:0"]] * len(quant_linears)
+
+    def test_gpu_phase_materializes_vllm_parameter_subclasses_before_quant_processing(
+        self,
+        loader_module,
+    ):
+        """Deferred quantization must see plain Parameters, not vLLM loader wrappers."""
+        model = _FakeModel()
+        quant_method = _FakePlainParameterRequiredMethod()
+        quant_linear = _FakeQuantLinearWithVllmParameter(quant_method)
+        model.model.layers[0].quant_linears = nn.ModuleList([quant_linear])
+
+        loader = loader_module.FlexTensorModelLoader.__new__(loader_module.FlexTensorModelLoader)
+        model_config = SimpleNamespace(dtype=torch.float32)
+
+        loader._process_weights_layer_by_layer(
+            model,
+            model_config,
+            gpu_device=torch.device("cuda", 0),
+            cpu_device=torch.device("cpu"),
+        )
+
+        assert type(quant_linear.weight) is nn.Parameter
+        assert quant_method.processed_devices == ["cuda:0"]
