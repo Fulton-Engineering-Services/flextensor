@@ -703,6 +703,48 @@ class _CloneProcessor(TensorProcessor):
         return src
 
 
+class TestDuplicateModuleTraversalLogging:
+    """Duplicate module traversal should be summarized once, not logged per skip."""
+
+    @staticmethod
+    def _model_with_shared_child(shared: nn.Module) -> nn.Module:
+        model = nn.Module()
+        model.left = nn.Module()
+        model.right = nn.Module()
+        model.extra = nn.Module()
+        model.left.shared = shared
+        model.right.shared = shared
+        model.extra.shared = shared
+        return model
+
+    def test_tensor_processor_logs_duplicate_module_summary(self, caplog):
+        shared = nn.Linear(2, 2)
+        model = self._model_with_shared_child(shared)
+        processor = _IdentityProcessor()
+
+        with caplog.at_level("DEBUG", logger="flextensor.tensor_processors"):
+            processor.apply(model)
+
+        messages = [record.getMessage() for record in caplog.records]
+        summary = next(message for message in messages if "already-visited module visit" in message)
+        assert "_IdentityProcessor: skipped 2 already-visited module visit(s)" in summary
+        assert f"shared (id={id(shared)}, skipped=2)" in summary
+
+    def test_move_buffers_processor_logs_duplicate_module_summary(self, caplog):
+        shared = nn.Module()
+        shared.register_buffer("buffer", torch.ones(1))
+        model = self._model_with_shared_child(shared)
+        processor = MoveBuffersToGPUTensorProcessor(torch.device("cpu"))
+
+        with caplog.at_level("DEBUG", logger="flextensor.tensor_processors"):
+            processor.apply(model)
+
+        messages = [record.getMessage() for record in caplog.records]
+        summary = next(message for message in messages if "already-visited module visit" in message)
+        assert "MoveBuffersToGPUTensorProcessor: skipped 2 already-visited module visit(s)" in summary
+        assert f"shared (id={id(shared)}, skipped=2)" in summary
+
+
 class TestFrozenDictPreservation:
     """Test that _apply_on preserves OrderedDict subclass types (e.g. FrozenDict)."""
 

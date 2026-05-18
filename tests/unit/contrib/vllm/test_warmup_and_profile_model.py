@@ -429,14 +429,14 @@ class TestResolveCudaGraphWrapper:
         sys.modules.pop("vllm.compilation.wrapper", None)
 
         try:
-            with caplog.at_level("INFO", logger="flextensor.contrib.vllm.worker"):
+            with caplog.at_level("DEBUG", logger="flextensor.contrib.vllm.worker"):
                 resolved = worker_module._resolve_cuda_graph_wrapper()
         finally:
             self._restore_modules(previous)
 
         assert resolved is _FallbackWrapper
         assert any("fallback path" in r.getMessage() for r in caplog.records), (
-            f"expected INFO logging the fallback path; got: {[r.getMessage() for r in caplog.records]}"
+            f"expected DEBUG logging the fallback path; got: {[r.getMessage() for r in caplog.records]}"
         )
         assert any("primary import failed" in r.getMessage() for r in caplog.records), (
             "fallback log must reference the primary failure for triage"

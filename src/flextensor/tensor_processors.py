@@ -371,14 +371,17 @@ class TensorProcessor:
         # initialised here so direct ``_process_module`` callers (subclasses
         # / tests) don't hit AttributeError before ``apply()`` runs.
         self._visited: set[int] = set()
+        self._skipped_visited_modules: list[tuple[str, int]] = []
 
     def apply(self, model):
         # Reset between applications so each call starts with a clean slate.
         self._visited = set()
+        self._skipped_visited_modules = []
         if isinstance(model, dict):
             self._process_dict(model, "model")
         else:
             self._process_module(model, "model")
+        self._log_skipped_visited_modules()
         self.cleanup()
 
     def process(self, _src):
@@ -420,6 +423,34 @@ class TensorProcessor:
         """Get the full handler chain: instance → global → built-in."""
         return [*self._custom_type_handlers, *self._global_type_handlers, *self._DEFAULT_TYPE_HANDLERS]
 
+    def _record_skipped_visited_module(self, module: torch.nn.Module, name: str) -> None:
+        self._skipped_visited_modules.append((name, id(module)))
+
+    def _mark_module_visited(self, module: torch.nn.Module, name: str) -> bool:
+        # Identity-keyed so weight-shared modules reachable via two parents are processed once.
+        module_id = id(module)
+        if module_id in self._visited:
+            self._record_skipped_visited_module(module, name)
+            return False
+        self._visited.add(module_id)
+        return True
+
+    def _log_skipped_visited_modules(self) -> None:
+        if not self._skipped_visited_modules:
+            return
+
+        skipped_counts = collections.Counter(self._skipped_visited_modules)
+        total_skips = sum(skipped_counts.values())
+        details = ", ".join(
+            f"{name} (id={module_id}, skipped={count})" for (name, module_id), count in skipped_counts.items()
+        )
+        LOGGER.debug(
+            "%s: skipped %d already-visited module visit(s): %s",
+            self.__class__.__name__,
+            total_skips,
+            details,
+        )
+
     def _process_inner_fields(self, src, new_tensor):
         ref_tensor_fields = set(dir(src))
         # Use class-level attributes to detect instance-specific fields
@@ -446,13 +477,8 @@ class TensorProcessor:
                 dict_model[attr_name] = attr_value
 
     def _process_module(self, module, _name):
-        # Cycle/dup guard (see TensorProcessor.__init__): identity-keyed so
-        # weight-shared modules reachable via two parents are processed once.
-        module_id = id(module)
-        if module_id in self._visited:
-            LOGGER.debug("TensorProcessor: skipping already-visited module %s (id=%d)", _name, module_id)
+        if not self._mark_module_visited(module, _name):
             return module
-        self._visited.add(module_id)
 
         # Extend the current module
         self._apply_on(module)
@@ -603,12 +629,8 @@ class MoveBuffersToGPUTensorProcessor(TensorProcessor):
         self.move_to_gpu.cleanup()
 
     def _process_module(self, module, _name):
-        # Cycle/dup guard: see TensorProcessor.__init__.
-        module_id = id(module)
-        if module_id in self._visited:
-            LOGGER.debug("MoveBuffersToGPUTensorProcessor: skipping already-visited module %s", _name)
+        if not self._mark_module_visited(module, _name):
             return module
-        self._visited.add(module_id)
 
         # Move all buffers in this module to GPU
         for buffer_name, buffer in module.named_buffers(recurse=False):

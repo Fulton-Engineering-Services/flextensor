@@ -53,12 +53,11 @@ _CUDA_GRAPH_WRAPPER_LOGGED = False
 def _resolve_cuda_graph_wrapper() -> type | None:
     """Locate vLLM's ``CUDAGraphWrapper`` class.
 
-    The class moved from ``vllm.compilation.wrapper`` (older vLLM) to
-    ``vllm.compilation.cuda_graph`` (newer vLLM).  Logs which path won the
-    first time it succeeds so a user diagnosing version drift can tell from
-    the worker's startup log which class their ``isinstance`` check actually
-    matches.  If both paths fail we return ``None`` and warn — callers must
-    treat the wrapper as absent rather than crash.
+    The primary import path logs at INFO the first time it succeeds.  The
+    fallback import path logs at DEBUG so normal startup stays quiet while
+    debug logs still show which wrapper was selected.  If both imports fail,
+    return ``None`` and warn so callers can treat CUDA-graph wrapping as
+    unavailable.
     """
     global _CUDA_GRAPH_WRAPPER_LOGGED
     primary_exc: ImportError | None = None
@@ -76,7 +75,7 @@ def _resolve_cuda_graph_wrapper() -> type | None:
         from vllm.compilation.cuda_graph import CUDAGraphWrapper
 
         if not _CUDA_GRAPH_WRAPPER_LOGGED:
-            LOGGER.info(
+            LOGGER.debug(
                 "FlexTensor: using CUDAGraphWrapper from vllm.compilation.cuda_graph (fallback path; "
                 "primary import failed: %s)",
                 primary_exc,
