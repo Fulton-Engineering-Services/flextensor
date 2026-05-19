@@ -13,103 +13,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- New `pinned_memory_mode` option (config field, `FT_PINNED_MEMORY_MODE` env
-  var, and `TensorManager` constructor argument) to choose between PyTorch's
-  pinned allocator (`"torch"`, default) and pinning existing allocations
-  in place via `cudaHostRegister` (`"host_register"`). The new path avoids
-  PyTorch's peak-memory doubling for allocations that straddle a
-  power-of-two boundary
-  (see [pytorch/pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)).
-  Registrations are tracked by a `HostPinRegistry` owned by each
-  `TensorManager` and released on `shutdown()`.
-- Profiling data control API: `flextensor.clear_profiling_durations()`,
-  `suspend_profiling()` / `resume_profiling()`, and the `pause_profiling()`
-  context manager. Lets backends (e.g. vLLM) bracket mixed-batch warmup so
-  paused passes contribute neither duration samples nor tensor IDs to the
-  PROFILING input — important on data-dependent models (MoE experts,
-  conditional branches, mixed-batch shapes) where a paused pass might
-  exercise a different parameter set than the real workload. The PROFILING
-  iteration counter is also frozen so suppressed passes don't consume the
-  `profiling_iters` budget. Suspensions are reference-counted, so
-  independent callers can nest without stepping on each other. See
+- `pinned_memory_mode` option (`"torch"` default, `"host_register"` opt-in) to
+  pin existing allocations in place via `cudaHostRegister` and avoid PyTorch's
+  peak-memory doubling on power-of-two boundaries
+  ([pytorch#150517](https://github.com/pytorch/pytorch/issues/150517)).
+  See [Switch to in-place pinning](docs/how-to/troubleshooting.md#step-3-switch-to-in-place-pinning).
+- Profiling data control API (`clear_profiling_durations()`,
+  `suspend_profiling()` / `resume_profiling()`, `pause_profiling()` context
+  manager) so backends can bracket mixed-batch warmup without polluting the
+  PROFILING input or consuming the `profiling_iters` budget. See
   [Profiling Data Control](docs/explanation/phases.md#profiling-data-control).
-- `torch.compile` support for offloaded models. Profile and inference can
-  run under `torch.compile(proxy)`; discovery must stay eager. See
-  `docs/how-to/torch-compile.md` for the supported flows (single-process
-  and two-process save / restore) and the discovery-must-stay-eager
-  constraint.
-- `include_patterns` / `exclude_patterns` now accept a ``class:<glob>`` prefix
-  that matches on the module's class instead of the module path. Patterns are
-  tested against both the short class name (``type(module).__name__``) and the
-  fully-qualified class name (``f"{cls.__module__}.{cls.__qualname__}"``), so
-  ``class:SharedExpertMLP`` and ``class:*.SharedExpertMLP`` both work, and
-  globs like ``class:torch.nn.*.Linear`` disambiguate classes that share a
-  short name. This makes it possible to keep hybrid-architecture sub-modules
-  (e.g. Nemotron-H ``SharedExpertMLP`` / ``MoELayer``) on GPU without long,
-  upstream-version-specific path patterns. A ``name:<glob>`` prefix is also
-  recognised for symmetry; bare patterns continue to behave as name-based as
-  before. Dict-typed models reject all-``class:`` include sets with
-  ``ValueError`` (no module hierarchy to resolve classes against); mixed
-  include sets warn and fall back to the surviving name patterns.
+- `torch.compile` support for offloaded models (profile and inference;
+  discovery must stay eager). See [docs/how-to/torch-compile.md](docs/how-to/torch-compile.md).
+- `class:<glob>` prefix on `include_patterns` / `exclude_patterns` that matches
+  on the module's class (short and fully-qualified) instead of its path.
+  A `name:<glob>` prefix is accepted for symmetry; bare patterns remain
+  name-based. See [Pattern Matching](docs/explanation/pattern-matching.md).
 
 ### Changed
 
 - `pinned_memory=True` on a CPU-only host now raises `RuntimeError` at
-  `TensorManager` construction (previously a silent no-op in
-  `AllocationBlock`). Set `pinned_memory=False` on hosts without CUDA.
-- `UntimedTrapsReport` is now emitted at `WARNING` whenever any trap has
-  tensor IDs but no duration samples, regardless of `enable_diagnostics`.
-  These labels are silently dropped from the strategy input; users need
-  visibility in production. The verbose layer-duration table remains
-  gated on `enable_diagnostics`.
-- Internal: `WarmupTrap` no longer measures per-iteration CUDA-event
-  durations (they were wiped before profiling began anyway), and the new
-  `TensorManager.record_tensors(label, tensor_ids)` is the DISCOVERY-only
-  recorder. Affects plugin authors who subclassed `WarmupTrap` or called
-  the recorders directly.
-- `BenchmarkReplace.__init__` now requires a keyword-only `host_pinner`,
-  so profiling uses the same pinning primitive as production transfers.
-- User-registered forward hooks *on the top-level offloaded model* now
-  observe the **post-transition** phase. FlexTensor installs an internal
-  state-update hook with `prepend=True` on the top-level model so it
-  always fires first, advancing the phase before user hooks read it.
-  Previously this was order-dependent: hooks registered before `offload()`
-  observed the pre-transition phase; hooks registered after observed the
-  post-transition phase. Sub-module hooks are unaffected — they fire
-  during the sub-module's own forward, before the top-level state-update
-  hook.
-- `OffloadConfig.include_patterns` / `exclude_patterns` now reject
-  non-string entries, empty / whitespace-only entries, empty-body
-  `class:` / `name:` prefixes, and typo prefixes (`clas:`, `Class:`,
-  anything containing `:` without a known prefix) at construction
-  (`ValueError`). Whitespace around entries and bodies is stripped, so
-  `"class: Linear "` is stored as `"class:Linear"`.
+  `TensorManager` construction (was a silent no-op).
+- `UntimedTrapsReport` is emitted at `WARNING` whenever a trap has tensor IDs
+  but no duration samples, regardless of `enable_diagnostics`.
+- User-registered forward hooks on the top-level offloaded model now always
+  observe the **post-transition** phase (previously order-dependent on whether
+  the hook was registered before or after `offload()`). Sub-module hooks are
+  unchanged.
+- `OffloadConfig.include_patterns` / `exclude_patterns` now reject non-string,
+  empty, and typo-prefixed entries (`clas:`, `Class:`, …) at construction
+  with `ValueError`; whitespace is stripped.
+- Internal: `WarmupTrap` no longer records per-iteration durations, and the
+  DISCOVERY-only recorder is `TensorManager.record_tensors(label, tensor_ids)`.
+  `BenchmarkReplace.__init__` now requires a keyword-only `host_pinner`.
+  Affects plugin authors who subclassed `WarmupTrap` or called the recorders
+  directly.
+
 ### Fixed
 
 - Include pattern derivation now skips unmatched sibling module patterns
   instead of truncating them to broad ancestors, preserving per-layer traps on
-  wrapper models such as Nemotron-H.
-- `FlexTensorOffloadWorker` now pushes the speculative-decoding drafter
-  (e.g. MTP / Eagle) to GPU before `flextensor.offload()` runs, so drafter
-  weights don't remain on CPU where FT's loader leaves them. This resolves
-  the Dynamo `cpu/cuda` device mismatch in vLLM's `@torch.compile`
-  layernorm helper that previously crashed warmup on every MTP + FT tier. (#140)
-- Instrumentation dumps are now valid JSON when components hold frozen maps
-  (e.g. `TensorManager.tensors_map`, a `MappingProxyType`); serializer failures
-  and non-JSON values in `dump_instrumentation(extra=…)` degrade gracefully
-  instead of aborting the dump or propagating out of decorated `__init__`. (#141)
-- FlexTensor no longer crashes during model discovery on modules or tensor
-  subclasses whose attribute access raises a non-`AttributeError` (e.g. vLLM
-  0.18.x `StageMissingLayer` raising `KeyError`). Probes that walk arbitrary
-  model trees now fail closed and log at `DEBUG` instead of aborting the run.
-- Diagnostic tables (block assignment, memory transfer) now appear under
-  vLLM and standalone when `FT_ENABLE_DIAGNOSTICS=1`, regardless of the
-  host application's log level.
-- vLLM online quantization loading now works with FlexTensor's CPU-first loader
-  for models whose BF16 checkpoint is larger than the target GPU memory by
-  deferring vLLM's CUDA-only weight processing until FlexTensor's
-  layer-by-layer GPU phase and preserving runtime tensor attributes in
-  profile-model copies.
+  wrapper models.
+- `FlexTensorOffloadWorker` pushes the speculative-decoding drafter (MTP /
+  Eagle) to GPU before `offload()` runs, fixing the Dynamo `cpu/cuda` device
+  mismatch in vLLM's `@torch.compile` layernorm helper on MTP + FT.
+- `dump_instrumentation()` now degrades gracefully on frozen maps (e.g.
+  `MappingProxyType`) and non-JSON values instead of aborting.
+- Model discovery no longer crashes on modules / tensor subclasses whose
+  attribute access raises non-`AttributeError` (e.g. vLLM 0.18.x
+  `StageMissingLayer` raising `KeyError`); probes fail closed and log at
+  `DEBUG`.
+- Diagnostic tables (block assignment, memory transfer) now appear under vLLM
+  and standalone when `FT_ENABLE_DIAGNOSTICS=1`, regardless of host log level.
+- vLLM online quantization loading now works with FlexTensor's CPU-first
+  loader for BF16 checkpoints larger than target GPU memory, by deferring
+  vLLM's CUDA-only weight processing until the layer-by-layer GPU phase.
 
 ## [0.2.0] — 2026-04-16
 
@@ -202,7 +160,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GPU memory budget (`max_gpu_mem_fraction`) is now capped by actual available GPU memory
   at strategy compute time. Previously, `total * fraction` could exceed available memory
   when CUDA context, KV cache, or framework buffers had already consumed GPU memory,
-  causing OOM. (#104)
+  causing OOM.
 
 ## [0.1.0] — 2026-03-16
 
