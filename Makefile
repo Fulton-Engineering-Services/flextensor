@@ -15,7 +15,7 @@ install: build
 	pip3 install dist/*.whl
 
 install-dev:
-	pip3 install -e .[dev]
+	uv pip install --group dev -e .
 
 clean: docs-clean
 
@@ -82,7 +82,7 @@ test-integration:
 				set -e; \
 				trap 'deactivate 2>/dev/null || true' EXIT; \
 				source $${dir}.venv/bin/activate && \
-				pip3 install -e ".[test]" -r $${dir}requirements.txt && \
+				uv pip install --group test -e . -r $${dir}requirements.txt && \
 				echo "========================================"; \
 				echo "Running $${dir}test.sh"; \
 				echo "========================================"; \

@@ -39,11 +39,12 @@ dependencies = [
     "shared-memory-dict~=0.7.2",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 test = [
     "pytest>=9.0.3",
     "pytest-cov>=4.0.0",
     "mypy>=1.10",
+    "tomli>=2.0; python_version < '3.11'",
 ]
 docs = [
     "mkdocs~=1.6",
@@ -52,12 +53,14 @@ docs = [
     "mkdocstrings[python]>=0.27",
 ]
 dev = [
+    { include-group = "test" },
     "build",
     "pre-commit",
-    "flextensor[test]",
 ]
 all = [
-    "flextensor[test,dev,docs]",
+    { include-group = "test" },
+    { include-group = "dev" },
+    { include-group = "docs" },
 ]
 
 [tool.setuptools.packages.find]
@@ -128,6 +131,8 @@ fail_under = 60
 
 [tool.uv]
 managed = true
+# uv pip install gained --group support in 0.6.7; Makefile and downstream CI use it for dependency groups.
+required-version = ">=0.6.7"
 
 [tool.ruff]
 preview = true

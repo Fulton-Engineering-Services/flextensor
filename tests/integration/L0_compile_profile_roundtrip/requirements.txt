@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Integration test requirements for L0_compile_profile_roundtrip
-# These are in addition to the flex-tensor[test] dependencies
+# These are in addition to the FlexTensor test dependency group
 
 numpy~=2.0

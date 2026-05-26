@@ -16,7 +16,7 @@
 ## Changing Pages
 
 - Update `nav:` in `mkdocs.yml` — unlisted pages won't appear in navigation
-- Validate with `uv run --extra docs mkdocs build --strict` — catches broken links and missing refs
+- Validate with `uv run --group docs mkdocs build --strict` — catches broken links and missing refs
 - Use relative paths for cross-page links (`../how-to/troubleshooting.md`)
 - When renaming headings, grep for old anchors and update references
 - API cross-refs: `` [`OffloadConfig`][flextensor.OffloadConfig] ``

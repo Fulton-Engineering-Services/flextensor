@@ -47,7 +47,7 @@ tests/
 ```bash
 # Setup
 uv venv --python 3.10 .venv && source .venv/bin/activate
-uv pip install -e ".[dev]" && pre-commit install
+uv pip install --group dev -e . && pre-commit install
 
 # Unit tests (no GPU)
 pytest -sv tests/unit --cov=flextensor --cov-report=term-missing
@@ -73,7 +73,7 @@ Each worktree needs its own `.venv` — the editable install is path-specific:
 ```bash
 cd .worktrees/<branch>
 uv venv --python 3.10 .venv && source .venv/bin/activate
-uv pip install -e ".[test]"
+uv pip install --group test -e .
 ```
 
 ---

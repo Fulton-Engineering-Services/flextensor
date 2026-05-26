@@ -32,7 +32,7 @@ To install FlexTensor from PyPI:
 pip install flextensor
 ```
 
-For more installation options (source, dev, optional dependencies), see the [Installation Guide](https://github.com/ai-dynamo/flextensor/blob/main/docs/installation.md).
+For more installation options (source and development), see the [Installation Guide](https://github.com/ai-dynamo/flextensor/blob/main/docs/installation.md).
 
 ## Quick Example
 

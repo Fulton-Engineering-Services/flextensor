@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 # Integration test requirements for L0_contrib_vllm
-# These are in addition to the flextensor[test] dependencies
+# These are in addition to the FlexTensor test dependency group
 vllm>=0.11.1
 requests~=2.32

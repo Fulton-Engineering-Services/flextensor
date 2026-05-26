@@ -30,17 +30,20 @@ pip install .
 
 ## Development Installation
 
-For development, install with all optional dependencies:
+For development, install with all dependency groups:
 
 ```bash
-pip install -e ".[all]"
+uv venv
+uv pip install --group all -e .
 ```
+
+This requires uv 0.6.7 or newer. If you use pip directly instead, use pip
+25.1 or newer for `pip install --group`.
 
 This includes:
 
 - Testing tools (pytest, pytest-cov)
 - Pre-commit hooks
-- Debugging tools (pudb)
 - Documentation generation tools (mkdocs, mike)
 
 ## Verify Installation

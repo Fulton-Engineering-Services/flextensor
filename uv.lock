@@ -385,7 +385,7 @@ dependencies = [
     { name = "torch" },
 ]
 
-[package.optional-dependencies]
+[package.dev-dependencies]
 all = [
     { name = "build" },
     { name = "mike" },
@@ -396,6 +396,7 @@ all = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 dev = [
     { name = "build" },
@@ -403,6 +404,7 @@ dev = [
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 docs = [
     { name = "mike" },
@@ -414,33 +416,56 @@ test = [
     { name = "mypy" },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "beartype", specifier = "~=0.21" },
-    { name = "build", marker = "extra == 'dev'" },
-    { name = "flextensor", extras = ["dev", "docs", "test"], marker = "extra == 'all'" },
-    { name = "flextensor", extras = ["test"], marker = "extra == 'dev'" },
-    { name = "mike", marker = "extra == 'docs'", specifier = "~=2.1" },
-    { name = "mkdocs", marker = "extra == 'docs'", specifier = "~=1.6" },
-    { name = "mkdocs-material", marker = "extra == 'docs'", specifier = "~=9.7" },
-    { name = "mkdocstrings", extras = ["python"], marker = "extra == 'docs'", specifier = ">=0.27" },
-    { name = "mypy", marker = "extra == 'test'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=1.20.0" },
     { name = "posix-ipc", specifier = "~=1.3.0" },
-    { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "proxytypes3", specifier = ">=1.0.1" },
     { name = "psutil", specifier = ">=5.9.0" },
     { name = "pydantic", specifier = ">=2.7.0" },
-    { name = "pytest", marker = "extra == 'test'", specifier = ">=7.0.0" },
-    { name = "pytest-cov", marker = "extra == 'test'", specifier = ">=4.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "scipy", specifier = ">=1.9.0" },
     { name = "shared-memory-dict", specifier = "~=0.7.2" },
     { name = "torch", specifier = ">=2.5" },
 ]
-provides-extras = ["test", "docs", "dev", "all"]
+
+[package.metadata.requires-dev]
+all = [
+    { name = "build" },
+    { name = "mike", specifier = "~=2.1" },
+    { name = "mkdocs", specifier = "~=1.6" },
+    { name = "mkdocs-material", specifier = "~=9.7" },
+    { name = "mkdocstrings", extras = ["python"], specifier = ">=0.27" },
+    { name = "mypy", specifier = ">=1.10" },
+    { name = "pre-commit" },
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-cov", specifier = ">=4.0.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
+dev = [
+    { name = "build" },
+    { name = "mypy", specifier = ">=1.10" },
+    { name = "pre-commit" },
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-cov", specifier = ">=4.0.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
+docs = [
+    { name = "mike", specifier = "~=2.1" },
+    { name = "mkdocs", specifier = "~=1.6" },
+    { name = "mkdocs-material", specifier = "~=9.7" },
+    { name = "mkdocstrings", extras = ["python"], specifier = ">=0.27" },
+]
+test = [
+    { name = "mypy", specifier = ">=1.10" },
+    { name = "pytest", specifier = ">=9.0.3" },
+    { name = "pytest-cov", specifier = ">=4.0.0" },
+    { name = "tomli", marker = "python_full_version < '3.11'", specifier = ">=2.0" },
+]
 
 [[package]]
 name = "fsspec"
