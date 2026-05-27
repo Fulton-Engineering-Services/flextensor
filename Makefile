@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-.PHONY: build install install-dev clean docs-clean docs-build docs-serve docs-deploy docs-set-default docs-list test test-unit test-integration
+.PHONY: build install install-dev clean docs-clean docs-build docs-serve docs-deploy docs-set-default docs-list test test-unit test-integration mypy
 
 DOCS_DIR := build/docs
 DOCS_BRANCH := gh-pages
@@ -96,5 +96,8 @@ test-integration:
 
 test-unit:
 	pytest -sv tests/unit --cov=flextensor --cov-report=html --cov-report=xml --cov-report=term-missing
+
+mypy:
+	mypy src/flextensor
 
 test: test-integration test-unit
