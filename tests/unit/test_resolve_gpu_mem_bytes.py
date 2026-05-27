@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for resolve_gpu_mem_bytes utility function."""
+"""Unit tests for resolve_gpu_mem_bytes budget helper."""
 
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from flextensor.config import OffloadConfig
-from flextensor.utils import resolve_gpu_mem_bytes
+from flextensor.gpu_budget import resolve_gpu_mem_bytes
 
 
 class TestResolveGpuMemBytes:
@@ -20,7 +20,7 @@ class TestResolveGpuMemBytes:
         fake_props = MagicMock()
         fake_props.total_memory = 80 * 1024**3  # 80 GB
 
-        with patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props) as mock_get:
+        with patch("flextensor.gpu_budget.torch.cuda.get_device_properties", return_value=fake_props) as mock_get:
             result = resolve_gpu_mem_bytes(config)
 
         assert result == int(0.8 * 80 * 1024**3)
@@ -32,7 +32,7 @@ class TestResolveGpuMemBytes:
         fake_props = MagicMock()
         fake_props.total_memory = 48 * 1024**3
 
-        with patch("flextensor.utils.torch.cuda.get_device_properties", return_value=fake_props) as mock_get:
+        with patch("flextensor.gpu_budget.torch.cuda.get_device_properties", return_value=fake_props) as mock_get:
             result = resolve_gpu_mem_bytes(config)
 
         assert result == int(0.5 * 48 * 1024**3)
@@ -42,7 +42,7 @@ class TestResolveGpuMemBytes:
         """Fraction=None (latency mode) returns None without querying GPU."""
         config = OffloadConfig(max_gpu_mem_fraction=None)
 
-        with patch("flextensor.utils.torch.cuda.get_device_properties") as mock_get:
+        with patch("flextensor.gpu_budget.torch.cuda.get_device_properties") as mock_get:
             result = resolve_gpu_mem_bytes(config)
 
         assert result is None
@@ -53,7 +53,7 @@ class TestResolveGpuMemBytes:
         with pytest.warns(DeprecationWarning):
             config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
 
-        with patch("flextensor.utils.torch.cuda.get_device_properties") as mock_get:
+        with patch("flextensor.gpu_budget.torch.cuda.get_device_properties") as mock_get:
             result = resolve_gpu_mem_bytes(config)
 
         assert result == 20 * 1024**3
@@ -65,7 +65,7 @@ class TestResolveGpuMemBytes:
 
         with (
             patch(
-                "flextensor.utils.torch.cuda.get_device_properties",
+                "flextensor.gpu_budget.torch.cuda.get_device_properties",
                 side_effect=RuntimeError("no CUDA"),
             ),
             pytest.raises(RuntimeError, match="Failed to query GPU device"),
@@ -78,7 +78,7 @@ class TestResolveGpuMemBytes:
 
         with (
             patch(
-                "flextensor.utils.torch.cuda.get_device_properties",
+                "flextensor.gpu_budget.torch.cuda.get_device_properties",
                 side_effect=RuntimeError("no CUDA"),
             ),
             pytest.raises(RuntimeError, match="computing SHM namespace"),

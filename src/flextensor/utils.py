@@ -26,7 +26,6 @@ __all__ = [
     "is_dense_layout",
     "matches_any_class_pattern",
     "matches_any_pattern",
-    "resolve_gpu_mem_bytes",
 ]
 
 # Prefix marker for class-based matching in include/exclude patterns.
@@ -305,41 +304,6 @@ def _match_parts(
         if regex_cache[pp].fullmatch(path_parts[0]):
             return _match_parts(path_parts[1:], pattern_parts[1:], regex_cache, recursive_star)
         return False
-
-
-def resolve_gpu_mem_bytes(config, *, context: str = "") -> int | None:
-    """Resolve GPU memory limit from config to an absolute byte count.
-
-    If ``max_gpu_mem_fraction`` is set, queries GPU device properties and returns
-    ``int(total_memory * fraction)``.  If ``None``, falls back to the deprecated
-    ``max_gpu_mem_bytes`` value (which may itself be ``None`` for latency mode).
-
-    Args:
-        config (OffloadConfig): FlexTensor offload configuration.
-        context: Description of calling context for error messages
-            (e.g. ``"computing SHM namespace"``).
-
-    Returns:
-        Resolved byte count, or ``None`` for latency mode.
-
-    Raises:
-        RuntimeError: If the CUDA device query fails.
-    """
-    if config.max_gpu_mem_fraction is not None:
-        try:
-            props = torch.cuda.get_device_properties(config.gpu_device)
-        except (RuntimeError, AssertionError) as e:
-            ctx = f" while {context}" if context else ""
-            raise RuntimeError(
-                f"Failed to query GPU device {config.gpu_device}{ctx} "
-                f"for max_gpu_mem_fraction={config.max_gpu_mem_fraction}. "
-                f"Ensure CUDA is available and gpu_device={config.gpu_device} is valid."
-            ) from e
-        return int(props.total_memory * config.max_gpu_mem_fraction)
-
-    # Fraction is None: either explicit latency mode or deprecated max_gpu_mem_bytes path.
-    # Read via model_dump to avoid triggering the deprecation accessor warning.
-    return config.model_dump(warnings=False).get("max_gpu_mem_bytes")
 
 
 def atomic_write_json(file_path: str | pathlib.Path, data: dict[str, Any]) -> None:

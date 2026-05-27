@@ -9,15 +9,17 @@ import dataclasses
 import torch
 import torch.nn as nn
 
+from flextensor.tensor_manager import ModelDict
 from flextensor.tensor_processors import (
     LegacySetTypeHandler,
     MoveBuffersToGPUTensorProcessor,
     MoveUnmappedTensorsToGPUProcessor,
     ProcessingContext,
-    ReachableTensorIdsProcessor,
+    ReachableTensorMapProcessor,
     TensorMappingProcessor,
     TensorProcessor,
     compute_reachable_tensor_ids,
+    compute_reachable_tensor_map,
     create_model_with_shared_tensors,
     preserve_parameter_type,
 )
@@ -203,13 +205,13 @@ class TestTensorMappingProcessor:
         assert result is param
 
 
-class TestReachableTensorIdsProcessor:
-    """Contract for ``ReachableTensorIdsProcessor`` and its convenience wrapper.
+class TestReachableTensorMapProcessor:
+    """Contract for ``ReachableTensorMapProcessor`` and its convenience wrappers.
 
     The processor walks an ``nn.Module`` (parameters, buffers, submodules,
     attributes) or a ``dict`` model, plus tensor inner fields (e.g.
-    ``weight.scale`` on a quantised parameter), and records ``id(tensor)``
-    for every non-meta tensor visited.
+    ``weight.scale`` on a quantised parameter), and records every non-meta
+    tensor visited.
 
     The narrowing input it produces is consumed by
     :class:`flextensor.loaders.TensorStrategyLoader` to scope the
@@ -231,10 +233,32 @@ class TestReachableTensorIdsProcessor:
         assert id(m.w) in ids
         assert id(m.b) in ids
 
+    def test_returns_reachable_tensor_map(self) -> None:
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+                self.register_buffer("b", torch.zeros(2))
+
+        m = _M()
+        tensors = compute_reachable_tensor_map(m)
+
+        assert tensors[id(m.w)] is m.w
+        assert tensors[id(m.b)] is m.b
+
     def test_returns_dict_model_tensor_ids(self) -> None:
         t1 = torch.zeros(4)
         t2 = torch.zeros(8)
         model = {"a": t1, "b": t2, "non_tensor": "ignored"}
+
+        ids = compute_reachable_tensor_ids(model)
+
+        assert ids == {id(t1), id(t2)}
+
+    def test_returns_model_dict_tensor_ids(self) -> None:
+        t1 = torch.zeros(4)
+        t2 = torch.zeros(8)
+        model = ModelDict(model={"a": t1, "b": t2, "non_tensor": "ignored"})
 
         ids = compute_reachable_tensor_ids(model)
 
@@ -250,9 +274,9 @@ class TestReachableTensorIdsProcessor:
         ``named_parameters``/``named_buffers`` walk would miss: a
         quantised parameter that carries a sibling tensor as an instance
         attribute. The :class:`TensorProcessor` traversal — inherited by
-        :class:`ReachableTensorIdsProcessor` — discovers these via the
-        standard ``map_inner_fields`` walk, so they participate in the
-        rescue's narrowing instead of being silently excluded.
+        :class:`ReachableTensorMapProcessor` — discovers these via the standard
+        ``map_inner_fields`` walk, so they participate in the rescue's
+        narrowing instead of being silently excluded.
         """
 
         class _M(nn.Module):
@@ -305,7 +329,7 @@ class TestReachableTensorIdsProcessor:
         assert id(m.w) in ids
         assert id(m.meta_buf) not in ids
 
-    def test_processor_does_not_mutate_attributes(self) -> None:
+    def test_id_wrapper_does_not_mutate_attributes(self) -> None:
         """Read-only walk: ``update_attributes=False`` keeps the model intact."""
 
         class _M(nn.Module):
@@ -315,11 +339,24 @@ class TestReachableTensorIdsProcessor:
 
         m = _M()
         original_w = m.w
-        proc = ReachableTensorIdsProcessor()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert m.w is original_w
+        assert id(original_w) in ids
+
+    def test_map_processor_does_not_mutate_attributes(self) -> None:
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.zeros(4))
+
+        m = _M()
+        original_w = m.w
+        proc = ReachableTensorMapProcessor()
         proc.apply(m)
 
         assert m.w is original_w
-        assert id(original_w) in proc.get_results()
+        assert proc.get_results()[id(original_w)] is original_w
 
 
 class TestMoveBuffersToGPUTensorProcessor:

@@ -29,14 +29,15 @@ runtime, but the safety nets live in different places:
   :class:`flextensor.tensor_processors.MoveUnmappedTensorsToGPUProcessor`,
   whose contract is "if not in ``tensor_id_to_view_map``, move to GPU
   permanently." So the same dropped tensor lands on GPU before
-  inference begins. The remaining concern — silent permanent-GPU
-  inflation without budget enforcement — is pinned by the third class.
+  inference begins. That permanent-GPU path is budgeted before strategy
+  computation and guarded again immediately before each CUDA move.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 from torch import nn
 
@@ -195,7 +196,7 @@ class TestComputeUntimedTracedPreload:
 # ---------------------------------------------------------------------------
 # Direct contract tests for ``compute_reachable_tensor_ids`` live next to the
 # helper itself, in ``tests/unit/test_tensor_processors.py``
-# (``TestReachableTensorIdsProcessor``). The two narrowing-via-loader tests
+# (``TestReachableTensorMapProcessor``). The two narrowing-via-loader tests
 # below stay here because they exercise the rescue's *use* of that input.
 # ---------------------------------------------------------------------------
 
@@ -499,9 +500,10 @@ class TestBlockLoaderUntimedSafetyNet:
     moves anything not in ``block_controller.tensor_id_to_view_map``
     to GPU before inference begins.
 
-    What's NOT controlled is the budget — the safety net consumes
-    permanent GPU memory without consulting ``max_gpu_mem_fraction``.
-    These tests pin both behaviours so future changes are explicit.
+    The safety net also participates in memory protection: strategy
+    planning reserves bytes for reachable tensors missing from layer
+    statistics, and the processor checks CUDA free memory before an
+    unmapped move.
     """
 
     def test_unmapped_processor_routes_untimed_to_move_to_gpu(self) -> None:
@@ -538,38 +540,38 @@ class TestBlockLoaderUntimedSafetyNet:
         assert result_timed is gpu_view_for_timed, "timed tensor returns its view"
         assert result_untimed is not None
 
-    def test_unmapped_processor_does_not_consult_max_gpu_mem_fraction(self) -> None:
-        """The auto-pin path bypasses the strategy budget.
+    def test_unmapped_processor_checks_cuda_free_memory_before_move(self) -> None:
+        """The auto-pin path has a move-time guard before touching CUDA memory."""
 
-        Empirical evidence for the secondary concern raised in review:
-        ``MoveUnmappedTensorsToGPUProcessor`` has no awareness of
-        ``max_gpu_mem_fraction`` or ``_resolve_gpu_budget``. A
-        profile-coverage regression on a multi-GiB layer will silently
-        inflate ``_unmapped_tensors_bytes`` and OOM mid-traversal with
-        no attribution to the dropped label.
+        tensor = nn.Parameter(torch.zeros(8, dtype=torch.float32))
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        proc = MoveUnmappedTensorsToGPUProcessor(torch.device("cuda:0"), tensor_id_mapping={})
 
-        If a future change adds budget gating to this processor, this
-        test will need to be updated to drive the budget check (and
-        assert the resulting failure mode).
-        """
-        big = nn.Parameter(torch.zeros(1024, 1024, dtype=torch.float32))
-        small_view = torch.zeros(4, dtype=torch.float32)
+        with (
+            patch.object(torch.cuda, "mem_get_info", return_value=(tensor_bytes - 1, tensor_bytes * 2)),
+            patch.object(proc.move_to_gpu, "process", return_value=tensor) as mock_move,
+            pytest.raises(RuntimeError, match=r"Insufficient GPU memory.*unmapped tensor"),
+        ):
+            proc.process(tensor)
 
-        device_gpu = torch.device("cpu")
-        proc = MoveUnmappedTensorsToGPUProcessor(device_gpu, {id(small_view): small_view})
+        mock_move.assert_not_called()
 
-        from inspect import signature
+    def test_unmapped_processor_moves_when_cuda_free_memory_is_sufficient(self) -> None:
+        """The auto-pin path proceeds when the move-time CUDA guard has room."""
 
-        sig = signature(proc.__init__)
-        budget_kwargs = [n for n in sig.parameters if "budget" in n.lower() or "fraction" in n.lower()]
-        assert budget_kwargs == [], (
-            f"MoveUnmappedTensorsToGPUProcessor.__init__ unexpectedly grew budget kwargs "
-            f"({budget_kwargs!r}); the silent-inflation contract has changed and the "
-            f"safety-net story may now include a hard-failure path — update this test"
-        )
+        tensor = nn.Parameter(torch.zeros(8, dtype=torch.float32))
+        tensor_bytes = tensor.numel() * tensor.element_size()
+        proc = MoveUnmappedTensorsToGPUProcessor(torch.device("cuda:0"), tensor_id_mapping={})
 
-        result = proc.process(big)
-        assert result is not None, "large untimed tensor is auto-pinned without checks"
+        with (
+            patch.object(torch.cuda, "mem_get_info", return_value=(tensor_bytes + 32 * 1024**2, tensor_bytes * 4)),
+            patch.object(proc.move_to_gpu, "process", return_value=tensor) as mock_move,
+        ):
+            result = proc.process(tensor)
+
+        assert result is tensor
+        mock_move.assert_called_once()
+        assert mock_move.call_args.args[0] is tensor
 
     def test_unmapped_bytes_accounting_for_real_gpu_target(self) -> None:
         """When the move target is a real CUDA device, bytes are accounted.
@@ -661,7 +663,7 @@ class TestPauseSuppressedRescue:
       so they survive the intersection.
 
     This test plugs that argument empirically end-to-end: real
-    two-expert MoE, real ``ReachableTensorIdsProcessor`` walk,
+    two-expert MoE, real ``compute_reachable_tensor_ids`` walk,
     real ``TensorStrategyLoader`` rescue. Expert A is the
     paused-only-observed one (no ``layer_stats`` row); expert B is
     timed normally.

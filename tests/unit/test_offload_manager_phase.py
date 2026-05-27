@@ -119,7 +119,7 @@ class DelegatingWrapper(torch.nn.Module):
 class TestMaxGpuMemResolution:
     """Tests that _initialize_tensor_manager passes max_gpu_mem_fraction to TensorManager.
 
-    Budget resolution (fraction → bytes) now happens inside TensorManager._resolve_gpu_budget()
+    Budget resolution (fraction → bytes) now happens inside resolve_gpu_budget()
     at compute time, not at strategy construction time. These tests verify the fraction
     is forwarded correctly to TensorManager.
     """
@@ -138,7 +138,7 @@ class TestMaxGpuMemResolution:
 
         mock_tm.assert_called_once()
         _, kwargs = mock_tm.call_args
-        assert kwargs["max_gpu_mem_fraction"] == 0.8
+        assert kwargs["max_gpu_mem_fraction"] == pytest.approx(0.8)
 
     def test_fraction_none_passed_to_tensor_manager(self):
         """max_gpu_mem_fraction=None (latency mode) is forwarded to TensorManager."""
@@ -185,7 +185,7 @@ class TestMaxGpuMemResolution:
             om._initialize_tensor_manager()
 
         _, kwargs = mock_tm.call_args
-        assert kwargs["max_gpu_mem_fraction"] == 0.5
+        assert kwargs["max_gpu_mem_fraction"] == pytest.approx(0.5)
 
 
 class TestOffloadManagerStateMachine:

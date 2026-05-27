@@ -270,6 +270,25 @@ The GPU has less than 256 MiB free when the strategy runs — typically consumed
 - In vLLM or TRT-LLM, lower GPU memory reservation so FlexTensor has room.
 - Set `max_gpu_mem_fraction=None` to switch to latency mode — this bypasses the memory budget check, but if the GPU genuinely has no free memory, block allocations will still fail with a CUDA OOM.
 
+If you see:
+
+```
+RuntimeError: Insufficient strategy GPU budget after reserving
+strategy-invisible permanent GPU tensors: original_budget=...,
+reserved_strategy_invisible_permanent_gpu=...,
+effective_strategy_budget=..., minimum_required=...
+```
+
+Some tensors that FlexTensor will keep on GPU are absent from the profiled layer
+statistics, so FlexTensor must reserve room for them before choosing a transfer
+strategy. This can happen during block-loader finalization or strategy-loader
+untimed-tensor rescue. The error means the remaining strategy budget is too
+small after that reservation. Reduce other GPU consumers (for example KV cache /
+batch size or competing processes), increase `max_gpu_mem_fraction` when it is
+set too low for the model's required permanent GPU tensors, or adjust
+`include_patterns` so tensors intended for offloading are actually profiled
+instead of left as permanent GPU tensors.
+
 ---
 
 ## Resolve Host Out-of-Memory Errors

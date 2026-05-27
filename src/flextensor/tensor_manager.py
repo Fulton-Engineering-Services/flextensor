@@ -18,6 +18,7 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
+from flextensor.gpu_budget import reserve_strategy_invisible_gpu_budget, resolve_gpu_budget
 from flextensor.helpers import ProfilingSuspender, TrapNestingGuard
 from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
 from flextensor.instrumentation import instrumentable
@@ -74,8 +75,6 @@ from flextensor.types import GPUMemoryUsage
 
 logger = logging.getLogger(__name__)
 
-_GiB = 1 << 30
-_MIN_GPU_BUDGET_BYTES = 256 * 1024**2  # 256 MiB — floor for strategy budget
 
 # =============================================================================
 # Helper Functions
@@ -334,7 +333,7 @@ class TensorManager:
             enable_diagnostics: Whether to log diagnostic information (layer duration statistics,
                 block assignment table) after strategy computation (default: False)
             max_gpu_mem_fraction: Fraction of total GPU memory to use as budget, in (0.0, 1.0].
-                Resolved to bytes at compute time via :meth:`_resolve_gpu_budget`. If None,
+                Resolved to bytes at compute time via :func:`flextensor.gpu_budget.resolve_gpu_budget`. If None,
                 no memory constraint is applied (latency mode). (default: None)
             _direct_mode: Internal debug flag — when False, uses TorchFunctionMode-based
                 traps instead of direct tensor replacement. Significant overhead; kept as
@@ -889,54 +888,6 @@ class TensorManager:
         """
         return self.memory_transfer_stats
 
-    def _resolve_gpu_budget(self) -> int | None:
-        """Resolve GPU memory budget from fraction and current device state.
-
-        Caps the fractional budget by actual available GPU memory to prevent OOM
-        when CUDA context, KV cache, or framework buffers have already consumed memory.
-
-        Available memory is computed as ``free_cuda + (reserved - allocated)``.
-        The ``reserved - allocated`` term accounts for PyTorch allocator cache that
-        CUDA reports as used but is actually reusable (reserved >= allocated is a
-        PyTorch allocator invariant).
-
-        Returns:
-            Budget in bytes (capped by available memory), or None for latency mode.
-
-        Raises:
-            RuntimeError: If available GPU memory < 256 MiB.
-        """
-        if self._max_gpu_mem_fraction is None:
-            return None
-
-        free_cuda, total = torch.cuda.mem_get_info(self.device_gpu)
-        budget = int(total * self._max_gpu_mem_fraction)
-
-        reserved = torch.cuda.memory_reserved(self.device_gpu)
-        allocated = torch.cuda.memory_allocated(self.device_gpu)
-        available = free_cuda + (reserved - allocated)
-
-        if available < _MIN_GPU_BUDGET_BYTES:
-            raise RuntimeError(
-                f"Insufficient free GPU memory: {available / _GiB:.2f} GiB available "
-                f"(free={free_cuda / _GiB:.2f}, reserved={reserved / _GiB:.2f}, "
-                f"allocated={allocated / _GiB:.2f}), "
-                f"minimum required: {_MIN_GPU_BUDGET_BYTES / _GiB:.2f} GiB"
-            )
-
-        if budget > available:
-            logger.warning(
-                "Capping GPU memory budget from %.2f GiB to %.2f GiB "
-                "(available: %.2f GiB free_cuda + %.2f GiB allocator cache)",
-                budget / _GiB,
-                available / _GiB,
-                free_cuda / _GiB,
-                (reserved - allocated) / _GiB,
-            )
-            budget = available
-
-        return budget
-
     def prepare_infer_mode(self):
         """Prepare inference mode from fresh profiling data.
 
@@ -973,8 +924,31 @@ class TensorManager:
                 format_memory_transfer_table(memory_stats),
             )
 
-        max_gpu_mem_bytes = self._resolve_gpu_budget()
-        result = self.tensor_manager_load_strategy.compute(self.stats, memory_stats, max_gpu_mem_bytes)
+        max_gpu_mem_bytes = resolve_gpu_budget(self._max_gpu_mem_fraction, self.device_gpu, logger=logger)
+        budget_reservation = reserve_strategy_invisible_gpu_budget(
+            max_gpu_mem_bytes,
+            model=self.model,
+            loader_type=self.loader_type,
+            device_gpu=self.device_gpu,
+            layer_stats=self.stats,
+            tensors_map=self.tensors_map,
+        )
+        if (
+            self.enable_diagnostics
+            and budget_reservation.reserved_bytes
+            and max_gpu_mem_bytes is not None
+            and budget_reservation.effective_budget is not None
+        ):
+            get_diagnostics_logger().info(
+                "GPU memory reserved for always-resident tensors: %.2f MiB (%d tensor(s)). "
+                "Strategy budget: %.2f MiB -> %.2f MiB.",
+                budget_reservation.reserved_bytes / 1024**2,
+                budget_reservation.reserved_count,
+                max_gpu_mem_bytes / 1024**2,
+                budget_reservation.effective_budget / 1024**2,
+            )
+        strategy_gpu_budget = budget_reservation.effective_budget
+        result = self.tensor_manager_load_strategy.compute(self.stats, memory_stats, strategy_gpu_budget)
         load_strategy = remove_layers_compound(result.strategy_map, self.stats, self.remove_layers_operations)
         self.traps_duration_ms = _compute_duration(self.stats)
         self.load_strategy = load_strategy

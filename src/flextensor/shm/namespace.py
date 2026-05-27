@@ -11,8 +11,8 @@ import pathlib
 from typing import Any
 
 from flextensor.config import OffloadConfig  # noqa: TC001
+from flextensor.gpu_budget import resolve_gpu_mem_bytes
 from flextensor.offload_manager import DEFAULT_MANAGER_NAME
-from flextensor.utils import resolve_gpu_mem_bytes
 
 SHM_PROTOCOL_VERSION: int = 2
 """Bumped when SHM data layout changes in incompatible ways.

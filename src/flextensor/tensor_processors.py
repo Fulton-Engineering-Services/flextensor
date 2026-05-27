@@ -15,6 +15,7 @@ from flextensor.instrumentation import instrumentable
 from flextensor.utils import calculate_tensor_size
 
 LOGGER = logging.getLogger(__name__)
+_UNMAPPED_GPU_MOVE_SAFETY_BYTES = 16 * 1024**2
 
 # ---------------------------------------------------------------------------
 # Utilities
@@ -581,7 +582,7 @@ class MoveUnmappedTensorsToGPUProcessor(TensorProcessor):
     def __init__(self, device_gpu, tensor_id_mapping):
         super().__init__()
         self.tensor_id_mapping = tensor_id_mapping
-        self.device_gpu = device_gpu
+        self.device_gpu = torch.device(device_gpu)
         self.move_to_gpu = MoveToGPUTensorProcessor(device_gpu, process_inner_fields=False)
         self.cache = {}
         self.unmapped_gpu_bytes = 0
@@ -594,6 +595,26 @@ class MoveUnmappedTensorsToGPUProcessor(TensorProcessor):
         self.cache = {}
         self.move_to_gpu.cleanup()
 
+    def _guard_unmapped_cuda_move(self, src: torch.Tensor) -> None:
+        if self.device_gpu.type != "cuda":
+            return
+        if src.device.type == "cuda" and src.device == self.device_gpu:
+            return
+
+        tensor_bytes = src.numel() * src.element_size()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(self.device_gpu)
+        required_bytes = tensor_bytes + _UNMAPPED_GPU_MOVE_SAFETY_BYTES
+        if free_bytes >= required_bytes:
+            return
+
+        raise RuntimeError(
+            "Insufficient GPU memory for unmapped tensor move: "
+            f"tensor={tensor_bytes} bytes, free={free_bytes} bytes, "
+            f"total={total_bytes} bytes, safety_margin={_UNMAPPED_GPU_MOVE_SAFETY_BYTES} bytes, "
+            f"device={self.device_gpu}. "
+            "FlexTensor cannot finalize this model without exceeding available CUDA memory."
+        )
+
     def process(self, src):
         if not isinstance(src, torch.Tensor) or src.is_meta:
             return src
@@ -605,6 +626,7 @@ class MoveUnmappedTensorsToGPUProcessor(TensorProcessor):
         if src_tensor_id in self.tensor_id_mapping:
             new_tensor = self.tensor_id_mapping[src_tensor_id]
         else:
+            self._guard_unmapped_cuda_move(src)
             new_tensor = self.move_to_gpu.process(src)
             # Track GPU memory used by unmapped tensors
             if new_tensor.device.type == "cuda":
@@ -723,35 +745,41 @@ class TensorMappingProcessor(TensorProcessor):
 
 
 @instrumentable
-class ReachableTensorIdsProcessor(TensorProcessor):
-    """Collect ``id(tensor)`` for every tensor reachable from a model.
+class ReachableTensorMapProcessor(TensorProcessor):
+    """Collect every tensor reachable from a model, keyed by ``id(tensor)``.
 
     Read-only walk over an ``nn.Module`` (parameters, buffers, attributes,
-    submodules) or a ``dict`` model, plus tensor inner fields (e.g. the
-    ``scale`` attribute on a quantised ``nn.Parameter``). Skips meta
+    submodules) or an ``items()``-based model container, plus tensor inner
+    fields (e.g. the ``scale`` attribute on a quantised ``nn.Parameter``). Skips meta
     tensors — their ``id()`` doesn't correspond to a real allocation, so
     they aren't useful as a narrowing input.
 
-    Used by :class:`flextensor.loaders.TensorStrategyLoader` to narrow its
-    untimed-traced rescue
-    (:func:`flextensor.loaders._compute_untimed_traced_preload`) to
-    tensors the live model can still reach. Anything in ``tensors_map``
-    outside this set is treated as suspicious — likely a stale ``id()``
-    or a non-model tensor — and excluded from auto-pinning.
-
-    Inherits the full :class:`TensorProcessor` traversal, so it covers the
-    same surface area as the other read-only collectors
-    (:class:`TensorMappingProcessor`, :class:`BenchmarkTensorProcessor`).
-    The convenience wrapper :func:`compute_reachable_tensor_ids` is the
-    typical entry point for callers that just want the resulting set.
+    Uses the full :class:`TensorProcessor` traversal, so it covers the same
+    surface area as the other read-only collectors (:class:`TensorMappingProcessor`,
+    :class:`BenchmarkTensorProcessor`). The convenience wrapper
+    :func:`compute_reachable_tensor_map` is the typical entry point for callers
+    that need the tensor objects.
     """
 
     def __init__(self) -> None:
         super().__init__(update_attributes=False)
-        self.reachable_ids: set[int] = set()
+        self.reachable_tensors: dict[int, torch.Tensor] = {}
 
-    def get_results(self) -> set[int]:
-        return self.reachable_ids
+    def apply(self, model: object) -> None:
+        # ``ModelDict`` is intentionally not imported here: tensor_manager
+        # imports this module, so support the wrapper structurally via items().
+        self._visited = set()
+        self._skipped_visited_modules = []
+        if _has_items(model) and not isinstance(model, torch.nn.Module):
+            self._process_items_container(model)
+        else:
+            self._process_module(model, "model")
+        self._log_skipped_visited_modules()
+        self.cleanup()
+
+    def _process_items_container(self, model: object) -> None:
+        for _key, value in model.items():  # type: ignore[attr-defined]
+            self.process(value)
 
     def map_inner_fields(self, src: torch.Tensor) -> None:
         ref_tensor_fields = set(dir(src))
@@ -763,27 +791,49 @@ class ReachableTensorIdsProcessor(TensorProcessor):
             if isinstance(field, torch.Tensor):
                 self.process(field)
 
-    def process(self, src):
+    def process(self, src: Any) -> Any:
         if not isinstance(src, torch.Tensor) or src.is_meta:
             return src
-        self.reachable_ids.add(id(src))
+        tensor_id = id(src)
+        if tensor_id in self.reachable_tensors:
+            return src
+        self.reachable_tensors[tensor_id] = src
         self.map_inner_fields(src)
         return src
 
+    def get_results(self) -> dict[int, torch.Tensor]:
+        return self.reachable_tensors
 
-def compute_reachable_tensor_ids(model) -> set[int]:
-    """Convenience wrapper around :class:`ReachableTensorIdsProcessor`.
 
-    Returns the set of tensor IDs reachable from ``model``. ``None`` is
-    accepted and yields an empty set so callers can use this as a
-    narrowing input to :class:`~flextensor.loaders.TensorStrategyLoader`
-    without an extra ``None`` check.
+def compute_reachable_tensor_map(model: object | None) -> dict[int, torch.Tensor]:
+    """Convenience wrapper around :class:`ReachableTensorMapProcessor`.
+
+    Returns the tensors reachable from ``model``, keyed by ``id(tensor)``.
+    ``None`` and unsupported model containers yield an empty mapping.
     """
-    if model is None:
-        return set()
-    collector = ReachableTensorIdsProcessor()
+    if model is None or not _is_reachable_tensor_container(model):
+        return {}
+    collector = ReachableTensorMapProcessor()
     collector.apply(model)
     return collector.get_results()
+
+
+def compute_reachable_tensor_ids(model: object | None) -> set[int]:
+    """Return IDs for tensors reachable from ``model``.
+
+    ``None`` and unsupported model containers yield an empty set so callers
+    can use this as a narrowing input to
+    :class:`~flextensor.loaders.TensorStrategyLoader` without an extra check.
+    """
+    return set(compute_reachable_tensor_map(model))
+
+
+def _has_items(model: object) -> bool:
+    return callable(getattr(model, "items", None))
+
+
+def _is_reachable_tensor_container(model: object) -> bool:
+    return isinstance(model, torch.nn.Module) or _has_items(model)
 
 
 @instrumentable
