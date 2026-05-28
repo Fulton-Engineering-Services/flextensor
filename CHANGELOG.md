@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Avoid raw CUDA OOM during inference setup by budgeting for available GPU
   memory and permanent GPU tensors before finalizing offloaded models.
+- Better direct-offload support for custom kernels and cross-layer parameter getters.
 
 ## [0.2.1] — 2026-05-19
 

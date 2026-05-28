@@ -48,23 +48,24 @@ The discovery phase identifies the relationship between modules and their parame
 ### What Happens Internally
 
 1. **Model Preprocessing**: Parameters are moved to CPU and optionally pinned in memory for faster transfers
-2. **Tensor Tracking**: Each tensor operation is intercepted via `WarmupTrap`
-3. **On-Demand Transfer**: When a module needs a weight, it's copied to GPU, used, then released
+2. **Tensor Tracking**: FlexTensor records which tensor IDs are associated with each trap
+3. **Temporary Materialization**: When a trap needs a weight, it's copied to GPU, used, then released
 4. **Statistics Collection**: The system records which tensor IDs are accessed by each trap
 
 ### Internal Mechanics
 
-During discovery, the `WarmupTrap` context manager:
+During discovery, FlexTensor uses one of two warmup traps:
 
-- Intercepts all PyTorch operations via `__torch_function__`
-- Tracks tensor IDs used in each operation
-- Copies weights to GPU on-demand when needed for computation
-- Collects parameter-to-trap mapping data
+- `WarmupTrapDirect` is the default path for normal `nn.Module` offload with forward-patched modules. It starts from the tensors owned by the active trap, materializes them for the duration of the trap, and records direct getter access plus any tensor IDs seen through `__torch_function__`.
+- `WarmupTrap` is the indirect fallback for trace/debug/manual paths. It intercepts PyTorch operations via `__torch_function__`, copies traced CPU tensors to GPU on demand, and records tensor IDs used in each operation.
+
+Direct discovery also temporarily rebinds raw parameter storage to the active materialized tensor. This covers custom kernels or Python call sites that read `self.weight` directly instead of entering `__torch_function__`; original storage is restored when the trap exits.
 
 ```python
 # Internal flow during discovery (simplified)
-with WarmupTrap(tensor_manager, layer_name, device_gpu):
-    # Tensors are copied to GPU as needed
+with WarmupTrapDirect(tensor_manager, layer_name, device_gpu):
+    # Known trap tensors are materialized for this block
+    # Raw parameter access sees active storage while the block runs
     # Tensor IDs are recorded
     # (No per-iteration timing — durations are measured in the Profiling phase)
     output = layer(input)
@@ -116,7 +117,8 @@ The profiling phase uses either `Trap` (indirect mode) or `TrapDirect` (direct m
 
 **Direct Mode (`TrapDirect`)**:
 - Uses regular context managers without function interception
-- Model is pre-patched to use GPU tensor references directly
+- Model is pre-patched to route parameter access through direct getters
+- Raw parameter storage is temporarily rebound to the active materialized tensor while the trap runs
 - Lower overhead, suitable for most transformer architectures
 
 ```python
@@ -313,7 +315,7 @@ When profiling is suspended, the effect on the iteration counter depends on the 
 
 | Phase | Recording | Iteration counter | Rationale |
 |-------|-----------|-------------------|-----------|
-| Discovery | N/A | **Still advances** | DISCOVERY uses `WarmupTrap` → `record_tensors()`, which never consults suspension — the tensor-to-layer mapping is a hard prerequisite for every later phase. The counter advances because each pass contributes valid tensor mapping. |
+| Discovery | N/A | **Still advances** | DISCOVERY uses warmup traps → `record_tensors()`, which never consults suspension — the tensor-to-layer mapping is a hard prerequisite for every later phase. The counter advances because each pass contributes valid tensor mapping. |
 | Profiling | Fully suppressed | **Paused** | Core protection — `TensorManager.record_all()` is a complete no-op while suspended (skips both tensor IDs and durations), so paused passes contribute nothing to per-layer statistics. The counter is paused so suppressed passes don't consume `profiling_iters` budget. |
 | Inference | N/A | N/A | `update_state()` already returns early. No recording or counting. |
 
@@ -390,7 +392,7 @@ For practical guidance on avoiding mistakes related to these behaviors, see [Tro
 
 | Phase | Purpose | Internal Trap Class | Key Output |
 |-------|---------|---------------------|------------|
-| Discovery | Discover parameter-to-trap relationships | `WarmupTrap` | Parameter ID mapping |
+| Discovery | Discover parameter-to-trap relationships | `WarmupTrapDirect` / `WarmupTrap` | Parameter ID mapping |
 | Profiling | Measure per-trap execution timing | `Trap` / `TrapDirect` | Per-trap statistics |
 | Inference | Apply optimized strategy | `TrapInfer` / `TrapInferDirect` | Production execution |
 

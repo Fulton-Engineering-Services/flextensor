@@ -84,7 +84,7 @@ Internal trap classes by phase:
 
 | Phase | Indirect mode | Direct mode |
 |-------|---------------|-------------|
-| Discovery | `WarmupTrap` | `WarmupTrap` |
+| Discovery | `WarmupTrap` | `WarmupTrapDirect` |
 | Profiling | `Trap` | `TrapDirect` |
 | Inference | `TrapInfer` | `TrapInferDirect` |
 
@@ -124,9 +124,11 @@ pre-fetching. Sometimes called "gap layer" in code identifiers — see the
 
 ### Direct Mode
 
-Trap implementation (used during profiling and inference phases) that patches model
-parameters in-place so the module's `forward` uses GPU tensor references directly.
-Lower overhead than indirect mode.
+Trap implementation that routes parameter access through materialized tensors
+without per-operation dispatch interception. During discovery and profiling, raw
+parameter storage can be temporarily rebound to the active materialized tensor;
+during inference, the prepared model uses direct getters or block-backed tensor
+views. Lower overhead than indirect mode.
 
 ### Indirect Mode
 
@@ -149,8 +151,9 @@ See: [Internal Phases](../explanation/phases.md)
 ### Discovery Phase
 
 First active phase. Runs for `discovery_iters` iterations. Discovers which parameters
-belong to which traps by intercepting PyTorch operations via `WarmupTrap`. Also
-referred to as the "parameter discovery phase."
+belong to which traps via direct module ownership, direct getter access, or
+`WarmupTrap` operation interception depending on mode. Also referred to as the
+"parameter discovery phase."
 
 ### Profiling Phase
 

@@ -5,7 +5,7 @@
 
 *[assignment strategy]: Algorithm that maps weights to memory blocks for pipelined transfer (e.g., StrictRoundRobinAssignment).
 *[auto trap]: Synonym for forward patching — FlexTensor automatically wraps matched modules' forward methods.
-*[direct mode]: Trap implementation that patches model parameters in-place instead of intercepting PyTorch operations at dispatch time. Lower overhead than indirect mode.
+*[direct mode]: Trap implementation that routes parameter access through materialized tensors instead of intercepting every PyTorch operation at dispatch time. Lower overhead than indirect mode.
 *[forward patching]: The mechanism where offload() replaces a module's forward method with a wrapper that manages weight transfers. Also called "auto trap."
 *[gap trap]: A trap whose module contains no offloadable weights. Gap traps extend the transfer window for neighboring traps.
 *[indirect mode]: Trap implementation that intercepts PyTorch operations via __torch_function__ to replace CPU tensors with GPU copies on the fly. More flexible than direct mode but higher overhead.
@@ -26,4 +26,4 @@
 *[transfer mode]: The mechanism for physically moving weights between CPU and GPU (strategy, allocation_block_transfer, or raw_block_transfer).
 *[transfer window]: The time available to pre-fetch the next trap's weights while the current trap's module executes on GPU.
 *[trap]: A context manager that wraps a module's forward pass to manage weight loading, timing, and release for that module.
-*[discovery phase]: First active phase — discovers which parameters belong to which traps by intercepting PyTorch operations.
+*[discovery phase]: First active phase — discovers which parameters belong to which traps through module ownership, direct getter access, or PyTorch operation interception.

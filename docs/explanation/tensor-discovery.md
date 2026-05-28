@@ -8,7 +8,7 @@ This document explains how FlexTensor discovers tensors that aren't traced throu
 
 ## The Problem: Untraced Tensors
 
-During the discovery phase, FlexTensor intercepts PyTorch operations via `__torch_function__` to build a map of which tensors belong to which layers. This works well for standard PyTorch operations, but some tensors slip through:
+During the discovery phase, FlexTensor builds a map of which tensors belong to which layers. In indirect paths it does this by intercepting PyTorch operations via `__torch_function__`. In the default direct path, forward-patched modules also provide a structural mapping from trap labels to owned tensors, and FlexTensor materializes those tensors while the trap executes. Some tensors can still slip through:
 
 ### Why Some Tensors Go Untraced
 
@@ -19,6 +19,16 @@ During the discovery phase, FlexTensor intercepts PyTorch operations via `__torc
 3. **Lazy tensor access**: Parameters that are only accessed under certain conditions during inference but not during discovery.
 
 The consequence: if FlexTensor doesn't know a tensor belongs to a layer, it can't offload it properly. The tensor either stays on GPU (wasting memory) or gets offloaded incorrectly (causing errors).
+
+Direct warmup/profile also handle the common raw-parameter case by temporarily pointing the original parameter storage at the active materialized tensor. That covers code that reads `self.weight` directly. It does not remove the need for discovery: FlexTensor still has to know which tensor IDs to materialize for each trap.
+
+For custom kernels and fused backends such as vLLM MoE, the supported shape is:
+
+1. Wrap the module that owns the kernel weights with forward patching (`offload()` plus matching `include_patterns`).
+2. Launch the custom kernel from inside that patched module's `forward`.
+3. Pass weights by reading module parameters while the trap is active, for example `self.weight`, `self.w13_weight`, or `self.w2_weight`.
+
+In that shape, direct warmup/profile materialize the raw parameter storage before the kernel launch, so the backend sees active GPU storage even if the kernel bypasses PyTorch dispatch. Manual `offload_block()` can work, but it relies on ModuleTracker or prefix matching rather than the direct forward-patched ownership path, so it is less robust for unconventional MoE parameter layouts. Avoid caching original CPU tensor or `Parameter` objects before `offload()` and using those cached references later; FlexTensor cannot rewrite opaque external pointers that never go through module ownership, direct getters, or discovery.
 
 ### Example: FP8 Weight Scales
 
@@ -254,8 +264,9 @@ Tensor discovery happens at a specific point in the discovery → profiling tran
 
 ```
 DISCOVERY PHASE
-├── WarmupTrap intercepts operations
-├── Traced tensors recorded via __torch_function__
+├── WarmupTrapDirect materializes known trap tensors in direct mode
+├── WarmupTrap records operation-level tensor IDs in indirect mode
+├── Traced tensors recorded via direct getters and __torch_function__
 ├── ModuleTracker records module → trap mapping (Strategy 2)
 └── Discovery complete
 

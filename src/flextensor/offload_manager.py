@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import functools
-import gc
 import logging
 import os
 import threading
@@ -24,12 +23,9 @@ from proxytypes3 import ObjectWrapper
 from torch import nn
 from torch.utils.hooks import RemovableHandle  # noqa: TC002 — beartype on @decorated __init__ evaluates this at runtime
 
-try:
-    import torch._dynamo as _dynamo
-except ImportError:  # pragma: no cover - torch built without dynamo
-    _dynamo = None  # type: ignore[assignment]
-
 from flextensor.benchmark_tensor_mode import PreloadToDevice
+from flextensor.compiler_hooks import disable as _compiler_disable
+from flextensor.compiler_hooks import find_torch_compile_wrapper
 from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
@@ -385,41 +381,6 @@ DEFAULT_MANAGER_NAME: str = "default"
 # Global singleton map for OffloadManager instances
 OFFLOAD_MANAGER_MAP = {}
 _MANAGER_MAP_LOCK = threading.Lock()
-
-
-def _find_optimized_module_wrapping(target: object) -> object | None:
-    """Return any ``torch._dynamo.eval_frame.OptimizedModule`` whose
-    ``_orig_mod`` is ``target``, or ``None`` if no compile wrapper has been
-    built around it.
-
-    Used by ``OffloadManager._transition_to_*`` to detect the documented
-    "torch.compile(proxy) does not survive a phase transition" failure mode:
-    ``OptimizedModule`` caches per-graph state against the proxy at
-    construction time; a subsequent transition swaps the proxy's
-    ``__subject__`` and the cached graph silently desyncs.
-
-    Implementation: walks ``gc.get_objects()`` rather than
-    ``gc.get_referrers(target)`` because ``OptimizedModule`` references
-    ``target`` indirectly through its ``_modules`` dict, which the referrer
-    graph does not surface in a single hop.  Phase transitions are rare, so
-    the linear scan cost is acceptable.
-    """
-    if _dynamo is None:
-        return None
-    eval_frame = getattr(_dynamo, "eval_frame", None)
-    optimized_cls = getattr(eval_frame, "OptimizedModule", None) if eval_frame is not None else None
-    if optimized_cls is None:
-        return None
-    for obj in gc.get_objects():
-        if type(obj) is not optimized_cls:
-            continue
-        try:
-            orig = obj._orig_mod  # noqa: SLF001 — Dynamo's OptimizedModule exposes the wrapped module here
-        except Exception:  # noqa: S112 — Dynamo internals may raise on partial init; skip those objects
-            continue
-        if orig is target:
-            return obj
-    return None
 
 
 def _safe_remove_hook_handle(handle: RemovableHandle, *, context: str) -> None:
@@ -821,7 +782,7 @@ class OffloadManager:
         """
         if self._model_proxy is None:
             return
-        wrapper = _find_optimized_module_wrapping(self._model_proxy)
+        wrapper = find_torch_compile_wrapper(self._model_proxy)
         if wrapper is None:
             return
         warnings.warn(
@@ -1023,10 +984,10 @@ class OffloadManager:
         return self._model_proxy
 
     def _install_state_update_hook(self) -> None:
-        """Register a Dynamo-disabled forward hook on ``self._model`` that
+        """Register a compiler-disabled forward hook on ``self._model`` that
         advances phase state.
 
-        ``@torch._dynamo.disable`` makes Dynamo emit a graph break at the hook's
+        ``compiler_hooks.disable`` makes ``torch.compile`` emit a graph break at the hook's
         call-site and run the body eagerly, so ``update_state`` fires reliably
         even when ``OptimizedModule`` bypasses ``OffloadModelProxy.__call__``
         under ``torch.compile(proxy)``.
@@ -1048,14 +1009,9 @@ class OffloadManager:
 
         om = self
 
-        # ``@_dynamo.disable`` causes Dynamo to emit a graph break at this
-        # hook's call-site and run the body eagerly.  On a torch build
-        # without Dynamo (``_dynamo is None``) the decorator is a no-op;
-        # the hook body still runs correctly in the eager interpreter
-        # because ``torch.compile`` also cannot be used in that setting.
-        dynamo_disable = _dynamo.disable if _dynamo is not None else (lambda f: f)
-
-        @dynamo_disable
+        # Keep the hook eager under torch.compile; on builds without the
+        # public compiler API, the decorator is a no-op.
+        @_compiler_disable
         def _update_state_hook(_module: nn.Module, _inputs: Any, _output: Any) -> None:
             om.update_state()
 

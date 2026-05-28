@@ -9,6 +9,8 @@ from collections.abc import Callable, Mapping
 import torch
 
 from flextensor.allocation_block import AllocationBlock, AllocationManager
+from flextensor.compiler_hooks import disable as _compiler_disable
+from flextensor.compiler_hooks import is_compiling as _is_compiling
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.strategy_operations import find_transfers_for_preload
@@ -168,6 +170,195 @@ class Loader(ABC):
         return None
 
 
+class _RawTensorDataBinder:
+    """Temporarily point original tensor objects at active materialized storage."""
+
+    def __init__(self, tensors_map: Mapping[int, torch.Tensor]) -> None:
+        self.tensors_map = tensors_map
+        self._original_data: dict[int, torch.Tensor] = {}
+        self._shared_storage_ids = self._find_shared_storage_ids(tensors_map)
+
+    @staticmethod
+    def _storage_key(tensor: torch.Tensor) -> tuple[str, int]:
+        return (str(tensor.device), tensor.untyped_storage().data_ptr())
+
+    @classmethod
+    def _find_shared_storage_ids(cls, tensors_map: Mapping[int, torch.Tensor]) -> dict[int, set[int]]:
+        storage_to_ids: dict[tuple[str, int], set[int]] = {}
+        for tensor_id, tensor in tensors_map.items():
+            storage_to_ids.setdefault(cls._storage_key(tensor), set()).add(tensor_id)
+
+        shared_storage_ids: dict[int, set[int]] = {}
+        for tensor_ids in storage_to_ids.values():
+            if len(tensor_ids) <= 1:
+                continue
+            for tensor_id in tensor_ids:
+                shared_storage_ids[tensor_id] = set(tensor_ids)
+        return shared_storage_ids
+
+    def _validate_bind(self, tensor_id: int, tensor: torch.Tensor, active_tensor: torch.Tensor) -> None:
+        shared_ids = self._shared_storage_ids.get(tensor_id)
+        if shared_ids is not None:
+            msg = (
+                f"Cannot bind tensor id {tensor_id}; managed tensor ids {sorted(shared_ids)} share storage. "
+                "Shared-storage parameters are not supported by raw materialization."
+            )
+            raise RuntimeError(msg)
+
+        if active_tensor.layout != tensor.layout:
+            msg = f"Materialized tensor layout {active_tensor.layout} does not match original layout {tensor.layout}."
+            raise RuntimeError(msg)
+        if active_tensor.dtype != tensor.dtype:
+            msg = f"Materialized tensor dtype {active_tensor.dtype} does not match original dtype {tensor.dtype}."
+            raise RuntimeError(msg)
+        if active_tensor.shape != tensor.shape:
+            msg = f"Materialized tensor shape {active_tensor.shape} does not match original shape {tensor.shape}."
+            raise RuntimeError(msg)
+        if active_tensor.stride() != tensor.stride():
+            active_stride = active_tensor.stride()
+            original_stride = tensor.stride()
+            msg = f"Materialized tensor stride {active_stride} does not match original stride {original_stride}."
+            raise RuntimeError(msg)
+
+    @_compiler_disable
+    def bind(self, tensor_id: int, active_tensor: torch.Tensor | None) -> None:
+        tensor = self.tensors_map.get(tensor_id)
+        if tensor is None or active_tensor is None or tensor_id in self._original_data:
+            return
+        self._validate_bind(tensor_id, tensor, active_tensor)
+        with torch.no_grad():
+            self._original_data[tensor_id] = tensor.data
+            tensor.data = active_tensor
+
+    @_compiler_disable
+    def restore(self, tensor_ids: set[int]) -> None:
+        for tensor_id in tensor_ids:
+            original_data = self._original_data.pop(tensor_id, None)
+            tensor = self.tensors_map.get(tensor_id)
+            if tensor is not None and original_data is not None:
+                with torch.no_grad():
+                    tensor.data = original_data
+
+    @_compiler_disable
+    def restore_all(self) -> None:
+        self.restore(set(self._original_data))
+
+
+@instrumentable
+class WarmupDirectTensorLoader(Loader):
+    """Per-trap tensor loader for direct-mode discovery.
+
+    Discovery normally records tensor IDs without building a full offload
+    strategy yet. Direct-mode models still need a loader so attribute access
+    sites that bypass torch dispatch, such as Triton custom kernels, see a
+    materialized tensor while the current trap is executing.
+    """
+
+    def __init__(
+        self,
+        label_to_tensor_ids: dict[str, set[int]],
+        tensors_map: Mapping[int, torch.Tensor],
+        device_gpu: torch.device,
+    ) -> None:
+        self.label_to_tensor_ids = label_to_tensor_ids
+        self.tensors_map = tensors_map
+        self.device_gpu = device_gpu
+        self.cpu_to_gpu_map: dict[int, torch.Tensor] = {}
+        self._active_counts: dict[int, int] = {}
+        self._active_labels: list[str] = []
+        self._borrowed_by_label: dict[str, set[int]] = {}
+        self._accessed_by_label: dict[str, set[int]] = {}
+        self._data_binder = _RawTensorDataBinder(tensors_map)
+
+    def get_label_tensor_ids(self, label: str) -> set[int]:
+        """Return the tensor IDs that belong to *label*."""
+        return set(self.label_to_tensor_ids.get(label, set()))
+
+    def get_accessed_tensor_ids(self, label: str) -> set[int]:
+        """Return tensor IDs read through direct getters while *label* was active."""
+        return set(self._accessed_by_label.get(label, set()))
+
+    @property
+    def _active_label(self) -> str | None:
+        return self._active_labels[-1] if self._active_labels else None
+
+    def _retain_tensor(self, tensor_id: int) -> torch.Tensor | None:
+        tensor = self.tensors_map.get(tensor_id)
+        if tensor is None:
+            return None
+
+        count = self._active_counts.get(tensor_id, 0)
+        if count:
+            self._active_counts[tensor_id] = count + 1
+            return self.cpu_to_gpu_map[tensor_id]
+
+        active_tensor = tensor.to(device=self.device_gpu, copy=True)
+        # Custom kernels may read the original Parameter object directly
+        # instead of going through direct-mode property getters.
+        if not _is_compiling():
+            self._data_binder.bind(tensor_id, active_tensor)
+        self.cpu_to_gpu_map[tensor_id] = active_tensor
+        self._active_counts[tensor_id] = 1
+        return active_tensor
+
+    def _release_tensor(self, tensor_id: int) -> None:
+        count = self._active_counts.get(tensor_id, 0)
+        if count <= 0:
+            return
+        if count > 1:
+            self._active_counts[tensor_id] = count - 1
+            return
+
+        self._active_counts.pop(tensor_id, None)
+        if not _is_compiling():
+            self._data_binder.restore({tensor_id})
+        self.cpu_to_gpu_map.pop(tensor_id, None)
+
+    def enter(self, label: str) -> None:
+        """Materialize every tensor owned by the active discovery trap."""
+        self._active_labels.append(label)
+        tensor_ids = self.get_label_tensor_ids(label)
+
+        for tensor_id in tensor_ids:
+            self._retain_tensor(tensor_id)
+
+    def exit(self, label: str) -> None:
+        """Release tensors materialized for *label*."""
+        tensor_ids = self.get_label_tensor_ids(label) | self._borrowed_by_label.pop(label, set())
+        if self.device_gpu.type == "cuda" and tensor_ids:
+            torch.cuda.synchronize(self.device_gpu)
+        for tensor_id in tensor_ids:
+            self._release_tensor(tensor_id)
+
+        self._accessed_by_label.pop(label, None)
+        if self._active_labels and self._active_labels[-1] == label:
+            self._active_labels.pop()
+        elif label in self._active_labels:
+            self._active_labels.remove(label)
+
+    def get(self, tensor_id: int) -> torch.Tensor | None:
+        """Return the materialized tensor for *tensor_id*, when active."""
+        active_label = self._active_label
+        if active_label is not None:
+            self._accessed_by_label.setdefault(active_label, set()).add(tensor_id)
+            if tensor_id not in self.cpu_to_gpu_map and tensor_id in self.tensors_map:
+                self._borrowed_by_label.setdefault(active_label, set()).add(tensor_id)
+                return self._retain_tensor(tensor_id)
+        return self.cpu_to_gpu_map.get(tensor_id)
+
+    def release_memory(self) -> None:
+        """Release any tensors left materialized by an interrupted warmup."""
+        if self.device_gpu.type == "cuda" and self.cpu_to_gpu_map:
+            torch.cuda.synchronize(self.device_gpu)
+        if not _is_compiling():
+            self._data_binder.restore_all()
+        self.cpu_to_gpu_map.clear()
+        self._active_counts.clear()
+        self._active_labels.clear()
+        self._borrowed_by_label.clear()
+        self._accessed_by_label.clear()
+
+
 @instrumentable
 class TensorLayerLoader(Loader):
     """
@@ -189,50 +380,60 @@ class TensorLayerLoader(Loader):
     ) -> None:
         self.layer_stats = layer_stats
         self.tensors_map = tensors_map
-        self.layer_stats_map = {}
-        self.load_time_ms = 0
+        self.layer_stats_map: dict[str, list[int]] = {}
+        self.load_time_ms = 0.0
         for statistics in layer_stats:
-            stats_list = []
+            stats_list: list[int] = []
             if statistics.label in self.layer_stats_map:
                 stats_list = self.layer_stats_map[statistics.label]
             stats_list.extend(statistics.tensor_ids)
             self.layer_stats_map[statistics.label] = stats_list
-        self.loaded = []
+        self.loaded: list[torch.Tensor] = []
         self.device_gpu = device_gpu
-        self.cpu_to_gpu_map = {}
+        self.cpu_to_gpu_map: dict[int, torch.Tensor] = {}
+        self._active_counts: dict[int, int] = {}
         self.del_tensor = delete_tensor_func
+        self._data_binder = _RawTensorDataBinder(tensors_map)
 
-        self.model_ids = set()
+        self.model_ids: set[int] = set()
 
-    def set_model_ids(self, tensor_ids):
+    def set_model_ids(self, tensor_ids: set[int]) -> None:
         self.model_ids = tensor_ids
+
+    def get_label_tensor_ids(self, label: str) -> set[int]:
+        """Return unique tensor IDs associated with *label*."""
+        return set(self.layer_stats_map.get(label, []))
 
     def enter(self, label: str) -> None:
         """Load tensors for the specified layer."""
         start_time_ns = time.time_ns()
-        tensor_ids_list: list[int] = []
-        if label in self.layer_stats_map:
-            tensor_ids_list = self.layer_stats_map[label]
+        tensor_ids_list = self.layer_stats_map.get(label, [])
         # TODO: after consolidating stats, remove unique_tensor_ids
         unique_tensor_ids = set()
         for tensor_id in tensor_ids_list:
             if tensor_id in unique_tensor_ids:
                 continue
             unique_tensor_ids.add(tensor_id)
+
+            count = self._active_counts.get(tensor_id, 0)
+            if count:
+                self._active_counts[tensor_id] = count + 1
+                continue
+
             tensor = self.tensors_map[tensor_id]
             if tensor.device != self.device_gpu:
                 gpu_tensor = tensor.to(device=self.device_gpu, copy=True)
+                if not _is_compiling():
+                    self._data_binder.bind(tensor_id, gpu_tensor)
                 self.cpu_to_gpu_map[tensor_id] = gpu_tensor
-        torch.cuda.synchronize()
+                self._active_counts[tensor_id] = 1
         end_time_ns = time.time_ns()
         duration_ms = (end_time_ns - start_time_ns) / 1e6
         self.load_time_ms += duration_ms
 
     def exit(self, label: str) -> None:
         """Release tensors for the specified layer."""
-        tensor_ids_list = []
-        if label in self.layer_stats_map:
-            tensor_ids_list = self.layer_stats_map[label]
+        tensor_ids_list = self.layer_stats_map.get(label, [])
         # TODO: after consolidating stats, remove unique_tensor_ids
         unique_tensor_ids = set()
         for tensor_id in tensor_ids_list:
@@ -240,7 +441,19 @@ class TensorLayerLoader(Loader):
                 continue
             unique_tensor_ids.add(tensor_id)
 
-            gpu_tensor = self.cpu_to_gpu_map[tensor_id]
+            count = self._active_counts.get(tensor_id, 0)
+            if count <= 0:
+                continue
+            if count > 1:
+                self._active_counts[tensor_id] = count - 1
+                continue
+
+            self._active_counts.pop(tensor_id, None)
+            if not _is_compiling():
+                self._data_binder.restore({tensor_id})
+            gpu_tensor = self.cpu_to_gpu_map.get(tensor_id)
+            if gpu_tensor is None:
+                continue
             if tensor_id in self.model_ids:
                 self.del_tensor(gpu_tensor)
             else:
@@ -256,6 +469,13 @@ class TensorLayerLoader(Loader):
 
     def release_memory(self) -> None:
         """Release memory (placeholder implementation)."""
+        if not _is_compiling():
+            self._data_binder.restore_all()
+        for tensor_id, gpu_tensor in list(self.cpu_to_gpu_map.items()):
+            if tensor_id in self.model_ids:
+                self.del_tensor(gpu_tensor)
+            del self.cpu_to_gpu_map[tensor_id]
+        self._active_counts.clear()
 
 
 @instrumentable
@@ -887,6 +1107,7 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
     def prepare(self) -> None:
         self.preload()
 
+    @_compiler_disable
     def enter(self, label):
         if label == self.first_layer_label:
             # Safety net: a previous iteration that aborted before reaching
@@ -928,6 +1149,7 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         event = self.transfer_stream.record_event()
         self.scheduled_transfers[label] = event
 
+    @_compiler_disable
     def exit(self, label):
         if label in self.scheduled_transfers:
             event = self.scheduled_transfers[label]
@@ -1009,6 +1231,7 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
     def prepare(self) -> None:
         self.preload()
 
+    @_compiler_disable
     def enter(self, label):
         if label == self.first_layer_label:
             # Safety net: see PreallocatedBatchTransferTensorLoader.enter for
@@ -1052,6 +1275,7 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         compute_label = self.transfer_to_compute_map[label]
         self.scheduled_transfers[compute_label] = event
 
+    @_compiler_disable
     def exit(self, label):
         event_compute = torch.cuda.current_stream().record_event()
         self.compute_events_map[label] = event_compute

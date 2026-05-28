@@ -1,32 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from types import TracebackType
+from typing import Any, cast
+
 import torch
 from torch.overrides import TorchFunctionMode
 
-try:
-    import torch._dynamo as _dynamo
-except ImportError:  # pragma: no cover - torch built without dynamo
-    _dynamo = None  # type: ignore[assignment]
-
-
-def _graph_break() -> None:
-    """Insert a Dynamo graph break at a trap boundary.
-
-    Called from each trap's ``__enter__`` and ``__exit__`` so that
-    ``torch.compile`` splits its graph at offload-block boundaries.  The
-    tensor ops *between* traps compile into subgraphs; the loader's eager
-    tensor movement runs in the resume functions Dynamo emits between
-    subgraphs.
-
-    No-op when ``torch._dynamo`` is not importable (e.g. a torch build
-    without Dynamo support).  Any future failure from ``graph_break()``
-    is deliberately not caught — real failures from Dynamo should surface
-    rather than silently degrade trap isolation.
-    """
-    if _dynamo is None:
-        return
-    _dynamo.graph_break()
+from flextensor.compiler_hooks import graph_break as _graph_break
 
 
 class Trap(TorchFunctionMode):
@@ -216,6 +197,112 @@ class TrapInfer(TorchFunctionMode):
                 new_kwargs[name] = new_arg
 
         return func(*new_args, **(new_kwargs or {}))
+
+
+class WarmupTrapDirect(TorchFunctionMode):
+    """Discovery trap for direct-mode models.
+
+    Direct-mode models read parameters through property getters backed by the
+    active tensor loader. That covers custom kernels that consume raw tensor
+    attributes and never enter ``TorchFunctionMode.__torch_function__``.
+    """
+
+    def __init__(self, tensor_manager: Any, trace_id: str, device_gpu: torch.device) -> None:
+        self.current_trace_id = trace_id
+        self.device_gpu = device_gpu
+        self.tensors_ids: set[int] = set()
+        self.tensor_layer_loader = tensor_manager.tensor_layer_loader
+        self.tensor_manager = tensor_manager
+        self._nesting_guard = tensor_manager.trap_nesting_guard
+
+    def __enter__(self) -> "WarmupTrapDirect":
+        _graph_break()
+        acquired = False
+        try:
+            self._nesting_guard.acquire(self.current_trace_id)
+            acquired = True
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            return cast("WarmupTrapDirect", super().__enter__())
+        except BaseException:
+            if acquired and self.tensor_layer_loader is not None:
+                self.tensor_layer_loader.exit(self.current_trace_id)
+            if acquired:
+                self._nesting_guard.release()
+            _graph_break()
+            raise
+
+    def __exit__(
+        self,
+        _type: type[BaseException] | None,
+        _value: BaseException | None,
+        _traceback: TracebackType | None,
+    ) -> bool | None:
+        mode_result: bool | None = False
+        tensor_ids: set[int] = set()
+        try:
+            mode_result = cast("bool | None", super().__exit__(_type, _value, _traceback))
+            tensor_ids = set(self.tensor_layer_loader.get_label_tensor_ids(self.current_trace_id))
+            get_accessed_tensor_ids = getattr(self.tensor_layer_loader, "get_accessed_tensor_ids", None)
+            if callable(get_accessed_tensor_ids):
+                tensor_ids |= set(get_accessed_tensor_ids(self.current_trace_id))
+        finally:
+            try:
+                # Restore raw Parameter storage after leaving TorchFunctionMode so
+                # the restore itself is not rewritten by the warmup fallback.
+                self.tensor_layer_loader.exit(self.current_trace_id)
+            finally:
+                self._nesting_guard.release()
+                _graph_break()
+        self.tensor_manager.record_tensors(self.current_trace_id, self.tensors_ids | tensor_ids)
+        return mode_result
+
+    def _update_tensors_ids(self, args: tuple[Any, ...], kwargs: dict[str, Any] | None) -> None:
+        for arg in args:
+            if self.tensor_manager.is_traced(arg):
+                tensor_id = id(arg)
+                self.tensors_ids.add(tensor_id)
+        if kwargs is not None:
+            for _name, arg in kwargs.items():
+                if self.tensor_manager.is_traced(arg):
+                    tensor_id = id(arg)
+                    self.tensors_ids.add(tensor_id)
+
+    def __torch_function__(  # type: ignore[override]
+        self,
+        func: Any,
+        _types: tuple[type[Any], ...],
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        self._update_tensors_ids(args, kwargs)
+
+        new_args = []
+        release_args = []
+        use_cuda = self.device_gpu.type == "cuda"
+        for arg in args:
+            new_arg = arg
+            if self.tensor_manager.is_traced(arg) and arg.device != self.device_gpu:
+                new_arg = arg.to(device=self.device_gpu, copy=True)
+                release_args.append(new_arg)
+            new_args.append(new_arg)
+
+        new_kwargs = kwargs
+        if kwargs is not None:
+            new_kwargs = {}
+            for name, arg in kwargs.items():
+                new_arg = arg
+                if self.tensor_manager.is_traced(arg) and arg.device != self.device_gpu:
+                    new_arg = arg.to(device=self.device_gpu, copy=True)
+                    release_args.append(new_arg)
+                new_kwargs[name] = new_arg
+
+        res = func(*new_args, **(new_kwargs or {}))
+        if use_cuda:
+            torch.cuda.synchronize(self.device_gpu)
+        for tensor in release_args:
+            del tensor
+
+        return res
 
 
 class TrapDirect:

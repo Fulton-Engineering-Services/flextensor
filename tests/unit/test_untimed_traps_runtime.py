@@ -20,9 +20,10 @@ runtime, but the safety nets live in different places:
   tensor in ``tensors_map`` that appears in no ``layer_stats`` row is
   added to the preload set at ``__init__`` time, so
   ``TensorStrategyLoader.get(...)`` returns a GPU copy instead of
-  ``None``. The trap-path tests below stay as *contract tests* on the
-  fall-through, documenting the precondition the loader is now
-  responsible for upholding.
+  ``None``. The getter tests below pin both edges: unconfigured mocks
+  keep the legacy fall-through used by older unit tests, while a
+  production-like manager with a real device fails loudly on misses so
+  profiling cannot hide an unplanned copy.
 
 * **Block loaders (``allocation_block_transfer``, ``raw_block_transfer``).**
   ``prepare_view_model`` runs
@@ -35,6 +36,7 @@ runtime, but the safety nets live in different places:
 
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -83,7 +85,7 @@ def _mock_cuda_event() -> MagicMock:
     return e
 
 
-def _patched_cuda():
+def _patched_cuda() -> list[Any]:
     """Return a list of started patchers; caller is responsible for stopping them."""
     patchers = [
         patch.object(torch.cuda, "Stream", return_value=_mock_cuda_stream()),
@@ -97,7 +99,7 @@ def _patched_cuda():
     return patchers
 
 
-def _stop_patches(patchers) -> None:
+def _stop_patches(patchers: list[Any]) -> None:
     for p in patchers:
         p.stop()
 
@@ -375,7 +377,7 @@ class TestStrategyLoaderUntimedRescue:
             "this preserves the contract for callers that opt out of the narrowing"
         )
 
-    def test_rescue_emits_warning_with_count_bytes_and_ids(self, caplog) -> None:
+    def test_rescue_emits_warning_with_count_bytes_and_ids(self, caplog: pytest.LogCaptureFixture) -> None:
         """The rescue's WARNING is the ONLY signal that profile coverage is
         incomplete — pin its content so a future refactor that drops the
         warning, lowers the level, or omits the byte/ID hint can't ship green.
@@ -418,6 +420,27 @@ class TestStrategyLoaderUntimedRescue:
         assert result is untimed_cpu, "the patched module property still returns the original (CPU) tensor"
         assert result.device.type == "cpu", "and that tensor is on CPU — what flows into the next forward op"
 
+    def test_property_getter_raises_when_real_device_loader_misses_traced_tensor(self) -> None:
+        """Production contract: traced tensor loader misses should fail loudly.
+
+        A getter-side device copy would make the op correct, but if it runs in
+        profiling it pollutes the measured duration. Dependencies must be
+        discovered before profiling, not patched over inside the getter.
+        """
+        untimed_cpu = torch.zeros(8, dtype=torch.float32)
+
+        tm = MagicMock()
+        tm.is_traced_by_id.return_value = True
+        tm.tensor_layer_loader = MagicMock()
+        tm.tensor_layer_loader.get.return_value = None
+        tm.device_gpu = torch.device("cpu")
+        tm.tensor_id_to_name_map = {id(untimed_cpu): "lm_head.weight"}
+
+        getter = _make_tensor_getter(untimed_cpu, tm, missing_fields=[])
+
+        with pytest.raises(RuntimeError, match=r"missing materialized tensor.*lm_head\.weight"):
+            getter(MagicMock())
+
     def test_trap_infer_falls_through_when_loader_returns_none(self) -> None:
         """Contract: TorchFunctionMode path also falls through on ``None``.
 
@@ -441,7 +464,8 @@ class TestStrategyLoaderUntimedRescue:
 
         seen_args: list[tuple] = []
 
-        def echo(*args, **kwargs):
+        def echo(*args: object, **kwargs: object) -> tuple[object, ...]:
+            del kwargs
             seen_args.append(args)
             return args
 
@@ -475,7 +499,8 @@ class TestStrategyLoaderUntimedRescue:
 
         seen_args: list[tuple] = []
 
-        def echo(*args, **kwargs):
+        def echo(*args: object, **kwargs: object) -> tuple[object, ...]:
+            del kwargs
             seen_args.append(args)
             return args
 

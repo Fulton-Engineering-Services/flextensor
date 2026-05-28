@@ -10,10 +10,10 @@ constraint: **discovery must run eagerly.** Profile and inference can run
 under compile.
 
 The trap boundaries around each offloaded block (``TrapDirect`` /
-``TrapInferDirect``) begin and end with ``_graph_break()``. Dynamo compiles
-the layer's tensor ops *between* the breaks; the loader's tensor movement
-runs eagerly in resume functions between subgraphs. Profile timing
-therefore reflects compiled-kernel execution.
+``TrapInferDirect``) begin and end with FlexTensor compiler graph breaks.
+Dynamo compiles the layer's tensor ops *between* the breaks; the loader's
+tensor movement runs eagerly in resume functions between subgraphs. Profile
+timing therefore reflects compiled-kernel execution.
 
 ## Supported flow — within a single process
 
@@ -25,9 +25,8 @@ model = MyModel().to("cpu")
 config = ft.OffloadConfig(include_patterns=["layers.*"], ...)
 proxy = ft.offload(model, config)
 
-# Discovery: eager.  WarmupTrap is a TorchFunctionMode that does not compose
-# with torch.compile — see "Why discovery cannot run under torch.compile"
-# below.
+# Discovery: eager. Warmup traps do not compose with torch.compile — see
+# "Why discovery cannot run under torch.compile" below.
 for _ in range(config.discovery_iters):
     proxy(x)
 
@@ -108,10 +107,10 @@ eager.
 ## Limits
 
 - **Don't compile before discovery completes.** Calling `compiled(x)` while
-  the manager is still in `DISCOVERY` raises `Unhandled FakeTensor Device
+  the manager is still in `DISCOVERY` can raise `Unhandled FakeTensor Device
   Propagation for aten.mm.default` on the first op of the first patched
-  layer (`WarmupTrap`'s `id()`-based staging is incompatible with Dynamo's
-  FakeTensor tracer).
+  layer. Warmup discovery uses real tensor IDs and temporary CPU-to-GPU
+  staging, which is incompatible with Dynamo's FakeTensor tracer.
 - **Don't compile across a phase transition.** `torch.compile` specializes
   on the underlying `nn.Module` live at compile time; FlexTensor swaps the
   proxy's underlying model on each transition (discovery → profile →
@@ -121,10 +120,16 @@ eager.
 
 ??? note "Why discovery cannot run under `torch.compile`"
 
-    Discovery uses `WarmupTrap`, a `TorchFunctionMode` that intercepts each
-    torch op and stages tensors from CPU to GPU on demand. Simplified excerpt
-    (see `src/flextensor/trap_tensor_mode.py::WarmupTrap.__torch_function__`
-    for the full implementation):
+    Discovery uses warmup traps (`WarmupTrap` for indirect mode,
+    `WarmupTrapDirect` for normal direct mode). Both are `TorchFunctionMode`
+    based and use real tensor identity to build the tensor-to-trap mapping.
+    Direct warmup also materializes known raw parameter access by temporarily
+    binding original parameter storage to active GPU copies while the trap is
+    executing.
+
+    Simplified indirect-mode excerpt (see
+    `src/flextensor/trap_tensor_mode.py::WarmupTrap.__torch_function__` for
+    the full implementation):
 
     ```python
     def __torch_function__(self, func, _types, args, kwargs=None):

@@ -394,6 +394,8 @@ model = flextensor.offload(model, config=config)
 
 Using manual `offload_block` context managers without forward patching relies on Module Tracker or Prefix Matching, which may miss tensors with unconventional naming.
 
+For custom kernels or fused backends such as vLLM MoE, include the module that owns the kernel weights and launch the backend while that module's trap is active. Direct warmup/profile temporarily materialize raw parameter storage, so calls that read `self.weight`-style attributes inside the patched `forward` see active GPU storage. Avoid using tensor references cached before `offload()`: FlexTensor cannot update opaque pointers that bypass module ownership and discovery.
+
 ### Step 3: Debug with instrumentation
 
 Enable debug instrumentation to capture component initialization details and verify the parameter-to-trap mapping:

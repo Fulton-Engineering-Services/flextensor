@@ -30,6 +30,7 @@ from flextensor.loaders import (
     RawBlockController,
     TensorLayerLoader,
     TensorStrategyLoader,
+    WarmupDirectTensorLoader,
 )
 from flextensor.memory_transfer_benchmark import (
     benchmark_memory_transfers,
@@ -58,6 +59,7 @@ from flextensor.tensor_discovery import (
     ModuleTracker,
     discover_untraced_tensors_for_layers,
     get_non_offloaded_tensor_ids,
+    get_offload_module_tensor_ids,
     has_offload_modules,
     resolve_include_patterns,
     validate_include_patterns,
@@ -70,7 +72,7 @@ from flextensor.tensor_processors import (
     create_model_with_shared_tensors,
     preprocess_model,
 )
-from flextensor.trap_tensor_mode import Trap, TrapDirect, TrapInfer, TrapInferDirect, WarmupTrap
+from flextensor.trap_tensor_mode import Trap, TrapDirect, TrapInfer, TrapInferDirect, WarmupTrap, WarmupTrapDirect
 from flextensor.types import GPUMemoryUsage
 
 logger = logging.getLogger(__name__)
@@ -178,6 +180,17 @@ def _make_tensor_getter(tensor_ref, tensor_manager, missing_fields):
                 tensor = new_tensor
                 for missing_field in missing_fields:
                     _apply_missing_field(tensor_ref, new_tensor, missing_field, tensor_manager)
+            elif isinstance(tensor_manager.device_gpu, torch.device):
+                tensor_names = getattr(tensor_manager, "tensor_id_to_name_map", {})
+                tensor_name = (
+                    tensor_names.get(tensor_id, "<unknown>") if isinstance(tensor_names, dict) else "<unknown>"
+                )
+                msg = (
+                    "FlexTensor missing materialized tensor for traced parameter "
+                    f"{tensor_name} (id={tensor_id}). This usually means a cross-layer dependency "
+                    "was not recorded before profiling/inference. Disable skip discovery or seed the dependency."
+                )
+                raise RuntimeError(msg)
         return tensor
 
     return getter
@@ -350,18 +363,18 @@ class TensorManager:
         if remove_layers_operations is None:
             remove_layers_operations = []
         self.device_gpu = device_gpu
-        self.tensor_statistics_map = {}
-        self.tensors_map = {}
-        self.trap_class = None
-        self.tensor_layer_loader = None
-        self.layer_statistics_collector = None
+        self.tensor_statistics_map: dict[int, TensorStatistics] = {}
+        self.tensors_map: Any = {}
+        self.trap_class: Any = None
+        self.tensor_layer_loader: Any = None
+        self.layer_statistics_collector: Any = None
         self.tensor_manager_load_strategy = tensor_manager_load_strategy
         self.release_tensors = True
         self.pinned_memory = pinned_memory
         self.host_pinner: HostPinner = make_host_pinner(pinned_memory, pinned_memory_mode)
         self._benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace if _use_trace_tensor else NoOpBenchmark
         self.direct_enabled = _direct_mode
-        self.traced_tensors = set()
+        self.traced_tensors: set[int] = set()
         self.transfer_stream_priority = 1
         self.blocks = blocks
         self.move_top_level_buffers_to_gpu = move_top_level_buffers_to_gpu
@@ -374,8 +387,8 @@ class TensorManager:
             ensure_diagnostics_visible()
         self._max_gpu_mem_fraction = max_gpu_mem_fraction
 
-        self.traps_duration_ms = 0
-        self.model_ids = set()
+        self.traps_duration_ms = 0.0
+        self.model_ids: set[int] = set()
         self.block_data: BlockStrategyData | None = None
 
         self.loader_type = loader_type
@@ -393,9 +406,9 @@ class TensorManager:
             )
             raise ValueError(msg)
 
-        self.model = None
-        self.tensor_id_to_name_map = {}
-        self.tensor_manager_state = None
+        self.model: Any = None
+        self.tensor_id_to_name_map: dict[int, str] = {}
+        self.tensor_manager_state: Any = None
         self.use_shm = use_shm
         self.shm_namespace: str | None = None
         self._unmapped_tensors_bytes = 0
@@ -549,6 +562,21 @@ class TensorManager:
 
     def prepare_warmup_mode(self):
         self.layer_statistics_collector = IterativeLayerStatisticsCollector()
+        if self._use_direct_warmup_model():
+            label_to_tensor_ids = get_offload_module_tensor_ids(
+                self.model,
+                self.tensors_map,
+                include_patterns=self.include_patterns,
+                exclude_patterns=self.exclude_patterns,
+            )
+            self.tensor_layer_loader = WarmupDirectTensorLoader(
+                label_to_tensor_ids,
+                self.tensors_map,
+                self.device_gpu,
+            )
+            self.trap_class = WarmupTrapDirect
+            return
+
         self.trap_class = WarmupTrap
         self.tensor_layer_loader = None
         # Initialize module tracker for manual traps (no forward patching).
@@ -556,6 +584,14 @@ class TensorManager:
         if self.model is not None and isinstance(self.model, torch.nn.Module) and not has_offload_modules(self.model):
             self.module_tracker = ModuleTracker()
             self.module_tracker.register(self.model)
+
+    def _use_direct_warmup_model(self) -> bool:
+        return (
+            self.direct_enabled
+            and not self.use_trace_tensor
+            and isinstance(self.model, torch.nn.Module)
+            and has_offload_modules(self.model)
+        )
 
     def prepare_profile_direct_mode_model(self, model):
         profile_model = model

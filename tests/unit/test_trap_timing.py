@@ -3,12 +3,13 @@
 
 """Unit tests for CUDA event timing in Trap, WarmupTrap, and TrapDirect."""
 
-from typing import ClassVar
+from typing import Any, ClassVar
 from unittest.mock import Mock, call
 
 import pytest
 import torch
 
+from flextensor import compiler_hooks, trap_tensor_mode
 from flextensor.helpers import TrapNestingGuard
 from flextensor.tensor_manager import TensorManager
 from flextensor.trap_tensor_mode import Trap, TrapDirect, WarmupTrap
@@ -46,32 +47,45 @@ def _make_mock_tensor_manager(
     return tm
 
 
+def _record_call(call_order: list[str], event_name: str) -> None:
+    call_order.append(event_name)
+
+
+def _record_elapsed(call_order: list[str], elapsed_time_ms: float) -> float:
+    call_order.append("elapsed_time")
+    return elapsed_time_ms
+
+
+def _guard_active(guard: TrapNestingGuard) -> bool:
+    return bool(guard._active)
+
+
 class TestTrapTiming:
     """Test CUDA event timing in Trap (TorchFunctionMode-based profile trap)."""
 
-    def test_events_from_tensor_manager(self):
+    def test_events_from_tensor_manager(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
 
         assert trap.start_event is tm.trap_start_event
         assert trap.end_event is tm.trap_end_event
 
-    def test_record_and_sync_ordering(self):
+    def test_record_and_sync_ordering(self) -> None:
         tm = _make_mock_tensor_manager(elapsed_time_ms=3.0)
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
 
-        call_order = []
-        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
-        tm.trap_end_event.record.side_effect = lambda: call_order.append("end.record")
-        tm.trap_end_event.synchronize.side_effect = lambda: call_order.append("end.synchronize")
-        tm.trap_start_event.elapsed_time.side_effect = lambda e: (call_order.append("elapsed_time"), 3.0)[1]
+        call_order: list[str] = []
+        tm.trap_start_event.record.side_effect = lambda: _record_call(call_order, "start.record")
+        tm.trap_end_event.record.side_effect = lambda: _record_call(call_order, "end.record")
+        tm.trap_end_event.synchronize.side_effect = lambda: _record_call(call_order, "end.synchronize")
+        tm.trap_start_event.elapsed_time.side_effect = lambda _end_event: _record_elapsed(call_order, 3.0)
 
         trap.__enter__()
         trap.__exit__(None, None, None)
 
         assert call_order == ["start.record", "end.record", "end.synchronize", "elapsed_time"]
 
-    def test_duration_flows_to_collector(self):
+    def test_duration_flows_to_collector(self) -> None:
         tm = _make_mock_tensor_manager(elapsed_time_ms=4.2)
         trap = Trap(tm, "layer.5", torch.device("cuda:0"))
 
@@ -80,7 +94,7 @@ class TestTrapTiming:
 
         tm.record_all.assert_called_once_with("layer.5", set(), 4.2)
 
-    def test_uses_event_sync_not_global_sync(self):
+    def test_uses_event_sync_not_global_sync(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
 
@@ -89,7 +103,7 @@ class TestTrapTiming:
 
         tm.trap_end_event.synchronize.assert_called_once()
 
-    def test_tensor_layer_loader_enter_exit(self):
+    def test_tensor_layer_loader_enter_exit(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
 
@@ -109,7 +123,7 @@ class TestWarmupTrapRecording:
     that ``Trap`` and ``TrapDirect`` use.
     """
 
-    def test_does_not_use_cuda_events(self):
+    def test_does_not_use_cuda_events(self) -> None:
         tm = _make_mock_tensor_manager(with_loader=False)
         trap = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
 
@@ -121,7 +135,7 @@ class TestWarmupTrapRecording:
         tm.trap_end_event.synchronize.assert_not_called()
         tm.trap_start_event.elapsed_time.assert_not_called()
 
-    def test_records_tensors_without_duration(self):
+    def test_records_tensors_without_duration(self) -> None:
         tm = _make_mock_tensor_manager(with_loader=False)
         trap = WarmupTrap(tm, "encoder.2", torch.device("cuda:0"))
 
@@ -132,7 +146,7 @@ class TestWarmupTrapRecording:
         tm.record_all.assert_not_called()
         tm.record_duration.assert_not_called()
 
-    def test_module_tracker_enter_exit(self):
+    def test_module_tracker_enter_exit(self) -> None:
         tm = _make_mock_tensor_manager(with_loader=False, with_module_tracker=True)
         trap = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
 
@@ -142,7 +156,7 @@ class TestWarmupTrapRecording:
         trap.__exit__(None, None, None)
         tm.module_tracker.exit_trap.assert_called_once_with("layer.0")
 
-    def test_no_module_tracker(self):
+    def test_no_module_tracker(self) -> None:
         tm = _make_mock_tensor_manager(with_loader=False, with_module_tracker=False)
         trap = WarmupTrap(tm, "layer.0", torch.device("cuda:0"))
 
@@ -155,21 +169,21 @@ class TestWarmupTrapRecording:
 class TestTrapDirectTiming:
     """Test CUDA event timing in TrapDirect (plain context manager profile trap)."""
 
-    def test_events_from_tensor_manager(self):
+    def test_events_from_tensor_manager(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = TrapDirect(tm, "layer.0", torch.device("cuda:0"))
 
         assert trap.start_event is tm.trap_start_event
         assert trap.end_event is tm.trap_end_event
 
-    def test_record_and_sync_ordering(self):
+    def test_record_and_sync_ordering(self) -> None:
         tm = _make_mock_tensor_manager(elapsed_time_ms=5.0)
 
-        call_order = []
-        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
-        tm.trap_end_event.record.side_effect = lambda: call_order.append("end.record")
-        tm.trap_end_event.synchronize.side_effect = lambda: call_order.append("end.synchronize")
-        tm.trap_start_event.elapsed_time.side_effect = lambda e: (call_order.append("elapsed_time"), 5.0)[1]
+        call_order: list[str] = []
+        tm.trap_start_event.record.side_effect = lambda: _record_call(call_order, "start.record")
+        tm.trap_end_event.record.side_effect = lambda: _record_call(call_order, "end.record")
+        tm.trap_end_event.synchronize.side_effect = lambda: _record_call(call_order, "end.synchronize")
+        tm.trap_start_event.elapsed_time.side_effect = lambda _end_event: _record_elapsed(call_order, 5.0)
 
         trap = TrapDirect(tm, "layer.0", torch.device("cuda:0"))
         trap.__enter__()
@@ -177,7 +191,7 @@ class TestTrapDirectTiming:
 
         assert call_order == ["start.record", "end.record", "end.synchronize", "elapsed_time"]
 
-    def test_duration_flows_to_add_duration(self):
+    def test_duration_flows_to_add_duration(self) -> None:
         tm = _make_mock_tensor_manager(elapsed_time_ms=6.1)
         trap = TrapDirect(tm, "attn.3", torch.device("cuda:0"))
 
@@ -186,7 +200,7 @@ class TestTrapDirectTiming:
 
         tm.record_duration.assert_called_once_with("attn.3", 6.1)
 
-    def test_tensor_layer_loader_enter_exit(self):
+    def test_tensor_layer_loader_enter_exit(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = TrapDirect(tm, "layer.0", torch.device("cuda:0"))
 
@@ -203,11 +217,11 @@ class TestMultiLayerTraps:
     LAYER_NAMES: ClassVar[list[str]] = ["model.layers.0", "model.layers.1", "model.layers.2", "model.layers.3"]
     LAYER_DURATIONS: ClassVar[list[float]] = [1.1, 2.2, 3.3, 4.4]
 
-    def _run_layers(self, trap_cls, tm, device):
+    def _run_layers(self, trap_cls: type[Any], tm: Mock, device: torch.device) -> None:
         """Enter/exit a fresh trap for each layer, returning per-layer durations from elapsed_time."""
         durations = iter(self.LAYER_DURATIONS)
 
-        def _next_elapsed(_end_event):
+        def _next_elapsed(_end_event: object) -> float:
             return next(durations)
 
         tm.trap_start_event.elapsed_time.side_effect = _next_elapsed
@@ -217,7 +231,7 @@ class TestMultiLayerTraps:
             trap.__enter__()
             trap.__exit__(None, None, None)
 
-    def test_trap_direct_multi_layer(self):
+    def test_trap_direct_multi_layer(self) -> None:
         tm = _make_mock_tensor_manager()
         device = torch.device("cuda:0")
 
@@ -230,7 +244,7 @@ class TestMultiLayerTraps:
         expected_calls = [call(name, dur) for name, dur in zip(self.LAYER_NAMES, self.LAYER_DURATIONS, strict=False)]
         tm.record_duration.assert_has_calls(expected_calls)
 
-    def test_warmup_trap_multi_layer(self):
+    def test_warmup_trap_multi_layer(self) -> None:
         """WarmupTrap records tensor IDs per layer without touching CUDA events."""
         tm = _make_mock_tensor_manager(with_loader=False)
         device = torch.device("cuda:0")
@@ -247,7 +261,7 @@ class TestMultiLayerTraps:
         tm.record_tensors.assert_has_calls(expected_calls)
         tm.record_all.assert_not_called()
 
-    def test_events_identity_preserved_across_layers(self):
+    def test_events_identity_preserved_across_layers(self) -> None:
         """All traps created for different layers reference the same two event objects."""
         tm = _make_mock_tensor_manager()
         device = torch.device("cuda:0")
@@ -266,7 +280,7 @@ class TestEventReuse:
     because discovery durations are unused (see :class:`TestWarmupTrapRecording`).
     """
 
-    def test_timed_traps_share_events(self):
+    def test_timed_traps_share_events(self) -> None:
         tm = _make_mock_tensor_manager(use_spec=True)
 
         trap = Trap(tm, "layer.0", torch.device("cuda:0"))
@@ -279,14 +293,14 @@ class TestEventReuse:
 class TestTrapNestingGuard:
     """Unit tests for the TrapNestingGuard utility itself."""
 
-    def test_acquire_sets_active(self):
+    def test_acquire_sets_active(self) -> None:
         guard = TrapNestingGuard()
 
         guard.acquire("layer.0")
 
         assert guard._active is True
 
-    def test_release_clears_active(self):
+    def test_release_clears_active(self) -> None:
         guard = TrapNestingGuard()
         guard._active = True
 
@@ -294,21 +308,21 @@ class TestTrapNestingGuard:
 
         assert guard._active is False
 
-    def test_acquire_raises_when_already_active(self):
+    def test_acquire_raises_when_already_active(self) -> None:
         guard = TrapNestingGuard()
         guard.acquire("layer.0")
 
         with pytest.raises(RuntimeError, match="Nested traps are not supported"):
             guard.acquire("attention.q")
 
-    def test_error_message_contains_trace_id(self):
+    def test_error_message_contains_trace_id(self) -> None:
         guard = TrapNestingGuard()
         guard.acquire("layer.0")
 
         with pytest.raises(RuntimeError, match=r"model\.layers\.7"):
             guard.acquire("model.layers.7")
 
-    def test_acquire_release_cycle(self):
+    def test_acquire_release_cycle(self) -> None:
         guard = TrapNestingGuard()
 
         guard.acquire("layer.0")
@@ -316,7 +330,7 @@ class TestTrapNestingGuard:
         guard.release()
         assert guard._active is False
 
-    def test_sequential_acquire_release(self):
+    def test_sequential_acquire_release(self) -> None:
         guard = TrapNestingGuard()
 
         for name in ["layer.0", "layer.1", "layer.2"]:
@@ -325,7 +339,7 @@ class TestTrapNestingGuard:
 
         assert guard._active is False
 
-    def test_second_acquire_without_release_raises(self):
+    def test_second_acquire_without_release_raises(self) -> None:
         guard = TrapNestingGuard()
 
         guard.acquire("layer.0")
@@ -339,7 +353,7 @@ class TestNestingGuard:
 
     DEVICE: ClassVar[torch.device] = torch.device("cuda:0")
 
-    def test_trap_rejects_nesting(self):
+    def test_trap_rejects_nesting(self) -> None:
         tm = _make_mock_tensor_manager()
         outer = Trap(tm, "layer.0", self.DEVICE)
         inner = Trap(tm, "layer.1", self.DEVICE)
@@ -349,7 +363,7 @@ class TestNestingGuard:
             inner.__enter__()
         outer.__exit__(None, None, None)
 
-    def test_warmup_trap_rejects_nesting(self):
+    def test_warmup_trap_rejects_nesting(self) -> None:
         tm = _make_mock_tensor_manager(with_loader=False)
         outer = WarmupTrap(tm, "layer.0", self.DEVICE)
         inner = WarmupTrap(tm, "layer.1", self.DEVICE)
@@ -359,7 +373,7 @@ class TestNestingGuard:
             inner.__enter__()
         outer.__exit__(None, None, None)
 
-    def test_trap_direct_rejects_nesting(self):
+    def test_trap_direct_rejects_nesting(self) -> None:
         tm = _make_mock_tensor_manager()
         outer = TrapDirect(tm, "layer.0", self.DEVICE)
         inner = TrapDirect(tm, "layer.1", self.DEVICE)
@@ -369,7 +383,7 @@ class TestNestingGuard:
             inner.__enter__()
         outer.__exit__(None, None, None)
 
-    def test_cross_type_nesting_rejected(self):
+    def test_cross_type_nesting_rejected(self) -> None:
         """Nesting different trap types still triggers the guard."""
         tm = _make_mock_tensor_manager()
         outer = TrapDirect(tm, "layer.0", self.DEVICE)
@@ -380,7 +394,7 @@ class TestNestingGuard:
             inner.__enter__()
         outer.__exit__(None, None, None)
 
-    def test_error_message_includes_trap_name(self):
+    def test_error_message_includes_trap_name(self) -> None:
         tm = _make_mock_tensor_manager()
         outer = TrapDirect(tm, "layer.0", self.DEVICE)
         inner = TrapDirect(tm, "attention.q", self.DEVICE)
@@ -390,17 +404,17 @@ class TestNestingGuard:
             inner.__enter__()
         outer.__exit__(None, None, None)
 
-    def test_guard_cleared_after_exit(self):
+    def test_guard_cleared_after_exit(self) -> None:
         tm = _make_mock_tensor_manager()
         trap = TrapDirect(tm, "layer.0", self.DEVICE)
 
-        assert tm.trap_nesting_guard._active is False
+        assert _guard_active(tm.trap_nesting_guard) is False
         trap.__enter__()
-        assert tm.trap_nesting_guard._active is True
+        assert _guard_active(tm.trap_nesting_guard) is True
         trap.__exit__(None, None, None)
-        assert tm.trap_nesting_guard._active is False
+        assert _guard_active(tm.trap_nesting_guard) is False
 
-    def test_sequential_traps_allowed(self):
+    def test_sequential_traps_allowed(self) -> None:
         """Sequential (non-nested) traps must work without error."""
         tm = _make_mock_tensor_manager()
 
@@ -419,19 +433,15 @@ class TestGraphBreakDynamoFallback:
 
     DEVICE: ClassVar[torch.device] = torch.device("cpu")
 
-    def test_graph_break_is_noop_when_dynamo_is_none(self, monkeypatch):
+    def test_graph_break_is_noop_when_dynamo_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When ``_dynamo is None``, ``_graph_break`` returns silently."""
-        from flextensor import trap_tensor_mode  # noqa: PLC0415
-
-        monkeypatch.setattr(trap_tensor_mode, "_dynamo", None)
+        monkeypatch.setattr(compiler_hooks, "_dynamo", None)
         # Must not raise.
         trap_tensor_mode._graph_break()
 
-    def test_traps_still_work_when_dynamo_is_none(self, monkeypatch):
+    def test_traps_still_work_when_dynamo_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Trap enter/exit cycles complete normally on a no-Dynamo torch build."""
-        from flextensor import trap_tensor_mode  # noqa: PLC0415
-
-        monkeypatch.setattr(trap_tensor_mode, "_dynamo", None)
+        monkeypatch.setattr(compiler_hooks, "_dynamo", None)
 
         tm = _make_mock_tensor_manager()
         trap = TrapDirect(tm, "layer.0", self.DEVICE)
@@ -441,13 +451,11 @@ class TestGraphBreakDynamoFallback:
         assert tm.trap_nesting_guard._active is False
         assert tm.trap_start_event.record.call_count == 1
 
-    def test_graph_break_failure_surfaces(self, monkeypatch):
+    def test_graph_break_failure_surfaces(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A failure from ``_dynamo.graph_break`` is deliberately not caught."""
-        from flextensor import trap_tensor_mode  # noqa: PLC0415
-
         broken_dynamo = Mock()
         broken_dynamo.graph_break.side_effect = RuntimeError("graph_break is gone")
-        monkeypatch.setattr(trap_tensor_mode, "_dynamo", broken_dynamo)
+        monkeypatch.setattr(compiler_hooks, "_dynamo", broken_dynamo)
 
         with pytest.raises(RuntimeError, match="graph_break is gone"):
             trap_tensor_mode._graph_break()
