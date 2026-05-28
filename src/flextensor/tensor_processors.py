@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import collections
+import inspect
 import logging
 import statistics
 import types
@@ -829,7 +830,7 @@ def compute_reachable_tensor_ids(model: object | None) -> set[int]:
 
 
 def _has_items(model: object) -> bool:
-    return callable(getattr(model, "items", None))
+    return callable(inspect.getattr_static(model, "items", None))
 
 
 def _is_reachable_tensor_container(model: object) -> bool:

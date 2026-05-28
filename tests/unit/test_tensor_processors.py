@@ -264,6 +264,25 @@ class TestReachableTensorMapProcessor:
 
         assert ids == {id(t1), id(t2)}
 
+    def test_module_with_nonstandard_missing_items_getattr(self) -> None:
+        """Diffusers modules can raise ``KeyError`` for missing config attrs."""
+
+        class _DiffusersLikeModule(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self._internal_dict: dict[str, object] = {}
+                self.w = nn.Parameter(torch.zeros(4))
+
+            def __getattr__(self, name: str) -> object:
+                if name == "items":
+                    return self._internal_dict[name]
+                return super().__getattr__(name)
+
+        m = _DiffusersLikeModule()
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(m.w) in ids
+
     def test_returns_empty_for_none(self) -> None:
         assert compute_reachable_tensor_ids(None) == set()
 
