@@ -63,4 +63,7 @@ See the [Quick Start](https://github.com/ai-dynamo/flextensor/blob/main/docs/qui
 
 ## License
 
-FlexTensor is licensed under the [Apache License 2.0](LICENSE). See [NOTICE](NOTICE) for additional notices and disclaimers regarding external materials.
+FlexTensor is licensed under the [Apache License 2.0](LICENSE). See
+[NOTICE](NOTICE) for the project notice, [ATTRIBUTIONS.md](ATTRIBUTIONS.md) for
+third-party dependency attributions, and
+[EXTERNAL_MATERIALS.md](EXTERNAL_MATERIALS.md) for external materials.
