@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
 
-# Keep review comments high-signal: correctness, reliability, performance, and missing tests matter more than style.
+# Keep review comments high-signal and adversarial: correctness, reliability, performance, and missing tests matter more than style.
 tone_instructions: |
-  Be direct and technical. Report only critical or important issues by default.
-  Prioritize correctness, performance, reliability, and missing tests over style nits.
-  Avoid low-confidence suggestions, compliments, poems, and speculative comments.
+  Be direct, technical, and skeptical. Report only material issues with evidence.
+  Prioritize correctness, reliability, performance, design assumptions, and missing tests.
+  Avoid low-confidence, speculative, or non-review commentary.
 
 reviews:
-  # Start with a lighter profile while the repo measures review signal/noise.
-  profile: chill
+  # Keep reviews assertive and challenge-oriented; suppress low-value noise through the instructions below.
+  profile: assertive
 
   # Keep the summary in CodeRabbit's walkthrough instead of rewriting the MR description.
   high_level_summary: false
@@ -82,6 +82,25 @@ reviews:
 
   # Route review attention to the repo-specific risk areas instead of using one generic reviewer prompt.
   path_instructions:
+    # Mirror the Codex adversarial-review stance: challenge the approach and assumptions, but stay grounded.
+    - path: "**/*"
+      instructions: |
+        Apply this global instruction together with any narrower path instruction; narrower entries add focus
+        but do not weaken the materiality, evidence, or low-noise requirements here.
+        Review adversarially. Try to find the strongest grounded reason the change should not ship yet,
+        including flaws in the chosen approach, design assumptions, tradeoffs, and failure handling.
+        Evaluate design fit, user/API impact, unnecessary complexity, test adequacy, documentation needs,
+        and concurrency or resource-ownership risks in the context of the surrounding code.
+        Treat happy-path-only behavior as a real weakness when the changed code can face bad inputs,
+        retries, partial failures, stale state, version skew, empty states, timeouts, or concurrent execution.
+        Report only material findings with concrete evidence from the diff or surrounding code. Do not post
+        checklist-style comments, style, naming, low-value cleanup, or speculative risks that are not defensible
+        from the repository context.
+        Do not recommend abstractions or future-proofing unless they reduce concrete current complexity or risk.
+        Do not restate deterministic lint, formatting, or metadata checks already covered by pre-commit or CI
+        unless they expose a material correctness, security, packaging, or release risk.
+        Each finding should explain what can go wrong, why this code path is vulnerable, the likely impact,
+        and the concrete change that would reduce the risk.
     - path: "src/flextensor/**/*.py"
       instructions: |
         Review for correctness of the tensor offload lifecycle, memory ownership, and public API compatibility.
@@ -109,6 +128,8 @@ reviews:
     - path: "tests/**/*.py"
       instructions: |
         Check that tests cover the changed success and failure paths.
+        Flag tests that could still pass when the production behavior is broken, assert brittle implementation
+        details instead of behavior, or skip relevant resource cleanup and failure-mode assertions.
         For integration tests, prefer feedback on coverage gaps, command accuracy, GPU assumptions, and cleanup
         behavior over style-only comments.
     - path: "tests/integration/**"
