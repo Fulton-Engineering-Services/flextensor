@@ -20,6 +20,11 @@ from pathlib import Path
 import pytest
 import requests
 
+from tests.integration._vllm_utils import (
+    assert_vllm_cuda_platform_logged,
+    validate_latest_memory_transfer_stats_for_current_bus,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[3]
 EXAMPLES_DIR = REPO_ROOT / "examples" / "vllm"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -91,12 +96,14 @@ class TestExampleVLLM:
 
     def _run_serve_and_validate(
         self,
+        output_dir: Path,
         extra_env: dict[str, str] | None = None,
         run_client: bool = True,
     ) -> list[str]:
         """Start serve.sh, optionally run client.sh, and return collected log lines.
 
         Args:
+            output_dir: Directory for instrumentation output.
             extra_env: Additional environment variables passed to serve.sh.
                 These simulate ``docker run -e KEY=VALUE`` passthrough.
             run_client: Whether to run client.sh and validate API responses.
@@ -111,7 +118,14 @@ class TestExampleVLLM:
 
         enable_offline_if_cached(MODEL_NAME)
 
+        instrumentation_dir = output_dir / "instrumentation"
+        instrumentation_dir.mkdir(parents=True, exist_ok=True)
+
         env = os.environ.copy()
+        env.update({
+            "FT_ENABLE_INSTRUMENTATION": "1",
+            "FT_INSTRUMENTATION_OUTPUT_DIR": str(instrumentation_dir),
+        })
         if extra_env:
             env.update(extra_env)
 
@@ -184,6 +198,7 @@ class TestExampleVLLM:
                 print("WARNING: log reader thread did not finish within 10s")
 
             log_text = "\n".join(log_lines)
+            assert_vllm_cuda_platform_logged(log_lines)
             assert "FlexTensor offloading enabled with config" in log_text, (
                 "FlexTensor offloading config not found in server logs"
             )
@@ -200,10 +215,25 @@ class TestExampleVLLM:
                 for line in log_lines[-50:]:
                     print(f"  {line}")
 
+        transfer_validation = validate_latest_memory_transfer_stats_for_current_bus(instrumentation_dir)
+        print("\nexamples/vllm - Memory transfer validation:")
+        print(
+            "  Bus: "
+            f"PCIe Gen{transfer_validation['pcie_link_gen']} x{transfer_validation['pcie_link_width']} "
+            f"({transfer_validation['pci_bus_id']}), CPU affinity={transfer_validation['cpu_affinity']}, "
+            f"NUMA affinity={transfer_validation['numa_affinity']}"
+        )
+        print(
+            "  Observed bandwidth: "
+            f"{transfer_validation['observed_bandwidth_gbps']:.2f} GB/s "
+            f"(expected {transfer_validation['min_expected_bandwidth_gbps']:.2f}-"
+            f"{transfer_validation['max_expected_bandwidth_gbps']:.2f} GB/s)"
+        )
+
         return log_lines
 
     @pytest.mark.gpu_vram_24g
-    def test_example_scripts_end_to_end(self) -> None:
+    def test_example_scripts_end_to_end(self, tmp_path: Path) -> None:
         """Test that serve.sh starts a working server and client.sh gets valid responses.
 
         This test exercises the exact same scripts that users run, validating
@@ -215,10 +245,10 @@ class TestExampleVLLM:
         5. Assert FlexTensor offloading log messages are present
         6. Stop the server
         """
-        self._run_serve_and_validate()
+        self._run_serve_and_validate(tmp_path)
 
     @pytest.mark.gpu_vram_24g
-    def test_env_var_passthrough(self) -> None:
+    def test_env_var_passthrough(self, tmp_path: Path) -> None:
         """Test that FT_* environment variables pass through to FlexTensor.
 
         Simulates ``docker run -e FT_ENABLE_DIAGNOSTICS=1`` by setting the
@@ -228,6 +258,7 @@ class TestExampleVLLM:
         not depend on profiling-data consistency.
         """
         log_lines = self._run_serve_and_validate(
+            tmp_path,
             extra_env={"FT_ENABLE_DIAGNOSTICS": "1"},
             run_client=False,
         )

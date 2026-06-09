@@ -225,18 +225,12 @@ If another process is consuming significant memory, stop it or move your workloa
 
 ### Step 2: Narrow the include patterns
 
-If `include_patterns=["*"]` is offloading embedding or output layers that need to stay on GPU, or container modules are inflating block sizes, narrow the scope. For example, with a decoder-only model in vLLM, these patterns target each transformer layer and special modules while leaving the rest unaffected:
-
-```python
-config = OffloadConfig(
-    include_patterns=[
-        "model.embed_tokens",
-        "model.layers.*",
-        "model.norm",
-        "lm_head",
-    ],
-)
-```
+If `include_patterns=["*"]` is offloading embedding or output layers that need to
+stay on GPU, or container modules are inflating block sizes, narrow the scope.
+For vLLM, prefer leaving `FT_INCLUDE_PATTERNS` / `FT_EXCLUDE_PATTERNS` unset
+unless you need a model-specific override; the worker defaults use
+decoder-layer class includes and MoE sidecar excludes. The exact defaults live
+in `src/flextensor/contrib/vllm/worker.py`.
 
 **Why this helps:** Offloaded layers are distributed across `num_blocks` GPU memory blocks, each sized to the largest layer assigned to it. With `["*"]`, container modules become the "largest layer" and inflate every memory block to the full model's size. Per-layer patterns remove the containers, so memory blocks are sized to individual layers.
 
@@ -312,20 +306,7 @@ You can also inspect the `host_memory` object in FlexTensor's [instrumentation o
 
 ### Step 2: Narrow the include patterns
 
-Narrow `include_patterns` from `["*"]` to target specific layers:
-
-```python
-config = OffloadConfig(
-    include_patterns=[
-        "model.embed_tokens",
-        "model.layers.*",
-        "model.norm",
-        "lm_head",
-    ],
-)
-```
-
-See [Step 2: Narrow the include patterns](#step-2-narrow-the-include-patterns) under [Resolve GPU Out-of-Memory Errors](#resolve-gpu-out-of-memory-errors) for more detail.
+Narrow `include_patterns` from `["*"]` to target specific layers. See [Step 2: Narrow the include patterns](#step-2-narrow-the-include-patterns) under [Resolve GPU Out-of-Memory Errors](#resolve-gpu-out-of-memory-errors) for a vLLM worker-aligned example.
 
 **Why this helps:** Fewer trapped modules means fewer weights pinned in host RAM.
 

@@ -6,17 +6,16 @@ set -xeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-source "$SCRIPT_DIR/../gpu_diagnostics.sh"
+# shellcheck source=../_install_requirements.sh
+source "$SCRIPT_DIR/../_install_requirements.sh"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-
-require_nvidia_gpu
 
 # Install example dependencies (same path as users)
 bash "$REPO_ROOT/examples/vllm/install.sh"
 
 # Install test-specific requirements if not in CI (CI installs with flextensor for proper dependency resolution)
 if [ -z "${CI:-}" ] && [ -f "$SCRIPT_DIR/requirements.txt" ]; then
-  pip install -r "$SCRIPT_DIR/requirements.txt" --quiet
+  install_requirements_preserving_vllm "$SCRIPT_DIR/requirements.txt"
 fi
 
 TIMEOUT=${TIMEOUT:-1800}

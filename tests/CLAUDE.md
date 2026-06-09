@@ -10,6 +10,8 @@ Structure: `integration/L{0,1,2}_<name>/` — each directory contains `.dockerim
 
 **GPU runner markers**: use `gpu_vram_*`, `gpu_vram_min_*`, `gpu_sm_*`, or `gpu_sm_min_*`; CI maps them to available runners.
 
+**requirements.txt**: for non-obvious version floors, add a brief comment with the model/doc/job reference that justifies the pin.
+
 ### test.sh Pattern
 
 ```bash

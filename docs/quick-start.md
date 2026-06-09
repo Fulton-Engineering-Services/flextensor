@@ -90,7 +90,7 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head,class:SharedExpertMLP" python my_script
 
 The most commonly tuned options are:
 
-- **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards, default `["*"]`; use specific patterns such as `model.layers.*` for better per-layer pipelining)
+- **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards plus `class:` selectors, default `["*"]`; use specific patterns such as `class:*DecoderLayer` or `model.layers.*` for better per-layer pipelining)
 - **`discovery_iters`** — iterations for tensor discovery (default `1`)
 - **`profiling_iters`** — iterations for timing measurement (default `10`)
 

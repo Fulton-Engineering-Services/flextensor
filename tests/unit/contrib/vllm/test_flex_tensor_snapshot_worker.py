@@ -44,8 +44,8 @@ class FakeBaseWorker:
     def load_model(self) -> None:
         pass
 
-    def compile_or_warm_up_model(self) -> None:
-        pass
+    def compile_or_warm_up_model(self) -> str:
+        return "compile-result"
 
     def determine_available_memory(self) -> int:
         return 0
@@ -105,12 +105,13 @@ class FakeFTSnapshotWorker(MemorySnapshotMixin, FakeFTOffloadWorker):
         finally:
             self._in_ft_warmup = False
 
-    def compile_or_warm_up_model(self) -> None:
+    def compile_or_warm_up_model(self) -> str:
         """Warm up model; capture snapshot and dump only on the final vLLM call."""
-        super().compile_or_warm_up_model()
+        result = super().compile_or_warm_up_model()
         if not getattr(self, "_in_ft_warmup", False):
             self._take_snapshot("after_compile_warmup")
             self._dump_snapshots()
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -238,3 +239,10 @@ class TestFlexTensorSnapshotWorkerDumpTiming:
             f"Expected exactly 1 after_compile_warmup snapshot, got {len(warmup_labels)}. "
             "Duplicate entries from internal warmup calls must be suppressed."
         )
+
+    def test_compile_or_warm_up_model_preserves_super_return(self, worker, tmp_path):
+        """vLLM 0.20 consumes compile timing data returned by worker warmup."""
+        with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}):
+            result = worker.compile_or_warm_up_model()
+
+        assert result == "compile-result"

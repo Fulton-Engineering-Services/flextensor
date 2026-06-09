@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Model under test: https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+# Model card vLLM install floor:
+# https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4#vllm
+vllm>=0.20.0
+requests~=2.32

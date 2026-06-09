@@ -14,7 +14,7 @@ import pytest
 # stub it out so the module loads without a network-capable environment.
 sys.modules.setdefault("requests", MagicMock())
 
-_vllm_utils_path = Path(__file__).parent.parent / "integration" / "L0_contrib_vllm" / "vllm_utils.py"
+_vllm_utils_path = Path(__file__).parent.parent / "integration" / "_vllm_utils.py"
 _spec = importlib.util.spec_from_file_location("_vllm_utils_for_test", _vllm_utils_path)
 assert _spec is not None and _spec.loader is not None, f"Could not load {_vllm_utils_path}"
 _vllm_utils_mod = importlib.util.module_from_spec(_spec)

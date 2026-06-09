@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Models under test:
+# https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8
+# https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4
+# Model card vLLM install floors:
+# https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8#use-it-with-vllm
+# https://huggingface.co/nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4#use-it-with-vllm
+vllm>=0.12.0
+requests~=2.32

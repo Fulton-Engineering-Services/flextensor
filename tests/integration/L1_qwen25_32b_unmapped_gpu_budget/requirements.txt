@@ -1,4 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# The vLLM version is pinned by .dockerimages; keep requirements to client-side helpers.
+# vLLM 0.11.1 is the minimum supported FlexTensor vLLM worker version here;
+# Qwen2.5 basic serving only requires vllm serve, available since vLLM 0.5.3:
+# https://qwenlm.github.io/blog/qwen2.5/
+vllm>=0.11.1
 requests~=2.32

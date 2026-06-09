@@ -9,13 +9,17 @@ from pathlib import Path
 
 import pytest
 import torch
-from vllm_utils import (
-    MemoryProfilingMetrics,
+
+from tests.integration._vllm_server import (
+    FLEXTENSOR_SNAPSHOT_WORKER_CLS,
+    VllmOffloadSmokeCase,
+    run_vllm_server_test,
+)
+from tests.integration._vllm_utils import (
     load_gpu_memory_snapshots,
     parse_block_assignment_layers,
+    sanitize_test_name,
 )
-
-from tests.integration._vllm_server import run_vllm_server_test, sanitize_test_name
 
 
 @pytest.fixture
@@ -53,39 +57,20 @@ def device_gpu() -> torch.device:
 class TestContribVLLM:
     """Test cases for flextensor.contrib.vllm.worker.FlexTensorOffloadWorker."""
 
-    def _run_vllm_server_test(
-        self,
-        model_name: str,
-        enable_offload: bool,
-        cli_args: list[str],
-        output_dir: Path,
-        port: int = 8000,
-        extra_env_vars: dict[str, str] | None = None,
-    ) -> tuple[MemoryProfilingMetrics, dict, list[str]]:
-        """Compatibility wrapper around the shared vLLM server runner."""
-        return run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=enable_offload,
-            cli_args=cli_args,
-            output_dir=output_dir,
-            port=port,
-            extra_env_vars=extra_env_vars,
-        )
-
     @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
-        "model_name, cli_args",
+        "case",
         [
-            (
-                "Qwen/Qwen2.5-7B-Instruct",
-                [],
+            VllmOffloadSmokeCase(
+                model_name="Qwen/Qwen2.5-7B-Instruct",
+                output_dir_name="qwen2_5_7b_instruct",
+                cli_args=("--enforce-eager",),
             ),
         ],
     )
     def test_vllm_offloading_reduces_memory(
         self,
-        model_name: str,
-        cli_args: list[str],
+        case: VllmOffloadSmokeCase,
         device_gpu: torch.device,
         test_output_dir: Path,
     ) -> None:
@@ -103,8 +88,7 @@ class TestContribVLLM:
         - Both baseline and offload weights_memory are successfully parsed from vLLM logs
 
         Args:
-            model_name: Model to test
-            cli_args: Additional CLI arguments to pass to vllm serve
+            case: vLLM launch case to test
             device_gpu: GPU device for testing (from fixture)
             test_output_dir: Directory for test output
         """
@@ -116,12 +100,7 @@ class TestContribVLLM:
         baseline_dir = test_output_dir / "baseline"
         baseline_dir.mkdir(parents=True, exist_ok=True)
 
-        baseline_memory, baseline_metrics, _ = self._run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=False,
-            cli_args=cli_args,
-            output_dir=baseline_dir,
-        )
+        baseline_memory, baseline_metrics, _ = run_vllm_server_test(case, output_dir=baseline_dir)
 
         # Phase 2: Run with offloading
         print("\n" + "=" * 60)
@@ -131,11 +110,8 @@ class TestContribVLLM:
         offload_dir = test_output_dir / "offload"
         offload_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, _ = self._run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=True,
-            cli_args=cli_args,
-            output_dir=offload_dir,
+        offload_memory, offload_metrics, _ = run_vllm_server_test(
+            case.with_flextensor_offload(), output_dir=offload_dir
         )
 
         # Phase 3: Compare results
@@ -164,7 +140,7 @@ class TestContribVLLM:
 
         # Save combined metrics
         combined_metrics = {
-            "model_name": model_name,
+            "model_name": case.model_name,
             "baseline": baseline_metrics,
             "offload": offload_metrics,
             "comparison": {
@@ -184,18 +160,18 @@ class TestContribVLLM:
 
     @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
-        "model_name, cli_args",
+        "case",
         [
-            (
-                "Qwen/Qwen2.5-7B-Instruct",
-                [],
+            VllmOffloadSmokeCase(
+                model_name="Qwen/Qwen2.5-7B-Instruct",
+                output_dir_name="qwen2_5_7b_instruct",
+                cli_args=("--enforce-eager",),
             ),
         ],
     )
     def test_vllm_no_wildcard_traps_by_default(
         self,
-        model_name: str,
-        cli_args: list[str],
+        case: VllmOffloadSmokeCase,
         device_gpu: torch.device,
         test_output_dir: Path,
     ) -> None:
@@ -209,14 +185,13 @@ class TestContribVLLM:
         Incorrect (wildcard default):
             model  ← entire model = 1 trap, no pipelining
 
-        Correct (specific patterns like model.layers.*):
+        Correct (specific layer patterns such as class:*DecoderLayer):
             model.layers.0  ← each layer has its own trap
             model.layers.1
             ...
 
         Args:
-            model_name: Model to test
-            cli_args: Additional CLI arguments to pass to vllm serve
+            case: vLLM launch case to test
             device_gpu: GPU device for testing (from fixture)
             test_output_dir: Directory for test output
         """
@@ -226,12 +201,9 @@ class TestContribVLLM:
         # Do NOT set FT_INCLUDE_PATTERNS — rely on worker defaults.
         # FT_ENABLE_DIAGNOSTICS=1 makes the BLOCK ASSIGNMENT table available for
         # trap enumeration regardless of measurement consistency.
-        offload_memory, _, log_lines = self._run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=True,
-            cli_args=cli_args,
+        offload_memory, _, log_lines = run_vllm_server_test(
+            case.with_flextensor_offload().with_env_vars(("FT_ENABLE_DIAGNOSTICS", "1")),
             output_dir=output_dir,
-            extra_env_vars={"FT_ENABLE_DIAGNOSTICS": "1"},
         )
 
         trap_labels = parse_block_assignment_layers(log_lines)
@@ -250,17 +222,17 @@ class TestContribVLLM:
         coarse_trap_keys = [k for k in trap_labels if k == "model" or k.endswith(".model")]
         assert not coarse_trap_keys, (
             f"Coarse trap detected: {coarse_trap_keys} — entire model wrapped in one trap. "
-            "Worker must use specific include_patterns (e.g. model.layers.*) "
+            "Worker must use specific include_patterns (for example class:*DecoderLayer) "
             "so each transformer layer gets its own trap."
         )
 
-        # Per-layer check: specific patterns like 'model.layers.*' produce one trap
+        # Per-layer check: specific layer patterns produce one trap
         # per layer. Trap names use the full module path (e.g. model.layers.0,
         # model.layers.1, ...), so we match by numeric suffix.
         layer_entries = [k for k in trap_labels if re.search(r"\.\d+$", k)]
         assert len(layer_entries) >= 10, (
             f"Expected at least 10 individual layer traps, found {len(layer_entries)}: "
-            f"{layer_entries}. Check that include_patterns includes 'model.layers.*'."
+            f"{layer_entries}. Check that include_patterns includes layer-level patterns."
         )
 
         # Offloading must have moved tensors (weights_memory < full-model size)
@@ -276,18 +248,18 @@ class TestContribVLLM:
 
     @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
-        "model_name, cli_args",
+        "case",
         [
-            (
-                "Qwen/Qwen2.5-7B-Instruct",
-                [],
+            VllmOffloadSmokeCase(
+                model_name="Qwen/Qwen2.5-7B-Instruct",
+                output_dir_name="qwen2_5_7b_instruct",
+                cli_args=("--enforce-eager",),
             ),
         ],
     )
     def test_diagnostics_tables_appear_under_vllm(
         self,
-        model_name: str,
-        cli_args: list[str],
+        case: VllmOffloadSmokeCase,
         device_gpu: torch.device,
         test_output_dir: Path,
     ) -> None:
@@ -303,12 +275,9 @@ class TestContribVLLM:
         output_dir = test_output_dir / "diagnostics"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        _, _, log_lines = self._run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=True,
-            cli_args=cli_args,
+        _, _, log_lines = run_vllm_server_test(
+            case.with_flextensor_offload().with_env_vars(("FT_ENABLE_DIAGNOSTICS", "1")),
             output_dir=output_dir,
-            extra_env_vars={"FT_ENABLE_DIAGNOSTICS": "1"},
         )
 
         log_text = "\n".join(log_lines)
@@ -330,18 +299,18 @@ class TestContribVLLM:
 
     @pytest.mark.gpu_vram_40g
     @pytest.mark.parametrize(
-        "model_name, cli_args",
+        "case",
         [
-            (
-                "Qwen/Qwen2.5-7B-Instruct",
-                [],
+            VllmOffloadSmokeCase(
+                model_name="Qwen/Qwen2.5-7B-Instruct",
+                output_dir_name="qwen2_5_7b_instruct",
+                cli_args=("--enforce-eager",),
             ),
         ],
     )
     def test_snapshot_worker_captures_all_stages(
         self,
-        model_name: str,
-        cli_args: list[str],
+        case: VllmOffloadSmokeCase,
         device_gpu: torch.device,
         test_output_dir: Path,
     ) -> None:
@@ -360,20 +329,19 @@ class TestContribVLLM:
         4. Asserting GPU cuda_memory increases from init → load_model → kv_cache_init
 
         Args:
-            model_name: Model to test
-            cli_args: Additional CLI arguments to pass to vllm serve
+            case: vLLM launch case to test
             device_gpu: GPU device for testing (from fixture)
             test_output_dir: Directory for test output
         """
         snapshot_dir = test_output_dir / "snapshots"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
 
-        _, _, _ = self._run_vllm_server_test(
-            model_name=model_name,
-            enable_offload=True,
-            cli_args=["--worker-cls", "flextensor.contrib.vllm.snapshot.FlexTensorSnapshotWorker", *cli_args],
+        _, _, _ = run_vllm_server_test(
+            case.with_flextensor_offload(worker_cls=FLEXTENSOR_SNAPSHOT_WORKER_CLS).with_env_vars((
+                "FT_VLLM_SNAPSHOT_OUTPUT_DIR",
+                str(snapshot_dir),
+            )),
             output_dir=test_output_dir,
-            extra_env_vars={"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(snapshot_dir)},
         )
 
         # Read snapshot file directly — no log parsing needed

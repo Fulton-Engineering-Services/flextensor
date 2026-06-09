@@ -11,46 +11,89 @@ See flextensor.config.OffloadConfig for configuration options (FT_* env vars).
 """
 
 import atexit
+import importlib
 import logging
-from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, cast
 
 import psutil
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker.gpu_worker import Worker
 
 import flextensor
-import flextensor.contrib.vllm.loader
 from flextensor.config import load_config
 from flextensor.contrib.vllm._drafter_device import ensure_drafter_on_device
 from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
+from flextensor.utils import config_field_was_set
 
 safely_install_flextensor_logging_bridge()
+# Register FlexTensor's vLLM load_format side effect.
+importlib.import_module("flextensor.contrib.vllm.loader")
 
 LOGGER = logging.getLogger(__name__)
 
-# Default include patterns for per-layer offloading in decoder-only transformer models.
+# Default patterns for per-layer offloading in decoder-only and text-only
+# hybrid-wrapper vLLM models.
 # Each transformer layer gets its own trap, enabling the prefetch pipeline to
 # overlap CPU→GPU transfers with GPU compute for subsequent layers.
 # Override via FT_INCLUDE_PATTERNS env var or OffloadConfig(include_patterns=[...]).
 VLLM_DEFAULT_INCLUDE_PATTERNS: list[str] = [
+    # Prefer class-based layer selection so model path changes across vLLM
+    # versions do not collapse the worker back to one coarse model trap.
+    "class:*DecoderLayer",
+    "class:*DecoderBlock",
+    "class:*TransformerBlock",
     "model.embed_tokens",
-    "model.layers.*",
     "model.norm",
+    # Nemotron-H uses ``model.norm_f`` for the final decoder norm.
+    "model.norm_f",
     "lm_head",
     "logits_processor",
+    # Qwen3.5/3.6 hybrid wrappers keep the causal LM under
+    # ``language_model`` even in text-only serving mode.
+    "language_model.model.embed_tokens",
+    "language_model.model.norm",
+    "language_model.lm_head",
+    "language_model.logits_processor",
 ]
+
+# Some MoE sidecars can contain CUDA-only kernels or small router/gating tensors
+# that are safer kept GPU-resident while the routed expert bulk remains
+# available to FlexTensor. Use class-based excludes when the class identifies
+# only the sidecar; keep name patterns for shared classes and parameter-level
+# exclusions. Non-matching patterns are harmless for other architectures.
+VLLM_DEFAULT_EXCLUDE_PATTERNS: list[str] = [
+    "class:GateLinear",
+    "model.layers.*.mixer.shared_experts",
+    "model.layers.*.mixer.fc1_latent_proj",
+    "model.layers.*.mixer.fc2_latent_proj",
+    # Qwen3.5/3.6 shared experts are invoked by vLLM's FusedMoE runner
+    # side path, including a separate CUDA stream, so keep them resident.
+    "model.layers.*.mlp.shared_expert",
+    "language_model.model.layers.*.mlp.shared_expert",
+    # Qwen3.5/3.6 MoE router/gating tensors are tiny compared with expert
+    # weights and are better kept resident while expert linears are offloaded.
+    "language_model.model.layers.*.mlp.gate",
+    "language_model.model.layers.*.mlp.shared_expert_gate",
+    # Qwen3.5/3.6 GDN linear-attention kernels read these parameters inside
+    # vLLM custom ops, outside the normal torch function argument rewrite path.
+    "language_model.model.layers.*.linear_attn.A_log",
+    "language_model.model.layers.*.linear_attn.dt_bias",
+]
+
+VLLM_COMPILE_WARMUP_FORWARD_COUNT = 2
+VLLM_DISCOVERY_ITER_FLOOR = VLLM_COMPILE_WARMUP_FORWARD_COUNT + 1
+VLLM_PROFILING_ITER_FLOOR = 2
 
 
 def _GiB(b: int) -> float:  # noqa: N802
-    return b / GiB_bytes
+    return b / float(GiB_bytes)
 
 
 _CUDA_GRAPH_WRAPPER_LOGGED = False
 
 
-def _resolve_cuda_graph_wrapper() -> type | None:
+def _resolve_cuda_graph_wrapper() -> type[Any] | None:
     """Locate vLLM's ``CUDAGraphWrapper`` class.
 
     The primary import path logs at INFO the first time it succeeds.  The
@@ -67,7 +110,7 @@ def _resolve_cuda_graph_wrapper() -> type | None:
         if not _CUDA_GRAPH_WRAPPER_LOGGED:
             LOGGER.info("FlexTensor: using CUDAGraphWrapper from vllm.compilation.wrapper (primary path)")
             _CUDA_GRAPH_WRAPPER_LOGGED = True
-        return CUDAGraphWrapper
+        return cast("type[Any]", CUDAGraphWrapper)
     except ImportError as exc:
         primary_exc = exc
 
@@ -81,7 +124,7 @@ def _resolve_cuda_graph_wrapper() -> type | None:
                 primary_exc,
             )
             _CUDA_GRAPH_WRAPPER_LOGGED = True
-        return CUDAGraphWrapper
+        return cast("type[Any]", CUDAGraphWrapper)
     except ImportError as exc:
         LOGGER.warning(
             "FlexTensor: CUDAGraphWrapper not importable from either vllm.compilation.wrapper "
@@ -93,8 +136,37 @@ def _resolve_cuda_graph_wrapper() -> type | None:
         return None
 
 
+def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
+    """Return vLLM-specific OffloadConfig updates.
+
+    Args:
+        offload_config: OffloadConfig-like object with discovery/profiling
+            iteration counts and include/exclude pattern lists.
+
+    Returns:
+        Config update dictionary with minimum vLLM warmup iteration counts,
+        default non-wildcard include patterns when the user did not customize
+        includes, and MoE sidecar excludes when the user did not customize
+        excludes.
+    """
+    # vLLM's first compile_or_warm_up_model() runs two forwards that already
+    # count as FlexTensor discovery. Keep one additional explicit small-token
+    # discovery pass, while using two max-token profiling passes to bound
+    # startup cost.
+    config_updates: dict[str, Any] = {
+        "discovery_iters": max(offload_config.discovery_iters, VLLM_DISCOVERY_ITER_FLOOR),
+        "profiling_iters": max(offload_config.profiling_iters, VLLM_PROFILING_ITER_FLOOR),
+    }
+    if offload_config.include_patterns == ["*"]:
+        config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
+    if offload_config.exclude_patterns == [] and not config_field_was_set(offload_config, "exclude_patterns"):
+        config_updates["exclude_patterns"] = VLLM_DEFAULT_EXCLUDE_PATTERNS
+    return config_updates
+
+
+# Return type is `Any` for beartype + @contextmanager compatibility.
 @contextmanager
-def vllm_model_context(model_runner: Any) -> Generator[list[Any], None, None]:
+def vllm_model_context(model_runner: Any) -> Any:
     """Context manager for unwrapping/re-wrapping vLLM model wrappers.
 
     Extracts actual model from UBatchWrapper/CUDAGraphWrapper on entry.
@@ -113,7 +185,7 @@ def vllm_model_context(model_runner: Any) -> Generator[list[Any], None, None]:
     """
     model_or_wrapper = model_runner.model
     actual_model = model_or_wrapper
-    wrapper_attrs = []  # Tracks which wrapper attributes to update
+    wrapper_attrs: list[str] = []  # Tracks which wrapper attributes to update
 
     try:
         from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
@@ -135,13 +207,14 @@ def vllm_model_context(model_runner: Any) -> Generator[list[Any], None, None]:
         wrapper_attrs.append("model")
 
     model_container = [actual_model]
-    yield model_container
-
-    if wrapper_attrs:
-        for attr in wrapper_attrs:
-            setattr(model_or_wrapper, attr, model_container[0])
-    else:
-        model_runner.model = model_container[0]
+    try:
+        yield model_container
+    finally:
+        if wrapper_attrs:
+            for attr in wrapper_attrs:
+                setattr(model_or_wrapper, attr, model_container[0])
+        else:
+            model_runner.model = model_container[0]
 
 
 class FlexTensorOffloadWorker(Worker):
@@ -150,16 +223,11 @@ class FlexTensorOffloadWorker(Worker):
     Applies tensor offloading after model loading when FT_ENABLED=1.
     """
 
-    def load_model(self):
+    def load_model(self) -> None:
         """Load model with optional FlexTensor offloading."""
         # Create offload config using the device set by init_device()
         offload_config = load_config(gpu_device=self.device.index)
-        config_updates: dict[str, Any] = {
-            "discovery_iters": max(offload_config.discovery_iters, 3),
-            "profiling_iters": max(offload_config.profiling_iters, 2),
-        }
-        if offload_config.include_patterns == ["*"]:
-            config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
+        config_updates = _vllm_config_updates(offload_config)
         self._offload_config = offload_config.model_copy(update=config_updates)
         if self._offload_config.enabled:
             LOGGER.info("FlexTensor offloading enabled with config: %s", self._offload_config)
@@ -222,7 +290,7 @@ class FlexTensorOffloadWorker(Worker):
         # vLLM's first compile_or_warm_up_model() runs 2 forward passes through
         # the offloaded model; each one counts as a discovery iteration in the
         # OffloadManager, so the loop below only tops up to discovery_iters.
-        compile_warm_iters = 2
+        compile_warm_iters = VLLM_COMPILE_WARMUP_FORWARD_COUNT
 
         discovery_iters = self._offload_config.discovery_iters - compile_warm_iters
         for i in range(discovery_iters):

@@ -134,7 +134,7 @@ config = load_config(
 |--------|------|---------|-------------|
 | `enabled` | bool | `True` | Master switch for offloading |
 | `gpu_device` | int | `0` | GPU device index to use |
-| `include_patterns` | list[str] | `["*"]` | Patterns to include for offloading. Each entry is a `<glob>` (module / parameter path), an explicit `name:<glob>`, or a `class:<glob>` matching on the module's class. Default `["*"]` works for quick experimentation; use specific patterns (e.g., `model.layers.*`) for transformer pipelining. |
+| `include_patterns` | list[str] | `["*"]` | Patterns to include for offloading. Each entry is a `<glob>` (module / parameter path), an explicit `name:<glob>`, or a `class:<glob>` matching on the module's class. Default `["*"]` works for quick experimentation; use specific patterns (e.g., `class:*DecoderLayer` or `model.layers.*`) for transformer pipelining. |
 | `exclude_patterns` | list[str] | `[]` | Patterns to exclude from offloading (same three forms as `include_patterns`). Applied after `include_patterns`. |
 
 #### Include / Exclude Patterns
@@ -201,23 +201,11 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head" FT_EXCLUDE_PATTERNS="class:MoELayer,*.
 See [Pattern Matching](pattern-matching.md) for the full matching semantics, including parameter-level vs. module-level matching, FQCN globs, and the dict-model caveats for `class:` patterns.
 
 !!! tip "vLLM worker default patterns"
-    The `FlexTensorOffloadWorker` uses these patterns by default when no custom `FT_INCLUDE_PATTERNS` is set. They are designed for decoder-only transformer layouts as served by vLLM:
+    When no custom `FT_INCLUDE_PATTERNS` / `FT_EXCLUDE_PATTERNS` are set, `FlexTensorOffloadWorker` installs vLLM-oriented defaults: decoder-layer class includes, common embedding/norm/head paths, and excludes for known MoE sidecars and tiny router/gating tensors that should stay GPU-resident.
 
-    ```python
-    config = OffloadConfig(
-        include_patterns=[
-            "model.embed_tokens",
-            "model.layers.*",
-            "model.norm",
-            "lm_head",
-            "logits_processor",
-        ]
-    )
-    ```
+    The class patterns give each transformer layer/block its own offload trap, enabling FlexTensor to overlap CPU→GPU transfers with GPU computation without depending on a specific `model.layers.*` path. The exact lists live in `VLLM_DEFAULT_INCLUDE_PATTERNS` and `VLLM_DEFAULT_EXCLUDE_PATTERNS` in `src/flextensor/contrib/vllm/worker.py`. For models with a different layout, inspect module names and classes with `model.named_modules()` and set `FT_INCLUDE_PATTERNS` / `FT_EXCLUDE_PATTERNS` accordingly.
 
-    These patterns give each transformer layer its own offload trap, enabling FlexTensor to overlap CPU→GPU transfers with GPU computation. For models with a different layout, inspect module names with `model.named_modules()` and set `FT_INCLUDE_PATTERNS` accordingly.
-
-The default `["*"]` matches all top-level child modules. It is a reasonable starting point for quick experimentation, but for transformer models in production, prefer specific patterns such as `model.layers.*`. With `["*"]`, every top-level child is wrapped in a single coarse trap, which prevents per-trap pipelining. With patterns like `model.layers.*`, each matched module gets its own trap, and FlexTensor can overlap CPU→GPU transfers for trap N+1 while the GPU computes trap N.
+The default `["*"]` matches all top-level child modules. It is a reasonable starting point for quick experimentation, but for transformer models in production, prefer specific patterns such as `class:*DecoderLayer` or `model.layers.*`. With `["*"]`, every top-level child is wrapped in a single coarse trap, which prevents per-trap pipelining. With layer-level class or name patterns, each matched module gets its own trap, and FlexTensor can overlap CPU→GPU transfers for trap N+1 while the GPU computes trap N.
 
 When `enabled=False`, FlexTensor passes through to normal PyTorch execution with no overhead. This is useful for:
 

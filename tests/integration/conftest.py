@@ -6,6 +6,10 @@
 from __future__ import annotations
 
 import os
+import shutil
+import subprocess  # noqa: S404 - subprocess needed for test diagnostics
+
+import pytest
 
 # Files that must all be present in the local HF cache before we trust it enough
 # to enable offline mode. A partial cache left by an HTTP 429-interrupted
@@ -18,6 +22,55 @@ _REQUIRED_CACHE_FILES = (
     "tokenizer_config.json",
     "tokenizer.json",
 )
+
+PCIE_QUERY_ARGS = (
+    "nvidia-smi",
+    (
+        "--query-gpu=index,name,uuid,pci.bus_id,pcie.link.gen.gpucurrent,pcie.link.gen.max,"
+        "pcie.link.gen.gpumax,pcie.link.gen.hostmax,pcie.link.width.current,pcie.link.width.max,"
+        "driver_version"
+    ),
+    "--format=csv",
+)
+
+
+def _run_nvidia_smi(args: tuple[str, ...], *, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603 - controlled integration-test diagnostic command
+        list(args),
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=timeout_s,
+    )
+
+
+def _print_command_output(title: str, args: tuple[str, ...], *, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    print(f"=== {title} ===")
+    result = _run_nvidia_smi(args, timeout_s=timeout_s)
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip())
+    return result
+
+
+@pytest.fixture(scope="session", autouse=True)
+def require_integration_nvidia_gpu() -> None:
+    """Require an NVIDIA GPU once per integration pytest session."""
+    if shutil.which("nvidia-smi") is None:
+        pytest.fail("nvidia-smi not found. Integration tests require an NVIDIA GPU.")
+
+    summary = _print_command_output("nvidia-smi", ("nvidia-smi",), timeout_s=15)
+    if summary.returncode != 0:
+        pytest.fail("NVIDIA GPU not detected. Integration tests require an NVIDIA GPU.")
+
+    pcie = _print_command_output("nvidia-smi PCIe details", PCIE_QUERY_ARGS, timeout_s=15)
+    if pcie.returncode != 0:
+        print("WARNING: failed to query detailed NVIDIA GPU PCIe information.")
+
+    topo = _print_command_output("nvidia-smi topo -m", ("nvidia-smi", "topo", "-m"), timeout_s=15)
+    if topo.returncode != 0:
+        print("WARNING: failed to query NVIDIA GPU topology.")
 
 
 def enable_offline_if_cached(model_name: str) -> None:

@@ -36,6 +36,11 @@ integration tests and examples.
 | Qwen/Qwen2.5-0.5B-Instruct | Apache 2.0 | Integration tests |
 | Qwen/Qwen2.5-7B-Instruct | Apache 2.0 | Integration tests |
 | Qwen/Qwen2.5-32B-Instruct | Apache 2.0 | Integration tests |
+| Qwen/Qwen3.6-35B-A3B | Apache 2.0 | Integration tests |
+| Qwen/Qwen3.6-35B-A3B-FP8 | Apache 2.0 | Integration tests |
+| nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8 | NVIDIA Nemotron Open Model License | Integration tests |
+| nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4 | NVIDIA Nemotron Open Model License | Integration tests |
+| nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | NVIDIA Nemotron Open Model License | Integration tests |
 | Qwen/Qwen2.5-72B-Instruct | Qwen License | Examples |
 | Wan-AI/Wan2.2-T2V-A14B-Diffusers | Apache 2.0 | Examples |
 

@@ -20,16 +20,16 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 try:
     from vllm.utils.mem_utils import MemorySnapshot
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.worker.gpu_worker import Worker
 except ModuleNotFoundError:  # vllm not installed (e.g. unit-test environment)
-    MemorySnapshot = None  # type: ignore[assignment,misc]
-    KVCacheConfig = None  # type: ignore[assignment,misc]
-    Worker = None  # type: ignore[assignment,misc]
+    MemorySnapshot = None
+    KVCacheConfig = None
+    Worker = None
 else:
     # In the else clause so a rename of flextensor.contrib.vllm._logging is
     # not misclassified as "vLLM not installed".
@@ -218,7 +218,7 @@ if Worker is not None:
             """
             result = super().determine_available_memory()
             self._take_snapshot("after_determine_available_memory")
-            return result
+            return cast("int", result)
 
         def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
             """Initialize KV cache from config and capture post-init snapshot.
@@ -229,11 +229,12 @@ if Worker is not None:
             super().initialize_from_config(kv_cache_config)
             self._take_snapshot("after_kv_cache_init")
 
-        def compile_or_warm_up_model(self) -> None:
+        def compile_or_warm_up_model(self) -> Any:
             """Warm up model, capture final snapshot, and dump all snapshots to disk."""
-            super().compile_or_warm_up_model()
+            result = super().compile_or_warm_up_model()
             self._take_snapshot("after_compile_warmup")
             self._dump_snapshots()
+            return result
 
 
 if FlexTensorOffloadWorker is not None:
@@ -267,7 +268,7 @@ if FlexTensorOffloadWorker is not None:
             """
             result = super().determine_available_memory()
             self._take_snapshot("after_determine_available_memory")
-            return result
+            return cast("int", result)
 
         def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
             """Initialize KV cache from config and capture post-init snapshot.
@@ -291,14 +292,15 @@ if FlexTensorOffloadWorker is not None:
             finally:
                 self._in_ft_warmup = False
 
-        def compile_or_warm_up_model(self) -> None:
+        def compile_or_warm_up_model(self) -> Any:
             """Warm up model; capture snapshot and dump only on the final vLLM call.
 
             When called from warmup_and_profile_model() (internal profiling),
             _in_ft_warmup is True and the snapshot/dump are suppressed.
             The snapshot and dump happen only on the external lifecycle call.
             """
-            super().compile_or_warm_up_model()
+            result = super().compile_or_warm_up_model()
             if not getattr(self, "_in_ft_warmup", False):
                 self._take_snapshot("after_compile_warmup")
                 self._dump_snapshots()
+            return result

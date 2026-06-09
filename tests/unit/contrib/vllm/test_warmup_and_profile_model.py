@@ -374,6 +374,24 @@ class TestWarmupAndProfileModelCallContract:
         )
 
 
+class TestVllmModelContext:
+    """Pins the model update behavior of ``vllm_model_context``."""
+
+    def test_updates_model_runner_when_body_raises_after_replacement(self, worker_module):
+        original_model = object()
+        replacement_model = object()
+        model_runner = SimpleNamespace(model=original_model)
+
+        with (
+            pytest.raises(RuntimeError, match="offload failed after replacement"),
+            worker_module.vllm_model_context(model_runner) as model_container,
+        ):
+            model_container[0] = replacement_model
+            raise RuntimeError("offload failed after replacement")
+
+        assert model_runner.model is replacement_model
+
+
 class TestResolveCudaGraphWrapper:
     """Pins the import-fallback contract for ``_resolve_cuda_graph_wrapper``."""
 

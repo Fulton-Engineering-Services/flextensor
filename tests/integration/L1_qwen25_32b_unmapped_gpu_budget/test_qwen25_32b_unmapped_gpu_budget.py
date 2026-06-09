@@ -17,14 +17,15 @@ from pathlib import Path
 import pytest
 import requests
 
-from tests.integration._vllm_server import sanitize_test_name
-from tests.integration.L0_contrib_vllm.vllm_utils import (
+from tests.integration._vllm_server import (
+    VllmOffloadSmokeCase,
     make_chat_request,
     parse_memory_profiling_logs,
     start_vllm_server,
     stop_vllm_server,
     wait_for_server,
 )
+from tests.integration._vllm_utils import sanitize_test_name
 
 pytestmark = [pytest.mark.gpu_vram_40g, pytest.mark.gpu_sm_80]
 
@@ -61,18 +62,21 @@ def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_outpu
     }
 
     try:
+        case = VllmOffloadSmokeCase(
+            model_name=MODEL_NAME,
+            output_dir_name="qwen25_32b_unmapped_gpu_budget",
+            cli_args=("--enforce-eager", "--max-num-seqs", "1", "--max-model-len", "128"),
+            extra_env_vars=(
+                ("VLLM_NO_USAGE_STATS", "1"),
+                ("VLLM_LOGGING_LEVEL", "DEBUG"),
+                ("FT_ENABLE_DIAGNOSTICS", "1"),
+                ("FT_MAX_GPU_MEM_FRACTION", "0.95"),
+                ("FT_INCLUDE_PATTERNS", INCLUDE_PATTERNS),
+                ("FT_DEBUG_LOG_PATH", str(test_output_dir / "debug.log")),
+            ),
+        ).with_flextensor_offload()
         process, log_lines = start_vllm_server(
-            MODEL_NAME,
-            offload_enabled=True,
-            additional_cli_args=["--enforce-eager", "--max-num-seqs", "1", "--max-model-len", "128"],
-            additional_env_vars={
-                "VLLM_NO_USAGE_STATS": "1",
-                "VLLM_LOGGING_LEVEL": "DEBUG",
-                "FT_ENABLE_DIAGNOSTICS": "1",
-                "FT_MAX_GPU_MEM_FRACTION": "0.95",
-                "FT_INCLUDE_PATTERNS": INCLUDE_PATTERNS,
-                "FT_DEBUG_LOG_PATH": str(test_output_dir / "debug.log"),
-            },
+            case,
         )
 
         ready = wait_for_server(timeout=2700, process=process)

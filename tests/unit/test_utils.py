@@ -6,6 +6,7 @@
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -17,11 +18,31 @@ from flextensor.utils import (
     any_path_matches_pattern,
     atomic_write_json,
     calculate_tensor_size,
+    config_field_was_set,
     get_class_matched_module_paths,
     matches_any_class_pattern,
     matches_any_pattern,
     partition_patterns,
 )
+
+
+class TestConfigFieldWasSet:
+    """Test cases for explicit config-field detection."""
+
+    def test_model_fields_set_marks_explicit_field(self):
+        config = SimpleNamespace(model_fields_set={"exclude_patterns"})
+
+        assert config_field_was_set(config, "exclude_patterns")
+        assert not config_field_was_set(config, "include_patterns")
+
+    def test_deprecated_fields_set_fallback_marks_explicit_field(self):
+        config = SimpleNamespace(__fields_set__={"include_patterns"})
+
+        assert config_field_was_set(config, "include_patterns")
+        assert not config_field_was_set(config, "exclude_patterns")
+
+    def test_missing_fields_set_is_false(self):
+        assert not config_field_was_set(SimpleNamespace(), "exclude_patterns")
 
 
 class TestAtomicWriteJson:

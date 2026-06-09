@@ -1293,6 +1293,49 @@ def test_get_non_offloaded_dict_model_infix_exclude():
     assert non_offloaded == {id(t_attn)}
 
 
+def test_get_non_offloaded_qwen_shared_expert_paths():
+    """Qwen shared-expert module paths can be kept GPU-resident."""
+
+    class SharedExpert(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = SimpleModule()
+
+    class MLP(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.shared_expert = SharedExpert()
+            self.experts = SimpleModule()
+
+    class Layer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = MLP()
+
+    class LanguageModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([Layer()])
+
+    class QwenWrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = LanguageModel()
+
+    model = QwenWrapper()
+    tensors_map = {id(p): p for p in model.parameters()}
+
+    non_offloaded = get_non_offloaded_tensor_ids(
+        model,
+        tensors_map,
+        exclude_patterns=["language_model.model.layers.*.mlp.shared_expert"],
+    )
+
+    expected = {id(p) for p in model.language_model.model.layers[0].mlp.shared_expert.parameters()}
+    assert non_offloaded == expected
+
+
 def test_get_non_offloaded_none_model():
     """None model returns empty set."""
     non_offloaded = get_non_offloaded_tensor_ids(None, {}, exclude_patterns=["*"])

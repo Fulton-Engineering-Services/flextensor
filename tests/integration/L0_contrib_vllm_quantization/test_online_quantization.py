@@ -17,10 +17,13 @@ from beartype import beartype
 from tests.integration._vllm_server import (
     VllmOffloadSmokeCase,
     run_vllm_server_test,
+)
+from tests.integration._vllm_utils import (
     sanitize_test_name,
 )
 
 BASE_CLI_ARGS = (
+    "--enforce-eager",
     "--tensor-parallel-size",
     "1",
     "--gpu-memory-utilization",
@@ -52,7 +55,7 @@ class OnlineQuantizationSmokeCase:
             output_dir_name=self.output_dir_name,
             cli_args=(*BASE_CLI_ARGS, "--quantization", self.quantization),
             extra_env_vars=ONLINE_QUANTIZATION_ENV_VARS,
-        )
+        ).with_flextensor_offload()
 
 
 ONLINE_QUANTIZATION_CASES = (
@@ -118,11 +121,8 @@ def run_online_quantization_smoke(case: OnlineQuantizationSmokeCase, test_output
     vllm_case = case.to_vllm_case()
 
     offload_memory, offload_metrics, log_lines = run_vllm_server_test(
-        model_name=vllm_case.model_name,
-        enable_offload=True,
-        cli_args=list(vllm_case.cli_args),
+        vllm_case,
         output_dir=output_dir,
-        extra_env_vars=dict(vllm_case.extra_env_vars),
         chat_request_timeout=180,
     )
 

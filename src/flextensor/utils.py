@@ -20,6 +20,7 @@ __all__ = [
     "atomic_write_json",
     "calculate_tensor_size",
     "clear_and_delete_tensor",
+    "config_field_was_set",
     "delete_tensor",
     "get_class_matched_module_paths",
     "get_module_paths",
@@ -43,6 +44,24 @@ CLASS_PATTERN_PREFIX = "class:"
 # symmetry with ``class:`` and to disambiguate a literal module path that starts
 # with ``class:`` (unlikely, but possible in principle).
 NAME_PATTERN_PREFIX = "name:"
+
+
+def config_field_was_set(config: Any, field_name: str) -> bool:
+    """Return whether a Pydantic config field was explicitly provided.
+
+    Args:
+        config: Pydantic model instance, or compatible object, exposing
+            ``model_fields_set`` or the deprecated ``__fields_set__``.
+        field_name: Field name to check.
+
+    Returns:
+        ``True`` if the field was explicitly provided during model
+        construction or copy/update; otherwise ``False``.
+    """
+    fields_set = getattr(config, "model_fields_set", None)
+    if fields_set is None:
+        fields_set = getattr(config, "__fields_set__", None)
+    return isinstance(fields_set, (set, frozenset)) and field_name in fields_set
 
 
 def _compile_segment_regex(segment: str) -> re.Pattern[str]:
