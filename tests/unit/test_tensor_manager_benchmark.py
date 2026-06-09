@@ -11,6 +11,7 @@ import torch
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, PreloadToDevice, TensorBenchmarkMode
 from flextensor.collectors import LayerStatistics, TensorStatistics
 from flextensor.host_pinning import HostPinner
+from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.strategy import KnapsackStrategy
 from flextensor.tensor import TraceTensor
 from flextensor.tensor_manager import TensorManager
@@ -50,6 +51,7 @@ class TestTensorManagerBenchmarkIntegration:
             device_gpu=self.device_gpu,
             tensor_manager_load_strategy=self.strategy,
             _use_trace_tensor=True,
+            profile_mode="getter",
         )
 
         assert tensor_manager._benchmark_cls == BenchmarkReplace
@@ -64,6 +66,7 @@ class TestTensorManagerBenchmarkIntegration:
             device_gpu=self.device_gpu,
             tensor_manager_load_strategy=self.strategy,
             _use_trace_tensor=True,
+            profile_mode="getter",
         )
 
         assert tm_default.is_traced == tm_default.__class__.is_traced.__get__(tm_default)
@@ -89,6 +92,7 @@ class TestTensorManagerBenchmarkIntegration:
             device_gpu=self.device_gpu,
             tensor_manager_load_strategy=self.strategy,
             _use_trace_tensor=True,
+            profile_mode="getter",
         )
         plain = torch.zeros(4)
         traced = TraceTensor(torch.zeros(4))
@@ -352,25 +356,114 @@ class TestTensorManagerBenchmarkIntegration:
 
     @pytest.mark.parametrize("loader_type", ["allocation_block_transfer", "raw_block_transfer"])
     def test_block_transfer_requires_direct_mode(self, loader_type: str) -> None:
-        """Block transfer loaders must reject _direct_mode=False."""
-        with pytest.raises(ValueError, match="_direct_mode=False is incompatible"):
+        """Block transfer loaders must reject ``profile_mode='torch_function'``."""
+        with pytest.raises(ValueError, match=r"torch_function.*incompatible"):
             TensorManager(
                 device_gpu=self.device_gpu,
                 tensor_manager_load_strategy=self.strategy,
                 loader_type=loader_type,
-                _direct_mode=False,
+                profile_mode="torch_function",
             )
 
-    def test_strategy_loader_allows_direct_mode_false(self) -> None:
-        """Strategy loader accepts _direct_mode=False."""
+    def test_strategy_loader_allows_torch_function_profile_mode(self) -> None:
+        """Strategy loader accepts ``profile_mode='torch_function'``."""
         tensor_manager = TensorManager(
             device_gpu=self.device_gpu,
             tensor_manager_load_strategy=self.strategy,
             loader_type="strategy",
-            _direct_mode=False,
+            profile_mode="torch_function",
         )
 
         assert tensor_manager.direct_enabled is False
+        assert tensor_manager.profile_mode == "torch_function"
+
+    def test_direct_mode_flag_decoupled_from_profile_mode(self) -> None:
+        """``_direct_mode`` is the runtime-family axis, independent of the
+        profile-phase variant. ``_direct_mode=False`` selects the indirect
+        runtime even with a ``view``/``getter`` ``profile_mode`` (the variant is
+        then ignored), and ``profile_mode='torch_function'`` forces it ``False``.
+        """
+        # Default: direct family.
+        tm_default = TensorManager(
+            device_gpu=self.device_gpu,
+            tensor_manager_load_strategy=self.strategy,
+        )
+        assert tm_default._direct_mode is True
+        assert tm_default.direct_enabled is True
+
+        # Explicit indirect family with a view profile_mode -> view is ignored.
+        tm_indirect = TensorManager(
+            device_gpu=self.device_gpu,
+            tensor_manager_load_strategy=self.strategy,
+            loader_type="strategy",
+            profile_mode="view",
+            _direct_mode=False,
+        )
+        assert tm_indirect.direct_enabled is False
+        assert tm_indirect._profile_uses_views is False
+
+        # profile_mode='torch_function' forces the indirect family.
+        tm_tf = TensorManager(
+            device_gpu=self.device_gpu,
+            tensor_manager_load_strategy=self.strategy,
+            loader_type="strategy",
+            profile_mode="torch_function",
+        )
+        assert tm_tf._direct_mode is False
+
+    def test_indirect_mode_rejects_block_loader(self) -> None:
+        """``_direct_mode=False`` is incompatible with block-transfer loaders,
+        same constraint as ``profile_mode='torch_function'``.
+        """
+        with pytest.raises(ValueError, match=r"[Ii]ndirect mode.*incompatible"):
+            TensorManager(
+                device_gpu=self.device_gpu,
+                tensor_manager_load_strategy=self.strategy,
+                loader_type="allocation_block_transfer",
+                _direct_mode=False,
+            )
+
+    def test_profile_mode_view_accepts_strategy_loader(self) -> None:
+        """``profile_mode='view'`` is accepted with ``loader_type='strategy'``.
+
+        The view-mode profile controller is self-contained and torn down before
+        the inference loader is built, so the profile mechanism and inference
+        loader are independent.
+        """
+        tensor_manager = TensorManager(
+            device_gpu=self.device_gpu,
+            tensor_manager_load_strategy=self.strategy,
+            loader_type="strategy",
+            profile_mode="view",
+        )
+
+        assert tensor_manager.profile_mode == "view"
+        assert tensor_manager.loader_type == "strategy"
+
+    def test_profile_mode_view_rejects_trace_tensor(self) -> None:
+        """``profile_mode='view'`` is incompatible with trace-tensor benchmarking."""
+        with pytest.raises(ValueError, match=r"view.*_use_trace_tensor"):
+            TensorManager(
+                device_gpu=self.device_gpu,
+                tensor_manager_load_strategy=self.strategy,
+                loader_type="allocation_block_transfer",
+                profile_mode="view",
+                _use_trace_tensor=True,
+            )
+
+    def test_profile_mode_unknown_rejected(self) -> None:
+        """Unknown ``profile_mode`` value raises immediately.
+
+        ``profile_mode`` carries a Literal type hint, so beartype rejects unknown
+        values before our internal validator runs. Either error is acceptable;
+        this asserts the name surfaces in the message.
+        """
+        with pytest.raises(Exception, match="profile_mode"):
+            TensorManager(
+                device_gpu=self.device_gpu,
+                tensor_manager_load_strategy=self.strategy,
+                profile_mode="bogus",  # type: ignore[arg-type]
+            )
 
 
 class MockBenchmarkReplace(TensorBenchmarkMode):
@@ -470,7 +563,14 @@ class TestUntracedTensorDiscoveryBranch:
     """Verify enable_untraced_tensor_discovery gates discover_untraced_tensors_for_layers."""
 
     def _prepare_tm(self, *, discovery_enabled: bool) -> TensorManager:
-        tm = _make_tm(_enable_untraced_tensor_discovery=discovery_enabled)
+        # ``profile_mode='getter'`` here because these tests drive
+        # ``prepare_profile_direct_mode`` directly without going through
+        # ``prepare_profile_direct_mode_model``, so the view path's
+        # pre-built ``ProfileBlockController`` is unavailable.
+        tm = _make_tm(
+            _enable_untraced_tensor_discovery=discovery_enabled,
+            profile_mode="getter",
+        )
         tm.layer_statistics_collector = MagicMock()
         fake_stats = [MagicMock()]
         tm.layer_statistics_collector.get_layer_stats.return_value = fake_stats
@@ -497,6 +597,131 @@ class TestUntracedTensorDiscoveryBranch:
         tm = self._prepare_tm(discovery_enabled=False)
         tm.prepare_profile_direct_mode()
         mock_discover.assert_not_called()
+
+
+class TestPrepareProfileDirectModeOrdering:
+    """Verify view-mode requires ``prepare_profile_direct_mode_model`` first.
+
+    For ``profile_mode='view'`` the setup is split across two methods:
+    ``prepare_profile_direct_mode_model`` builds the
+    ``ProfileBlockController`` and patches the model with views, then
+    ``prepare_profile_direct_mode`` wires ``TrapProfileView`` against it.
+    Reversing or skipping the first call must raise loudly so the bug
+    surfaces at setup time, not as silent garbage profile measurements later.
+    """
+
+    def test_raises_when_called_before_prepare_model_in_view_mode(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        assert not isinstance(tm.tensor_layer_loader, ProfileBlockController)
+
+        with pytest.raises(RuntimeError, match="view-mode controller missing"):
+            tm.prepare_profile_direct_mode()
+
+
+class TestInitializeProfileViewModeFailureCleanup:
+    """``initialize_profile`` must drop the view-mode controller if patching
+    raises after ``ProfileBlockController.__init__`` has allocated the GPU
+    block. Otherwise the multi-GiB block leaks until process exit, since the
+    only path that calls ``_teardown_profile_block_controller`` in normal flow
+    is ``prepare_infer_mode``, which never runs after a failed profile setup.
+    """
+
+    def test_view_mode_setup_failure_releases_controller(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        tm.model = MagicMock()
+        tm._move_non_offloaded_tensors_to_gpu = MagicMock()
+
+        # Stand-in controller: ``spec=ProfileBlockController`` makes the mock
+        # pass ``isinstance`` so the teardown path actually fires.
+        fake_controller = MagicMock(spec=ProfileBlockController)
+
+        def _fake_prepare_model(model):
+            tm.tensor_layer_loader = fake_controller
+            raise RuntimeError("simulated patching failure")
+
+        tm.prepare_profile_direct_mode_model = _fake_prepare_model
+
+        with pytest.raises(RuntimeError, match="simulated patching failure"):
+            tm.initialize_profile()
+
+        fake_controller.teardown.assert_called_once_with(tm.model, tm.tensors_map)
+        assert tm.tensor_layer_loader is None
+
+
+class TestShutdownTearsDownProfileController:
+    """``TensorManager.shutdown()`` must restore ``.data`` before releasing the
+    GPU block when a view-mode profile is still in flight. Otherwise patched
+    parameters end up aliasing freed storage -> silent garbage on any
+    subsequent use of the model.
+    """
+
+    def test_shutdown_runs_controller_teardown_first(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        tm.model = MagicMock()
+        tm.host_pinner = MagicMock()
+
+        controller = MagicMock(spec=ProfileBlockController)
+        tm.tensor_layer_loader = controller
+
+        tm.shutdown()
+
+        # ``.data`` restoration runs (via ``_teardown_profile_block_controller``)
+        # and the loader ref is cleared, so the subsequent ``loader.shutdown()``
+        # branch is a no-op rather than freeing a still-referenced block.
+        controller.teardown.assert_called_once_with(tm.model, tm.tensors_map)
+        controller.shutdown.assert_not_called()
+        assert tm.tensor_layer_loader is None
+        tm.host_pinner.release_all.assert_called_once()
+
+
+class TestTeardownProfileBlockControllerClearsRefs:
+    """``_teardown_profile_block_controller`` must clear
+    ``tensor_layer_loader`` even when ``controller.teardown`` raises.
+    Otherwise the manager keeps a dangling ref into a shut-down controller,
+    breaking the next ``release_memory()`` (which routes through the loader)
+    and any subsequent profile setup that branches on the loader's type.
+    """
+
+    def test_loader_cleared_when_teardown_raises(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        tm.model = MagicMock()
+
+        controller = MagicMock(spec=ProfileBlockController)
+        controller.teardown.side_effect = RuntimeError("teardown failed")
+        tm.tensor_layer_loader = controller
+
+        with pytest.raises(RuntimeError, match="teardown failed"):
+            tm._teardown_profile_block_controller()
+
+        assert tm.tensor_layer_loader is None
+
+
+class TestPrepareProfileDirectModeModelDictDispatch:
+    """View-mode + dict-shaped models (vLLM-style flows).
+
+    ``prepare_profile_direct_mode_model`` branches on ``isinstance(model, dict)``
+    to choose between ``copy.copy(model)`` and ``create_model_with_shared_tensors``.
+    Now that ``profile_mode='view'`` is the default, dict-using callers exercise
+    this branch in the hot path; the integration test only covers ``nn.Module``,
+    so this unit pins that the dict input is *copied* (not aliased) and routed
+    through the view-profile-model construction.
+    """
+
+    def test_view_mode_with_dict_model_routes_through_view_path(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        prepared_dict = {"sentinel": object()}
+        tm._prepare_view_profile_model = MagicMock(return_value=prepared_dict)
+
+        original = {"weight": torch.zeros(4, 4)}
+        result = tm.prepare_profile_direct_mode_model(original)
+
+        # Routed through the view path with a *copy* of the input dict.
+        tm._prepare_view_profile_model.assert_called_once()
+        passed_model = tm._prepare_view_profile_model.call_args.args[0]
+        assert isinstance(passed_model, dict)
+        assert passed_model is not original
+        assert passed_model == original
+        assert result is prepared_dict
 
 
 class TestAutoEnableRearrangeTransfers:
@@ -621,3 +846,80 @@ class TestAutoEnableRearrangeTransfers:
 
         assert tm.rearrange_transfers is True
         mock_has_gaps.assert_not_called()
+
+
+class TestInitializeProfileSavedStateShortCircuit:
+    """``profile_mode='view'`` is the new default. The saved-profile workflow
+    short-circuits ``initialize_profile`` (state already populated), so the
+    view controller is *never* built. Pin that the short-circuit returns the
+    untouched model and leaves no controller behind -- otherwise a future
+    refactor that moves view-mode setup above the short-circuit would
+    silently allocate (and leak) the rotating block.
+    """
+
+    def test_view_mode_with_saved_state_skips_controller_setup(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        tm.model = MagicMock(name="user_model")
+        tm.tensor_manager_state = MagicMock(name="loaded_state")
+        tm._move_non_offloaded_tensors_to_gpu = MagicMock()
+        tm.prepare_profile_direct_mode_model = MagicMock()
+        tm.prepare_profile_direct_mode = MagicMock()
+        tm.prepare_profile_mode = MagicMock()
+
+        result = tm.initialize_profile()
+
+        assert result is tm.model
+        assert not isinstance(tm.tensor_layer_loader, ProfileBlockController)
+        tm._move_non_offloaded_tensors_to_gpu.assert_not_called()
+        tm.prepare_profile_direct_mode_model.assert_not_called()
+        tm.prepare_profile_direct_mode.assert_not_called()
+        tm.prepare_profile_mode.assert_not_called()
+
+
+class TestPrepareWarmupModeResetsLayerStats:
+    """``prepare_warmup_mode`` must clear ``_layer_stats_computed`` so a fresh
+    discovery cycle (warmup -> profile -> ... -> warmup -> profile) recomputes
+    layer stats instead of silently reusing the previous cycle's. Drop the
+    reset and cycle 2's profile picks up cycle 1's stale stats.
+    """
+
+    def test_layer_stats_flag_is_reset_on_each_warmup_entry(self) -> None:
+        tm = _make_tm()
+        tm.model = None  # avoid module-tracker registration in this minimal harness
+
+        tm.prepare_warmup_mode()
+        assert tm._layer_stats_computed is False
+
+        tm._layer_stats_computed = True
+        tm.prepare_warmup_mode()
+        assert tm._layer_stats_computed is False
+
+
+class TestRunProfileSuiteLegacyDirectSemantics:
+    """The deprecated ``run_profile_suite`` historically meant "direct profile"
+    when ``direct_mode=True``, regardless of any other config. Now that
+    ``profile_mode="view"`` is the default, Phase 3 must still drive the
+    direct path so existing callers don't suddenly OOM on the rotating
+    block during their deprecation window. ``profile_mode`` must also be
+    restored after the call so the manager state isn't mutated.
+    """
+
+    def test_phase3_uses_direct_even_when_profile_mode_is_view(self) -> None:
+        tm = _make_tm(profile_mode="view")
+        observed_modes: list[str] = []
+
+        def _record(_model):
+            observed_modes.append(tm.profile_mode)
+
+        tm.prepare_warmup_mode = MagicMock()
+        tm.prepare_profile_mode = MagicMock()
+        tm.prepare_profile_direct_mode_model = MagicMock(side_effect=_record, return_value=MagicMock())
+        tm.prepare_profile_direct_mode = MagicMock(side_effect=lambda: observed_modes.append(tm.profile_mode))
+
+        with pytest.warns(DeprecationWarning, match="run_profile_suite"):
+            tm.run_profile_suite(callback=lambda _m: None, model=MagicMock(), direct_mode=True)
+
+        # Both phase-3 setup steps ran with profile_mode forced to "getter".
+        assert observed_modes == ["getter", "getter"]
+        # And the original mode is restored when the shim returns.
+        assert tm.profile_mode == "view"

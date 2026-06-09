@@ -187,6 +187,36 @@ class TestMaxGpuMemResolution:
         _, kwargs = mock_tm.call_args
         assert kwargs["max_gpu_mem_fraction"] == pytest.approx(0.5)
 
+    def test_profile_mode_default_forwarded(self):
+        """profile_mode defaults to 'view' and is forwarded to TensorManager."""
+        config = OffloadConfig()
+        om = OffloadManager("test_profile_mode_default")
+        om.set_config(config)
+
+        with (
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
+        ):
+            om._initialize_tensor_manager()
+
+        _, kwargs = mock_tm.call_args
+        assert kwargs["profile_mode"] == "view"
+
+    def test_profile_mode_view_forwarded(self):
+        """profile_mode='view' is forwarded to TensorManager."""
+        config = OffloadConfig(profile_mode="view")
+        om = OffloadManager("test_profile_mode_view")
+        om.set_config(config)
+
+        with (
+            patch("flextensor.offload_manager.AdaptiveStrategy"),
+            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
+        ):
+            om._initialize_tensor_manager()
+
+        _, kwargs = mock_tm.call_args
+        assert kwargs["profile_mode"] == "view"
+
 
 class TestOffloadManagerStateMachine:
     """Test cases for OffloadManager state machine logic."""

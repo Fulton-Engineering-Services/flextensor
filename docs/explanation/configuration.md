@@ -442,6 +442,32 @@ from flextensor import OffloadConfig, GreedyStrategy
 config = OffloadConfig(load_strategy=GreedyStrategy())
 ```
 
+### Profile Phase Mode
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `profile_mode` | str | `"view"` | How the profile-phase model is wired to the per-trap loader |
+
+`profile_mode` selects the mechanism used during the **profiling** phase. For `view` and `getter` — both variants of the model-patching runtime — the choice affects only the profile phase and has no effect on discovery or inference. `torch_function` additionally selects the indirect runtime (it forces `_direct_mode=False`), which also changes the warmup and inference trap classes.
+
+| Mode | Description | Compatibility |
+|------|-------------|---------------|
+| `view` | Default. Profile model is patched with views into a single rotating GPU block (sized to the largest per-label exclusive footprint) plus a fixed prefix for tensors shared across labels. The timed region contains no property-getter indirection, so per-trap timings are cleaner than `getter`'s; for block-transfer loaders this also matches the access pattern used at inference. Both modes do the H2D copy before the timing window opens, so neither includes transfer cost in the per-trap duration. | All `transfer_mode` values |
+| `getter` | Profile model uses Python property getters that route every parameter access through the per-trap loader. Lower GPU memory footprint during profile than `view`, at the cost of attribute-getter overhead in per-trap durations. | All `transfer_mode` values |
+| `torch_function` | `TorchFunctionMode` traps that rewrite tensor arguments per call, without patching the model. Fallback for models that don't tolerate the patching used by `getter` or `view`. Significant per-op overhead; not torch.compile-compatible. | `transfer_mode='strategy'` only (block transfers also require patching the model) |
+
+```python
+config = OffloadConfig(profile_mode="view")
+```
+
+This option can also be set via the `FT_PROFILE_MODE` environment variable. Invalid combinations are rejected at config construction.
+
+!!! note "Memory cost of `view`"
+    `view` pre-allocates roughly *(bytes of the largest label's exclusive tensors) + (total bytes of tensors shared across labels)* of GPU memory for the duration of the profile phase (released before the inference loader is built). An equally-sized host-memory staging block is allocated alongside it. On models that already run close to the GPU memory ceiling, switch to `profile_mode="getter"` to keep the profile-phase footprint to one layer's tensors at a time.
+
+!!! note "When to switch from `view`"
+    Picking `getter` instead of the default is appropriate when (a) the profile phase OOMs under `view`, or (b) your model rejects `.data` reassignment on its parameters (for example, custom parameter classes with overridden ``__setattr__``). Picking `torch_function` is appropriate only when the model also rejects the synthetic-subclass + property-descriptor patching used by `getter`.
+
 ### Profile Storage
 
 | Option | Type | Default | Description |

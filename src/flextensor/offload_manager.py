@@ -661,6 +661,7 @@ class OffloadManager:
                 use_shm=self.config.shm_enabled,
                 enable_diagnostics=self.config.enable_diagnostics,
                 max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,
+                profile_mode=self.config.profile_mode,
             )
 
     def _transfer_hooks(self, old_model: nn.Module | None, new_model: nn.Module):  # noqa: C901

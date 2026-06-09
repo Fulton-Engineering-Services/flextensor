@@ -155,3 +155,10 @@ echo ""
 
 # Generate summary from all result files
 python "$SCRIPT_DIR/summarize_results.py" "$RESULTS_DIR"
+
+# View-mode profile integration tests (pytest-style; not driven by run_single_test.py).
+echo ""
+echo "Running profile-view-mode integration tests..."
+PYTEST_ARGS=(-v -rA -s --tb=short --maxfail=3 --durations=10)
+[ -n "${PYTEST_MARKER:-}" ] && PYTEST_ARGS+=(-m "$PYTEST_MARKER")
+timeout "${TIMEOUT:-1800}" python3 -m pytest "$SCRIPT_DIR/test_profile_view_mode_integration.py" "${PYTEST_ARGS[@]}"

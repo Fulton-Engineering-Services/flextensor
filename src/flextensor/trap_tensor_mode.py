@@ -359,3 +359,56 @@ class TrapInferDirect:
     def __exit__(self, _type, _value, _traceback):
         self.tensor_layer_loader.exit(self.current_trace_id)
         _graph_break()
+
+
+class TrapProfileView:
+    """Profile-phase trap for ``profile_mode='view'``.
+
+    Assumes the model has already been patched so each parameter's ``.data``
+    points at a view into the controller's GPU block (set up by
+    :class:`flextensor.profile_block_controller.ProfileBlockController` and
+    the view-mode model preparation step).
+
+    The per-label pack-and-copy step happens inside
+    ``tensor_layer_loader.enter()``: it packs the label's bytes into the
+    rotating CPU block, H2D-copies them, and synchronizes the GPU device
+    before returning. The CUDA ``start_event`` is therefore recorded with
+    the device idle, so the timed window contains only the forward's kernel
+    work.
+    """
+
+    def __init__(self, tensor_manager, trace_id, device_gpu):
+        self.current_trace_id = trace_id
+        self.device_gpu = device_gpu
+        self.tensor_layer_loader = tensor_manager.tensor_layer_loader
+        self.tensor_manager = tensor_manager
+        self.start_event = tensor_manager.trap_start_event
+        self.end_event = tensor_manager.trap_end_event
+        self._nesting_guard = tensor_manager.trap_nesting_guard
+
+    def __enter__(self):
+        _graph_break()
+        self._nesting_guard.acquire(self.current_trace_id)
+        try:
+            self.tensor_layer_loader.enter(self.current_trace_id)
+            self.start_event.record()
+            return self
+        except BaseException:
+            # Release the guard so the next trap doesn't fail with a misleading
+            # "Nested traps are not supported" error masking the real cause.
+            self._nesting_guard.release()
+            # See Trap.__enter__: pair the graph break on the failure path.
+            _graph_break()
+            raise
+
+    def __exit__(self, _type, _value, _traceback):
+        try:
+            self.end_event.record()
+            self.end_event.synchronize()
+            duration_ms = self.start_event.elapsed_time(self.end_event)
+            self.tensor_manager.record_duration(self.current_trace_id, duration_ms)
+            self.tensor_layer_loader.exit(self.current_trace_id)
+        finally:
+            # Release on failure too, so the next trap doesn't see a stale guard.
+            self._nesting_guard.release()
+            _graph_break()

@@ -137,7 +137,7 @@ The JSON file contains:
         "use_shm": false,
         "enable_diagnostics": false,
         "max_gpu_mem_fraction": null,
-        "_direct_mode": true,
+        "profile_mode": "view",
         "_use_trace_tensor": false,
         "_rearrange_transfers": false,
         "_compute_transfer_gap": 1,
@@ -159,7 +159,7 @@ Each component record includes:
 - `init_timestamp`: When the component was initialized
 - `args`: All initialization arguments **and their default values**. The decorator captures every parameter, including those not explicitly passed by the caller.
 
-> **Note:** Fields prefixed with `_` (e.g. `_direct_mode`, `_use_trace_tensor`) are internal debug parameters. Their presence in instrumentation output is expected. In normal operation they remain at their defaults (`true` and `false` respectively). The exact set of fields may vary across components and versions.
+> **Note:** Fields prefixed with `_` (e.g. `_use_trace_tensor`, `_rearrange_transfers`) are internal debug parameters. Their presence in instrumentation output is expected. In normal operation they remain at their defaults. The exact set of fields may vary across components and versions.
 
 The `host_memory` object captures a point-in-time snapshot of host physical memory (`host_memory_*`) and swap space (`swap_*`) at the time the dump is written. All values are in bytes. Divide by `1024 ** 3` to convert to GiB.
 

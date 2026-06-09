@@ -11,6 +11,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- View-mode profile phase: patches a copy of the model with views into a
+  rotating GPU block, removing property-getter indirection from the timed
+  region. Yields more accurate per-layer durations than the previous direct
+  path. Now the default; see [Profile mode](docs/explanation/configuration.md#profile-phase-mode)
+  for the GPU-memory trade-off.
+- `profile_mode` config option (with `FT_PROFILE_MODE` env var and
+  `TensorManager` constructor argument) selecting the profile-phase
+  mechanism. One of `"view"` (default, see above), `"getter"` (the previous
+  property-getter path; lower profile-phase GPU footprint at the cost of
+  attribute-getter overhead in per-trap durations), or `"torch_function"`
+  (fallback for models that reject in-place patching; only valid with
+  `transfer_mode="strategy"`). See
+  [Profile mode](docs/explanation/configuration.md#profile-phase-mode).
+
+### Changed
+
+- **Breaking (memory):** the default `profile_mode` changed to `"view"`, which
+  uses more GPU memory during the profile phase than the previous default. If you
+  set `max_gpu_mem_fraction`, FlexTensor now checks this up front and raises a
+  clear error (instead of running out of GPU memory) when it won't fit. To keep
+  the old, lower memory usage, set `profile_mode="getter"`.
+- The private `_direct_mode` `TensorManager` parameter is superseded by the new
+  public `profile_mode` selector. It remains as an internal flag and is forced to
+  `False` when `profile_mode="torch_function"`.
+
+### Deprecated
+
+- `TensorManager.run_profile_suite()` — superseded by `OffloadManager` /
+  `offload()`. Will be removed in v0.4.0.
+
 ### Fixed
 
 - Avoid raw CUDA OOM during inference setup by budgeting for available GPU

@@ -32,6 +32,7 @@ class TestHuggingFaceModelBenchmarking:
             device_gpu=device_gpu,
             tensor_manager_load_strategy=strategy,
             _use_trace_tensor=True,
+            profile_mode="getter",
         )
 
     def load_hf_model(self, model_name: str):

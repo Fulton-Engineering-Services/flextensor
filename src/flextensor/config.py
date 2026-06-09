@@ -42,6 +42,8 @@ _ALL_WARMUP_ITERS_MSG = (
 
 _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
+ProfileMode = Literal["torch_function", "getter", "view"]
+
 # Bidirectional deprecated ↔ canonical field pairs.  Used by model_copy()
 # to mirror updates so that Pydantic v2's validator-bypass doesn't desync
 # deprecated fields from their replacements.  One-directional deprecations
@@ -341,6 +343,28 @@ class OffloadConfig(BaseModel):
        after strategy computation.
     """
 
+    profile_mode: ProfileMode = Field(default="view")
+    """Profile-phase mechanism (how the profile model is patched).
+
+    * ``"view"`` — default. Pre-allocates substantial GPU memory during profile;
+      pick ``"getter"`` if tight on memory.
+    * ``"getter"`` — property getters route parameter access through the
+      per-trap loader. Lower GPU footprint, attribute-getter overhead in
+      per-trap durations.
+    * ``"torch_function"`` — fallback for models that reject the patching used
+      by ``"view"`` / ``"getter"``. Heavy per-op overhead; only valid with
+      ``transfer_mode='strategy'``.
+
+    ``"view"`` and ``"getter"`` are the two profiling variants of the
+    model-patching ("direct") runtime and affect only the profile phase;
+    ``"torch_function"`` selects the indirect runtime, which also changes
+    warmup and inference.
+
+    See ``profile_mode`` in ``docs/explanation/configuration.md`` for the
+    timing model, memory formula, and tradeoffs. Can also be set via the
+    ``FT_PROFILE_MODE`` env var.
+    """
+
     model_config = {"arbitrary_types_allowed": True, "use_attribute_docstrings": True}
 
     @model_validator(mode="before")
@@ -509,6 +533,22 @@ class OffloadConfig(BaseModel):
     def _validate_block_range(self) -> Self:
         if self.num_blocks < self.min_blocks:
             raise ValueError(f"num_blocks ({self.num_blocks}) must be >= min_blocks ({self.min_blocks})")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_profile_mode(self) -> Self:
+        """Validate the publicly-observable ``profile_mode`` / ``transfer_mode``
+        combinations at config construction so errors fail fast before the
+        manager is built. ``TensorManager`` performs additional checks for
+        internal flags (e.g. ``_use_trace_tensor``) that aren't expressible on
+        ``OffloadConfig``."""
+        block_loaders = ("allocation_block_transfer", "raw_block_transfer")
+        if self.profile_mode == "torch_function" and self.transfer_mode in block_loaders:
+            raise ValueError(
+                f"profile_mode='torch_function' is incompatible with "
+                f"transfer_mode={self.transfer_mode!r}. Use profile_mode='getter' "
+                f"or 'view', or set transfer_mode='strategy'."
+            )
         return self
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:

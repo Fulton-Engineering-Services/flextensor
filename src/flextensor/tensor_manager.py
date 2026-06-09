@@ -6,9 +6,10 @@ import types
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import torch
+from typing_extensions import deprecated as _deprecated
 
 from flextensor._logging import ensure_diagnostics_visible, get_diagnostics_logger
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, TensorBenchmarkMode
@@ -18,6 +19,7 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
+from flextensor.config import ProfileMode
 from flextensor.gpu_budget import reserve_strategy_invisible_gpu_budget, resolve_gpu_budget
 from flextensor.helpers import ProfilingSuspender, TrapNestingGuard
 from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
@@ -37,6 +39,7 @@ from flextensor.memory_transfer_benchmark import (
     extract_memory_transfers_from_layer_stats,
     format_memory_transfer_table,
 )
+from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.state_handler import (
     LoaderInputData,
     TensorManagerStateHandler,
@@ -72,8 +75,18 @@ from flextensor.tensor_processors import (
     create_model_with_shared_tensors,
     preprocess_model,
 )
-from flextensor.trap_tensor_mode import Trap, TrapDirect, TrapInfer, TrapInferDirect, WarmupTrap, WarmupTrapDirect
+from flextensor.trap_tensor_mode import (
+    Trap,
+    TrapDirect,
+    TrapInfer,
+    TrapInferDirect,
+    TrapProfileView,
+    WarmupTrap,
+    WarmupTrapDirect,
+)
 from flextensor.types import GPUMemoryUsage
+
+_PROFILE_MODES: tuple[str, ...] = get_args(ProfileMode)
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +316,7 @@ class TensorManager:
         exclude_patterns: list[str] | None = None,
         enable_diagnostics: bool = False,
         max_gpu_mem_fraction: float | None = None,
+        profile_mode: ProfileMode = "view",
         *,
         _direct_mode: bool = True,
         _use_trace_tensor: bool = False,
@@ -348,9 +362,31 @@ class TensorManager:
             max_gpu_mem_fraction: Fraction of total GPU memory to use as budget, in (0.0, 1.0].
                 Resolved to bytes at compute time via :func:`flextensor.gpu_budget.resolve_gpu_budget`. If None,
                 no memory constraint is applied (latency mode). (default: None)
-            _direct_mode: Internal debug flag — when False, uses TorchFunctionMode-based
-                traps instead of direct tensor replacement. Significant overhead; kept as
-                a debug fallback. Not part of the public API.
+            profile_mode: Profile-phase mechanism. ``"view"``/``"getter"`` are
+                profiling variants of the model-patching runtime and affect only
+                the profile phase; ``"torch_function"`` selects the indirect
+                runtime, which also changes warmup and inference. One of:
+
+                * ``"view"`` — default. Patches the profile model with views
+                  into a rotating GPU block plus a shared prefix for tensors
+                  reused across labels. Pre-allocates substantial GPU memory
+                  during profile — pick ``"getter"`` if you are tight on
+                  memory. Incompatible with ``_use_trace_tensor=True``. See
+                  ``profile_mode`` in ``docs/explanation/configuration.md`` for
+                  the timing model and memory formula.
+                * ``"getter"`` — profile model uses property getters that route
+                  every parameter access through ``TensorLayerLoader``. Lower
+                  profile-phase GPU footprint than ``"view"`` at the cost of
+                  attribute-getter overhead in per-trap durations.
+                * ``"torch_function"`` — fallback using ``TorchFunctionMode`` traps
+                  that rewrite tensor arguments per call, without patching the
+                  model. Significant overhead, not torch.compile-compatible; only
+                  valid with ``loader_type='strategy'``.
+            _direct_mode: Internal — runtime family. ``True`` (default) uses the
+                model-patching runtime across warmup/profile/inference; ``False``
+                uses the indirect ``TorchFunctionMode`` runtime (requires
+                ``loader_type='strategy'``). ``profile_mode='torch_function'``
+                forces this ``False``. Not part of the public API.
             _use_trace_tensor: Internal debug flag — enables TraceTensor + BenchmarkReplace
                 for per-tensor transfer timing. Not part of the public API.
             _rearrange_transfers: Internal — whether to enable transfer rearrangement.
@@ -371,9 +407,14 @@ class TensorManager:
         self.tensor_manager_load_strategy = tensor_manager_load_strategy
         self.release_tensors = True
         self.pinned_memory = pinned_memory
+        self.pinned_memory_mode = pinned_memory_mode
         self.host_pinner: HostPinner = make_host_pinner(pinned_memory, pinned_memory_mode)
         self._benchmark_cls: type[TensorBenchmarkMode] = BenchmarkReplace if _use_trace_tensor else NoOpBenchmark
-        self.direct_enabled = _direct_mode
+        if profile_mode not in _PROFILE_MODES:
+            raise ValueError(f"Invalid profile_mode={profile_mode!r}; expected one of {_PROFILE_MODES!r}.")
+        self.profile_mode: ProfileMode = profile_mode
+        # Runtime family: True = model-patching, False = indirect (torch_function).
+        self._direct_mode: bool = False if profile_mode == "torch_function" else _direct_mode
         self.traced_tensors: set[int] = set()
         self.transfer_stream_priority = 1
         self.blocks = blocks
@@ -399,12 +440,7 @@ class TensorManager:
         if _use_trace_tensor:
             self.is_traced = self.is_traced_trace_tensor
 
-        if self.loader_type in ["allocation_block_transfer", "raw_block_transfer"] and not _direct_mode:
-            msg = (
-                f"_direct_mode=False is incompatible with loader_type={self.loader_type!r}. "
-                "Either remove the _direct_mode override or use loader_type='strategy'."
-            )
-            raise ValueError(msg)
+        self._validate_profile_mode_combination()
 
         self.model: Any = None
         self.tensor_id_to_name_map: dict[int, str] = {}
@@ -414,11 +450,51 @@ class TensorManager:
         self._unmapped_tensors_bytes = 0
         self.module_tracker: ModuleTracker | None = None
         self._non_offloaded_tensors_moved = False
+        self._layer_stats_computed = False
+        # Retained so teardown can restore dict-container entries patched with views.
+        self._profile_view_model: Any = None
         self.memory_transfer_stats: dict[int, float] | None = None
         self.trap_start_event = torch.cuda.Event(enable_timing=True)
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
         self._profiling_suspender = ProfilingSuspender()
+
+    def _validate_profile_mode_combination(self) -> None:
+        """Reject impossible direct-mode / loader-type / trace combinations."""
+        block_loaders = ("allocation_block_transfer", "raw_block_transfer")
+
+        if not self._direct_mode and self.loader_type in block_loaders:
+            msg = (
+                f"Indirect mode (profile_mode='torch_function' or _direct_mode=False) "
+                f"is incompatible with loader_type={self.loader_type!r}. Use the direct "
+                f"runtime (profile_mode='getter'/'view') or set loader_type='strategy'."
+            )
+            raise ValueError(msg)
+
+        if self._direct_mode and self.profile_mode == "view" and self.use_trace_tensor:
+            msg = (
+                "profile_mode='view' is incompatible with _use_trace_tensor=True. "
+                "Set profile_mode='getter' to use tracing."
+            )
+            raise ValueError(msg)
+
+    @property
+    def direct_enabled(self) -> bool:
+        """``True`` when the model-patching ("direct") runtime is active.
+
+        This is the runtime-family axis (warmup/profile/inference), held by
+        :attr:`_direct_mode`. ``False`` selects the indirect ``TorchFunctionMode``
+        runtime. Independent of the profile-phase variant (``view``/``getter``).
+        """
+        return self._direct_mode
+
+    @property
+    def _profile_uses_views(self) -> bool:
+        """``True`` when profile patches the model with views into a rotating block.
+
+        Only meaningful in the direct family; ``view`` is ignored when indirect.
+        """
+        return self._direct_mode and self.profile_mode == "view"
 
     @property
     def host_pin_registry(self) -> HostPinRegistry | None:
@@ -528,8 +604,16 @@ class TensorManager:
         self._move_non_offloaded_tensors_to_gpu()
         profile_model = self.model
         if self.direct_enabled:
-            profile_model = self.prepare_profile_direct_mode_model(self.model)
-            self.prepare_profile_direct_mode()
+            try:
+                profile_model = self.prepare_profile_direct_mode_model(self.model)
+                self.prepare_profile_direct_mode()
+            except BaseException:
+                # Suppress teardown errors so the original failure propagates.
+                try:
+                    self._teardown_profile_block_controller()
+                except Exception:
+                    logger.exception("Profile-setup cleanup failed; preserving the original error.")
+                raise
         else:
             self.prepare_profile_mode()
         return profile_model
@@ -562,6 +646,8 @@ class TensorManager:
 
     def prepare_warmup_mode(self):
         self.layer_statistics_collector = IterativeLayerStatisticsCollector()
+        # Fresh discovery cycle -> the next profile setup must rebuild stats.
+        self._layer_stats_computed = False
         if self._use_direct_warmup_model():
             label_to_tensor_ids = get_offload_module_tensor_ids(
                 self.model,
@@ -594,23 +680,40 @@ class TensorManager:
         )
 
     def prepare_profile_direct_mode_model(self, model):
-        profile_model = model
+        """Return the profile-phase model for ``profile_mode`` in {``view``, ``getter``}.
+
+        Must be called before :meth:`prepare_profile_direct_mode`. View mode
+        patches a copy with block-views and stages the controller into
+        ``self.tensor_layer_loader``; getter mode wraps in property getters.
+        No-op for ``torch_function``.
+        """
+        if self._profile_uses_views:
+            # Patch a copy regardless of ``loader_type``: the view controller is
+            # a self-contained profile-only loader, torn down before inference.
+            profile_model = copy.copy(model) if isinstance(model, dict) else create_model_with_shared_tensors(model)
+            return self._prepare_view_profile_model(profile_model)
         if self.loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
             profile_model = copy.copy(model) if isinstance(model, dict) else create_model_with_shared_tensors(model)
-            # TODO: Consider using prepare_view_model() instead of prepare_model() for block transfer loaders
-            # to get better statistics during profiling
-            profile_model = self.prepare_model(profile_model)
-        elif self.direct_enabled:
-            profile_model = self.prepare_model(model)
-        return profile_model
+            return self.prepare_model(profile_model)
+        if self.direct_enabled:
+            return self.prepare_model(model)
+        return model
 
-    def prepare_profile_direct_mode(self):
+    def _compute_profile_layer_stats(self) -> None:
+        """Materialize ``self.layer_stats`` for profile and unregister the module tracker.
+
+        Idempotent: safe to call from any profile-setup path
+        (``prepare_profile_direct_mode_model`` view, ``prepare_profile_direct_mode``
+        getter, ``prepare_profile_mode`` torch_function).
+        """
+        if self._layer_stats_computed:
+            return
+
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
         self.layer_stats = IterativeLayerStatisticsFilter().filter_by_tensor_ids(
             self.layer_stats,
             set(self.tensors_map.keys()),
         )
-        # Add untraced tensors (e.g., fp8 weights passed to Triton) to layer stats for profiling
         if self.enable_untraced_tensor_discovery:
             self.layer_stats = discover_untraced_tensors_for_layers(
                 self.layer_stats,
@@ -622,41 +725,81 @@ class TensorManager:
                 exclude_patterns=self.exclude_patterns,
             )
 
-        # Remove module tracker hooks after discovery - no longer needed
         if self.module_tracker is not None:
             self.module_tracker.unregister()
             self.module_tracker = None
 
-        # TODO: When profile direct mode switches to using view models (prepare_view_model),
-        # this TensorLayerLoader may need to be replaced with a view-compatible loader
+        self._layer_stats_computed = True
+
+    def _prepare_view_profile_model(self, profile_model):
+        """Build the view-mode profile controller and patch ``profile_model`` with its views.
+
+        The controller is installed as ``self.tensor_layer_loader`` immediately
+        so the failure-recovery path in :meth:`initialize_profile` (and
+        :meth:`_teardown_profile_block_controller`) can find it via the loader
+        slot. ``prepare_profile_direct_mode`` later wires the matching trap
+        class against the same instance.
+        """
+        self._compute_profile_layer_stats()
+
+        gpu_budget_bytes = resolve_gpu_budget(self._max_gpu_mem_fraction, self.device_gpu)
+        controller = ProfileBlockController(
+            self.layer_stats,
+            self.tensors_map,
+            self.device_gpu,
+            pinned_memory=self.pinned_memory,
+            pinned_memory_mode=self.pinned_memory_mode,
+            gpu_budget_bytes=gpu_budget_bytes,
+        )
+        self.tensor_layer_loader = controller
+        self._prepare_view_model_from_id_to_view_map(profile_model, controller.get_tensor_id_to_view_mapping())
+        self._profile_view_model = profile_model
+        return profile_model
+
+    def _teardown_profile_block_controller(self) -> None:
+        """Restore ``.data`` via ``self.tensors_map`` and drop the view-mode
+        controller. No-op for any other profile mode.
+        """
+        controller = self.tensor_layer_loader
+        if not isinstance(controller, ProfileBlockController):
+            return
+
+        # Pass the patched model so teardown can restore dict-container entries.
+        profile_model = self._profile_view_model if self._profile_view_model is not None else self.model
+        try:
+            controller.teardown(profile_model, self.tensors_map)
+        finally:
+            # Drop the refs unconditionally; the block is already released by
+            # ``teardown``'s own finally.
+            self._profile_view_model = None
+            self.tensor_layer_loader = None
+
+    def prepare_profile_direct_mode(self):
+        """Wire the profile-phase trap class for ``profile_mode`` in {``view``, ``getter``}.
+
+        Must run after :meth:`prepare_profile_direct_mode_model`. View mode
+        raises ``RuntimeError`` if that method hasn't built the controller
+        yet; getter mode builds the loader inline.
+        """
+        if self._profile_uses_views:
+            if not isinstance(self.tensor_layer_loader, ProfileBlockController):
+                raise RuntimeError("view-mode controller missing; call prepare_profile_direct_mode_model() first.")
+            self.trap_class = TrapProfileView
+            return
+
+        self._compute_profile_layer_stats()
+
         self.tensor_layer_loader = TensorLayerLoader(self.layer_stats, self.tensors_map, self.device_gpu)
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
 
         self.trap_class = TrapDirect
 
     def prepare_profile_mode(self):
-        self.layer_stats = self.layer_statistics_collector.get_layer_stats()
-        self.layer_stats = IterativeLayerStatisticsFilter().filter_by_tensor_ids(
-            self.layer_stats,
-            set(self.tensors_map.keys()),
-        )
-        # Add untraced tensors (e.g., fp8 weights passed to Triton) to layer stats for profiling
-        if self.enable_untraced_tensor_discovery:
-            self.layer_stats = discover_untraced_tensors_for_layers(
-                self.layer_stats,
-                self.tensors_map,
-                self.model,
-                self.tensor_id_to_name_map,
-                module_tracker=self.module_tracker,
-                include_patterns=self.include_patterns,
-                exclude_patterns=self.exclude_patterns,
-            )
+        """Wire the profile-phase trap for ``profile_mode='torch_function'``.
 
-        # Remove module tracker hooks after discovery - no longer needed
-        if self.module_tracker is not None:
-            self.module_tracker.unregister()
-            self.module_tracker = None
-
+        Single-call setup (the ``torch_function`` path doesn't patch the model).
+        """
+        self._compute_profile_layer_stats()
         self.tensor_layer_loader = TensorLayerLoader(self.layer_stats, self.tensors_map, self.device_gpu)
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
         self.trap_class = Trap
@@ -930,6 +1073,13 @@ class TensorManager:
         This method is called after profiling to compute the load strategy and create
         the appropriate loader for inference.
         """
+        # View-mode profile owns a per-profile rotating block plus a shared
+        # prefix; release them before inference allocates its own per-strategy
+        # CPU/GPU blocks. The CUDA caching allocator keeps the freed bytes in
+        # its pool, so inference's allocations reuse them without going back
+        # to the driver.
+        self._teardown_profile_block_controller()
+
         report_profiling_quality(self.layer_statistics_collector, self.enable_diagnostics)
 
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
@@ -1210,6 +1360,9 @@ class TensorManager:
 
     def shutdown(self):
         try:
+            # If a view-mode profile is still in flight, restore ``.data`` first
+            # so model parameters don't end up aliasing freed GPU storage.
+            self._teardown_profile_block_controller()
             if self.tensor_layer_loader is not None:
                 self.tensor_layer_loader.shutdown()
         finally:
@@ -1350,14 +1503,16 @@ class TensorManager:
                 new_model = prepare_model(model, self)
         return new_model
 
+    @_deprecated(
+        "TensorManager.run_profile_suite() is deprecated and will be removed "
+        "in v0.4.0. Use OffloadManager / offload() instead."
+    )
     def run_profile_suite(self, callback, model=None, direct_mode=True):
-        """
-        Run all three phases (discovery, profiling, direct_mode) in sequence with a callback.
+        """Run all three phases (discovery, profiling, direct_mode) in sequence with a callback.
 
-        This method automates the three-phase process:
-        1. Discovery phase: Collects initial tensor statistics
-        2. Profile phase: Collects detailed layer statistics with tensor loading
-        3. Direct mode phase: Profiles with direct tensor access (if enabled)
+        .. deprecated:: v0.3
+            Use ``initialize_warmup`` / ``initialize_profile`` /
+            ``initialize_inference`` directly. Removed in v0.4.0.
 
         Args:
             callback: Function to call for each phase. Should accept model as argument.
@@ -1366,7 +1521,6 @@ class TensorManager:
 
         Returns:
             The inference results
-
         """
         # Phase 1: Discovery
         self.prepare_warmup_mode()
@@ -1378,8 +1532,21 @@ class TensorManager:
 
         # Phase 3: Direct mode (if enabled)
         if direct_mode and model is not None:
-            prepared_model = self.prepare_profile_direct_mode_model(model)
-            self.prepare_profile_direct_mode()
-            results = callback(prepared_model)
+            # Preserve historical semantics: ``direct_mode=True`` always meant
+            # the property-getter profile (``profile_mode='getter'``) in the
+            # direct family, regardless of the (newer) ``profile_mode`` setting
+            # (now defaulting to "view"). Forcing both keeps the deprecation
+            # window backwards compatible.
+            saved_profile_mode = self.profile_mode
+            saved_direct_mode = self._direct_mode
+            self.profile_mode = "getter"
+            self._direct_mode = True
+            try:
+                prepared_model = self.prepare_profile_direct_mode_model(model)
+                self.prepare_profile_direct_mode()
+                results = callback(prepared_model)
+            finally:
+                self.profile_mode = saved_profile_mode
+                self._direct_mode = saved_direct_mode
 
         return results

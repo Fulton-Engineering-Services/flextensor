@@ -197,6 +197,41 @@ class TestOffloadConfig:
         assert config.num_blocks == 3
         assert config.min_blocks == 3
 
+    def test_profile_mode_default(self):
+        """Default profile_mode is 'view' to match TensorManager."""
+        assert OffloadConfig().profile_mode == "view"
+
+    def test_profile_mode_view_with_block_loader(self):
+        """profile_mode='view' is accepted with the default block-transfer loader."""
+        config = OffloadConfig(profile_mode="view")
+        assert config.profile_mode == "view"
+
+    def test_profile_mode_view_accepts_strategy_transfer_mode(self):
+        """profile_mode='view' is accepted with transfer_mode='strategy'.
+
+        The view-mode profile controller is self-contained and torn down before
+        the inference loader is built, so profile mode and inference transfer
+        mode are independent knobs.
+        """
+        config = OffloadConfig(profile_mode="view", transfer_mode="strategy")
+        assert config.profile_mode == "view"
+        assert config.transfer_mode == "strategy"
+
+    def test_profile_mode_torch_function_with_strategy_ok(self):
+        """profile_mode='torch_function' is accepted with strategy transfer mode."""
+        config = OffloadConfig(profile_mode="torch_function", transfer_mode="strategy")
+        assert config.profile_mode == "torch_function"
+
+    def test_profile_mode_torch_function_rejects_block_loader(self):
+        """profile_mode='torch_function' rejects block transfer loaders."""
+        with pytest.raises(ValidationError, match="profile_mode='torch_function'"):
+            OffloadConfig(profile_mode="torch_function", transfer_mode="allocation_block_transfer")
+
+    def test_profile_mode_invalid_rejected(self):
+        """Unknown profile_mode values are rejected by the Literal validator."""
+        with pytest.raises(ValidationError, match="profile_mode"):
+            OffloadConfig(profile_mode="bogus")
+
     def test_max_gpu_mem_bytes_custom(self):
         """Test setting custom max_gpu_mem_bytes value."""
         with pytest.warns(DeprecationWarning):
@@ -618,6 +653,23 @@ class TestLoadConfigFromEnv:
         os.environ["FT_PINNED_MEMORY_MODE"] = "host_register"
         config = load_config_from_env()
         assert config.pinned_memory_mode == "host_register"
+
+    def test_load_profile_mode_from_env(self):
+        """FT_PROFILE_MODE is picked up from the environment."""
+        os.environ["FT_PROFILE_MODE"] = "view"
+        config = load_config_from_env()
+        assert config.profile_mode == "view"
+
+    def test_load_profile_mode_from_env_rejects_invalid(self):
+        """Invalid FT_PROFILE_MODE values must surface as a ValidationError.
+
+        Same regression guard as ``test_load_pinned_memory_mode_from_env_rejects_invalid``:
+        Literal-typed env vars must reach Pydantic's validator instead of being
+        dropped by the env-var resolver.
+        """
+        os.environ["FT_PROFILE_MODE"] = "bogus"
+        with pytest.raises(ValidationError, match="profile_mode"):
+            load_config_from_env()
 
     def test_load_pinned_memory_mode_from_env_rejects_invalid(self):
         """Invalid FT_PINNED_MEMORY_MODE values must surface as a

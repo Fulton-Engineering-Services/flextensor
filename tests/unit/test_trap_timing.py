@@ -12,7 +12,7 @@ import torch
 from flextensor import compiler_hooks, trap_tensor_mode
 from flextensor.helpers import TrapNestingGuard
 from flextensor.tensor_manager import TensorManager
-from flextensor.trap_tensor_mode import Trap, TrapDirect, WarmupTrap
+from flextensor.trap_tensor_mode import Trap, TrapDirect, TrapProfileView, WarmupTrap
 
 
 def _make_mock_event(elapsed_time_ms: float = 2.5) -> Mock:
@@ -209,6 +209,94 @@ class TestTrapDirectTiming:
 
         trap.__exit__(None, None, None)
         tm.tensor_layer_loader.exit.assert_called_once_with("layer.0")
+
+
+class TestTrapProfileViewTiming:
+    """Test CUDA event timing in TrapProfileView (view-mode profile trap).
+
+    The accuracy claim for ``profile_mode="view"`` rests on a specific
+    ordering: the per-layer H2D pack must complete *before* ``start_event``
+    is recorded, so the timed window contains only forward work. These tests
+    pin that ordering down — losing it (e.g. recording start_event before
+    loader.enter()) silently inflates per-trap durations with transfer cost
+    and is the kind of bug a refactor could introduce without breaking
+    anything else.
+    """
+
+    def test_loader_enter_runs_before_start_event_record(self):
+        """The entire reason ``TrapProfileView`` exists as a separate class.
+
+        ``ProfileBlockController.enter()`` packs the label's bytes into the
+        rotating block, H2D-copies them, and synchronizes. That work must be
+        finished before the start event is recorded — otherwise the timed
+        region includes transfer cost and the load-strategy optimizer sees
+        inflated kernel times for layers whose tensors are slow to transfer.
+        """
+        tm = _make_mock_tensor_manager()
+
+        call_order = []
+        tm.tensor_layer_loader.enter.side_effect = lambda _: call_order.append("loader.enter")
+        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
+
+        trap = TrapProfileView(tm, "layer.0", torch.device("cuda:0"))
+        trap.__enter__()
+
+        assert call_order == ["loader.enter", "start.record"]
+
+    def test_record_and_sync_ordering(self):
+        tm = _make_mock_tensor_manager(elapsed_time_ms=5.0)
+
+        call_order = []
+        tm.trap_start_event.record.side_effect = lambda: call_order.append("start.record")
+        tm.trap_end_event.record.side_effect = lambda: call_order.append("end.record")
+        tm.trap_end_event.synchronize.side_effect = lambda: call_order.append("end.synchronize")
+        tm.trap_start_event.elapsed_time.side_effect = lambda e: (call_order.append("elapsed_time"), 5.0)[1]
+
+        trap = TrapProfileView(tm, "layer.0", torch.device("cuda:0"))
+        trap.__enter__()
+        trap.__exit__(None, None, None)
+
+        assert call_order == ["start.record", "end.record", "end.synchronize", "elapsed_time"]
+
+    def test_duration_flows_to_record_duration(self):
+        tm = _make_mock_tensor_manager(elapsed_time_ms=7.5)
+        trap = TrapProfileView(tm, "attn.5", torch.device("cuda:0"))
+
+        trap.__enter__()
+        trap.__exit__(None, None, None)
+
+        tm.record_duration.assert_called_once_with("attn.5", 7.5)
+
+    def test_tensor_layer_loader_enter_exit(self):
+        tm = _make_mock_tensor_manager()
+        trap = TrapProfileView(tm, "layer.0", torch.device("cuda:0"))
+
+        trap.__enter__()
+        tm.tensor_layer_loader.enter.assert_called_once_with("layer.0")
+
+        trap.__exit__(None, None, None)
+        tm.tensor_layer_loader.exit.assert_called_once_with("layer.0")
+
+    def test_enter_releases_nesting_guard_when_loader_enter_raises(self):
+        """If ``loader.enter`` raises after the nesting guard was acquired,
+        ``TrapProfileView.__enter__`` must release the guard so the next trap
+        can enter without a misleading ``"Nested traps are not supported"``
+        error masking the real failure cause.
+        """
+        tm = _make_mock_tensor_manager()
+        tm.tensor_layer_loader.enter.side_effect = RuntimeError("simulated loader failure")
+
+        trap1 = TrapProfileView(tm, "layer.0", torch.device("cuda:0"))
+        with pytest.raises(RuntimeError, match="simulated loader failure"):
+            trap1.__enter__()
+
+        # The guard must be free so a fresh trap can enter on the next call.
+        # If __enter__ leaked the guard, this would raise
+        # ``"Nested traps are not supported"``.
+        tm.tensor_layer_loader.enter.side_effect = None
+        trap2 = TrapProfileView(tm, "layer.1", torch.device("cuda:0"))
+        trap2.__enter__()
+        trap2.__exit__(None, None, None)
 
 
 class TestMultiLayerTraps:

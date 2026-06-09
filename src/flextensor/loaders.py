@@ -20,6 +20,7 @@ from .utils import clear_and_delete_tensor, delete_tensor, is_dense_layout
 
 LOGGER = logging.getLogger(__name__)
 
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -404,6 +405,7 @@ class TensorLayerLoader(Loader):
         """Return unique tensor IDs associated with *label*."""
         return set(self.layer_stats_map.get(label, []))
 
+    @_compiler_disable
     def enter(self, label: str) -> None:
         """Load tensors for the specified layer."""
         start_time_ns = time.time_ns()
@@ -431,6 +433,7 @@ class TensorLayerLoader(Loader):
         duration_ms = (end_time_ns - start_time_ns) / 1e6
         self.load_time_ms += duration_ms
 
+    @_compiler_disable
     def exit(self, label: str) -> None:
         """Release tensors for the specified layer."""
         tensor_ids_list = self.layer_stats_map.get(label, [])
@@ -570,6 +573,7 @@ class TensorStrategyLoader(Loader):
                 release_labels.add(release_label)
             self.load_to_release_labels_map[label] = release_labels
 
+    @_compiler_disable
     def enter(self, label: str) -> None:
         if label not in self.strategy_map:
             return
@@ -624,6 +628,7 @@ class TensorStrategyLoader(Loader):
                 if tensor_id in self.transfer_events:
                     del self.transfer_events[tensor_id]
 
+    @_compiler_disable
     def exit(self, label: str) -> None:
         if not self.release_tensors:
             return
@@ -1092,6 +1097,7 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         self.preload_transfers = find_transfers_for_preload(self.transfer_to_compute_map, layer_stats)
         self.prepare()
 
+    @_compiler_disable
     def preload(self) -> None:
         with torch.cuda.stream(self.transfer_stream):
             for label, _compute_label in self.preload_transfers.items():
@@ -1216,6 +1222,7 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         self.preload_transfers = find_transfers_for_preload(self.transfer_to_compute_map, layer_stats)
         self.prepare()
 
+    @_compiler_disable
     def preload(self) -> None:
         with torch.cuda.stream(self.transfer_stream):
             for label, _compute_label in self.preload_transfers.items():
