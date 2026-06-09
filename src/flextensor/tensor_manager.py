@@ -6,7 +6,7 @@ import types
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 import torch
 from typing_extensions import deprecated as _deprecated
@@ -87,6 +87,9 @@ from flextensor.trap_tensor_mode import (
 from flextensor.types import GPUMemoryUsage
 
 _PROFILE_MODES: tuple[str, ...] = get_args(ProfileMode)
+
+if TYPE_CHECKING:
+    from flextensor.offload_manager import TensorManagerProtocol as _TensorManagerProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -297,6 +300,11 @@ def compute_layer_statistics(iterative_layer_statistics, tensor_statistics_map) 
         layers_stats.append(layers_statistics)
 
     return layers_stats
+
+
+if TYPE_CHECKING:
+    # Keep the structural contract visible near the concrete implementation.
+    _TENSOR_MANAGER_PROTOCOL: type[_TensorManagerProtocol]
 
 
 @instrumentable

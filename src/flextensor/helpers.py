@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torch.overrides import TorchFunctionMode
 
 from flextensor.trap_tensor_mode import _graph_break
 from flextensor.types import GPUMemoryUsage
+
+if TYPE_CHECKING:
+    from flextensor.offload_manager import TensorManagerProtocol as _TensorManagerProtocol
 
 
 class TrapNestingGuard:
@@ -131,6 +134,11 @@ class EmptyFunctionModeTrap(TorchFunctionMode):
         return func(*args, **(kwargs or {}))
 
 
+if TYPE_CHECKING:
+    # Keep the structural contract visible near the no-op implementation.
+    _NOOP_TENSOR_MANAGER_PROTOCOL: type[_TensorManagerProtocol]
+
+
 class NoOpTensorManager:
     """Stand-in ``TensorManager`` used when ``OffloadConfig(enabled=False)``.
 
@@ -159,6 +167,7 @@ class NoOpTensorManager:
         self.tensors_map = {}
         self.traced_tensors = set()
         self.loader_type = ""
+        self.shm_namespace: str | None = None
 
     def build_parameters_mapping(self, _model):
         pass
@@ -228,6 +237,22 @@ class NoOpTensorManager:
 
     def shutdown(self):
         pass
+
+    def restore_state(self, model: Any, _state: Any) -> None:
+        # Match TensorManager's profile-restore contract: later initialize_* calls
+        # return the model associated with the restored state.
+        self.model = model
+
+    def save_profile(self, _profile_directory: str) -> None:
+        pass
+
+    def load_profile(self, _profile_directory: str, model: Any) -> None:
+        # Disabled offload has no profile to load, but callers can still use the
+        # load_profile -> initialize_* sequence and expect the target model back.
+        self.model = model
+
+    def get_memory_transfer_stats(self) -> dict[int, float] | None:
+        return None
 
     def get_gpu_memory_usage(self) -> GPUMemoryUsage:
         """Get GPU memory usage (returns zeros for disabled offload).
