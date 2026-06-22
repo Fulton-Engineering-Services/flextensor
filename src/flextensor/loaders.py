@@ -899,10 +899,10 @@ class AllocationBlockController:
                     continue
                 block = allocation_manager.block()
                 self.block_map_cpu[label] = block
-                # _add_tensors calls block.allocate() which releases each tensor immediately after copying
-                tensors_list, tensor_ids_list = self._add_tensors(label, strategy, tensors_map, block)
+                # _add_tensors calls block.allocate(), which releases each tensor's
+                # storage immediately after copying because release_tensor_memory=True.
+                tensor_ids_list = self._add_tensors(label, strategy, tensors_map, block)
                 self.label_to_cpu_tensor_id_map[label] = tensor_ids_list
-                self.release_memory(tensors_list)
 
             gpu_block = allocation_manager.create_max_block(device=self.device_gpu_str)
             for label in layers:
@@ -926,11 +926,12 @@ class AllocationBlockController:
         strategy: list[TensorStatistics],
         tensors_map: Mapping[int, torch.Tensor],
         block: AllocationBlock,
-    ) -> tuple[list[torch.Tensor], list[int]]:
+    ) -> list[int]:
         """Add tensors from strategy to an allocation block.
 
         Collects tensors referenced by the strategy, deduplicates by tensor ID,
         adds them to the allocation block, and allocates the block memory.
+        Allocation releases each original tensor's storage after copying.
 
         Args:
             label: Layer label identifying this tensor group.
@@ -939,17 +940,13 @@ class AllocationBlockController:
             block: AllocationBlock to add tensors to and allocate.
 
         Returns:
-            A tuple containing:
-                - List of tensors that were added (for subsequent memory release).
-                - List of corresponding tensor IDs in the same order.
+            List of corresponding tensor IDs in the same order.
 
         Example:
             >>> block = allocation_manager.block()
-            >>> tensors, ids = self._add_tensors("layer.0", strategy, tensors_map, block)
-            >>> self.release_memory(tensors)
+            >>> ids = self._add_tensors("layer.0", strategy, tensors_map, block)
         """
         unique_tensor_ids: set[int] = set()
-        tensors_list: list[torch.Tensor] = []
         tensor_ids_list: list[int] = []
         for tensor_info in strategy:
             tensor_id = tensor_info.tensor_id
@@ -959,13 +956,10 @@ class AllocationBlockController:
             unique_tensor_ids.add(tensor_id)
 
             tensor = tensors_map[tensor_id]
-            tensors_list.append(tensor)
             tensor_ids_list.append(tensor_id)
             block.add(tensor)
         _views = block.allocate()
-        self.label_to_cpu_tensor_id_map[label] = tensor_ids_list
-        # TODO: FIX release memory!
-        return tensors_list, tensor_ids_list
+        return tensor_ids_list
 
     def _format_device_str(self, device_gpu: torch.device) -> str:
         """Format a torch device to its string representation.
@@ -981,10 +975,6 @@ class AllocationBlockController:
         if device_gpu.index is not None:
             device_str += ":" + str(device_gpu.index)
         return device_str
-
-    def release_memory(self, tensors_list):
-        for tensor in tensors_list:
-            del tensor
 
     def prepare_tensor_id_to_view_mapping(self):
         self.tensor_id_to_view_map = {}
