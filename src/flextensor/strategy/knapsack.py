@@ -11,8 +11,7 @@ from typing import ClassVar
 
 import numpy
 
-from flextensor.collectors import LayerStatistics, TensorStatistics
-from flextensor.memory_transfer_benchmark import extract_memory_transfers_from_layer_stats
+from flextensor.collectors import LayerStatistics, TensorStatistics, extract_memory_transfers_from_layer_stats
 from flextensor.memory_transfer_interpolator import MemoryTransferInterpolator
 
 from .protocol import BlockStrategyData, StrategyComputeError, StrategyResult

@@ -37,3 +37,13 @@ repos:
     hooks:
       - id: shfmt
         args: ["-i", "2", "-ci", "-w"]
+
+  - repo: local
+    hooks:
+      - id: lint-imports
+        name: lint imports
+        entry: make lint-imports
+        language: python
+        additional_dependencies: ["uv>=0.6.7"]
+        pass_filenames: false
+        files: ^(src/|pyproject\.toml$)

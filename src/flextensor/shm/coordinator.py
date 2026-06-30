@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 
-import flextensor
+from flextensor._version import __version__
 from flextensor.shm.coord_block import CoordBlockHeader
 from flextensor.shm.flexible_shm import FlexibleSharedMemory
 from flextensor.shm.namespace import SHM_PROTOCOL_VERSION, coord_block_name, profile_block_name
@@ -72,7 +72,7 @@ class ShmCoordinator:
         """Write version header to coordination block (creator only)."""
         shm = _require_block(self._coord_shm, "coord")
         header = CoordBlockHeader(
-            flextensor_version=flextensor.__version__,
+            flextensor_version=__version__,
             protocol_version=SHM_PROTOCOL_VERSION,
         )
         # block guaranteed non-None by _require_block
@@ -83,7 +83,7 @@ class ShmCoordinator:
         shm = _require_block(self._coord_shm, "coord")
         header = CoordBlockHeader.read_from(shm.block.buf, offset=0)  # type: ignore[arg-type, union-attr]
         header.validate(
-            expected_version=flextensor.__version__,
+            expected_version=__version__,
             expected_protocol=SHM_PROTOCOL_VERSION,
         )
 

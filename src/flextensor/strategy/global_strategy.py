@@ -11,8 +11,7 @@ import warnings
 
 import numpy as np
 
-from flextensor.collectors import LayerStatistics, TensorStatistics
-from flextensor.memory_transfer_benchmark import extract_memory_transfers_from_layer_stats
+from flextensor.collectors import LayerStatistics, TensorStatistics, extract_memory_transfers_from_layer_stats
 from flextensor.memory_transfer_interpolator import MemoryTransferInterpolator
 
 from .assignment import AssignmentStrategy, OptimizedRoundRobinAssignment

@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-import flextensor
+from flextensor._version import __version__
 from flextensor.instrumentation.host_resources import capture_host_resources
 from flextensor.instrumentation.registry import ComponentRecord, InstrumentationRegistry
 from flextensor.instrumentation.serializers import serialize_value
@@ -64,7 +64,7 @@ def dump_to_file(output_path: str | Path, *, extra: dict[str, Any] | None = None
 
     output_data = {
         "timestamp": datetime.now().isoformat(),
-        "flextensor_version": flextensor.__version__,
+        "flextensor_version": __version__,
         "components": [_record_to_dict(record) for record in records],
         "host_memory": capture_host_resources(),
     }

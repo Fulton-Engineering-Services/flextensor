@@ -8,7 +8,8 @@ strategies, collectors, loaders, and tensor management operations.
 """
 
 import os
-from importlib.metadata import PackageNotFoundError, version
+
+from flextensor._version import __version__
 
 # Package-wide beartype integration with environment variable control
 try:
@@ -57,11 +58,6 @@ from flextensor.strategy import (
 )
 from flextensor.tensor_manager import TensorManager
 from flextensor.types import GPUMemoryUsage
-
-try:
-    __version__ = version("flextensor")
-except PackageNotFoundError:
-    __version__ = "0.0.0+unknown"  # Fallback for editable installs without version
 
 __all__ = [  # noqa: RUF022
     # Simplified API (recommended)

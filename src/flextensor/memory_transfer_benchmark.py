@@ -10,7 +10,7 @@ import gc
 
 import torch
 
-from .collectors import LayerStatistics
+from .collectors import LayerStatistics, extract_memory_transfers_from_layer_stats  # noqa: F401
 from .tensor_processors import BenchmarkTensorProcessor
 from .utils import calculate_tensor_size
 
@@ -54,42 +54,6 @@ def format_memory_transfer_table(memory_stats: dict[int, float]) -> str:
 
     lines.append(header)
     return "\n".join(lines)
-
-
-def extract_memory_transfers_from_layer_stats(
-    layer_stats: list[LayerStatistics],
-) -> dict[int, float]:
-    """
-    Extract memory transfer characteristics from layer statistics.
-
-    Uses the profiled tensor data (size_bytes and load_time_ms) to build
-    a memory transfer map suitable for MemoryTransferInterpolator.
-
-    Args:
-        layer_stats: List of layer statistics containing tensor info with profiled transfer times.
-
-    Returns:
-        Dictionary mapping tensor size (bytes) to transfer time (ms).
-        Uses representative samples to avoid duplicates.
-    """
-    # Collect unique (size, duration) pairs - use dict to deduplicate by size
-    # If multiple tensors have same size, average their transfer times
-    size_to_times: dict[int, list[float]] = {}
-
-    for layer in layer_stats:
-        for tensor in layer.tensors:
-            if tensor.load_time_ms > 0:  # Only include tensors with valid measurements
-                size = tensor.size_bytes
-                if size not in size_to_times:
-                    size_to_times[size] = []
-                size_to_times[size].append(tensor.load_time_ms)
-
-    # Average the times for each size
-    memory_transfers: dict[int, float] = {}
-    for size, times in size_to_times.items():
-        memory_transfers[size] = sum(times) / len(times)
-
-    return memory_transfers
 
 
 def benchmark_memory_transfers(

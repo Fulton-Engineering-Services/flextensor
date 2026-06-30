@@ -152,6 +152,53 @@ managed = true
 # uv pip install gained --group support in 0.6.7; Makefile and downstream CI use it for dependency groups.
 required-version = ">=0.6.7"
 
+[tool.importlinter]
+root_package = "flextensor"
+exclude_type_checking_imports = true
+
+[[tool.importlinter.contracts]]
+name = "vLLM is an adapter"
+type = "protected"
+protected_modules = ["flextensor.contrib.vllm"]
+allowed_importers = ["flextensor.contrib.vllm"]
+
+[[tool.importlinter.contracts]]
+name = "Package facade is external"
+type = "protected"
+protected_modules = ["flextensor"]
+allowed_importers = ["flextensor.contrib.**"]
+as_packages = false
+
+[[tool.importlinter.contracts]]
+name = "Strategy is execution-independent"
+type = "forbidden"
+source_modules = ["flextensor.strategy"]
+forbidden_modules = [
+    "flextensor.offload_manager",
+    "flextensor.tensor_manager",
+    "flextensor.loaders",
+    "flextensor.tensor_processors",
+    "flextensor.trap_tensor_mode",
+    "flextensor.state_handler",
+    "flextensor.profile_block_controller",
+    "flextensor.shm",
+]
+
+[[tool.importlinter.contracts]]
+name = "Instrumentation is observation-only"
+type = "forbidden"
+source_modules = ["flextensor.instrumentation"]
+forbidden_modules = [
+    "flextensor.offload_manager",
+    "flextensor.tensor_manager",
+    "flextensor.loaders",
+    "flextensor.tensor_processors",
+    "flextensor.trap_tensor_mode",
+    "flextensor.state_handler",
+    "flextensor.profile_block_controller",
+    "flextensor.shm",
+]
+
 [tool.ruff]
 preview = true
 target-version = "py310"
