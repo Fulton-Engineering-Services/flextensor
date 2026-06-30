@@ -43,6 +43,7 @@ integration tests and examples.
 | nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 | NVIDIA Nemotron Open Model License | Integration tests |
 | Qwen/Qwen2.5-72B-Instruct | Qwen License | Examples |
 | Wan-AI/Wan2.2-T2V-A14B-Diffusers | Apache 2.0 | Examples |
+| NVIDIA Cosmos models | NVIDIA Open Model License | Examples |
 
 ## Notice and Disclaimer
 
