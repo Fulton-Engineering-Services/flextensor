@@ -44,6 +44,10 @@ integration tests and examples.
 | Qwen/Qwen2.5-72B-Instruct | Qwen License | Examples |
 | Wan-AI/Wan2.2-T2V-A14B-Diffusers | Apache 2.0 | Examples |
 | NVIDIA Cosmos models | NVIDIA Open Model License | Examples |
+| Lightricks/LTX-2.3 | [LTX-2 Community License Agreement](https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE) | Examples |
+| Lightricks/LTX-2.3-22b-IC-LoRA-LipDub | [LTX-2 Community License Agreement](https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE) | Examples |
+| oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint | [LTX-2 Community License Agreement](https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE) | Examples |
+| google/gemma-3-12b-it-qat-q4_0-unquantized | Gemma Terms of Use | Examples |
 
 ## Notice and Disclaimer
 

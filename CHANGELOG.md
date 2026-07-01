@@ -26,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (fallback for models that reject in-place patching; only valid with
   `transfer_mode="strategy"`). See
   [Profile mode](docs/explanation/configuration.md#profile-phase-mode).
+- LTX 2.3 LipDub and Outpaint examples.
 
 ### Changed
 
