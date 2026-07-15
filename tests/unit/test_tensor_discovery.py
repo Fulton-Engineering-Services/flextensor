@@ -18,6 +18,7 @@ from flextensor.tensor_discovery import (
     get_offload_name,
     has_offload_modules,
     is_offload_patched_module,
+    select_offload_unit_paths,
 )
 
 # Exception types a misbehaving ``__getattr__`` / descriptor may raise that the
@@ -58,9 +59,60 @@ class SimpleModel(torch.nn.Module):
         return x
 
 
+class _AutomaticSelectionModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.encoder = torch.nn.Sequential(
+            torch.nn.Linear(4, 4),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4, 4),
+        )
+        self.head = torch.nn.Linear(4, 2)
+
+
 # =============================================================================
 # Tests for helper functions
 # =============================================================================
+
+
+def test_select_offload_unit_paths_applies_name_includes_and_excludes() -> None:
+    selected = select_offload_unit_paths(
+        _AutomaticSelectionModel(),
+        include_patterns=["encoder.0.weight", "encoder.2.weight", "head"],
+        exclude_patterns=["encoder.2"],
+    )
+
+    assert selected == {"encoder.0", "head"}
+
+
+def test_select_offload_unit_paths_expands_class_patterns() -> None:
+    selected = select_offload_unit_paths(
+        _AutomaticSelectionModel(),
+        include_patterns=["class:Linear"],
+        exclude_patterns=["head"],
+    )
+
+    assert selected == {"encoder.0", "encoder.2"}
+
+
+def test_select_offload_unit_paths_keeps_only_top_level_matches() -> None:
+    selected = select_offload_unit_paths(
+        _AutomaticSelectionModel(),
+        include_patterns=["encoder", "encoder.*"],
+        exclude_patterns=[],
+    )
+
+    assert selected == {"encoder"}
+
+
+def test_select_offload_unit_paths_drops_unmatched_param_pattern() -> None:
+    selected = select_offload_unit_paths(
+        _AutomaticSelectionModel(),
+        include_patterns=["encoder.9.weight"],
+        exclude_patterns=[],
+    )
+
+    assert selected == set()
 
 
 def test_is_offload_patched_module():

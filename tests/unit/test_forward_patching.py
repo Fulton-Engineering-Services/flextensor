@@ -13,7 +13,7 @@ from torch import nn
 
 from flextensor.config import OffloadConfig
 from flextensor.offload_manager import OffloadManager
-from flextensor.tensor_discovery import has_patched_ancestor
+from flextensor.tensor_discovery import _derive_module_patterns, has_patched_ancestor
 
 
 class SimpleLayer(nn.Module):
@@ -701,7 +701,6 @@ class TestDeriveModulePatterns:
 
     def test_module_level_pattern_unchanged(self):
         """A pattern matching a module directly is preserved."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = ModelWithLayers()
@@ -710,7 +709,6 @@ class TestDeriveModulePatterns:
 
     def test_wildcard_module_pattern_unchanged(self):
         """Wildcard module-level pattern is kept as-is."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = NestedModel()
@@ -719,7 +717,6 @@ class TestDeriveModulePatterns:
 
     def test_param_pattern_derives_module(self):
         """A parameter-level pattern derives the module-level prefix."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = ModelWithLayers()
@@ -728,7 +725,6 @@ class TestDeriveModulePatterns:
 
     def test_wildcard_param_pattern_derives_module(self):
         """layers.*.weight derives layers.* for module patching."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = NestedModel()
@@ -737,7 +733,6 @@ class TestDeriveModulePatterns:
 
     def test_star_pattern_unchanged(self):
         """The catch-all '*' pattern is preserved."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = ModelWithLayers()
@@ -746,7 +741,6 @@ class TestDeriveModulePatterns:
 
     def test_deduplication(self):
         """Multiple patterns deriving the same module produce a single entry."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = NestedModel()
@@ -755,7 +749,6 @@ class TestDeriveModulePatterns:
 
     def test_star_weight_does_not_collapse_to_star(self):
         """*.weight must not truncate to bare * on a wrapper model."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = WrappedNestedModel()
@@ -766,7 +759,6 @@ class TestDeriveModulePatterns:
 
     def test_star_weight_derives_correct_param_owners(self):
         """*.weight fallback must derive the exact modules that own weight parameters."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = WrappedNestedModel()
@@ -784,7 +776,6 @@ class TestDeriveModulePatterns:
 
     def test_star_weight_flat_model_derives_linear_modules(self):
         """*.weight on a flat model (ModelWithLayers) derives the Linear sub-modules."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = ModelWithLayers()
@@ -794,7 +785,6 @@ class TestDeriveModulePatterns:
 
     def test_star_weight_without_model_gracefully_skips(self):
         """*.weight without model arg falls through truncation and is skipped (no crash)."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = WrappedNestedModel()
@@ -803,7 +793,6 @@ class TestDeriveModulePatterns:
 
     def test_mixed_truncation_and_fallback(self):
         """Patterns that truncate fine and patterns that need fallback coexist."""
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = WrappedNestedModel()
@@ -826,7 +815,6 @@ class TestDeriveModulePatterns:
         ``model.norm`` default must be skipped, not truncated to ``model``,
         because patching ``model`` turns the whole decoder into one offload unit.
         """
-        from flextensor.offload_manager import _derive_module_patterns
         from flextensor.utils import get_module_paths
 
         model = WrappedNestedModel()

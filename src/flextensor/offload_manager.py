@@ -30,10 +30,13 @@ from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
-from flextensor.tensor_discovery import has_patched_ancestor, is_offload_patched_module
+from flextensor.tensor_discovery import (
+    has_patched_ancestor,
+    is_offload_patched_module,
+    select_offload_unit_paths,
+)
 from flextensor.types import GPUMemoryUsage  # noqa: TC001
 from flextensor.utils import (
-    any_path_matches_pattern,
     get_class_matched_module_paths,
     get_module_paths,
     matches_any_class_pattern,
@@ -140,103 +143,6 @@ def _find_matched_patterns(
     _collect_class_matches(model, remaining, matched, partitioned.class_bodies)
 
     return matched
-
-
-def _matching_parameter_paths(model: nn.Module, pattern: str) -> list[str]:
-    """Return parameter paths matched by *pattern* using runtime include semantics."""
-    return [
-        param_path
-        for param_path, _ in model.named_parameters()
-        if matches_any_pattern(param_path, [pattern], recursive_star=True)
-    ]
-
-
-def _derive_truncated_module_pattern(
-    pattern: str,
-    module_paths: list[str],
-    model: nn.Module | None,
-) -> tuple[str | None, bool]:
-    """Find a module prefix by truncating *pattern* from the right.
-
-    Returns ``(candidate, suppress_fallback)``:
-
-    * ``(candidate, True)`` — a module prefix of *pattern* matches a real
-      module path; the caller should patch ``candidate``.
-    * ``(None, True)`` — a module prefix matched but the original pattern
-      owns no parameters (e.g. ``model.norm`` on a model whose only norm
-      module is ``model.norm_f``). The per-parameter fallback must not run,
-      otherwise the unmatched name would still collapse to an ancestor.
-    * ``(None, False)`` — no module prefix of *pattern* matches anything.
-      The caller may try the per-parameter fallback.
-    """
-    parts = pattern.split(".")
-    for length in range(len(parts), 0, -1):
-        candidate = ".".join(parts[:length])
-        if length < len(parts) and candidate == "*":
-            continue
-        if not any_path_matches_pattern(module_paths, candidate, recursive_star=False):
-            continue
-        if length < len(parts) and model is not None and not _matching_parameter_paths(model, pattern):
-            return None, True
-        return candidate, True
-    return None, False
-
-
-def _derive_module_patterns(
-    patterns: list[str],
-    module_paths: list[str],
-    model: nn.Module | None = None,
-) -> list[str]:
-    """Derive module-level patterns from potentially parameter-level include patterns.
-
-    A pattern that directly names a module path (e.g. ``model.norm_f``) or
-    contains a wildcard that matches at least one module (e.g. ``layers.*``) is
-    used verbatim. Otherwise the function truncates the pattern from the right
-    looking for a module ancestor (e.g. ``layers.*.weight`` → ``layers.*``);
-    that truncation is rejected when the *original* pattern matches no parameter
-    on *model*, which prevents misspelled sibling names like ``model.norm`` from
-    collapsing to the wrapper ``model`` and patching the whole decoder as one
-    offload unit.
-
-    A bare ``*`` produced by truncation is rejected because it would match every
-    top-level module and collapse the model into a single offload unit (via the
-    ancestor guard). When truncation gives no candidate and *model* is provided,
-    the function falls back to finding all parameters that match the original
-    pattern and collecting their owning module paths.
-
-    Unmatched patterns are dropped silently; the aggregate warning in
-    ``_offload_modules`` reports them so the user sees one message per pattern,
-    not several.
-
-    Args:
-        patterns: Original include patterns (may target modules or parameters).
-        module_paths: Non-root module paths (e.g. from ``named_modules()``).
-        model: Optional model instance for parameter-based fallback derivation.
-
-    Returns:
-        Deduplicated list of patterns/paths that identify modules to patch.
-    """
-    result: set[str] = set()
-    module_paths_set = set(module_paths)
-    for pattern in patterns:
-        module_pattern, suppress_fallback = _derive_truncated_module_pattern(pattern, module_paths, model)
-        if module_pattern is not None:
-            result.add(module_pattern)
-            continue
-        if suppress_fallback:
-            continue
-
-        if model is not None:
-            # TODO: On large models this produces O(params) exact paths (e.g. 80
-            # literal entries for an 80-layer model).  A post-processing step
-            # could collapse sibling paths into compact wildcards (e.g.
-            # layers.*.attn.q_proj), but the heuristics are non-trivial and the
-            # current approach is correct.  Revisit if init time becomes an issue.
-            for param_path in _matching_parameter_paths(model, pattern):
-                parent = ".".join(param_path.split(".")[:-1])
-                if parent in module_paths_set:
-                    result.add(parent)
-    return list(result)
 
 
 def _log_diagnostic_snapshot(label: str, om: OffloadManager | None) -> None:
@@ -1275,9 +1181,7 @@ class OffloadManager:
             patterns: Include patterns (name-based and/or ``class:`` prefixed).
         """
         module_paths = get_module_paths(model)
-        name_patterns, class_patterns = partition_patterns(patterns)
-        module_patterns = _derive_module_patterns(name_patterns, module_paths, model)
-        class_matched_paths = get_class_matched_module_paths(model, class_patterns)
+        selected_paths = select_offload_unit_paths(model, patterns, [])
         matched_patterns = _find_matched_patterns(
             model,
             patterns,
@@ -1289,9 +1193,7 @@ class OffloadManager:
         for module_path, module in model.named_modules():
             if not module_path:  # skip root
                 continue
-            matched_by_name = matches_any_pattern(module_path, module_patterns, recursive_star=False)
-            matched_by_class = module_path in class_matched_paths
-            if matched_by_name or matched_by_class:
+            if module_path in selected_paths:
                 if has_patched_ancestor(model, module_path):
                     continue
                 self._patch_module_forward(module, module_path)

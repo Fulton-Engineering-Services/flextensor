@@ -21,7 +21,9 @@ import torch
 
 from flextensor.collectors import IterativeLayerStatistics
 from flextensor.utils import (
+    any_path_matches_pattern,
     get_class_matched_module_paths,
+    get_module_paths,
     matches_any_pattern,
     partition_patterns,
 )
@@ -467,6 +469,103 @@ def _validate_dict_model_class_patterns(
 def resolve_include_patterns(include_patterns: list[str] | None) -> list[str]:
     """Normalise *include_patterns*: ``None`` becomes ``["*"]``."""
     return ["*"] if include_patterns is None else include_patterns
+
+
+def _matching_parameter_paths(model: torch.nn.Module, pattern: str) -> list[str]:
+    """Return parameter paths matched by *pattern* using runtime include semantics."""
+    return [
+        param_path
+        for param_path, _ in model.named_parameters()
+        if matches_any_pattern(param_path, [pattern], recursive_star=True)
+    ]
+
+
+def _derive_truncated_module_pattern(
+    pattern: str,
+    module_paths: list[str],
+    model: torch.nn.Module | None,
+) -> tuple[str | None, bool]:
+    """Find a module prefix by truncating *pattern* from the right.
+
+    Returns ``(candidate, suppress_fallback)``:
+
+    * ``(candidate, True)`` — a module prefix of *pattern* matches a real
+      module path; the caller should patch ``candidate``.
+    * ``(None, True)`` — a module prefix matched but the original pattern
+      owns no parameters. The per-parameter fallback must not run, otherwise
+      the unmatched name would still collapse to an ancestor.
+    * ``(None, False)`` — no module prefix of *pattern* matches anything.
+      The caller may try the per-parameter fallback.
+    """
+    parts = pattern.split(".")
+    for length in range(len(parts), 0, -1):
+        candidate = ".".join(parts[:length])
+        if length < len(parts) and candidate == "*":
+            continue
+        if not any_path_matches_pattern(module_paths, candidate, recursive_star=False):
+            continue
+        if length < len(parts) and model is not None and not _matching_parameter_paths(model, pattern):
+            return None, True
+        return candidate, True
+    return None, False
+
+
+def _derive_module_patterns(
+    patterns: list[str],
+    module_paths: list[str],
+    model: torch.nn.Module | None = None,
+) -> list[str]:
+    """Derive module-level patterns from potentially parameter-level include patterns."""
+    result: set[str] = set()
+    module_paths_set = set(module_paths)
+    for pattern in patterns:
+        module_pattern, suppress_fallback = _derive_truncated_module_pattern(pattern, module_paths, model)
+        if module_pattern is not None:
+            result.add(module_pattern)
+            continue
+        if suppress_fallback:
+            continue
+
+        if model is not None:
+            for param_path in _matching_parameter_paths(model, pattern):
+                parent = ".".join(param_path.split(".")[:-1])
+                if parent in module_paths_set:
+                    result.add(parent)
+    return list(result)
+
+
+def select_offload_unit_paths(
+    model: torch.nn.Module,
+    include_patterns: list[str] | None,
+    exclude_patterns: list[str] | None,
+) -> set[str]:
+    """Select paths of top-level offload units."""
+    active_includes = resolve_include_patterns(include_patterns)
+    if not active_includes:
+        return set()
+
+    module_paths = get_module_paths(model)
+    include_names, include_classes = partition_patterns(active_includes)
+    module_patterns = _derive_module_patterns(include_names, module_paths, model)
+    include_class_paths = get_class_matched_module_paths(model, include_classes)
+
+    selected_paths: list[str] = []
+    for module_path in module_paths:
+        if not matches_any_pattern(module_path, module_patterns, recursive_star=False) and (
+            module_path not in include_class_paths
+        ):
+            continue
+        if any(module_path.startswith(f"{parent}.") for parent in selected_paths):
+            continue
+        selected_paths.append(module_path)
+
+    exclude_names, exclude_classes = partition_patterns(exclude_patterns or [])
+    exclude_class_paths = get_class_matched_module_paths(model, exclude_classes)
+    return {
+        path
+        for path in selected_paths
+        if not matches_any_pattern(path, exclude_names, recursive_star=True) and path not in exclude_class_paths
+    }
 
 
 def get_non_offloaded_tensor_ids(
