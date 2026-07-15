@@ -42,6 +42,7 @@ from flextensor.memory_transfer_benchmark import (
 from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.state_handler import (
     LoaderInputData,
+    TensorManagerState,
     TensorManagerStateHandler,
 )
 from flextensor.strategy import (
@@ -49,6 +50,7 @@ from flextensor.strategy import (
     GreedyStrategy,
     KnapsackStrategy,
     NthLayerStrategy,
+    Strategy,
 )
 from flextensor.strategy.utils import compute_label_to_size_map, log_block_table, strategy_has_transfer_gaps
 from flextensor.strategy_operations import (
@@ -311,14 +313,14 @@ if TYPE_CHECKING:
 class TensorManager:
     def __init__(
         self,
-        device_gpu,
-        tensor_manager_load_strategy,
+        device_gpu: str | torch.device,
+        tensor_manager_load_strategy: Strategy,
         pinned_memory: bool = True,
         pinned_memory_mode: PinnedMemoryMode = "torch",
-        loader_type="allocation_block_transfer",
-        remove_layers_operations=None,
-        blocks=4,
-        move_top_level_buffers_to_gpu=True,
+        loader_type: str = "allocation_block_transfer",
+        remove_layers_operations: list[dict[str, Any]] | None = None,
+        blocks: int = 4,
+        move_top_level_buffers_to_gpu: bool = True,
         use_shm=False,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -331,7 +333,7 @@ class TensorManager:
         _rearrange_transfers: bool = False,
         _compute_transfer_gap: int = 1,
         _enable_untraced_tensor_discovery: bool = True,
-    ):
+    ) -> None:
         """
         Initialize TensorManager with configurable tensor loading strategy.
 
@@ -1234,7 +1236,7 @@ class TensorManager:
         profile_file = profile_path / "profile.json"
         self._save_state_to_file(profile_file)
 
-    def load_state(self, profile_directory: str):
+    def load_state(self, profile_directory: str) -> TensorManagerState:
         """Load profile state from directory without restoring.
 
         Use this when you need access to the state object before restoring,
@@ -1244,12 +1246,12 @@ class TensorManager:
             profile_directory: Directory containing the profile
 
         Returns:
-            TensorManagerState: The loaded state object
+            The loaded state object
         """
         profile_file = Path(profile_directory) / "profile.json"
         return self._load_state_from_file(profile_file)
 
-    def load_profile(self, profile_directory: str, model) -> None:
+    def load_profile(self, profile_directory: str, model: torch.nn.Module) -> None:
         """Load profile from directory and restore state to model.
 
         This method loads a saved TensorManagerState and restores it to the manager,
@@ -1515,7 +1517,12 @@ class TensorManager:
         "TensorManager.run_profile_suite() is deprecated and will be removed "
         "in v0.4.0. Use OffloadManager / offload() instead."
     )
-    def run_profile_suite(self, callback, model=None, direct_mode=True):
+    def run_profile_suite(
+        self,
+        callback: Callable[[Any], Any],
+        model: Any | None = None,
+        direct_mode: bool = True,
+    ) -> Any:
         """Run all three phases (discovery, profiling, direct_mode) in sequence with a callback.
 
         .. deprecated:: v0.3

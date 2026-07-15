@@ -49,3 +49,4 @@ Lower-level components for custom workflows:
 - [`TensorManager`](advanced.md#flextensor.tensor_manager.TensorManager) — Direct control over discovery, profiling, and inference phases
 - [`TensorBenchmarkMode`](advanced.md#flextensor.benchmark_tensor_mode.TensorBenchmarkMode) — Benchmark mode base class
 - [`BenchmarkReplace`](advanced.md#flextensor.benchmark_tensor_mode.BenchmarkReplace) / [`PreloadToDevice`](advanced.md#flextensor.benchmark_tensor_mode.PreloadToDevice) — Benchmark implementations
+- [Host pinning](advanced.md#host-pinning) — Lower-level pinned-memory helpers and modes

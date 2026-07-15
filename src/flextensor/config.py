@@ -965,7 +965,7 @@ def load_config(
     env_prefix: str = "FT_",
     use_env: bool = True,
     config_file_env_var: str = "FT_CONFIG_FILE",
-    **kwargs,
+    **kwargs: Any,
 ) -> OffloadConfig:
     """Load OffloadConfig with precedence: file < env vars < kwargs.
 
@@ -1035,7 +1035,7 @@ def load_config(
 def load_config_from_file(
     config_path: str | Path | None = None,
     env_var: str = "FT_CONFIG_FILE",
-    **kwargs,
+    **kwargs: Any,
 ) -> OffloadConfig:
     """Load OffloadConfig from a configuration file (no env var override).
 
@@ -1072,7 +1072,7 @@ def load_config_from_file(
     return load_config(config_path=config_path, use_env=False, config_file_env_var=env_var, **kwargs)
 
 
-def load_config_from_env(prefix: str = "FT_", **kwargs) -> OffloadConfig:
+def load_config_from_env(prefix: str = "FT_", **kwargs: Any) -> OffloadConfig:
     """Load OffloadConfig from environment variables (no file).
 
     This is a convenience wrapper around load_config() that loads from

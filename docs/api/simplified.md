@@ -23,10 +23,6 @@ These wrap the [`OffloadManager`](offload-manager.md) singleton for common use c
     options:
       show_root_full_path: false
 
-::: flextensor.offload_manager.DEFAULT_MANAGER_NAME
-    options:
-      show_root_full_path: false
-
 ::: flextensor.offload_manager.set_config
     options:
       show_root_full_path: false

@@ -486,15 +486,10 @@ def make_host_pinner(pinned_memory: bool, mode: PinnedMemoryMode) -> HostPinner:
             ``torch.cuda.is_available()`` is ``False``. Set
             ``pinned_memory=False`` on intentional CPU-only deployments.
 
-    Warns:
-        Logs (not :class:`Warning`) at ``WARNING`` level when:
-
-        - ``mode="host_register"`` is requested on a CUDA host where
-          ``torch.cuda.cudart()`` is broken/missing — the returned
-          pinner falls back to torch mode.
-        - ``mode != "torch"`` is set with ``pinned_memory=False`` — the
-          mode field is ignored and a :class:`NoOpHostPinner` is
-          returned.
+    Note:
+        Logs at ``WARNING`` level when ``mode="host_register"`` cannot use
+        ``torch.cuda.cudart()`` and falls back to torch mode, or when a
+        non-torch mode is ignored because ``pinned_memory=False``.
     """
     if not pinned_memory:
         if mode != "torch":
