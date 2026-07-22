@@ -19,10 +19,17 @@ WORKER_HOST="${WORKER_HOST:-127.0.0.1}"
 BASE_PORT="${BASE_PORT:-8020}"
 FRONTEND_HOST="${FRONTEND_HOST:-0.0.0.0}"
 FRONTEND_PORT="${FRONTEND_PORT:-8080}"
+# NUM_WORKERS remains the number of GPUs for backward compatibility. The
+# number of HTTP replicas is NUM_WORKERS / CONTEXT_PARALLEL_SIZE.
 NUM_WORKERS="${NUM_WORKERS:-8}"
+CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
+CONTROL_PLANE_TIMEOUT_SECONDS="${CONTROL_PLANE_TIMEOUT_SECONDS:-30}"
+TORCHRUN_MAX_RESTARTS="${TORCHRUN_MAX_RESTARTS:-3}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 PY="$VENV_DIR/bin/python"
 export HF_HOME HF_HUB_CACHE XDG_CACHE_HOME
-export HF_XET_CACHE
+export HF_XET_CACHE PYTORCH_CUDA_ALLOC_CONF TORCH_NCCL_ASYNC_ERROR_HANDLING
 
 SNAP="${SNAP:-}"
 DISTILLED="${DISTILLED:-}"
@@ -34,7 +41,11 @@ DISTILLED_FILENAME="ltx-2.3-22b-distilled-1.1.safetensors"
 UPSAMPLER_FILENAME="ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 LORA_FILENAME="ltx-2.3-22b-ic-lora-outpaint.safetensors"
 
-PROFILE_DIR="${PROFILE_DIR:-$OUTPUT_DIR/ltx23_outpaint_profile}"
+DEFAULT_PROFILE_DIR="$OUTPUT_DIR/ltx23_outpaint_profile"
+if [[ "$CONTEXT_PARALLEL_SIZE" != "1" ]]; then
+  DEFAULT_PROFILE_DIR="${DEFAULT_PROFILE_DIR}_cp${CONTEXT_PARALLEL_SIZE}"
+fi
+PROFILE_DIR="${PROFILE_DIR:-$DEFAULT_PROFILE_DIR}"
 LETTERBOXED_VIDEO="${LETTERBOXED_VIDEO:-$INPUT_DIR/letterboxed_720p.mp4}"
 HEIGHT="${HEIGHT:-704}"
 WIDTH="${WIDTH:-1280}"
@@ -52,11 +63,29 @@ WORKER_PIDS=()
 WORKER_LOGS=()
 NGINX_PID=""
 CLEANED_UP=0
+REPLICA_COUNT=0
 
 validate_num_frames() {
   if [[ ! "$NUM_FRAMES" =~ ^[0-9]+$ ]] ||
     ((NUM_FRAMES < 1 || (NUM_FRAMES - 1) % 8 != 0)); then
     echo "NUM_FRAMES must be a positive integer of the form 8*k + 1; got: $NUM_FRAMES" >&2
+    exit 1
+  fi
+}
+
+validate_context_parallel_size() {
+  case "$CONTEXT_PARALLEL_SIZE" in
+    1 | 2 | 4 | 8) ;;
+    *)
+      echo "CONTEXT_PARALLEL_SIZE must be one of 1, 2, 4, or 8; got: $CONTEXT_PARALLEL_SIZE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_torchrun_max_restarts() {
+  if [[ ! "$TORCHRUN_MAX_RESTARTS" =~ ^[0-9]+$ ]]; then
+    echo "TORCHRUN_MAX_RESTARTS must be a non-negative integer; got: $TORCHRUN_MAX_RESTARTS" >&2
     exit 1
   fi
 }
@@ -229,10 +258,10 @@ report_exited_processes() {
 
 write_nginx_config() {
   local servers=""
-  local worker_index
+  local replica_index
 
-  for worker_index in "${!GPU_ID_ARRAY[@]}"; do
-    local worker_port=$((BASE_PORT + worker_index))
+  for replica_index in $(seq 0 $((REPLICA_COUNT - 1))); do
+    local worker_port=$((BASE_PORT + replica_index))
     servers+="        server $WORKER_HOST:$worker_port max_fails=1 fail_timeout=30s;
 "
   done
@@ -280,6 +309,8 @@ EOF
 }
 
 validate_num_frames
+validate_context_parallel_size
+validate_torchrun_max_restarts
 mkdir -p "$OUTPUT_DIR" "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$XDG_CACHE_HOME"
 trap cleanup EXIT
 trap 'trap - EXIT; cleanup; exit 130' HUP INT TERM
@@ -295,6 +326,14 @@ parse_gpu_ids
 if ((NUM_WORKERS < 1)); then
   echo "NUM_WORKERS must be at least 1" >&2
   exit 1
+fi
+if ((${#GPU_ID_ARRAY[@]} % CONTEXT_PARALLEL_SIZE != 0)); then
+  echo "GPU count (${#GPU_ID_ARRAY[@]}) must be divisible by CONTEXT_PARALLEL_SIZE ($CONTEXT_PARALLEL_SIZE)" >&2
+  exit 1
+fi
+REPLICA_COUNT=$((${#GPU_ID_ARRAY[@]} / CONTEXT_PARALLEL_SIZE))
+if ((CONTEXT_PARALLEL_SIZE > 1)); then
+  require_path "torchrun executable" "$VENV_DIR/bin/torchrun"
 fi
 
 shopt -s nullglob
@@ -373,25 +412,43 @@ if [[ "$OFFLOAD_TEXT" == "1" ]]; then
   echo "Using FlexTensor text-encoder offload with text mem fraction: $TEXT_MEM_FRACTION"
 fi
 
-for worker_index in "${!GPU_ID_ARRAY[@]}"; do
-  gpu_id="${GPU_ID_ARRAY[$worker_index]}"
-  WORKER_PORT=$((BASE_PORT + worker_index))
-  SERVE_LOG="$OUTPUT_DIR/serve_gpu${gpu_id}_port${WORKER_PORT}.log"
+for replica_index in $(seq 0 $((REPLICA_COUNT - 1))); do
+  group_start=$((replica_index * CONTEXT_PARALLEL_SIZE))
+  replica_gpu_ids=("${GPU_ID_ARRAY[@]:group_start:CONTEXT_PARALLEL_SIZE}")
+  visible_devices="$(
+    IFS=,
+    echo "${replica_gpu_ids[*]}"
+  )"
+  WORKER_PORT=$((BASE_PORT + replica_index))
+  SERVE_LOG="$OUTPUT_DIR/serve_cp${CONTEXT_PARALLEL_SIZE}_replica${replica_index}_port${WORKER_PORT}.log"
   WORKER_LOGS+=("$SERVE_LOG")
-  echo "Starting worker $worker_index on GPU $gpu_id at http://$WORKER_HOST:$WORKER_PORT"
-  CUDA_VISIBLE_DEVICES="$gpu_id" nohup "$PY" "$EX/serve_infer.py" serve \
+  echo "Starting CP${CONTEXT_PARALLEL_SIZE} replica $replica_index on GPUs $visible_devices at http://$WORKER_HOST:$WORKER_PORT"
+
+  LAUNCH_COMMAND=("$PY")
+  if ((CONTEXT_PARALLEL_SIZE > 1)); then
+    LAUNCH_COMMAND=(
+      "$VENV_DIR/bin/torchrun"
+      --standalone
+      --nproc-per-node="$CONTEXT_PARALLEL_SIZE"
+      --max-restarts="$TORCHRUN_MAX_RESTARTS"
+    )
+  fi
+
+  CUDA_VISIBLE_DEVICES="$visible_devices" nohup "${LAUNCH_COMMAND[@]}" "$EX/serve_infer.py" serve \
     --conditioning-video "$LETTERBOXED_VIDEO" \
     --height "$HEIGHT" \
     --width "$WIDTH" \
     --num-frames "$NUM_FRAMES" \
     --frame-rate "$FRAME_RATE" \
+    --context-parallel-size "$CONTEXT_PARALLEL_SIZE" \
+    --control-plane-timeout-seconds "$CONTROL_PLANE_TIMEOUT_SECONDS" \
     "${MODEL_ARGS[@]}" \
     --max-gpu-mem-fraction "$MAX_GPU_MEM_FRACTION" \
     --profile-dir "$PROFILE_DIR" \
     --host "$WORKER_HOST" \
     --port "$WORKER_PORT" \
-    --warmup-output-path "$OUTPUT_DIR/server_warmup_gpu${gpu_id}.mp4" \
-    --output-path "$OUTPUT_DIR/server_default_gpu${gpu_id}.mp4" \
+    --warmup-output-path "$OUTPUT_DIR/server_warmup_cp${CONTEXT_PARALLEL_SIZE}_replica${replica_index}.mp4" \
+    --output-path "$OUTPUT_DIR/server_default_cp${CONTEXT_PARALLEL_SIZE}_replica${replica_index}.mp4" \
     >"$SERVE_LOG" 2>&1 &
   WORKER_PIDS+=("$!")
 done

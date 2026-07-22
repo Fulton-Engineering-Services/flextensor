@@ -9,7 +9,7 @@ These examples show how to use FlexTensor weight streaming with LTX 2.3 video ge
 | Example | Description |
 |---------|-------------|
 | [`lipdub/`](lipdub/) | Serves the LTX 2.3 LipDub IC-LoRA with one FlexTensor manager per diffusion stage and optional Gemma text-encoder offload. |
-| [`outpaint/`](outpaint/) | Serves the LTX 2.3 Outpaint IC-LoRA, including letterbox preparation and single-GPU or NGINX-backed multi-GPU helper scripts. |
+| [`outpaint/`](outpaint/) | Serves the LTX 2.3 Outpaint IC-LoRA with FlexTensor, including letterbox preparation, the single-GPU `single_serve.sh` helper, and CP1/CP2/CP4/CP8 NGINX-backed deployment helpers. |
 
 Start with **lipdub** for A100 40 GB viability experiments. Use **outpaint** for canvas-extension experiments and warmed-worker serving helpers.
 

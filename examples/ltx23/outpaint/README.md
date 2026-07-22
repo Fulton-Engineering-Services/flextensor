@@ -8,7 +8,7 @@ This example serves the [`oumoumad/LTX-2.3-22b-IC-LoRA-Outpaint`](https://huggin
 
 The Outpaint IC-LoRA extends the canvas of an input video: you letterbox the source to the target canvas with pure-black bars in the regions you want to fill, and the model paints those regions with content that is visually and temporally consistent with the original footage. It exercises FlexTensor on the default LTX-2.3 two-stage (latent upscaling) path.
 
-The example is intended for memory-constrained single-GPU serving experiments. It separates startup/profile cost from request latency:
+The example supports memory-constrained single-GPU serving and Ulysses context parallelism across 2, 4, or 8 GPUs. It separates startup/profile cost from request latency:
 
 - `profile`: builds the LTX transformers (and, with `--offload-text`, the Gemma text encoder) on CPU, wraps each in its own FlexTensor manager, drives discovery/profiling passes, and saves one profile per manager.
 - `serve`: loads the profiles, keeps the FlexTensor-managed models resident, and serves local HTTP POST requests.
@@ -29,8 +29,9 @@ Related upstream references:
 ## Files
 
 - `serve_infer.py`: FlexTensor-only profile and serving entrypoint.
-- `single_serve.sh`: single-GPU serving helper for an existing FlexTensor profile.
-- `nginx_serve.sh`: single-node multi-GPU serving helper for an existing FlexTensor profile.
+- `context_parallel.py`: world-group Ulysses attention and distributed request coordination helpers.
+- `single_serve.sh`: CP1/single-GPU serving helper for an existing FlexTensor profile.
+- `nginx_serve.sh`: single-node DP/CP replica launcher and NGINX front end for an existing profile.
 - `setup.sh`: environment setup helper for the LTX-2 checkout and FlexTensor install.
 - `letterbox.py`: helper to pad a source video onto the target canvas with pure-black bars.
 
@@ -207,7 +208,16 @@ Because `setup.sh` downloads external model snapshots, it also requires
 
 ## Profile
 
-Create the FlexTensor profile before serving. Profile at the resolution you intend to serve. Heights and widths must be multiples of 64; for 720p use `1280x704` (720 snaps to 704) and pass the same dimensions to `serve` and to each request.
+Create the FlexTensor profile before serving. Use the same request shape and CP
+size for profiling and serving:
+
+- `height` and `width` must be multiples of 64. For 720p, use `1280x704`
+  because 720 snaps to 704.
+- `num_frames` must be a positive integer of the form `8*k + 1`, for example
+  `1`, `9`, `17`, `49`, or `449`. This applies to `--num-frames`, the
+  `NUM_FRAMES` shell variable, and request JSON.
+- The CP size, set with `--context-parallel-size` or `CONTEXT_PARALLEL_SIZE`,
+  must be `1`, `2`, `4`, or `8`. CP3 and other values are rejected at startup.
 
 On A100 40 GB, start with a low memory fraction such as `0.15`:
 
@@ -221,6 +231,81 @@ On A100 40 GB, start with a low memory fraction such as `0.15`:
   --max-gpu-mem-fraction 0.15 \
   --output-path /workspace/outputs/profile_warmup.mp4
 ```
+
+For CP2, CP4, or CP8, create a separate profile with a matching `torchrun` world size. For example, CP4:
+
+```bash
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/workspace/LTX-2/.venv/bin/torchrun --standalone --nproc-per-node=4 \
+  /path/to/flextensor/examples/ltx23/outpaint/serve_infer.py profile \
+  --accept-external-licenses \
+  --context-parallel-size 4 \
+  --conditioning-video /workspace/inputs/letterboxed_720p.mp4 \
+  --num-frames 449 --frame-rate 15 \
+  --height 704 --width 1280 \
+  --profile-dir /workspace/outputs/ltx23_outpaint_profile_cp4 \
+  --max-gpu-mem-fraction 0.30 \
+  --control-plane-timeout-seconds 30 \
+  --output-path /workspace/outputs/profile_cp4.mp4
+```
+
+Each rank instantiates the upstream pipeline, but context parallelism shards only
+the transformer-block activation/context work in the two DiT stages, not model
+weights. Each rank manages a full copy of both DiTs and processes its local
+video-token shard. Prompt encoding, VAE conditioning encoding, and inter-stage
+upsampling currently run independently on every rank because the leader
+broadcasts the request payload rather than those intermediate tensors. Rank 0
+alone decodes the video/audio outputs and writes the result. Making
+preprocessing leader-only would require explicit broadcasts of the prompt
+embeddings, conditioning tensors, and upscaled latent. The cached stage
+transformers bypass LTX's normal per-stage teardown; their weights remain under
+FlexTensor management across requests.
+
+For CP2, CP4, and CP8 there is one additional hard input-shape constraint: each
+DiT stage's complete video-token sequence must split evenly across the selected
+number of ranks. This sequence is computed after VAE compression and includes
+both generated-video and IC-LoRA reference tokens. Therefore compatibility
+cannot be inferred from raw `W x H x F` or from `F % CP` alone.
+
+To check a shape beforehand, use the same calculation as the runtime. Define
+the latent-token count for a video as:
+
+```text
+L(f, h, w) = (((f - 1) // 8) + 1) * (h // 32) * (w // 32)
+```
+
+Then define:
+
+```text
+R0 = min(F, frames_available_in_conditioning_video)
+R1 = 1 + ((R0 - 1 + temporal_reference_scale - 1)
+          // temporal_reference_scale)
+
+Stage 1 dimensions: h1 = H // 2, w1 = W // 2
+Stage 2 dimensions: h2 = H,      w2 = W
+
+S1 = L(F, h1, w1) + L(R1, h1 // spatial_reference_scale,
+                           w1 // spatial_reference_scale)
+S2 = L(F, h2, w2) + L(R1, h2 // spatial_reference_scale,
+                           w2 // spatial_reference_scale)
+```
+
+The shape is sequence-compatible when both `S1 % CP == 0` and `S2 % CP == 0`.
+`spatial_reference_scale` and `temporal_reference_scale` come from the loaded
+IC-LoRA pipeline, so use the values for the selected LoRA rather than assuming
+they are the same for every model. Each stage dimension must also divide evenly
+by `spatial_reference_scale`, and the resulting reference height and width must
+be divisible by 32.
+
+The server performs exactly this check while preparing the HTTP payload, before
+allocating a request ID, broadcasting to follower ranks, or running GPU
+inference. An incompatible request therefore returns HTTP `400` immediately and
+reports the failing stage token counts. Start a server with a lower supported CP
+size, or profile and serve a compatible shape. At startup, the server also
+verifies that CP divides the loaded transformer's video-attention head count.
+Runtime tensor-shard checks remain as a defensive backstop. The tested
+`1280x704`, 449-frame shape works with CP1, CP2, CP4, and CP8.
 
 On A100 80 GB, a larger fraction such as `0.30` is a good starting point: at 720p the per-layer DiT compute already hides block transfers, so this is effectively latency-bound while staying memory-safe. Raise it toward lower latency if memory allows, or lower it if you OOM.
 
@@ -238,13 +323,19 @@ The profile command runs one discovery request and one profiling request by defa
 ```text
 /workspace/outputs/ltx23_outpaint_profile/stage1/profile.json
 /workspace/outputs/ltx23_outpaint_profile/stage2/profile.json
+/workspace/outputs/ltx23_outpaint_profile/parallelism.json
 ```
 
 With `--offload-text`, a third profile is also written under `text/`.
 
-### Profiles are resolution-specific
+### Profiles are request-shape- and CP-specific
 
-The block assignment depends on per-layer compute time, which scales with the latent sequence length (and therefore with `--height`/`--width`). Profile at the resolution you intend to serve, and serve with the same dimensions. Reusing a low-resolution profile for high-resolution requests applies the wrong block strategy. At higher resolutions the per-layer DiT compute exceeds a block transfer, so transfers hide almost completely and FlexTensor can offload nearly the entire DiT with negligible latency cost; the peak then becomes activation-bound rather than weight-bound.
+The block assignment depends on per-layer compute time, which scales with the
+latent sequence length and CP degree. Profile with the `height`, `width`,
+`num_frames`, and `--context-parallel-size` you intend to serve.
+`parallelism.json` prevents a CP2/CP4/CP8 server from loading a profile created
+for a different CP degree. Reusing a profile for a different resolution or
+frame count still applies the wrong block strategy.
 
 ## Serve
 
@@ -266,9 +357,46 @@ Start the local server from the saved profile:
 
 The server performs one warmup generation at startup so model/profile construction is not counted in later request latency.
 
+### Single-GPU helper (CP1)
+
+`single_serve.sh` remains the convenience entrypoint for the original
+single-GPU server. It starts one CP1 worker directly, without `torchrun` or
+NGINX:
+
+```bash
+WORKSPACE_DIR=/workspace \
+BASE=/workspace/outpaint \
+EX=/my_home/flex-tensor/examples/ltx23/outpaint \
+PROFILE_DIR=/workspace/outpaint/outputs/ltx23_outpaint_profile \
+LETTERBOXED_VIDEO=/workspace/outpaint/inputs/letterboxed_720p.mp4 \
+NUM_FRAMES=449 \
+FRAME_RATE=15 \
+bash /my_home/flex-tensor/examples/ltx23/outpaint/single_serve.sh
+```
+
+It listens on `127.0.0.1:8020` by default. The CP2/CP4/CP8 workflow below is
+an additional deployment option; it does not replace single-GPU serving.
+
+CP is fixed for the lifetime of a server. A direct CP4 server uses four processes but exposes HTTP only from rank 0:
+
+```bash
+TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+/workspace/LTX-2/.venv/bin/torchrun --standalone --nproc-per-node=4 --max-restarts=3 \
+  /path/to/flextensor/examples/ltx23/outpaint/serve_infer.py serve \
+  --accept-external-licenses \
+  --context-parallel-size 4 \
+  --conditioning-video /workspace/inputs/letterboxed_720p.mp4 \
+  --num-frames 449 --frame-rate 15 \
+  --height 704 --width 1280 \
+  --profile-dir /workspace/outputs/ltx23_outpaint_profile_cp4 \
+  --control-plane-timeout-seconds 30 \
+  --host 127.0.0.1 --port 8020
+```
+
 ## Request
 
-Issue a local request. `conditioning_video` is the already-letterboxed source; `frame_rate` is flexible (15 or 24 fps both work). Add `"gamma": 2.0` for dark scenes.
+Issue a local request with `POST /`. `conditioning_video` is the already-letterboxed source; `frame_rate` is flexible (15 or 24 fps both work). Add `"gamma": 2.0` for dark scenes.
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8020 \
@@ -285,7 +413,7 @@ curl -sS -X POST http://127.0.0.1:8020 \
   }'
 ```
 
-The response includes the output path, resolved `num_frames`/`frame_rate`, request wall time, CUDA peak allocation, and before/after GPU memory snapshots.
+The response includes the output path, resolved `num_frames`/`frame_rate`, fixed CP size, request wall time, CUDA peak allocation, and before/after GPU memory snapshots.
 
 `audio_mode` defaults to `copy`, which remuxes source audio up to the
 generated video duration. This keeps capped-frame requests such as
@@ -295,11 +423,68 @@ to omit audio.
 
 ## Multi-GPU serving with NGINX
 
-For a single node with multiple GPUs, run one outpaint server process per GPU
-and put NGINX in front of them. Each worker process has its own
-`CUDA_VISIBLE_DEVICES` value, local port, warmup output, and default output.
-NGINX exposes one front-end port and load balances POST requests across the
-warmed workers.
+On an eight-GPU node, `nginx_serve.sh` partitions the GPUs into independent
+replicas and puts NGINX in front of each replica leader:
+
+| CP size | Replica layout | HTTP backends |
+| ---: | --- | ---: |
+| 1 | 8 replicas × 1 GPU | 8 |
+| 2 | 4 replicas × 2 GPUs | 4 |
+| 4 | 2 replicas × 4 GPUs | 2 |
+| 8 | 1 replica × 8 GPUs | 1 |
+
+Each CP2/CP4/CP8 replica is a separate `torchrun` job; each CP1 replica is a
+plain Python process. Rank 0 accepts HTTP requests and, for CP greater than 1,
+broadcasts each payload to its follower ranks. All ranks run the two DiT stages
+in lockstep, while rank 0 alone decodes and writes the final video. Each CP
+greater than 1 replica uses its own NCCL world process group rather than sharing
+one eight-rank world; CP1 does not initialize a process group.
+
+Distributed ranks dispatch commands and report request completion over separate
+Gloo control-plane process groups. Followers may wait indefinitely for the next
+command while the server is idle, but rank 0 bounds each command send with
+`--control-plane-timeout-seconds` (default `30`). The same setting bounds the
+request-status exchange and coordinated shutdown, so a failed rank cannot leave
+its peers or the HTTP request path silently waiting for the 1,800-second NCCL
+collective timeout. This is intentionally distinct from
+`--distributed-timeout-seconds`, which remains the timeout for NCCL tensor
+collectives. The shell helpers expose the shorter setting as
+`CONTROL_PLANE_TIMEOUT_SECONDS` and export
+`TORCH_NCCL_ASYNC_ERROR_HANDLING=1` by default; both environment defaults can be
+overridden explicitly.
+
+For CP greater than 1, a replica that cannot dispatch a command or complete the
+status exchange exits without running potentially blocking NCCL destructors.
+`torchrun` terminates the other ranks and restarts the complete rank group up to
+`TORCHRUN_MAX_RESTARTS` times (default `3`). Set it to `0` to disable restarts.
+A failed CP1 worker instead makes `nginx_serve.sh` exit immediately. After a
+CP1 failure or exhaustion of the CP2/CP4/CP8 restart budget, an external service
+manager can restart the launcher or alert an operator.
+
+The leader distinguishes coordinated request failures from fatal CUDA or
+distributed-runtime failures. Recoverable validation and model errors return
+`400` or `500` and leave the replica available. A fatal error marks the replica
+unhealthy, returns `503` when possible, shuts down the HTTP loop, and exits
+non-zero. For CP greater than 1, `torchrun` restarts the replica within its
+configured budget; a CP1 worker relies on its external supervisor to restart
+the launcher. `/healthz` returns `503` whenever it can observe the poisoned
+state; otherwise the listener closes during shutdown. The health check
+deliberately performs no collective.
+
+`SIGTERM` and `SIGINT` handlers are active before distributed initialization
+and latch shutdown requests without asynchronously unwinding a collective.
+Rank 0 stops the HTTP loop from a helper thread, allowing an active request to
+finish its ordered collectives. It broadcasts the final follower shutdown
+command only after the HTTP loop has stopped and no request is in flight; an
+unsafe or poisoned path skips that broadcast and exits non-zero so `torchrun`
+reaps the replica. A watchdog bounds the final command by the control-plane
+timeout if a follower has already disappeared.
+
+Signal rank 0 for a graceful long-request drain; do not signal an individual
+follower. Signals delivered through the `torchrun` agent or the whole replica
+are still handled, but the agent's own worker-close timeout can send `SIGKILL`
+before a multi-minute request finishes, regardless of the orchestrator's
+longer grace period. `SIGKILL` cannot run the shutdown handshake.
 
 The HTTP API does not change when NGINX is enabled. Requests still pass
 `conditioning_video` and `output_path` as filesystem paths, so every worker
@@ -315,7 +500,7 @@ WORKSPACE_DIR=/workspace
 BASE=$WORKSPACE_DIR/outpaint
 INPUT_DIR=$BASE/inputs
 OUTPUT_DIR=$BASE/outputs
-PROFILE_DIR=$OUTPUT_DIR/ltx23_outpaint_profile
+PROFILE_DIR=$OUTPUT_DIR/ltx23_outpaint_profile_cp4  # when CONTEXT_PARALLEL_SIZE=4
 EX=/my_home/flex-tensor/examples/ltx23/outpaint
 ```
 
@@ -323,10 +508,15 @@ Place your letterboxed conditioning videos under `$INPUT_DIR`, or override
 `LETTERBOXED_VIDEO` when running `setup.sh`. The setup helper installs NGINX,
 creates or reuses the LTX-2 checkout and Python environment, downloads model
 snapshots into the configured Hugging Face cache, and writes the FlexTensor
-profile used by all workers. It defaults to `OFFLOAD_TEXT=1`,
+profile used by all replicas. It defaults to `OFFLOAD_TEXT=1`,
 `TEXT_MEM_FRACTION=0.05`, and `MAX_GPU_MEM_FRACTION=0.15` to preserve activation
-headroom on A100 40 GB. Override these environment variables for larger GPUs or
-throughput experiments.
+headroom on A100 40 GB. The NGINX helper also defaults
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` so cached FlexTensor managers
+do not fragment the allocator before large VAE workspaces. Distributed helpers
+default `CONTROL_PLANE_TIMEOUT_SECONDS=30` and
+`TORCH_NCCL_ASYNC_ERROR_HANDLING=1` for bounded failure detection. The NGINX
+serving helper also defaults `TORCHRUN_MAX_RESTARTS=3`. Override these
+environment variables for larger GPUs or throughput experiments.
 
 1. Prepare the container/workspace and profile the target resolution:
 
@@ -336,15 +526,22 @@ export BASE=/workspace/outpaint
 export EX=/my_home/flex-tensor/examples/ltx23/outpaint
 export LETTERBOXED_VIDEO=$BASE/inputs/letterboxed_720p.mp4
 export ACCEPT_EXTERNAL_LICENSES=1
+export CONTEXT_PARALLEL_SIZE=4
+export NUM_FRAMES=449
+export FRAME_RATE=15
 
 mkdir -p "$BASE/inputs" "$BASE/outputs"
 bash "$EX/setup.sh"
 ```
 
-2. Start one worker per GPU behind NGINX:
+This profiles one CP4 replica on four GPUs and writes the default profile path
+`$OUTPUT_DIR/ltx23_outpaint_profile_cp4`.
+
+2. Start two CP4 replicas behind NGINX, using all eight GPUs:
 
 ```bash
 NUM_WORKERS=8 \
+CONTEXT_PARALLEL_SIZE=4 \
 BASE_PORT=8020 \
 FRONTEND_HOST=0.0.0.0 \
 FRONTEND_PORT=8080 \
@@ -354,21 +551,25 @@ EX=/my_home/flex-tensor/examples/ltx23/outpaint \
 bash /my_home/flex-tensor/examples/ltx23/outpaint/nginx_serve.sh
 ```
 
-By default this starts workers on `127.0.0.1:8020` through
-`127.0.0.1:8027` and exposes NGINX on `0.0.0.0:8080`. Override `GPU_IDS`
-when the visible GPU IDs are not `0..NUM_WORKERS-1`:
+Here, `NUM_WORKERS` remains the total GPU count for backward compatibility.
+This starts two CP4 replica leaders on `127.0.0.1:8020` and
+`127.0.0.1:8021`, then exposes NGINX on `0.0.0.0:8080`. Set
+`CONTEXT_PARALLEL_SIZE=2` for four replicas or `8` for one replica. Override
+`GPU_IDS` when the GPU IDs are not `0..NUM_WORKERS-1`; the count must be
+divisible by the CP size:
 
 ```bash
-GPU_IDS="0,2,4,6" \
+GPU_IDS="0,1,2,3,4,5,6,7" \
+CONTEXT_PARALLEL_SIZE=4 \
 FRONTEND_PORT=8080 \
 bash /my_home/flex-tensor/examples/ltx23/outpaint/nginx_serve.sh
 ```
 
-The launcher waits for every worker to finish warmup and answer `GET /healthz`
+The launcher waits for every replica leader to finish warmup and answer `GET /healthz`
 before starting NGINX. It writes worker logs to:
 
 ```text
-$OUTPUT_DIR/serve_gpu<GPU_ID>_port<PORT>.log
+$OUTPUT_DIR/serve_cp<CP_SIZE>_replica<INDEX>_port<PORT>.log
 ```
 
 3. In another shell, check the front end and send requests to NGINX:

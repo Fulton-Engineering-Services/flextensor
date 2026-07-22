@@ -10,18 +10,25 @@ import gc
 import json
 import logging
 import os
-import subprocess  # noqa: S404 - used for nvidia-smi diagnostics and the optional ffmpeg gamma round-trip.
+import subprocess  # noqa: S404 - used for diagnostics and the optional ffmpeg gamma round-trip.
 import sys
 import tempfile
 import time
-import traceback
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 import av
 import torch
+from context_parallel import (
+    ContextParallelRuntime,
+    DistributedRequestError,
+    ReplicaFatalError,
+    RequestOutcomeCoordinator,
+    install_context_parallel,
+    is_replica_fatal_error,
+    validate_context_parallel_video_sequence_lengths,
+)
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
@@ -34,13 +41,18 @@ from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings
 from ltx_pipelines.utils.media_io import encode_video, get_videostream_metadata
 from ltx_pipelines.utils.types import ModalitySpec
+from serve_http import (
+    ReplicaRequestServer,
+    ReplicaShutdownCoordinator,
+    ShutdownSignalHandlers,
+    finalize_follower_shutdown,
+)
 
 import flextensor
 from flextensor import OffloadConfig
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from _common import (
-    decode_json_payload,
     gpu_memory_snapshot,
     payload_value,
     require_external_license_ack,
@@ -49,6 +61,8 @@ from _common import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ltx_pipelines.utils.args import ImageConditioningInput
 
 EXPECTED_STAGE_CALLS = 2
@@ -57,6 +71,7 @@ STAGE_MANAGER_NAMES = {
     2: "ltx_stage2",
 }
 TEXT_MANAGER_NAME = "ltx_text"
+PROFILE_METADATA_FILENAME = "parallelism.json"
 LOGGER = logging.getLogger(__name__)
 DEFAULT_INCLUDE_PATTERNS = [
     "velocity_model.transformer_blocks.*",
@@ -74,6 +89,13 @@ def _snap_frames_to_8k1(frames: int) -> int:
     return 8 * k + 1
 
 
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return parsed
+
+
 class RequestTransformerCache:
     """Cache stage transformers (and optionally the Gemma text encoder), each behind its own FlexTensor manager."""
 
@@ -83,9 +105,11 @@ class RequestTransformerCache:
         profile_dir: Path,
         from_profile: bool,
         *,
+        context_parallel: ContextParallelRuntime,
         text_config: OffloadConfig | None = None,
     ) -> None:
         self.config = config
+        self.context_parallel = context_parallel
         self.text_config = text_config
         self.offload_text = text_config is not None
         self.profile_dir = profile_dir
@@ -93,7 +117,30 @@ class RequestTransformerCache:
         self.cache: dict[int, torch.nn.Module] = {}
         self.text_model: torch.nn.Module | None = None
         self.stage_index = 0
-        self.original_build = DiffusionStage._build_transformer  # noqa: SLF001 - example hooks into LTX lifecycle.
+        self.original_build = (
+            DiffusionStage._build_transformer  # noqa: SLF001 - example hooks into LTX lifecycle.
+        )
+        if from_profile:
+            self._validate_profile_parallelism()
+
+    def _validate_profile_parallelism(self) -> None:
+        metadata_path = self.profile_dir / PROFILE_METADATA_FILENAME
+        if not metadata_path.exists():
+            if self.context_parallel.enabled:
+                raise RuntimeError(
+                    f"FlexTensor profile {self.profile_dir} has no {PROFILE_METADATA_FILENAME}; "
+                    "create a new profile with the requested context parallel size."
+                )
+            LOGGER.warning("Using a legacy CP1 FlexTensor profile without %s", PROFILE_METADATA_FILENAME)
+            return
+
+        metadata = json.loads(metadata_path.read_text())
+        profile_size = int(metadata.get("context_parallel_size", 1))
+        if profile_size != self.context_parallel.size:
+            raise RuntimeError(
+                f"FlexTensor profile {self.profile_dir} was created for CP{profile_size}, "
+                f"but this server requested CP{self.context_parallel.size}."
+            )
 
     def reset_request(self) -> None:
         self.stage_index = 0
@@ -114,6 +161,9 @@ class RequestTransformerCache:
                 )
             if stage_index not in cache.cache:
                 cache.cache[stage_index] = cache.build_transformer(self, stage_index, **kwargs)
+            # Intentionally call run() directly instead of DiffusionStage.__call__.
+            # The latter enters LTX's gpu_model context and tears the transformer
+            # down itself; FlexTensor exclusively owns the stage lifecycle here.
             return self.run(cache.cache[stage_index], *args, **kwargs)
 
         DiffusionStage.__call__ = cached_call
@@ -127,7 +177,7 @@ class RequestTransformerCache:
         def patched_text_encoder_ctx(pe_self: PromptEncoder):
             if cache.text_model is None:
                 LOGGER.info("Building text encoder (CPU) for FlexTensor manager %s", TEXT_MANAGER_NAME)
-                cpu_encoder = pe_self._text_encoder_builder.build(  # noqa: SLF001 - example hooks into LTX lifecycle.
+                cpu_encoder = pe_self._text_encoder_builder.build(  # noqa: SLF001
                     device=torch.device("cpu"),
                     dtype=pe_self._dtype,  # noqa: SLF001
                 ).eval()
@@ -164,6 +214,7 @@ class RequestTransformerCache:
         build_kwargs["device"] = torch.device("cpu")
         LOGGER.info("Building stage%s CPU transformer", stage_index)
         transformer = self.original_build(stage, **build_kwargs)
+        install_context_parallel(transformer, self.context_parallel)
         if self.from_profile:
             LOGGER.info("Loading FlexTensor profile for %s from %s", manager_name, stage_profile_dir)
             return flextensor.offload_from_profile(
@@ -178,6 +229,8 @@ class RequestTransformerCache:
 
     def save_profile(self) -> None:
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        metadata = {"context_parallel_size": self.context_parallel.size}
+        (self.profile_dir / PROFILE_METADATA_FILENAME).write_text(json.dumps(metadata, indent=2) + "\n")
         for stage_index, manager_name in STAGE_MANAGER_NAMES.items():
             stage_profile_dir = self.stage_profile_dir(stage_index)
             stage_profile_dir.mkdir(parents=True, exist_ok=True)
@@ -227,7 +280,10 @@ def apply_gamma(src_path: str, dst_path: str, gamma: float, *, keep_audio: bool)
     ]
     cmd += ["-c:a", "copy"] if keep_audio else ["-an"]
     cmd += [dst_path]
-    subprocess.run(cmd, check=True)  # noqa: S603 - args are constructed locally, not from untrusted input.
+    subprocess.run(  # noqa: S603 - arguments are constructed locally.
+        cmd,
+        check=True,
+    )
 
 
 def stream_duration_s(path: str) -> float | None:
@@ -398,9 +454,11 @@ def install_stage2_video_conditioning_patch() -> None:
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
         skip_stage_2: bool = False,
+        decode_output: bool = True,
+        distributed_postflight: Callable[[], None] | None = None,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
-    ) -> tuple[Any, Audio]:
+    ) -> tuple[Any, Audio | None]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -448,6 +506,10 @@ def install_stage2_video_conditioning_patch() -> None:
         )
 
         if skip_stage_2:
+            if distributed_postflight is not None:
+                distributed_postflight()
+            if not decode_output:
+                return None, None
             decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
             decoded_audio = self.audio_decoder(audio_state.latent)
             return decoded_video, decoded_audio
@@ -501,6 +563,10 @@ def install_stage2_video_conditioning_patch() -> None:
             ),
         )
 
+        if distributed_postflight is not None:
+            distributed_postflight()
+        if not decode_output:
+            return None, None
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
         decoded_audio = self.audio_decoder(audio_state.latent)
         return decoded_video, decoded_audio
@@ -521,19 +587,31 @@ def install_stage2_lora_patch() -> None:
         stage_1_loras = self.stage_1._transformer_builder.loras  # noqa: SLF001
         if stage_1_loras:
             LOGGER.info("Applying %s IC-LoRA(s) to Stage 2 transformer builder", len(stage_1_loras))
-            self.stage_2._transformer_builder = self.stage_2._transformer_builder.with_loras(stage_1_loras)  # noqa: SLF001
+            self.stage_2._transformer_builder = (  # noqa: SLF001
+                self.stage_2._transformer_builder.with_loras(stage_1_loras)  # noqa: SLF001
+            )
             if hasattr(self.stage_2, "_streaming_builder"):
-                self.stage_2._streaming_builder = self.stage_2._streaming_builder.with_loras(stage_1_loras)  # noqa: SLF001
+                self.stage_2._streaming_builder = (  # noqa: SLF001
+                    self.stage_2._streaming_builder.with_loras(stage_1_loras)  # noqa: SLF001
+                )
 
     patched_init._flextensor_stage2_lora = True  # noqa: SLF001
     ICLoraPipeline.__init__ = patched_init  # type: ignore[method-assign]
 
 
 class OutpaintFlexTensorService:
-    def __init__(self, args: argparse.Namespace, *, from_profile: bool) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        context_parallel: ContextParallelRuntime,
+        *,
+        from_profile: bool,
+    ) -> None:
         self.args = args
+        self.context_parallel = context_parallel
         self.profile_dir = Path(args.profile_dir)
         self.config = OffloadConfig(
+            gpu_device=context_parallel.local_rank,
             include_patterns=args.include_patterns or DEFAULT_INCLUDE_PATTERNS,
             discovery_iters=args.discovery_iters,
             profiling_iters=args.profiling_iters,
@@ -549,6 +627,7 @@ class OutpaintFlexTensorService:
         text_config = None
         if args.offload_text:
             text_config = OffloadConfig(
+                gpu_device=context_parallel.local_rank,
                 include_patterns=args.text_include_patterns or DEFAULT_TEXT_INCLUDE_PATTERNS,
                 discovery_iters=args.discovery_iters,
                 profiling_iters=args.profiling_iters,
@@ -563,10 +642,12 @@ class OutpaintFlexTensorService:
             self.config,
             self.profile_dir,
             from_profile=from_profile,
+            context_parallel=context_parallel,
             text_config=text_config,
         )
         self.cache.install()
         self.request_lock = Lock()
+        self.request_id = 0
         install_stage2_video_conditioning_patch()
         install_stage2_lora_patch()
         self.pipeline = ICLoraPipeline(
@@ -577,36 +658,139 @@ class OutpaintFlexTensorService:
         )
 
     def generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.context_parallel.is_leader:
+            raise RuntimeError("Only context-parallel rank 0 may dispatch an HTTP request.")
         with self.request_lock:
-            return self._generate_locked(payload)
+            prepared_payload = self._prepare_payload(payload)
+            request_id = self._claim_request_id()
+            if self.context_parallel.enabled:
+                self.context_parallel.broadcast_object({
+                    "operation": "generate",
+                    "request_id": request_id,
+                    "payload": prepared_payload,
+                })
+            return self._generate_locked(prepared_payload, request_id=request_id)
 
-    def _generate_locked(self, payload: dict[str, Any]) -> dict[str, Any]:
-        prompt = payload_value(payload, "prompt", self.args.prompt)
-        conditioning_video = payload_value(payload, "conditioning_video", self.args.conditioning_video)
-        output_path = payload_value(payload, "output_path", self.args.output_path)
+    def generate_local(
+        self,
+        payload: dict[str, Any],
+        *,
+        prepared: bool = False,
+        request_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Run a request already coordinated across all context-parallel ranks."""
+        with self.request_lock:
+            request_id = self._claim_request_id(request_id)
+            if prepared:
+                prepared_payload = payload
+            else:
+                try:
+                    prepared_payload = self._prepare_payload(payload)
+                except Exception as exc:
+                    RequestOutcomeCoordinator(self.context_parallel, request_id).synchronize(exc)
+                    raise
+            return self._generate_locked(prepared_payload, request_id=request_id)
+
+    def _claim_request_id(self, request_id: int | None = None) -> int:
+        expected_request_id = self.request_id + 1
+        if request_id is None:
+            request_id = expected_request_id
+        if request_id != expected_request_id:
+            self.context_parallel.fail_replica(
+                f"Expected context-parallel request {expected_request_id}, got {request_id!r}"
+            )
+        self.request_id = request_id
+        return request_id
+
+    def _prepare_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        conditioning_video = str(payload_value(payload, "conditioning_video", self.args.conditioning_video))
+        src = get_videostream_metadata(conditioning_video)
+        num_frames = int(payload_value(payload, "num_frames", self.args.num_frames or _snap_frames_to_8k1(src.frames)))
+        if num_frames < 1 or (num_frames - 1) % 8 != 0:
+            raise ValueError(f"num_frames must be a positive integer of the form 8*k + 1; got {num_frames}.")
+
+        frame_rate = float(payload_value(payload, "frame_rate", self.args.frame_rate or src.fps))
+        if frame_rate <= 0:
+            raise ValueError(f"frame_rate must be positive; got {frame_rate}.")
+
         height = int(payload_value(payload, "height", self.args.height))
         width = int(payload_value(payload, "width", self.args.width))
-        seed = int(payload_value(payload, "seed", self.args.seed))
-        conditioning_strength = float(payload_value(payload, "conditioning_strength", self.args.conditioning_strength))
-        gamma = float(payload_value(payload, "gamma", self.args.gamma))
-        use_gamma = abs(gamma - 1.0) > 1e-6
+        assert_resolution(height=height, width=width, is_two_stage=True)
+        validate_context_parallel_video_sequence_lengths(
+            size=self.context_parallel.size,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            available_reference_frames=src.frames,
+            reference_downscale_factor=self.pipeline.reference_downscale_factor,
+            reference_temporal_scale_factor=self.pipeline.reference_temporal_scale_factor,
+        )
+
         audio_mode = str(payload_value(payload, "audio_mode", self.args.audio_mode))
         if audio_mode not in {"copy", "none"}:
             raise ValueError(f"audio_mode must be one of copy, none; got {audio_mode!r}")
 
-        src = get_videostream_metadata(conditioning_video)
-        num_frames = int(payload_value(payload, "num_frames", self.args.num_frames or _snap_frames_to_8k1(src.frames)))
-        frame_rate = float(payload_value(payload, "frame_rate", self.args.frame_rate or src.fps))
+        gamma = float(payload_value(payload, "gamma", self.args.gamma))
+        if gamma <= 0:
+            raise ValueError(f"gamma must be positive; got {gamma}.")
 
-        self.cache.reset_request()
-        torch.cuda.reset_peak_memory_stats()
-        before_memory = gpu_memory_snapshot()
+        return {
+            "prompt": payload_value(payload, "prompt", self.args.prompt),
+            "conditioning_video": conditioning_video,
+            "output_path": str(payload_value(payload, "output_path", self.args.output_path)),
+            "height": height,
+            "width": width,
+            "seed": int(payload_value(payload, "seed", self.args.seed)),
+            "conditioning_strength": float(
+                payload_value(payload, "conditioning_strength", self.args.conditioning_strength)
+            ),
+            "gamma": gamma,
+            "audio_mode": audio_mode,
+            "num_frames": num_frames,
+            "frame_rate": frame_rate,
+        }
+
+    def _generate_locked(  # noqa: C901 - cleanup and post-processing remain explicit.
+        self,
+        payload: dict[str, Any],
+        *,
+        request_id: int,
+    ) -> dict[str, Any]:
+        produce_output = self.context_parallel.is_leader
+        prompt = payload["prompt"]
+        conditioning_video = payload["conditioning_video"]
+        output_path = payload["output_path"]
+        height = payload["height"]
+        width = payload["width"]
+        seed = payload["seed"]
+        conditioning_strength = payload["conditioning_strength"]
+        gamma = payload["gamma"]
+        use_gamma = abs(gamma - 1.0) > 1e-6
+        audio_mode = payload["audio_mode"]
+        num_frames = payload["num_frames"]
+        frame_rate = payload["frame_rate"]
+
         start = time.time()
         video = None
         audio = None
+        before_memory = None
         tmp_paths: list[str] = []
         target_duration_s: float | None = None
+        outcome = RequestOutcomeCoordinator(self.context_parallel, request_id)
+
+        def distributed_postflight() -> None:
+            validation_error = None
+            try:
+                self.cache.validate_request_complete()
+            except Exception as exc:
+                validation_error = exc
+            outcome.synchronize(validation_error)
+
         try:
+            self.cache.reset_request()
+            torch.cuda.reset_peak_memory_stats()
+            before_memory = gpu_memory_snapshot() if produce_output else None
+
             # Optional dark-scene gamma trick: brighten the (already letterboxed) input
             # so real content lifts away from the pure-black "generate here" bars.
             cond_path = conditioning_video
@@ -632,134 +816,216 @@ class OutpaintFlexTensorService:
                     video_conditioning=[(cond_path, conditioning_strength)],
                     tiling_config=TilingConfig.default(),
                     enhance_prompt=False,
-                )
-                self.cache.validate_request_complete()
-
-                # When post-processing is needed, encode to a temp file first. This
-                # keeps visual transforms and source-audio muxing explicit.
-                encode_target = output_path
-                needs_postprocess = use_gamma or audio_mode == "copy"
-                if needs_postprocess:
-                    fd, encode_target = tempfile.mkstemp(suffix=".mp4", prefix="outpaint_gamma_out_")
-                    os.close(fd)
-                    tmp_paths.append(encode_target)
-
-                encode_video(
-                    video=video,
-                    fps=int(frame_rate),
-                    audio=None,
-                    output_path=encode_target,
-                    video_chunks_number=get_video_chunks_number(num_frames, TilingConfig.default()),
+                    decode_output=produce_output,
+                    distributed_postflight=distributed_postflight,
                 )
 
-                if use_gamma:
-                    gamma_target = output_path
-                    if audio_mode == "copy":
-                        fd, gamma_target = tempfile.mkstemp(suffix=".mp4", prefix="outpaint_gamma_final_")
+                if produce_output:
+                    # When post-processing is needed, encode to a temp file first. This
+                    # keeps visual transforms and source-audio muxing explicit.
+                    encode_target = output_path
+                    needs_postprocess = use_gamma or audio_mode == "copy"
+                    if needs_postprocess:
+                        fd, encode_target = tempfile.mkstemp(suffix=".mp4", prefix="outpaint_gamma_out_")
                         os.close(fd)
-                        tmp_paths.append(gamma_target)
-                    apply_gamma(encode_target, gamma_target, 1.0 / gamma, keep_audio=False)
-                    encode_target = gamma_target
+                        tmp_paths.append(encode_target)
 
-                target_duration_s = finalize_output_audio(
-                    encode_target,
-                    conditioning_video,
-                    output_path,
-                    audio_mode=audio_mode,
-                    num_frames=num_frames,
-                    frame_rate=frame_rate,
+                    encode_video(
+                        video=video,
+                        fps=int(frame_rate),
+                        audio=None,
+                        output_path=encode_target,
+                        video_chunks_number=get_video_chunks_number(num_frames, TilingConfig.default()),
+                    )
+
+                    if use_gamma:
+                        gamma_target = output_path
+                        if audio_mode == "copy":
+                            fd, gamma_target = tempfile.mkstemp(suffix=".mp4", prefix="outpaint_gamma_final_")
+                            os.close(fd)
+                            tmp_paths.append(gamma_target)
+                        apply_gamma(encode_target, gamma_target, 1.0 / gamma, keep_audio=False)
+                        encode_target = gamma_target
+
+                    target_duration_s = finalize_output_audio(
+                        encode_target,
+                        conditioning_video,
+                        output_path,
+                        audio_mode=audio_mode,
+                        num_frames=num_frames,
+                        frame_rate=frame_rate,
+                    )
+        except Exception as exc:
+            if not outcome.attempted:
+                outcome.synchronize(exc)
+            elif is_replica_fatal_error(exc):
+                self.context_parallel.fail_replica(
+                    f"Request {request_id} hit an unsafe postflight error on rank {self.context_parallel.rank}",
+                    cause=exc,
                 )
+            raise
         finally:
-            self.cache.reset_request()
-            del video
-            del audio
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            for tmp_path in tmp_paths:
-                with contextlib.suppress(OSError):
-                    Path(tmp_path).unlink()
+            # A poisoned rank must reach process exit without touching CUDA,
+            # cached model state, or another distributed primitive.
+            if not self.context_parallel.poisoned:
+                del video, audio
+                try:
+                    self.cache.reset_request()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    for tmp_path in tmp_paths:
+                        with contextlib.suppress(OSError):
+                            Path(tmp_path).unlink()
+                except Exception as exc:
+                    if self.context_parallel.enabled or is_replica_fatal_error(exc):
+                        self.context_parallel.fail_replica(
+                            f"Request {request_id} cleanup failed on rank {self.context_parallel.rank}",
+                            cause=exc,
+                        )
+                    raise
 
-        return {
-            "ok": True,
-            "output_path": str(output_path),
-            "num_frames": num_frames,
-            "frame_rate": frame_rate,
-            "gamma": gamma if use_gamma else None,
-            "audio_mode": audio_mode,
-            "target_duration_s": target_duration_s,
-            "wall_s": time.time() - start,
-            "torch_cuda_max_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2,
-            "gpu_memory_before": before_memory,
-            "gpu_memory_after_cleanup": gpu_memory_snapshot(),
-        }
+        try:
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "output_path": str(output_path) if produce_output else None,
+                "num_frames": num_frames,
+                "frame_rate": frame_rate,
+                "context_parallel_size": self.context_parallel.size,
+                "context_parallel_rank": self.context_parallel.rank,
+                "gamma": gamma if use_gamma else None,
+                "audio_mode": audio_mode,
+                "target_duration_s": target_duration_s,
+                "wall_s": time.time() - start,
+                "torch_cuda_max_allocated_mib": torch.cuda.max_memory_allocated() / 1024**2,
+                "gpu_memory_before": before_memory,
+                "gpu_memory_after_cleanup": gpu_memory_snapshot() if produce_output else None,
+            }
+        except Exception as exc:
+            if is_replica_fatal_error(exc):
+                self.context_parallel.fail_replica(
+                    f"Request {request_id} hit an unsafe response-finalization error on rank "
+                    f"{self.context_parallel.rank}",
+                    cause=exc,
+                )
+            raise
 
 
-def drive_profile(args: argparse.Namespace) -> None:
-    service = OutpaintFlexTensorService(args, from_profile=False)
+def drive_profile(args: argparse.Namespace, context_parallel: ContextParallelRuntime) -> None:
+    service = OutpaintFlexTensorService(args, context_parallel, from_profile=False)
     manager_names = list(STAGE_MANAGER_NAMES.values())
     if args.offload_text:
         manager_names.append(TEXT_MANAGER_NAME)
     managers = [flextensor.get_offload_manager(manager_name) for manager_name in manager_names]
 
     for index in range(args.discovery_iters):
-        result = service.generate({"output_path": f"{args.output_path}.discovery_{index}.mp4"})
-        LOGGER.info("Discovery result:\n%s", json.dumps(result, indent=2))
+        context_parallel.barrier()
+        result = service.generate_local(
+            {"output_path": f"{args.output_path}.discovery_{index}.mp4"},
+        )
+        context_parallel.barrier()
         for manager in managers:
             manager.update_state()
-        LOGGER.info("Discovery pass %s complete", index)
+        context_parallel.barrier()
+        if context_parallel.is_leader:
+            LOGGER.info("Discovery result:\n%s", json.dumps(result, indent=2))
+            LOGGER.info("Discovery pass %s complete", index)
 
     for index in range(args.profiling_iters):
-        result = service.generate({"output_path": f"{args.output_path}.profiling_{index}.mp4"})
-        LOGGER.info("Profiling result:\n%s", json.dumps(result, indent=2))
+        context_parallel.barrier()
+        result = service.generate_local(
+            {"output_path": f"{args.output_path}.profiling_{index}.mp4"},
+        )
+        context_parallel.barrier()
         for manager in managers:
             manager.update_state()
-        LOGGER.info("Profiling pass %s complete", index)
+        context_parallel.barrier()
+        if context_parallel.is_leader:
+            LOGGER.info("Profiling result:\n%s", json.dumps(result, indent=2))
+            LOGGER.info("Profiling pass %s complete", index)
 
-    service.cache.save_profile()
+    if context_parallel.is_leader:
+        service.cache.save_profile()
+    context_parallel.barrier()
 
 
-def serve(args: argparse.Namespace) -> None:
-    service = OutpaintFlexTensorService(args, from_profile=True)
-    LOGGER.info("Starting warmup")
-    LOGGER.info("Warmup result:\n%s", json.dumps(service.generate({"output_path": args.warmup_output_path}), indent=2))
+def _run_context_parallel_follower(
+    service: OutpaintFlexTensorService,
+    context_parallel: ContextParallelRuntime,
+) -> None:
+    LOGGER.info("Context-parallel rank %s waiting for leader requests", context_parallel.rank)
+    while True:
+        command = context_parallel.broadcast_object()
+        operation = command.get("operation") if isinstance(command, dict) else None
+        if operation == "shutdown":
+            return
+        if operation != "generate":
+            context_parallel.fail_replica(f"Unknown context-parallel command: {command!r}")
+        request_id = command.get("request_id")
+        if not isinstance(request_id, int) or isinstance(request_id, bool) or request_id <= 0:
+            context_parallel.fail_replica(f"Invalid context-parallel request ID: {request_id!r}")
+        payload = command.get("payload")
+        if not isinstance(payload, dict):
+            context_parallel.fail_replica(
+                f"Context-parallel request payload must be a dictionary; got {type(payload).__name__}."
+            )
+        try:
+            service.generate_local(payload, prepared=True, request_id=request_id)
+        except DistributedRequestError as exc:
+            # The leader receives the same aggregate and converts it to HTTP 500.
+            # Because every rank reached the postflight, this request is recoverable.
+            LOGGER.error("%s", exc)
 
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:  # noqa: N802, RUF100 - BaseHTTPRequestHandler requires this method name.
-            if self.path != "/healthz":
-                self.send_error(404, "Not Found")
-                return
 
-            body = json.dumps({"ok": True}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+def serve(
+    args: argparse.Namespace,
+    context_parallel: ContextParallelRuntime,
+    shutdown: ReplicaShutdownCoordinator,
+    signal_handlers: ShutdownSignalHandlers,
+) -> None:
+    service = OutpaintFlexTensorService(args, context_parallel, from_profile=True)
+    context_parallel.barrier()
+    if _leader_requested_shutdown(shutdown, signal_handlers, context_parallel):
+        LOGGER.info("Shutdown requested during service construction")
+        return
+    if not context_parallel.is_leader:
+        _run_context_parallel_follower(service, context_parallel)
+        return
 
-        def do_POST(self) -> None:  # noqa: N802, RUF100 - BaseHTTPRequestHandler requires this method name.
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                payload = decode_json_payload(self.rfile.read(length) if length > 0 else b"{}")
-                result = service.generate(payload)
-                status = 200
-            except (json.JSONDecodeError, ValueError) as exc:
-                result = {"ok": False, "error": f"Invalid JSON: {exc}"}
-                status = 400
-            except Exception as exc:
-                traceback.print_exc()
-                result = {"ok": False, "error": repr(exc)}
-                status = 500
-            body = json.dumps(result, indent=2).encode()
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+    server = ReplicaRequestServer(args.host, args.port, service, context_parallel, logger=LOGGER)
+    shutdown.attach_server(server)
+    if not shutdown.requested:
+        LOGGER.info("Starting warmup")
+        LOGGER.info(
+            "Warmup result:\n%s",
+            json.dumps(service.generate({"output_path": args.warmup_output_path}), indent=2),
+        )
 
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    LOGGER.info("Serving on http://%s:%s", args.host, args.port)
-    server.serve_forever()
+    http_loop_stopped = False
+    try:
+        if not shutdown.requested:
+            LOGGER.info(
+                "Serving on http://%s:%s (CP%s replica leader)",
+                args.host,
+                args.port,
+                context_parallel.size,
+            )
+        server.serve_forever()
+        http_loop_stopped = True
+    finally:
+        if signal_handlers.received_signal is not None:
+            LOGGER.info(
+                "Received signal %s; completing coordinated replica shutdown",
+                signal_handlers.received_signal,
+            )
+        if context_parallel.enabled:
+            finalize_follower_shutdown(
+                context_parallel,
+                http_loop_stopped=http_loop_stopped,
+                request_in_flight=server.request_in_flight,
+                logger=LOGGER,
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -799,6 +1065,25 @@ def parse_args() -> argparse.Namespace:
         p.add_argument("--height", type=int, default=704)
         p.add_argument("--width", type=int, default=1280)
         p.add_argument("--seed", type=int, default=171198)
+        p.add_argument(
+            "--context-parallel-size",
+            type=int,
+            choices=(1, 2, 4, 8),
+            default=1,
+            help="Ulysses context-parallel degree; CP>1 must be launched with matching torchrun world size.",
+        )
+        p.add_argument(
+            "--distributed-timeout-seconds",
+            type=positive_int,
+            default=1800,
+            help="Per-collective NCCL timeout; this is not an overall request deadline.",
+        )
+        p.add_argument(
+            "--control-plane-timeout-seconds",
+            type=positive_int,
+            default=30,
+            help="Timeout for CPU/Gloo command dispatch, request outcomes, and coordinated shutdown.",
+        )
         p.add_argument("--profile-dir", default="/workspace/outputs/ltx23_outpaint_profile")
         p.add_argument("--discovery-iters", type=int, default=1)
         p.add_argument("--profiling-iters", type=int, default=1)
@@ -820,44 +1105,105 @@ def parse_args() -> argparse.Namespace:
     server.add_argument("--port", type=int, default=8020)
     server.add_argument("--warmup-output-path", default="/workspace/outputs/ltx23_outpaint_warmup.mp4")
 
-    args = parser.parse_args()
-    repos_to_download = []
-    if not args.distilled_checkpoint_path:
-        repos_to_download.append(args.distilled_checkpoint_repo)
-    if not args.spatial_upsampler_path:
-        repos_to_download.append(args.spatial_upsampler_repo)
-    if not args.lora_path:
-        repos_to_download.append(args.lora_repo)
-    if not args.gemma_root:
-        repos_to_download.append(args.gemma_repo)
-    require_external_license_ack(args, repos_to_download)
+    return parser.parse_args()
 
-    args.distilled_checkpoint_path = resolve_file(
-        args.distilled_checkpoint_path,
-        args.distilled_checkpoint_repo,
-        args.distilled_checkpoint_filename,
-        args.cache_dir,
-    )
-    args.spatial_upsampler_path = resolve_file(
-        args.spatial_upsampler_path,
-        args.spatial_upsampler_repo,
-        args.spatial_upsampler_filename,
-        args.cache_dir,
-    )
-    args.lora_path = resolve_file(args.lora_path, args.lora_repo, args.lora_filename, args.cache_dir)
-    args.gemma_root = resolve_snapshot(args.gemma_root, args.gemma_repo, args.cache_dir)
+
+def resolve_model_artifacts(
+    args: argparse.Namespace,
+    context_parallel: ContextParallelRuntime,
+) -> argparse.Namespace:
+    resolved_paths = None
+    if context_parallel.is_leader:
+        repos_to_download = []
+        if not args.distilled_checkpoint_path:
+            repos_to_download.append(args.distilled_checkpoint_repo)
+        if not args.spatial_upsampler_path:
+            repos_to_download.append(args.spatial_upsampler_repo)
+        if not args.lora_path:
+            repos_to_download.append(args.lora_repo)
+        if not args.gemma_root:
+            repos_to_download.append(args.gemma_repo)
+        require_external_license_ack(args, repos_to_download)
+
+        resolved_paths = {
+            "distilled_checkpoint_path": resolve_file(
+                args.distilled_checkpoint_path,
+                args.distilled_checkpoint_repo,
+                args.distilled_checkpoint_filename,
+                args.cache_dir,
+            ),
+            "spatial_upsampler_path": resolve_file(
+                args.spatial_upsampler_path,
+                args.spatial_upsampler_repo,
+                args.spatial_upsampler_filename,
+                args.cache_dir,
+            ),
+            "lora_path": resolve_file(args.lora_path, args.lora_repo, args.lora_filename, args.cache_dir),
+            "gemma_root": resolve_snapshot(args.gemma_root, args.gemma_repo, args.cache_dir),
+        }
+
+    resolved_paths = context_parallel.broadcast_object(resolved_paths)
+    if not isinstance(resolved_paths, dict):
+        raise TypeError(f"Resolved model paths must be a dictionary; got {type(resolved_paths).__name__}.")
+    for name, value in resolved_paths.items():
+        setattr(args, name, value)
     return args
+
+
+def _leader_requested_shutdown(
+    shutdown: ReplicaShutdownCoordinator,
+    signal_handlers: ShutdownSignalHandlers,
+    context_parallel: ContextParallelRuntime,
+) -> bool:
+    """Share a latched leader signal at a collective-safe setup checkpoint."""
+    local_request = shutdown.requested or signal_handlers.received_signal is not None
+    requested = context_parallel.broadcast_object(local_request if context_parallel.is_leader else None)
+    if not isinstance(requested, bool):
+        context_parallel.fail_replica(f"Invalid setup shutdown flag: {requested!r}")
+    return requested
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args()
-    if args.command == "profile":
-        drive_profile(args)
-    elif args.command == "serve":
-        serve(args)
-    else:
-        raise ValueError(args.command)
+    shutdown = ReplicaShutdownCoordinator()
+    signal_context = (
+        ShutdownSignalHandlers(shutdown.request_shutdown) if args.command == "serve" else contextlib.nullcontext(None)
+    )
+    with signal_context as signal_handlers:
+        context_parallel = ContextParallelRuntime.initialize(
+            args.context_parallel_size,
+            timeout_seconds=args.distributed_timeout_seconds,
+            control_timeout_seconds=args.control_plane_timeout_seconds,
+        )
+        try:
+            if (
+                args.command == "serve"
+                and signal_handlers is not None
+                and _leader_requested_shutdown(shutdown, signal_handlers, context_parallel)
+            ):
+                LOGGER.info("Shutdown requested during distributed initialization")
+                return
+            args = resolve_model_artifacts(args, context_parallel)
+            if args.command == "profile":
+                drive_profile(args, context_parallel)
+            elif args.command == "serve":
+                if signal_handlers is None:
+                    raise RuntimeError("Serve-mode signal handlers were not installed")
+                if _leader_requested_shutdown(shutdown, signal_handlers, context_parallel):
+                    LOGGER.info("Shutdown requested during model artifact resolution")
+                    return
+                serve(args, context_parallel, shutdown, signal_handlers)
+            else:
+                raise ValueError(args.command)
+        except ReplicaFatalError as exc:
+            context_parallel.terminate(str(exc))
+        except Exception as exc:
+            if context_parallel.enabled:
+                context_parallel.terminate(f"Unhandled {type(exc).__name__} on rank {context_parallel.rank}: {exc}")
+            raise
+        finally:
+            context_parallel.close()
 
 
 if __name__ == "__main__":

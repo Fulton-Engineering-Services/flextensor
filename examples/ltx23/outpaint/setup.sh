@@ -22,6 +22,10 @@ export HF_XET_CACHE
 OFFLOAD_TEXT="${OFFLOAD_TEXT:-1}"
 TEXT_MEM_FRACTION="${TEXT_MEM_FRACTION:-0.05}"
 MAX_GPU_MEM_FRACTION="${MAX_GPU_MEM_FRACTION:-0.15}"
+CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
+CONTROL_PLANE_TIMEOUT_SECONDS="${CONTROL_PLANE_TIMEOUT_SECONDS:-30}"
+TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+export TORCH_NCCL_ASYNC_ERROR_HANDLING
 
 SNAP="${SNAP:-}"
 DISTILLED="${DISTILLED:-}"
@@ -35,7 +39,11 @@ LORA_FILENAME="ltx-2.3-22b-ic-lora-outpaint.safetensors"
 GEMMA_REPO_ID="google/gemma-3-12b-it-qat-q4_0-unquantized"
 LTX_LICENSE_URL="https://huggingface.co/Lightricks/LTX-2.3/raw/main/LICENSE"
 
-PROFILE_DIR="${PROFILE_DIR:-$OUTPUT_DIR/ltx23_outpaint_profile}"
+DEFAULT_PROFILE_DIR="$OUTPUT_DIR/ltx23_outpaint_profile"
+if [[ "$CONTEXT_PARALLEL_SIZE" != "1" ]]; then
+  DEFAULT_PROFILE_DIR="${DEFAULT_PROFILE_DIR}_cp${CONTEXT_PARALLEL_SIZE}"
+fi
+PROFILE_DIR="${PROFILE_DIR:-$DEFAULT_PROFILE_DIR}"
 LETTERBOXED_VIDEO="${LETTERBOXED_VIDEO:-$INPUT_DIR/letterboxed_720p.mp4}"
 HEIGHT="${HEIGHT:-704}"
 WIDTH="${WIDTH:-1280}"
@@ -48,6 +56,16 @@ validate_num_frames() {
     echo "NUM_FRAMES must be a positive integer of the form 8*k + 1; got: $NUM_FRAMES" >&2
     exit 1
   fi
+}
+
+validate_context_parallel_size() {
+  case "$CONTEXT_PARALLEL_SIZE" in
+    1 | 2 | 4 | 8) ;;
+    *)
+      echo "CONTEXT_PARALLEL_SIZE must be one of 1, 2, 4, or 8; got: $CONTEXT_PARALLEL_SIZE" >&2
+      exit 1
+      ;;
+  esac
 }
 
 require_hf_token_for_gemma() {
@@ -128,6 +146,7 @@ PY
 }
 
 validate_num_frames
+validate_context_parallel_size
 mkdir -p "$BASE" "$INPUT_DIR" "$OUTPUT_DIR" "$WORKSPACE_DIR" "$HF_HOME" "$HF_HUB_CACHE" "$HF_XET_CACHE" "$XDG_CACHE_HOME"
 
 apt-get update
@@ -261,16 +280,30 @@ if [[ "$OFFLOAD_TEXT" != "0" ]]; then
   echo "Using FlexTensor text-encoder offload with text mem fraction: $TEXT_MEM_FRACTION"
 fi
 
-"$PY" "$EX/serve_infer.py" profile \
+PROFILE_COMMAND=("$PY")
+if ((CONTEXT_PARALLEL_SIZE > 1)); then
+  TORCHRUN="$VENV_DIR/bin/torchrun"
+  require_path "torchrun executable" "$TORCHRUN"
+  PROFILE_COMMAND=("$TORCHRUN" --standalone --nproc-per-node="$CONTEXT_PARALLEL_SIZE")
+fi
+
+"${PROFILE_COMMAND[@]}" "$EX/serve_infer.py" profile \
   --conditioning-video "$LETTERBOXED_VIDEO" \
   --height "$HEIGHT" \
   --width "$WIDTH" \
   --num-frames "$NUM_FRAMES" \
   --frame-rate "$FRAME_RATE" \
+  --context-parallel-size "$CONTEXT_PARALLEL_SIZE" \
+  --control-plane-timeout-seconds "$CONTROL_PLANE_TIMEOUT_SECONDS" \
   "${MODEL_ARGS[@]}" \
   --max-gpu-mem-fraction "$MAX_GPU_MEM_FRACTION" \
   --profiling-iters 2 \
   --profile-dir "$PROFILE_DIR" \
   --output-path "$OUTPUT_DIR/profile_warmup.mp4"
 
-echo "Profiling complete. Run $EX/single_serve.sh to start serving and send the sample request."
+echo "CP${CONTEXT_PARALLEL_SIZE} profiling complete: $PROFILE_DIR"
+if ((CONTEXT_PARALLEL_SIZE == 1)); then
+  echo "Run $EX/single_serve.sh or $EX/nginx_serve.sh to start serving."
+else
+  echo "Run CONTEXT_PARALLEL_SIZE=$CONTEXT_PARALLEL_SIZE $EX/nginx_serve.sh to start serving."
+fi
