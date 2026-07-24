@@ -75,7 +75,7 @@ def main():
 
     flextensor.save_profile(transformer_profile_dir, name="transformer")
     flextensor.save_profile(transformer2_profile_dir, name="transformer2")
-    print(f"Profiles saved to {transformer_profile_dir}/ and {transformer2_profile_dir}/")  # noqa: T201
+    print(f"Profiles saved to {transformer_profile_dir}/ and {transformer2_profile_dir}/")
 
     flextensor.release("transformer")
     flextensor.release("transformer2")

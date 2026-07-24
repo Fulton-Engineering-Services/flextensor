@@ -9,7 +9,7 @@ from unittest.mock import Mock, call
 import pytest
 import torch
 
-from flextensor import compiler_hooks, trap_tensor_mode
+from flextensor import compiler_utils, trap_tensor_mode
 from flextensor.helpers import TrapNestingGuard
 from flextensor.tensor_manager import TensorManager
 from flextensor.trap_tensor_mode import Trap, TrapDirect, TrapProfileView, WarmupTrap
@@ -523,13 +523,13 @@ class TestGraphBreakDynamoFallback:
 
     def test_graph_break_is_noop_when_dynamo_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When ``_dynamo is None``, ``_graph_break`` returns silently."""
-        monkeypatch.setattr(compiler_hooks, "_dynamo", None)
+        monkeypatch.setattr(compiler_utils, "_dynamo", None)
         # Must not raise.
         trap_tensor_mode._graph_break()
 
     def test_traps_still_work_when_dynamo_is_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Trap enter/exit cycles complete normally on a no-Dynamo torch build."""
-        monkeypatch.setattr(compiler_hooks, "_dynamo", None)
+        monkeypatch.setattr(compiler_utils, "_dynamo", None)
 
         tm = _make_mock_tensor_manager()
         trap = TrapDirect(tm, "layer.0", self.DEVICE)
@@ -543,7 +543,7 @@ class TestGraphBreakDynamoFallback:
         """A failure from ``_dynamo.graph_break`` is deliberately not caught."""
         broken_dynamo = Mock()
         broken_dynamo.graph_break.side_effect = RuntimeError("graph_break is gone")
-        monkeypatch.setattr(compiler_hooks, "_dynamo", broken_dynamo)
+        monkeypatch.setattr(compiler_utils, "_dynamo", broken_dynamo)
 
         with pytest.raises(RuntimeError, match="graph_break is gone"):
             trap_tensor_mode._graph_break()

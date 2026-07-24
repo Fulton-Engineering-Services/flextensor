@@ -6,6 +6,7 @@
 import collections
 import dataclasses
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -1049,6 +1050,58 @@ class TestPreserveParameterType:
 
         assert isinstance(model.param, nn.Parameter), "Should still be nn.Parameter"
         assert id(model.param) != original_id, "Should be a new Parameter object"
+
+
+class TestUnwrapCompiledModule:
+    """``_unwrap_compiled_module`` must follow Dynamo's OptimizedModule contract."""
+
+    def test_unwrap_real_torch_compile_wrapper(self):
+        from flextensor.tensor_processors import _unwrap_compiled_module
+
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale_shift_table = nn.Parameter(torch.randn(2, 4))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.scale_shift_table.sum()
+
+        inner = Block()
+        compiled = torch.compile(inner)
+        assert _unwrap_compiled_module(compiled) is inner
+        assert _unwrap_compiled_module(inner) is inner
+
+    def test_unwrap_raises_on_broken_wrapper(self, monkeypatch):
+        import flextensor.tensor_processors as tp
+
+        class BrokenOptimizedModule(nn.Module):
+            def __init__(self):
+                super().__init__()
+
+        monkeypatch.setattr(
+            tp,
+            "is_torch_compiled_module",
+            lambda module: isinstance(module, BrokenOptimizedModule),
+        )
+        broken = BrokenOptimizedModule()
+        with pytest.raises(RuntimeError, match="missing _orig_mod"):
+            tp._unwrap_compiled_module(broken)
+
+    def test_apply_on_compiled_preserves_direct_parameters(self):
+        class Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.scale_shift_table = nn.Parameter(torch.randn(2, 4))
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                return x + self.scale_shift_table.sum()
+
+        inner = Block()
+        original_id = id(inner.scale_shift_table)
+        compiled = torch.compile(inner)
+        _CloneProcessor().apply(compiled)
+        assert isinstance(inner.scale_shift_table, nn.Parameter)
+        assert id(inner.scale_shift_table) == original_id
 
 
 class TestParameterFactory:

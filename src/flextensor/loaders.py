@@ -9,8 +9,8 @@ from collections.abc import Callable, Mapping
 import torch
 
 from flextensor.allocation_block import AllocationBlock, AllocationManager
-from flextensor.compiler_hooks import disable as _compiler_disable
-from flextensor.compiler_hooks import is_compiling as _is_compiling
+from flextensor.compiler_utils import disable as _compiler_disable
+from flextensor.compiler_utils import is_compiling as _is_compiling
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.strategy_operations import find_transfers_for_preload
@@ -689,6 +689,7 @@ class RawBlockController:
         label_to_block_id,
         *,
         host_pinner: HostPinner,
+        release_tensor_memory: bool = True,
     ):
         self.block_map_cpu = {}
         self.block_map_cpu_sizes = {}
@@ -697,6 +698,11 @@ class RawBlockController:
         self.device_gpu = device_gpu
         self.label_to_block_id = label_to_block_id
         self.host_pinner = host_pinner
+        # When True (inference default), each source weight in ``tensors_map`` is
+        # freed right after being copied into its pinned CPU block. Compiled
+        # re-plan's first (non-destructive) build must pass False so originals
+        # survive for the subsequent destructive rebuild.
+        self.release_tensor_memory = release_tensor_memory
 
         # Process each layer: allocate block, copy tensors, release tensors
         # This interleaved approach reduces peak memory compared to allocating all blocks upfront
@@ -727,7 +733,7 @@ class RawBlockController:
                 tensors_list.append(tensor)
                 tensor_ids_list.append(tensor_id)
 
-            # combine_tensors copies tensor data to block and releases each tensor immediately
+            # combine_tensors copies tensor data to block and optionally releases
             meta = self.combine_tensors(tensors_list, block)
             self.block_meta_map[label] = meta
             self.label_to_cpu_tensor_id_map[label] = tensor_ids_list
@@ -794,7 +800,8 @@ class RawBlockController:
             metadata.append((start_idx, end_idx, tensor_shape, tensor_dtype, tensor_stride))
             current_idx = end_idx
 
-            tensor.data = torch.empty(0, device="cpu", dtype=tensor_dtype)
+            if getattr(self, "release_tensor_memory", True):
+                tensor.data = torch.empty(0, device="cpu", dtype=tensor_dtype)
 
         return metadata
 
@@ -837,6 +844,18 @@ class RawBlockController:
         # Currently nothing explicit to free; method present for API compatibility.
         return None
 
+    def release_gpu_blocks(self) -> None:
+        """Drop every reference to this controller's GPU block allocations.
+
+        Mirrors :meth:`AllocationBlockController.release_gpu_blocks` so compiled
+        re-plan can free loader-1 GPU storage before rebuilding. Caller contract:
+        only safe once no live tensor (e.g. ``param.data``) aliases these views.
+        """
+        self.block_map_gpu = {}
+        self.gpu_block_view_map = {}
+        self.label_to_tensor_views_map = {}
+        self.tensor_id_to_view_map = {}
+
     def get_gpu_memory_bytes(self) -> int:
         """Get total GPU memory used by transfer blocks.
 
@@ -863,6 +882,7 @@ class AllocationBlockController:
         block_name_fn: Callable[[int], str] | None = None,
         *,
         host_pinner: HostPinner,
+        release_tensor_memory: bool = True,
     ) -> None:
         self.block_map_cpu = {}  # label to cpu block
         self.label_to_cpu_tensor_id_map = {}
@@ -876,6 +896,13 @@ class AllocationBlockController:
         self.shm_block_name_map = shm_block_name_map or {}
         self._block_name_fn = block_name_fn or (lambda index: f"ft_{os.getpid()}_{index}")
         self.host_pinner = host_pinner
+        # When True (inference default), each source weight in ``tensors_map`` is
+        # freed right after being copied into its pinned CPU block, to keep peak
+        # host memory low. A profiling-phase controller built to measure the
+        # *compiled* per-layer timings must pass False: the strategy is recomputed
+        # from those timings and a second (destructive) controller is built from
+        # ``tensors_map`` afterwards, so the source weights must survive this build.
+        self.release_tensor_memory = release_tensor_memory
 
         for index, (_block_id, layers) in enumerate(allocation_ordered.items()):
             shm_prefix = None
@@ -889,7 +916,7 @@ class AllocationBlockController:
                 load_from_shm=self.load_model_from_shm,
                 pinned_memory=True,
                 host_pinner=self.host_pinner,
-                release_tensor_memory=True,
+                release_tensor_memory=self.release_tensor_memory,
             )
             for label in layers:
                 if self.use_shm and label not in self.shm_block_name_map:
@@ -994,6 +1021,26 @@ class AllocationBlockController:
     def shutdown(self):
         for block in self.block_map_cpu.values():
             block.release()
+
+    def release_gpu_blocks(self) -> None:
+        """Drop every reference to this controller's GPU block allocations.
+
+        ``shutdown`` only frees the pinned CPU blocks; the GPU block storage is
+        kept alive by ``label_to_gpu_block`` (the full blocks) and the view maps
+        (``block_map_gpu``/``gpu_block_view_map``/``label_to_tensor_views_map``/
+        ``tensor_id_to_view_map``) that alias into them. Clearing all of these
+        returns the segments to the caching allocator's free pool so the next
+        allocation (e.g. a re-plan's rebuilt loader) can reuse them, keeping peak
+        GPU memory at ~1x instead of holding old+new blocks simultaneously.
+
+        Caller contract: only safe once no live tensor (e.g. ``param.data``)
+        aliases these GPU views.
+        """
+        self.label_to_gpu_block = {}
+        self.block_map_gpu = {}
+        self.gpu_block_view_map = {}
+        self.label_to_tensor_views_map = {}
+        self.tensor_id_to_view_map = {}
 
     def get_gpu_memory_bytes(self) -> int:
         """Get total GPU memory used by transfer blocks.
@@ -1255,6 +1302,10 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         if label not in self.label_to_block_id:
             return
 
+        self._schedule_block_transfer(label)
+
+    def _schedule_block_transfer(self, label) -> None:
+        """Issue the rolling-block H2D transfer for ``label`` on the transfer stream."""
         block_id = self.label_to_block_id[label]
         if block_id in self.last_block_id_to_label_map:
             last_label = self.last_block_id_to_label_map[block_id]
@@ -1265,11 +1316,11 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
         self.last_block_id_to_label_map[block_id] = label
 
+        compute_label = self.transfer_to_compute_map[label]
         with torch.cuda.stream(self.transfer_stream):
             self.allocation_controller.schedule_transfer(label)
             event = self.transfer_stream.record_event()
 
-        compute_label = self.transfer_to_compute_map[label]
         self.scheduled_transfers[compute_label] = event
 
     @_compiler_disable

@@ -13,6 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Support compiled offload with ``pre_compute/post_compute`` custom ops so ``torch.compile``
+  can include offloaded layer compute in the compiled graph without a graph break
+  at each trap boundary (``compile_fn`` on :func:`~flextensor.offload` or
+  ``OffloadConfig.external_compile=True``). See
+  [docs/how-to/torch-compile.md](docs/how-to/torch-compile.md).
+- `OffloadManager.iters_before_inference` — path-aware count of forwards before the
+  model serves in INFERENCE. Unlike the static `OffloadConfig.pre_inference_iters`,
+  it reflects the active options (the external-compile replan path uses a fixed
+  eager seed rather than the full `profiling_iters`; `compile_fn` + view-profile
+  keeps the full profile budget under compile).
 - View-mode profile phase: patches a copy of the model with views into a
   rotating GPU block, removing property-getter indirection from the timed
   region. Yields more accurate per-layer durations than the previous direct
@@ -43,6 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `TensorManager.run_profile_suite()` — superseded by `OffloadManager` /
   `offload()`. Will be removed in v0.4.0.
+- `OffloadConfig.pre_inference_iters` is documented as plain-offload only; it
+  cannot account for the compile path (`offload(model, compile_fn=...)`). Prefer
+  the path-aware `OffloadManager.iters_before_inference`.
 
 ### Fixed
 

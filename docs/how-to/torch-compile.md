@@ -5,160 +5,144 @@ SPDX-License-Identifier: Apache-2.0
 
 # Use `torch.compile` with FlexTensor offload
 
-FlexTensor's offloaded proxy composes with `torch.compile` under one
-constraint: **discovery must run eagerly.** Profile and inference can run
-under compile.
+FlexTensor supports `torch.compile` under one hard rule: **offload first, then
+compile.** Calling `offload()` on an already-compiled model is rejected.
 
-The trap boundaries around each offloaded block (``TrapDirect`` /
-``TrapInferDirect``) begin and end with FlexTensor compiler graph breaks.
-Dynamo compiles the layer's tensor ops *between* the breaks; the loader's
-tensor movement runs eagerly in resume functions between subgraphs. Profile
-timing therefore reflects compiled-kernel execution.
+There are two paths, in order of preference:
 
-## Supported flow — within a single process
+| Path | When to use |
+|---|---|
+| **`compile_fn` on `offload()`** | Default — compiled offload with break-free custom ops |
+| **`external_compile=True` + external compile** | Your pipeline already calls `torch.compile` outside FlexTensor |
 
-```python
-import torch
-import flextensor as ft
+Under offload, compile **one offloaded unit per graph** (typically per block).
+Whole-model `torch.compile` is not supported for correct output: rolling GPU
+weight slots can alias inside one monolithic graph. With `compile_fn`, FlexTensor
+applies compile at the same granularity as offload automatically.
 
-model = MyModel().to("cpu")
-config = ft.OffloadConfig(include_patterns=["layers.*"], ...)
-proxy = ft.offload(model, config)
+## Recommended: `compile_fn`
 
-# Discovery: eager. Warmup traps do not compose with torch.compile — see
-# "Why discovery cannot run under torch.compile" below.
-for _ in range(config.discovery_iters):
-    proxy(x)
-
-# Profile + inference: compiled.
-compiled = torch.compile(proxy, backend="inductor")
-for _ in range(config.profiling_iters):
-    compiled(x)          # profile under compile; timing reflects compiled kernels
-compiled(x)              # inference under compile
-```
-
-## Supported flow — two processes with profile save / restore
-
-**Process 1** — offload, drive discovery eagerly, compile, profile, save:
+Pass any `module -> module` callable to `offload()`. With default
+`profile_mode='view'`, FlexTensor runs **compiled view-profile** under
+`compile_fn` (strategy timings are already compiled) and re-applies
+`compile_fn` at INFERENCE for serving. No `request_strategy_replan()` is
+needed on this path.
 
 ```python
 import torch
 import flextensor as ft
 
-model = MyModel().to("cpu")
 config = ft.OffloadConfig(include_patterns=["layers.*"], ...)
-proxy = ft.offload(model, config)
+model = MyModel().to("cpu")
 
-for _ in range(config.discovery_iters):
-    proxy(x)                          # discovery eager
+def compile_fn(module: torch.nn.Module) -> torch.nn.Module:
+    return torch.compile(module, fullgraph=True)
 
-compiled = torch.compile(proxy, backend="inductor")
-for _ in range(config.profiling_iters):
-    compiled(x)                       # profile under compile
+model = ft.offload(model, config, compile_fn=compile_fn)
+om = ft.get_offload_manager()
 
-ft.save_profile("/path/to/profile_dir")
+# discovery + compiled view-profile → INFERENCE (compile_fn applied)
+for _ in range(om.iters_before_inference):
+    model(x)
 ```
 
-**Process 2** — load the profile, compile immediately, infer:
+Runnable example: `examples/diffusers/compiled-offload/wan_t2v_compiled.py`
+(compiled view-profile). Use `request_strategy_replan()` only when profile
+was eager — `profile_mode='getter'`, or external compile after
+`external_compile=True` (`wan_t2v_external_compile.py`).
+
+`compile_fn` is backend-independent — Torch-TensorRT, a custom tuner, or
+`lambda m: m` (identity compiler: no `torch.compile`, but still activates the
+compiled-offload custom-op path; omit `compile_fn` entirely for plain eager offload).
+
+## Advanced: external `torch.compile`
+
+Use when compile must stay **outside** FlexTensor. Set
+``OffloadConfig(external_compile=True)`` (or ``FT_EXTERNAL_COMPILE=1``), run the
+eager lifecycle to INFERENCE, then call ``torch.compile`` yourself — **per
+offloaded unit**, not on the whole model.
 
 ```python
-import torch
 import flextensor as ft
+from flextensor.compiled_offload import bump_dynamo_limits_for_compiled_offload
+from flextensor.offload_manager import get_offload_manager
 
-model = MyModel().to("cpu")
-# include_patterns / exclude_patterns must match the config used in
-# Process 1 — they are not serialized into the saved profile.
-config = ft.OffloadConfig(include_patterns=["layers.*"], ...)
-proxy = ft.offload_from_profile(model, "/path/to/profile_dir", config)
+config = ft.OffloadConfig(include_patterns=["layers.*"], external_compile=True)
+model = ft.offload(model, config)
 
-compiled = torch.compile(proxy, backend="inductor")
-compiled(x)                            # inference under compile
+for _ in range(get_offload_manager().iters_before_inference):
+    model(x)  # discovery + profiling → INFERENCE (eager)
+
+blocks = model.layers
+bump_dynamo_limits_for_compiled_offload(len(blocks))
+for i in range(len(blocks)):
+    blocks[i] = torch.compile(blocks[i], fullgraph=True)
+
+om = get_offload_manager()
+for _ in range(om.request_strategy_replan()):
+    model(x)  # warm→measure→replan tail
 ```
 
-`offload_from_profile` skips discovery / profiling and hands the model
-straight to inference-ready state. The next `compiled(x)` compiles once
-and reuses the cached graph from then on.
+Runnable example: `examples/diffusers/compiled-offload/wan_t2v_external_compile.py`.
 
-!!! warning "Pattern fields must match across processes"
-    The saved profile stores the *result* of offload planning (tensor
-    names, block assignments, layer stats) but not `include_patterns` /
-    `exclude_patterns`.  Process 2 must construct its `OffloadConfig`
-    so that its patterns patch the same set of modules as Process 1.
+Prefer `compile_fn` unless your pipeline already owns the compile step.
 
-    A divergent pattern set is **silently accepted** at load time —
-    `validate_state_compatibility` only checks that the tensors named in
-    the profile exist on the new model, not that the configs are
-    equivalent.  The mismatch surfaces only at runtime, typically as a
-    `KeyError` on the first forward (loader looks up a label for a
-    module Process 2 never patched) or, in the absence of an early
-    lookup, as wrong output from skipped transfers.  Reproduce the
-    Process 1 `OffloadConfig` exactly to avoid this class of bug.
+## Backends and modes
 
-## `torch.compile` backends and modes
-
-FlexTensor's role is to insert graph breaks at trap boundaries so that
-`torch.compile` has something compilable between them — it does not
-constrain which backend or mode you pass to `torch.compile`. Any
-`backend=` / `mode=` combination supported by your PyTorch version can
-be used; choosing among them is up to you and outside the scope of this
-guide. The only hard constraint is the one below: discovery must stay
-eager.
+FlexTensor does not constrain which `backend=` / `mode=` you pass to
+``torch.compile``. The hard constraints are ordering (offload first) and
+granularity (one graph per offloaded unit under compiled offload).
 
 ## Limits
 
+- **Don't offload an already-compiled model.** `offload()` detects
+  ``OptimizedModule`` wrappers and raises. Use ``offload(..., compile_fn=...)``
+  or ``external_compile=True`` with external compile instead.
 - **Don't compile before discovery completes.** Calling `compiled(x)` while
   the manager is still in `DISCOVERY` can raise `Unhandled FakeTensor Device
-  Propagation for aten.mm.default` on the first op of the first patched
-  layer. Warmup discovery uses real tensor IDs and temporary CPU-to-GPU
-  staging, which is incompatible with Dynamo's FakeTensor tracer.
-- **Don't compile across a phase transition.** `torch.compile` specializes
-  on the underlying `nn.Module` live at compile time; FlexTensor swaps the
-  proxy's underlying model on each transition (discovery → profile →
-  inference), so Dynamo's guards fail and the next call triggers a full
-  recompile under the new specialization. Compile *after* the transitions
-  you care about, as the supported flows above show.
+  Propagation for aten.mm.default`. Warmup discovery uses real tensor IDs,
+  which is incompatible with Dynamo's FakeTensor tracer.
+- **Don't compile across a phase transition.** FlexTensor swaps trap behavior
+  on discovery → profile → inference transitions. Compile after the transitions
+  you care about (typically compile at or after INFERENCE for compiled offload).
+- **Don't compile the whole model under offload.** Use per-block / per-unit
+  compile so each graph only ever reads one rolling weight slot.
 
-??? note "Why discovery cannot run under `torch.compile`"
+## Why discovery cannot run under `torch.compile`
 
-    Discovery uses warmup traps (`WarmupTrap` for indirect mode,
-    `WarmupTrapDirect` for normal direct mode). Both are `TorchFunctionMode`
-    based and use real tensor identity to build the tensor-to-trap mapping.
-    Direct warmup also materializes known raw parameter access by temporarily
-    binding original parameter storage to active GPU copies while the trap is
-    executing.
+Discovery uses warmup traps (`WarmupTrap` for indirect mode,
+`WarmupTrapDirect` for normal direct mode). Both are `TorchFunctionMode`
+based and use real tensor identity to build the tensor-to-trap mapping.
+Direct warmup also materializes known raw parameter access by temporarily
+binding original parameter storage to active GPU copies while the trap is
+executing.
 
-    Simplified indirect-mode excerpt (see
-    `src/flextensor/trap_tensor_mode.py::WarmupTrap.__torch_function__` for
-    the full implementation):
+Simplified indirect-mode excerpt (see
+`src/flextensor/trap_tensor_mode.py::WarmupTrap.__torch_function__` for
+the full implementation):
 
-    ```python
-    def __torch_function__(self, func, _types, args, kwargs=None):
-        for arg in args:
-            if self.tensor_manager.is_traced(arg) and arg.device != self.device_gpu:
-                new_arg = arg.to(device=self.device_gpu, copy=True)
-                torch.cuda.synchronize()
-                ...
-        return func(*new_args, **(new_kwargs or {}))
-    ```
+```python
+def __torch_function__(self, func, _types, args, kwargs=None):
+    for arg in args:
+        if self.tensor_manager.is_traced(arg) and arg.device != self.device_gpu:
+            new_arg = arg.to(device=self.device_gpu, copy=True)
+            torch.cuda.synchronize()
+            ...
+    return func(*new_args, **(new_kwargs or {}))
+```
 
-    Under Dynamo tracing this fails for two compounding reasons:
+Under Dynamo tracing this fails for two compounding reasons:
 
-    1. `tensor_manager.is_traced(arg)` is `id(arg) in tracked_ids`. During
-       tracing, `arg` is a `FakeTensor` with a different Python `id()` than
-       the real parameter, so every lookup returns `False` and no substitution
-       is recorded in the traced graph.
-    2. `FakeTensorProp` then sees `aten.mm.default(gpu_input_fake, cpu_weight_fake)`
-       and raises `Unhandled FakeTensor Device Propagation for aten.mm.default,
-       found two different devices cuda:0, cpu`.
+1. `tensor_manager.is_traced(arg)` is `id(arg) in tracked_ids`. During
+   tracing, `arg` is a `FakeTensor` with a different Python `id()` than
+   the real parameter, so every lookup returns `False` and no substitution
+   is recorded in the traced graph.
+2. `FakeTensorProp` then sees `aten.mm.default(gpu_input_fake, cpu_weight_fake)`
+   and raises `Unhandled FakeTensor Device Propagation for aten.mm.default,
+   found two different devices cuda:0, cpu`.
 
-## Related tests
+## Related tests and examples
 
-Integration tests exercising these flows live in
-`tests/integration/L0_compile_profile_roundtrip/test_compile_profile_roundtrip.py`:
-
-- `TestCompileWrappedProxy::test_user_two_process_flow` — the full save /
-  restore round-trip above.
-- `TestCompileWrappedProxy::test_compile_after_lifecycle_matches_eager` —
-  single-process compile applied after the entire lifecycle.
-- `TestCompileWrappedProxy::test_compile_on_restored_profile_matches_reference`
-  — restored profile then compile.
+- `examples/diffusers/compiled-offload/` — `compile_fn` and external compile
+- `tests/integration/L0_torch_compile/test_torch_compile.py` — compile + offload
+  ordering, external compile, per-unit compile

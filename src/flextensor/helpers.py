@@ -208,6 +208,12 @@ class NoOpTensorManager:
     def release_memory(self):
         self.traps_direct_duration_ms = 0
 
+    def arm_non_destructive_first_loader(self) -> None:
+        pass
+
+    def clear_replan_state(self) -> None:
+        pass
+
     def prepare_profile_direct_mode_model(self, model):
         return model
 

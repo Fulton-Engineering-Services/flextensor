@@ -391,3 +391,81 @@ class TestContribVLLM:
         for snap in snapshots:
             cuda_gib = snap["gpu_memory"]["cuda_memory"] / (1024**3)
             print(f"  {snap['label']:45s} cuda={cuda_gib:.2f} GiB")
+
+    @pytest.mark.gpu_vram_40g
+    @pytest.mark.parametrize(
+        "case",
+        [
+            VllmOffloadSmokeCase(
+                model_name="Qwen/Qwen2.5-7B-Instruct",
+                output_dir_name="qwen2_5_7b_instruct_external_compile",
+                # Non-eager native compile path: no --enforce-eager, CUDA graphs off.
+                cli_args=(
+                    "--compilation-config",
+                    '{"cudagraph_mode": "NONE"}',
+                    "--max-model-len",
+                    "256",
+                    "--max-num-seqs",
+                    "1",
+                ),
+            ),
+        ],
+    )
+    def test_vllm_external_compile_activates_compiled_offload(
+        self,
+        case: VllmOffloadSmokeCase,
+        device_gpu: torch.device,
+        test_output_dir: Path,
+    ) -> None:
+        """Smoke the real vLLM non-eager compiled-offload path.
+
+        Existing L0 cases all pass ``--enforce-eager``, so they never exercise
+        import-time compile-cache/AOT env handling, worker compile gating, or
+        native fullgraph serving. This case enables ``FT_EXTERNAL_COMPILE=1``,
+        leaves eager mode off, disables CUDA graphs, serves one request, and
+        asserts compiled-offload activation from worker logs.
+        """
+        assert "--enforce-eager" not in case.cli_args
+
+        output_dir = test_output_dir / "external_compile"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Native compile + replan warmups run during server startup before /health.
+        memory, metrics, log_lines = run_vllm_server_test(
+            case.with_flextensor_offload().with_env_vars(("FT_EXTERNAL_COMPILE", "1")),
+            output_dir=output_dir,
+            server_ready_timeout=1800,
+        )
+        log_text = "\n".join(log_lines)
+
+        assert "FT-COMPILE-PATH: compiled-offload running under vLLM native fullgraph=True" in log_text, (
+            "Import-time compiled-offload env setup did not run — FT_EXTERNAL_COMPILE may not "
+            "have been visible when flextensor.contrib.vllm.worker was imported."
+        )
+        assert "external_compile=True" in log_text, (
+            "Offload config log did not show external_compile=True; compiled-offload was not activated."
+        )
+        assert "FlexTensor compiled-offload: suppressed torch.compile" in log_text, (
+            "Worker compile gate did not suppress vLLM compile during discovery/profiling."
+        )
+        assert "FlexTensor compiled-offload: re-enabled torch.compile" in log_text, (
+            "Worker compile gate did not re-enable vLLM compile at INFERENCE."
+        )
+        assert "FlexTensor compiled-offload: installed compile-transparent forwards" in log_text, (
+            "Compiled-offload forwards were not installed at the INFERENCE transition."
+        )
+        assert "FlexTensor compiled-offload: armed passive re-plan tail" in log_text, (
+            "External-compile replan tail was not armed after INFERENCE."
+        )
+        assert "FlexTensor compiled offload does not support CUDA graphs yet" not in log_text, (
+            'CUDA graphs were not disabled; pass --compilation-config \'{"cudagraph_mode": "NONE"}\'.'
+        )
+
+        assert memory.weights_memory_gib is not None and memory.weights_memory_gib > 0, (
+            f"weights_memory should be non-zero with compiled offload, got {memory.weights_memory_gib}"
+        )
+        assert metrics.get("response_content"), "Expected a non-empty chat response from the compiled-offload serve"
+
+        print("\nExternal-compile compiled-offload smoke passed")
+        print(f"  Weights memory: {memory.weights_memory_gib:.2f} GiB")
+        print(f"  Response: {metrics['response_content']}")

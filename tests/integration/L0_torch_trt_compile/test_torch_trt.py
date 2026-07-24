@@ -8,8 +8,10 @@ then TRT compilation is applied.
 
 **Unsupported order**: ``torch_tensorrt.compile`` first, then offload.
 ``torch_tensorrt`` uses ``torch.compile`` internally, wrapping the model in
-``OptimizedModule`` whose recursive structure causes ``RecursionError`` in
-FlexTensor's module preprocessing (same limitation as plain ``torch.compile``).
+``OptimizedModule``.  FlexTensor detects this wrapper at the ``offload()`` entry
+point and raises a ``RuntimeError`` directing the caller to use
+``offload(..., compile_fn=...)`` on the eager model instead (same limitation as
+plain ``torch.compile``).
 
 **Numerical note**: TensorRT compilation has a tolerance for numerical
 differences due to FP16/FP32 kernel selection, so we use relaxed tolerances
@@ -240,23 +242,16 @@ class TestTRTThenOffload:
     """TRT-compile first, then FlexTensor offload().
 
     This order is NOT supported: ``torch_tensorrt.compile`` uses ``torch.compile``
-    internally, wrapping the model in ``OptimizedModule`` whose custom
-    ``__setattr__`` proxy corrupts the underlying model's ``_modules`` dict
-    during FlexTensor's preprocessing.  Same limitation as plain
-    ``torch.compile`` -- always offload first, then compile.
+    internally, wrapping the model in ``OptimizedModule``.  FlexTensor detects the
+    wrapper at the ``offload()`` entry point and raises a ``RuntimeError`` with
+    guidance to use ``offload(..., compile_fn=...)`` on the eager model instead
+    of crashing deep in module preprocessing (the wrapper's self-referential
+    ``__getattr__`` otherwise makes the recursive tree-walk loop until
+    ``RecursionError``).  Same limitation as plain ``torch.compile``.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AttributeError,
-        reason=(
-            "OptimizedModule.__setattr__ proxies attribute writes to _orig_mod, "
-            "corrupting the model's _modules dict during preprocessing. "
-            "Requires unwrapping _orig_mod in offload() entry point."
-        ),
-    )
     def test_trt_then_offload_raises(self, device: torch.device) -> None:
-        """Offloading a TRT-compiled model raises AttributeError."""
+        """Offloading a TRT-compiled model is rejected with an actionable RuntimeError."""
         manager_name = f"test_trt_off_{uuid.uuid4().hex[:8]}"
         om = get_offload_manager(manager_name)
         config = _make_offload_config()
@@ -264,8 +259,8 @@ class TestTRTThenOffload:
         model, x = _create_model_and_input(device, on_cpu=True)
         compiled = _trt_compile_model(model, x)
         try:
-            proxy = om.offload(compiled, config)
-            _run_offload_lifecycle(proxy, x)
+            with pytest.raises(RuntimeError, match="does not support offloading an already-compiled model"):
+                om.offload(compiled, config)
         finally:
             om.release()
 

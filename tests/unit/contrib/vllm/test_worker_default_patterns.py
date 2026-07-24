@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 import sys
 import types
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,17 +45,19 @@ def worker_module():
 
     _stub("psutil", Error=_PsutilError, virtual_memory=lambda: SimpleNamespace(available=0))
 
-    flextensor = _stub("flextensor")
+    flextensor = _stub("flextensor", get_offload_manager=lambda: None)
     flextensor.__path__ = []
     contrib = _stub("flextensor.contrib")
     contrib.__path__ = []
     vllm_pkg = _stub("flextensor.contrib.vllm")
     vllm_pkg.__path__ = []
 
-    _stub("flextensor.config", load_config=lambda **_: None)
+    _stub("flextensor.compile", COMPILED_EAGER_PROFILE_FORWARDS=3)
+    _stub("flextensor.config", load_config=lambda **_: SimpleNamespace(external_compile=False))
     _stub("flextensor.contrib.vllm.loader")
     _stub("flextensor.contrib.vllm._drafter_device", ensure_drafter_on_device=lambda *_: None)
     _stub("flextensor.contrib.vllm._logging", safely_install_flextensor_logging_bridge=lambda: None)
+    _stub("flextensor.offload_manager", OffloadPhase=SimpleNamespace)
     _stub(
         "flextensor.utils",
         config_field_was_set=lambda config, field_name: field_name in getattr(config, "model_fields_set", set()),
@@ -161,3 +165,198 @@ class TestVllmDefaultPatternUpdates:
         assert "exclude_patterns" not in updates
         assert updates["discovery_iters"] == 5
         assert updates["profiling_iters"] == 4
+
+    def test_external_compile_floors_profiling_iters_at_eager_seed(self, worker_module) -> None:
+        from flextensor.compile import COMPILED_EAGER_PROFILE_FORWARDS
+
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            external_compile=True,
+            include_patterns=["custom.layers.*"],
+            exclude_patterns=[],
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert updates["profiling_iters"] == COMPILED_EAGER_PROFILE_FORWARDS
+
+
+@dataclass
+class _FakeCompileModule:
+    """Stand-in for a ``@support_torch_compile`` module exposing ``do_not_compile``."""
+
+    do_not_compile: bool
+    compiled: bool = False
+
+
+class _FakeRoot:
+    def __init__(self, modules: list[object]) -> None:
+        self._modules = modules
+
+    def modules(self):
+        return iter(self._modules)
+
+
+class TestCompiledOffloadCompileGate:
+    """The compiled-offload compile gate must defer the single compile to inference."""
+
+    def _gate(self, worker_module):
+        return worker_module.FlexTensorOffloadWorker._ft_set_compiled_offload_compile_enabled
+
+    def test_noop_when_flag_disabled(self, worker_module, monkeypatch) -> None:
+        monkeypatch.setattr(
+            worker_module.flextensor,
+            "get_offload_manager",
+            lambda: SimpleNamespace(compiled_offload_active=False),
+        )
+        fake_self = SimpleNamespace()
+
+        self._gate(worker_module)(fake_self, False)
+
+    def test_disable_then_enable_round_trip(self, worker_module, monkeypatch) -> None:
+        compilable_a = _FakeCompileModule(do_not_compile=False)
+        compilable_b = _FakeCompileModule(do_not_compile=False)
+        already_ignored = _FakeCompileModule(do_not_compile=True)
+        plain = SimpleNamespace()  # no do_not_compile attribute
+        root = _FakeRoot([compilable_a, already_ignored, plain, compilable_b])
+        monkeypatch.setattr(
+            worker_module.flextensor,
+            "get_offload_manager",
+            lambda: SimpleNamespace(model=root, compiled_offload_active=True),
+        )
+        fake_self = SimpleNamespace()
+        gate = self._gate(worker_module)
+
+        # Disable: only the two compilable modules get silenced; ignored/plain untouched.
+        gate(fake_self, False)
+        assert compilable_a.do_not_compile is True
+        assert compilable_b.do_not_compile is True
+        assert already_ignored.do_not_compile is True
+        assert not hasattr(plain, "do_not_compile")
+        assert fake_self._ft_compile_gated_modules == [compilable_a, compilable_b]
+
+        # Simulate a stray compile having latched on one module.
+        compilable_a.compiled = True
+
+        # Enable: only the previously-gated modules are restored, and any latched
+        # ``compiled`` flag is cleared so inference takes the first-compile path.
+        gate(fake_self, True)
+        assert compilable_a.do_not_compile is False
+        assert compilable_b.do_not_compile is False
+        assert compilable_a.compiled is False
+        assert already_ignored.do_not_compile is True
+        assert fake_self._ft_compile_gated_modules is None
+
+    def test_duplicate_disable_preserves_gated_modules(self, worker_module, monkeypatch) -> None:
+        compilable = _FakeCompileModule(do_not_compile=False)
+        root = _FakeRoot([compilable])
+        monkeypatch.setattr(
+            worker_module.flextensor,
+            "get_offload_manager",
+            lambda: SimpleNamespace(model=root, compiled_offload_active=True),
+        )
+        fake_self = SimpleNamespace()
+        gate = self._gate(worker_module)
+
+        gate(fake_self, False)
+        gate(fake_self, False)
+
+        assert fake_self._ft_compile_gated_modules == [compilable]
+        gate(fake_self, True)
+        assert compilable.do_not_compile is False
+
+
+class TestConfigureVllmCompileEnvForCompiledOffload:
+    """Import-time vLLM compile env must not silently misconfigure AOT/cache."""
+
+    def test_disables_cache_and_leaves_aot_unset(self, worker_module, monkeypatch, caplog) -> None:
+        monkeypatch.delenv("VLLM_DISABLE_COMPILE_CACHE", raising=False)
+        monkeypatch.delenv("VLLM_USE_AOT_COMPILE", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._configure_vllm_compile_env_for_compiled_offload()
+
+        assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
+        assert "VLLM_USE_AOT_COMPILE" not in os.environ
+        messages = [record.message for record in caplog.records]
+        assert any("compiled-offload running under vLLM native fullgraph=True" in m for m in messages)
+        assert not any("set directly" in m for m in messages)
+        assert not any("correcting conflicting" in m for m in messages)
+        assert not any("overriding explicit" in m for m in messages)
+
+    def test_warns_before_overriding_explicit_cache_setting(self, worker_module, monkeypatch, caplog) -> None:
+        monkeypatch.setenv("VLLM_DISABLE_COMPILE_CACHE", "0")
+        monkeypatch.delenv("VLLM_USE_AOT_COMPILE", raising=False)
+
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._configure_vllm_compile_env_for_compiled_offload()
+
+        assert os.environ["VLLM_DISABLE_COMPILE_CACHE"] == "1"
+        assert any("overriding explicit VLLM_DISABLE_COMPILE_CACHE=0" in r.message for r in caplog.records)
+
+    def test_warns_and_corrects_explicit_aot_one(self, worker_module, monkeypatch, caplog) -> None:
+        monkeypatch.delenv("VLLM_DISABLE_COMPILE_CACHE", raising=False)
+        monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "1")
+
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._configure_vllm_compile_env_for_compiled_offload()
+
+        assert os.environ["VLLM_USE_AOT_COMPILE"] == "0"
+        assert any("correcting conflicting VLLM_USE_AOT_COMPILE=1" in r.message for r in caplog.records)
+
+    def test_leaves_explicit_aot_zero_alone(self, worker_module, monkeypatch, caplog) -> None:
+        monkeypatch.delenv("VLLM_DISABLE_COMPILE_CACHE", raising=False)
+        monkeypatch.setenv("VLLM_USE_AOT_COMPILE", "0")
+
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._configure_vllm_compile_env_for_compiled_offload()
+
+        assert os.environ["VLLM_USE_AOT_COMPILE"] == "0"
+        assert not any("correcting conflicting" in r.message for r in caplog.records)
+        assert not any("VLLM_USE_AOT_COMPILE=0 set" in r.message for r in caplog.records)
+
+
+class TestWarnVllmRuntimeRequirements:
+    """Plain offload vs external_compile get different runtime warnings."""
+
+    def test_plain_offload_warns_for_missing_enforce_eager(self, worker_module, caplog) -> None:
+        offload_config = SimpleNamespace(external_compile=False)
+        vllm_config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=False))
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._warn_vllm_runtime_requirements(offload_config, vllm_config)
+        assert any("enforce-eager" in record.message for record in caplog.records)
+        assert not any("cudagraph_mode" in record.message for record in caplog.records)
+
+    def test_plain_offload_silent_when_enforce_eager(self, worker_module, caplog) -> None:
+        offload_config = SimpleNamespace(external_compile=False)
+        vllm_config = SimpleNamespace(model_config=SimpleNamespace(enforce_eager=True))
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._warn_vllm_runtime_requirements(offload_config, vllm_config)
+        assert not caplog.records
+
+    def test_external_compile_warns_for_cudagraphs_not_enforce_eager(self, worker_module, caplog) -> None:
+        offload_config = SimpleNamespace(external_compile=True)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            compilation_config=SimpleNamespace(cudagraph_mode="PIECEWISE"),
+        )
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._warn_vllm_runtime_requirements(offload_config, vllm_config)
+        assert any("cudagraph_mode" in record.message for record in caplog.records)
+        assert not any("enforce-eager" in record.message for record in caplog.records)
+
+    def test_external_compile_silent_when_cudagraph_mode_none(self, worker_module, caplog) -> None:
+        offload_config = SimpleNamespace(external_compile=True)
+        vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(enforce_eager=False),
+            compilation_config=SimpleNamespace(cudagraph_mode="NONE"),
+        )
+        with caplog.at_level(logging.WARNING, logger=worker_module.LOGGER.name):
+            worker_module._warn_vllm_runtime_requirements(offload_config, vllm_config)
+        assert not caplog.records
+
+    def test_is_cudagraph_mode_none_accepts_enum_name(self, worker_module) -> None:
+        assert worker_module._is_cudagraph_mode_none(SimpleNamespace(name="NONE")) is True
+        assert worker_module._is_cudagraph_mode_none(SimpleNamespace(name="PIECEWISE")) is False
+        assert worker_module._is_cudagraph_mode_none(0) is True

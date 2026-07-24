@@ -402,13 +402,14 @@ def _collect_non_offloaded_ids(
     """
     non_offloaded_ids: set[int] = set()
     for name, tensor in named_tensors:
-        if not _should_offload_param(
+        keep_resident = not _should_offload_param(
             name,
             include_patterns,
             exclude_patterns,
             include_class_paths=include_class_paths,
             exclude_class_paths=exclude_class_paths,
-        ):
+        )
+        if keep_resident:
             tensor_id = id(tensor)
             if tensor_id in all_tensor_ids:
                 non_offloaded_ids.add(tensor_id)

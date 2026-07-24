@@ -11,6 +11,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 import torch
 
 from flextensor.collectors import TensorStatistics
+from flextensor.compiler_utils import is_torch_compiled_module
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.utils import calculate_tensor_size
@@ -347,6 +348,34 @@ class DictTypeHandler:
         return new_dict if any_changed else value
 
 
+def _unwrap_compiled_module(module: object) -> object:
+    """Return the real module behind a ``torch.compile`` ``OptimizedModule``.
+
+    ``OptimizedModule.__setattr__`` forwards every attribute *write* whose name
+    is not in its small exempt set -- including ``_parameters``, ``_buffers`` and
+    ``_modules`` -- to its wrapped ``_orig_mod``. A :class:`TensorProcessor`'s
+    ``_apply_on`` loop ends with ``setattr(module, key, value)`` for each
+    ``__dict__`` entry, so running it on the wrapper writes the wrapper's *empty*
+    ``_parameters``/``_buffers`` onto the real module, silently dropping its
+    direct ``nn.Parameter`` attributes (e.g. a transformer block's
+    ``scale_shift_table``). This bites whenever a module is compiled *before*
+    being (re-)processed -- notably the compiled-offload re-plan, which
+    re-prepares the model after per-block ``torch.compile``. Always process the
+    underlying module instead; a no-op for uncompiled modules.
+
+    Broken wrappers (missing ``_orig_mod``, or a cycle) raise rather than being
+    processed unsafely.
+    """
+    while is_torch_compiled_module(module):
+        modules = getattr(module, "_modules", None)
+        if not isinstance(modules, dict) or "_orig_mod" not in modules:
+            raise RuntimeError(
+                "FlexTensor: torch.compile OptimizedModule is missing _orig_mod; refusing to process the wrapper."
+            )
+        module = modules["_orig_mod"]
+    return module
+
+
 class TensorProcessor:
     _global_type_handlers: ClassVar[list[TypeHandler]] = []
     _DEFAULT_TYPE_HANDLERS: ClassVar[list[TypeHandler]] = [
@@ -479,6 +508,10 @@ class TensorProcessor:
                 dict_model[attr_name] = attr_value
 
     def _process_module(self, module, _name):
+        # torch.compile wraps modules in an OptimizedModule that forwards
+        # attribute writes to its _orig_mod; processing the wrapper would wipe
+        # the real module's _parameters/_buffers (see _unwrap_compiled_module).
+        module = _unwrap_compiled_module(module)
         if not self._mark_module_visited(module, _name):
             return module
 
@@ -652,6 +685,7 @@ class MoveBuffersToGPUTensorProcessor(TensorProcessor):
         self.move_to_gpu.cleanup()
 
     def _process_module(self, module, _name):
+        module = _unwrap_compiled_module(module)
         if not self._mark_module_visited(module, _name):
             return module
 

@@ -51,6 +51,7 @@ class TestOffloadConfig:
         assert config.load_strategy is None
         assert config.min_blocks == 4
         assert config.max_gpu_mem_fraction == 0.9
+        assert config.external_compile is False
         with pytest.warns(DeprecationWarning):
             assert config.max_gpu_mem_bytes is None
 
@@ -226,6 +227,18 @@ class TestOffloadConfig:
         """profile_mode='torch_function' rejects block transfer loaders."""
         with pytest.raises(ValidationError, match="profile_mode='torch_function'"):
             OffloadConfig(profile_mode="torch_function", transfer_mode="allocation_block_transfer")
+
+    def test_external_compile_rejects_strategy_transfer_mode(self):
+        """external_compile requires a PreallocatedLoader-backed transfer mode."""
+        with pytest.raises(ValidationError, match="external_compile=True requires a block transfer_mode"):
+            OffloadConfig(external_compile=True, transfer_mode="strategy")
+
+    def test_external_compile_accepts_block_transfer_modes(self):
+        """external_compile is valid with either block transfer_mode."""
+        for transfer_mode in ("allocation_block_transfer", "raw_block_transfer"):
+            config = OffloadConfig(external_compile=True, transfer_mode=transfer_mode)
+            assert config.external_compile is True
+            assert config.transfer_mode == transfer_mode
 
     def test_profile_mode_invalid_rejected(self):
         """Unknown profile_mode values are rejected by the Literal validator."""
@@ -922,6 +935,11 @@ class TestLoadConfigFromEnv:
         os.environ["FT_EXCLUDE_PATTERNS"] = "lm_head"
         config = load_config_from_env()
         assert config.exclude_patterns == ["lm_head"]
+
+    def test_external_compile_from_env(self):
+        os.environ["FT_EXTERNAL_COMPILE"] = "1"
+        config = load_config_from_env()
+        assert config.external_compile is True
 
 
 class TestLoadConfigFromFile:

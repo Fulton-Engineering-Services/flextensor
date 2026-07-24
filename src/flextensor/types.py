@@ -31,8 +31,8 @@ class GPUMemoryUsage:
         >>> om = flextensor.get_offload_manager()
         >>> config = OffloadConfig(include_patterns=["layers.*"])
         >>> model = om.offload(model, config=config)
-        >>> # Run discovery and profiling iterations...
-        >>> for _ in range(config.pre_inference_iters):
+        >>> # Run discovery and profiling iterations (path-aware count)...
+        >>> for _ in range(om.iters_before_inference):
         ...     model(input)
         >>> # Now in inference mode, get memory usage
         >>> usage = om.get_gpu_memory_usage()

@@ -652,7 +652,7 @@ class TestOffloadFromProfile:
 
         mock_init.assert_called_once_with(config=config, name="mymodel")
         mock_load.assert_called_once_with(profile_dir, model=self.model, name="mymodel")
-        mock_offload.assert_called_once_with(self.model, config=config, name="mymodel")
+        mock_offload.assert_called_once_with(self.model, config=config, name="mymodel", compile_fn=None)
 
     @patch("flextensor.offload_manager.offload")
     @patch("flextensor.offload_manager.load_profile")
@@ -684,7 +684,25 @@ class TestOffloadFromProfile:
 
         mock_init.assert_called_once_with(config=None, name=DEFAULT_MANAGER_NAME)
         mock_load.assert_called_once_with(profile_dir, model=self.model, name=DEFAULT_MANAGER_NAME)
-        mock_offload.assert_called_once_with(self.model, config=None, name=DEFAULT_MANAGER_NAME)
+        mock_offload.assert_called_once_with(self.model, config=None, name=DEFAULT_MANAGER_NAME, compile_fn=None)
+
+    @patch("flextensor.offload_manager.offload")
+    @patch("flextensor.offload_manager.load_profile")
+    @patch("flextensor.offload_manager.init")
+    def test_forwards_compile_fn(self, mock_init, mock_load, mock_offload, tmp_path):
+        """Test that compile_fn is forwarded to offload()."""
+        from flextensor.offload_manager import offload_from_profile
+
+        mock_offload.return_value = self.model
+        config = OffloadConfig(include_patterns=["linear1"])
+        profile_dir = str(tmp_path / "profile")
+
+        def compile_fn(module: torch.nn.Module) -> torch.nn.Module:
+            return module
+
+        offload_from_profile(self.model, profile_dir, config=config, name="test", compile_fn=compile_fn)
+
+        mock_offload.assert_called_once_with(self.model, config=config, name="test", compile_fn=compile_fn)
 
     @patch("flextensor.offload_manager.offload")
     @patch("flextensor.offload_manager.load_profile")

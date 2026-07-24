@@ -40,7 +40,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadModelProxy, OffloadPhase
+from flextensor.compile import COMPILED_EAGER_PROFILE_FORWARDS
+from flextensor.offload_manager import (
+    OffloadConfig,
+    OffloadManager,
+    OffloadModelProxy,
+    OffloadPhase,
+)
 
 
 # Simple model for testing
@@ -325,7 +331,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model
@@ -400,7 +406,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
 
         # Create THREE DIFFERENT model instances (as happens in real code)
         warmup_model = SimpleModel()
@@ -477,7 +483,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model
@@ -524,7 +530,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model
@@ -606,7 +612,7 @@ class TestOffloadManagerStateMachine:
         # Setup mock
         mock_noop_manager = MagicMock()
         mock_noop_manager_cls.return_value = mock_noop_manager
-        mock_noop_manager.trap = lambda name: MockTrap(name)
+        mock_noop_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_noop_manager.initialize_warmup.return_value = self.model
         mock_noop_manager.initialize_profile.return_value = self.model
         mock_noop_manager.initialize_inference.return_value = self.model
@@ -654,7 +660,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
@@ -713,7 +719,7 @@ class TestOffloadManagerStateMachine:
         """Test that model becomes None after release() and raises appropriate errors."""
         # Setup mocks
         mock_tensor_manager = MagicMock()
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.release_memory = MagicMock()
 
@@ -743,7 +749,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
@@ -765,7 +771,7 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
@@ -820,3 +826,101 @@ class TestOffloadManagerConfig:
         assert config.discovery_iters == 5
         assert config.profiling_iters == 15
         assert config.pre_inference_iters == 20  # 5 + 15
+
+
+class TestEagerProfilingBudget:
+    """Single profiling_iters knob: eager seed (compile path) + compiled measure window."""
+
+    def _manager(self, *, activated_compiled, profiling_iters=10, replan=True):
+        om = OffloadManager("test_eager_budget")
+        om.config = OffloadConfig(enabled=True, profiling_iters=profiling_iters)
+        om._compiled.active = activated_compiled
+        om._compiled.replan_active = replan if activated_compiled else False
+        return om
+
+    def test_full_budget_when_not_compile_path(self):
+        """Non-compile path uses the full profiling_iters (no seed cap)."""
+        om = self._manager(activated_compiled=False, profiling_iters=10)
+        assert om._eager_profiling_iters() == 10
+
+    def test_reduced_budget_on_compile_path_with_replan(self):
+        """Compile path + replan caps the eager budget to the fixed seed constant."""
+        om = self._manager(activated_compiled=True, profiling_iters=10)
+        assert om._eager_profiling_iters() == COMPILED_EAGER_PROFILE_FORWARDS
+
+    def test_full_budget_on_compile_path_when_replan_disabled(self):
+        """With replan off the eager plan is final, so keep full profiling_iters."""
+        om = self._manager(activated_compiled=True, profiling_iters=10, replan=False)
+        assert om._eager_profiling_iters() == 10
+
+    def test_eager_seed_is_fixed_regardless_of_profiling_iters(self):
+        """Eager seed is a fixed constant, independent of profiling_iters (no clamp)."""
+        om_low = self._manager(activated_compiled=True, profiling_iters=1)
+        assert om_low._eager_profiling_iters() == COMPILED_EAGER_PROFILE_FORWARDS
+        om_high = self._manager(activated_compiled=True, profiling_iters=50)
+        assert om_high._eager_profiling_iters() == COMPILED_EAGER_PROFILE_FORWARDS
+
+    def test_compiled_measure_window_equals_profiling_iters(self):
+        """profiling_iters sizes the compiled measure window directly (no floor)."""
+        om_low = self._manager(activated_compiled=True, profiling_iters=5)
+        assert om_low._compiled.measure_forwards() == 5
+        om_high = self._manager(activated_compiled=True, profiling_iters=25)
+        assert om_high._compiled.measure_forwards() == 25
+
+    def test_manager_iters_before_inference_plain_path(self):
+        """Plain path: discovery_iters + profiling_iters (matches config)."""
+        om = OffloadManager("test_iters_plain")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=7)
+        om._compiled.active = False
+        om._compiled.replan_active = False
+        assert om.iters_before_inference == 9
+        assert om.iters_before_inference == om.config.pre_inference_iters
+
+    def test_manager_iters_before_inference_compile_path(self):
+        """Compile path without compile_fn: eager seed only (no replan tail in count)."""
+        om = OffloadManager("test_iters_compile")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=50)
+        om._compiled.active = True
+        om._compiled.replan_active = True
+        assert om.iters_before_inference == 2 + COMPILED_EAGER_PROFILE_FORWARDS
+        assert om.iters_before_inference != om.config.pre_inference_iters
+
+    def test_manager_iters_before_inference_compile_fn_view_no_replan_tail(self):
+        """Default compile_fn + view: warmup + full profile budget, no post-INFERENCE replan count."""
+        from flextensor.compile.lifecycle import PROFILE_COMPILE_WARMUP_FORWARDS
+
+        om = OffloadManager("test_iters_compile_fn_view")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="view")
+        om._compiled.active = True
+        om._compiled.replan_active = False
+        om._compiled.profile_active = True
+        om._compiled.compile_fn = lambda m: m
+        assert om.iters_before_inference == 2 + PROFILE_COMPILE_WARMUP_FORWARDS + 10
+
+    def test_manager_iters_before_inference_compile_fn_non_view_uses_eager_seed(self):
+        """compile_fn + non-view: eager seed only; replan measure is post-INFERENCE."""
+        om = OffloadManager("test_iters_compile_fn_getter")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="getter")
+        om._compiled.active = True
+        om._compiled.replan_active = True
+        om._compiled.profile_active = False
+        om._compiled.compile_fn = lambda m: m
+        assert om.iters_before_inference == 2 + COMPILED_EAGER_PROFILE_FORWARDS
+
+    def test_update_state_transitions_at_reduced_budget(self):
+        """PROFILING -> INFERENCE fires after the seed, not full profiling_iters."""
+        om = self._manager(activated_compiled=True, profiling_iters=10)
+        om._current_phase = OffloadPhase.PROFILING
+        om._iteration_count = 0
+        mock_tm = MagicMock()
+        mock_tm.is_profiling_suspended.return_value = False
+        om._tensor_manager = mock_tm
+
+        with (
+            patch.object(om, "_transition_to_inference") as mock_transition,
+        ):
+            for _ in range(COMPILED_EAGER_PROFILE_FORWARDS - 1):
+                om.update_state()
+            mock_transition.assert_not_called()
+            om.update_state()  # forward that hits the seed budget
+            mock_transition.assert_called_once()

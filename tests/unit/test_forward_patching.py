@@ -12,7 +12,8 @@ import torch
 from torch import nn
 
 from flextensor.config import OffloadConfig
-from flextensor.offload_manager import OffloadManager
+from flextensor.loaders import PreallocatedLoader
+from flextensor.offload_manager import OffloadManager, OffloadPhase
 from flextensor.tensor_discovery import _derive_module_patterns, has_patched_ancestor
 
 
@@ -179,6 +180,21 @@ class TestForwardPatching:
 
         om.release()
 
+    def test_patched_forward_is_dynamo_disabled(self):
+        """Default patched forward stays outside the compiled graph (eager trap path)."""
+        model = ModelWithLayers()
+        om = OffloadManager("test_dynamo_disable")
+
+        om._patch_module_forward(model.layer1, "test_name")
+
+        bound = model.layer1.forward
+        func = getattr(bound, "__func__", bound)
+        assert getattr(func, "_torchdynamo_disable", False), (
+            "patched forward must stay outside the compiled graph so the trap-wrapped forward runs eagerly"
+        )
+
+        om.release()
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
     def test_patched_module_named_modules(self):
         """Test that named_modules() works correctly with patched modules."""
@@ -253,6 +269,279 @@ class TestForwardPatching:
         # Release should clear tracking
         om.release()
         assert len(om._patched_modules) == 0
+
+
+class TestCompiledOffloadForwardPatching:
+    """Compiled-offload (``FT_EXTERNAL_COMPILE=1``) forward installation.
+
+    With the flag on, ``_patch_module_forward`` pre-builds a compile-transparent
+    forward (``_ft_compiled_offload_forward``) that closes over the offload-unit
+    name, while still installing the default eager forward used for discovery /
+    profiling. ``_install_compiled_forwards`` swaps in the transparent one at
+    INFERENCE so ``pre_compute`` / ``post_compute`` mark residency and the unit
+    body can compile as one subgraph.
+    """
+
+    def test_flag_off_no_compiled_forward_built(self, monkeypatch):
+        monkeypatch.delenv("FT_EXTERNAL_COMPILE", raising=False)
+        model = ModelWithLayers()
+        om = OffloadManager("test_co_off")
+
+        om._patch_module_forward(model.layer1, "layer1")
+
+        assert not hasattr(model.layer1, "_ft_compiled_offload_forward")
+        assert not hasattr(model.layer1, "_ft_manager_id")
+        # Default path: forward stays outside the compiled graph.
+        bound = model.layer1.forward
+        func = getattr(bound, "__func__", bound)
+        assert getattr(func, "_torchdynamo_disable", False)
+
+        om.release()
+
+    def test_flag_on_builds_compiled_forward_and_manager_id(self, monkeypatch):
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        model = ModelWithLayers()
+        om = OffloadManager("test_co_on")
+        om._compiled.active = True
+
+        om._patch_module_forward(model.layer1, "layer1")
+        om._patch_module_forward(model.layer2, "layer2")
+
+        assert hasattr(model.layer1, "_ft_compiled_offload_forward")
+        assert model.layer1._ft_manager_id == om.compiled_offload_manager_id
+        assert model.layer2._ft_manager_id == om.compiled_offload_manager_id
+        # Default forward installed initially still runs eagerly (warmup path).
+        bound = model.layer1.forward
+        func = getattr(bound, "__func__", bound)
+        assert getattr(func, "_torchdynamo_disable", False)
+
+        om.release()
+
+    def test_install_swaps_to_non_disabled_forward(self, monkeypatch):
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        model = ModelWithLayers()
+        om = OffloadManager("test_co_install")
+        om._compiled.active = True
+
+        om._patch_module_forward(model.layer1, "layer1")
+        om._patch_module_forward(model.layer2, "layer2")
+
+        om._install_compiled_forwards()
+
+        for layer in (model.layer1, model.layer2):
+            bound = layer.forward
+            func = getattr(bound, "__func__", bound)
+            assert not getattr(func, "_torchdynamo_disable", False), (
+                "compiled-offload forward must stay inside the compiled graph so "
+                "the unit body between pre_compute/post_compute can compile as one subgraph"
+            )
+
+        om.release()
+
+    def test_get_layer_label_by_idx_matches_patch_order(self, monkeypatch):
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        model = ModelWithLayers()
+        om = OffloadManager("test_co_labels")
+        om._compiled.active = True
+
+        om._patch_module_forward(model.layer1, "layer1")
+        om._patch_module_forward(model.layer2, "layer2")
+        om._patch_module_forward(model.layer3, "layer3")
+
+        assert om.get_layer_label_by_idx() == ["layer1", "layer2", "layer3"]
+
+        om.release()
+
+    def test_labels_after_prune(self, monkeypatch):
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        model = ModelWithLayers()
+        om = OffloadManager("test_co_refresh")
+        om._compiled.active = True
+
+        om._patch_module_forward(model.layer1, "layer1")
+        om._patch_module_forward(model.layer2, "layer2")
+        om._patch_module_forward(model.layer3, "layer3")
+
+        # Simulate exclude pruning the middle module; names need no renumbering.
+        om._patched_modules.remove(model.layer2)
+
+        assert om.get_layer_label_by_idx() == ["layer1", "layer3"]
+
+        om.release()
+
+    def test_select_infer_trap_class_uses_eager_trap_when_compiled(self, monkeypatch):
+        """Compiled-offload auto path does not use a special trap class."""
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        from flextensor.tensor_manager import TensorManager
+        from flextensor.trap_tensor_mode import TrapInferDirect
+
+        class _Stub:
+            direct_enabled = True
+
+        assert TensorManager._select_infer_trap_class(_Stub()) is TrapInferDirect
+
+    def test_select_infer_trap_class_default_when_disabled(self, monkeypatch):
+        monkeypatch.delenv("FT_EXTERNAL_COMPILE", raising=False)
+        from flextensor.tensor_manager import TensorManager
+        from flextensor.trap_tensor_mode import TrapInferDirect
+
+        class _Stub:
+            direct_enabled = True
+
+        assert TensorManager._select_infer_trap_class(_Stub()) is TrapInferDirect
+
+
+class _AnyForwardLayer(nn.Module):
+    """Layer whose forward accepts any args and returns a tensor.
+
+    Lets a test drive the compiled-offload forward with a non-tensor input
+    (so the carrier resolver returns ``None``) without the real forward
+    blowing up first -- isolating the guard behavior.
+    """
+
+    def forward(self, *args, **kwargs):  # noqa: ARG002
+        return torch.zeros(1)
+
+
+class _NonTensorReturnLayer(nn.Module):
+    """Layer that returns a non-tensor so the output carrier resolves ``None``."""
+
+    def forward(self, x):  # noqa: ARG002
+        return "not-a-tensor"
+
+
+class _RaisingForwardLayer(nn.Module):
+    """Layer that raises after enter would have fired."""
+
+    def forward(self, x):  # noqa: ARG002
+        raise ValueError("forward failed")
+
+
+class _GuardRecordingLoader(PreallocatedLoader):
+    """Minimal active-loader stand-in for the loud-fail guard tests.
+
+    Subclasses the real base so it satisfies ``install_active_loader``'s
+    beartype-enforced ``PreallocatedLoader`` hint, but bypasses the base
+    ``__init__`` (no allocation controller / CUDA needed). The guard only
+    checks ``custom_ops.get_active_loader() is not None``; the custom ops then
+    dispatch ``enter``/``exit`` by label, recorded here so a test can assert
+    the input op still fired before an output-carrier failure.
+    """
+
+    def __init__(self) -> None:
+        self.entered: list[str] = []
+        self.exited: list[str] = []
+
+    def enter(self, label: str) -> None:
+        self.entered.append(label)
+
+    def exit(self, label: str) -> None:
+        self.exited.append(label)
+
+    def preload(self) -> None:
+        return None
+
+    def prepare(self) -> None:
+        return None
+
+
+class TestCompiledOffloadMissingCarrierLoudFail:
+    """``FT_EXTERNAL_COMPILE=1`` carrier-resolution loud-fail guard.
+
+    When the rolling-block loader is active (inference phase) and a patched
+    layer resolves no input/output carrier tensor, the compiled forward must
+    raise immediately with a precise message rather than silently skip the
+    ``pre_compute/post_compute`` op (which would run the layer against non-resident
+    weights). Before the loader is installed the skip stays quiet.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_loader_singleton(self):
+        from flextensor import custom_ops
+
+        custom_ops.clear_active_loader()
+        yield
+        custom_ops.clear_active_loader()
+
+    def _patch(self, module, name, monkeypatch):
+        monkeypatch.setenv("FT_EXTERNAL_COMPILE", "1")
+        om = OffloadManager("test_co_loud")
+        om._compiled.active = True
+        om._current_phase = OffloadPhase.INFERENCE
+        om._patch_module_forward(module, name)
+        return om
+
+    def test_missing_input_carrier_raises_when_loader_active(self, monkeypatch):
+        from flextensor import custom_ops
+
+        layer = _AnyForwardLayer()
+        om = self._patch(layer, "decoder.0", monkeypatch)
+        custom_ops.install_active_loader(_GuardRecordingLoader(), om.compiled_offload_manager_id)
+
+        # No tensor anywhere in the call -> input carrier resolves None.
+        with pytest.raises(RuntimeError, match="resolved no input carrier"):
+            layer._ft_compiled_offload_forward(layer, 123)
+
+        om.release()
+
+    def test_missing_output_carrier_raises_when_loader_active(self, monkeypatch):
+        from flextensor import custom_ops
+
+        layer = _NonTensorReturnLayer()
+        om = self._patch(layer, "decoder.0", monkeypatch)
+        loader = _GuardRecordingLoader()
+        custom_ops.install_active_loader(loader, om.compiled_offload_manager_id)
+
+        # Real tensor input -> enter fires; non-tensor return -> output None.
+        with pytest.raises(RuntimeError, match="resolved no output carrier"):
+            layer._ft_compiled_offload_forward(layer, torch.zeros(4))
+
+        assert loader.entered == ["decoder.0"], "enter must fire before the output-carrier guard trips"
+        assert loader.exited == ["decoder.0"], "exit must pair enter even when output carrier is missing"
+
+        om.release()
+
+    def test_forward_exception_pairs_exit(self, monkeypatch):
+        from flextensor import custom_ops
+
+        layer = _RaisingForwardLayer()
+        om = self._patch(layer, "decoder.0", monkeypatch)
+        loader = _GuardRecordingLoader()
+        custom_ops.install_active_loader(loader, om.compiled_offload_manager_id)
+
+        with pytest.raises(ValueError, match="forward failed"):
+            layer._ft_compiled_offload_forward(layer, torch.zeros(4))
+
+        assert loader.entered == ["decoder.0"]
+        assert loader.exited == ["decoder.0"]
+
+        om.release()
+
+    def test_missing_input_carrier_is_quiet_skip_when_loader_inactive(self, monkeypatch):
+        # Loader NOT installed: the historical quiet-skip behavior must hold so
+        # ops baked into the graph before the loader exists do nothing.
+        layer = _AnyForwardLayer()
+        om = self._patch(layer, "decoder.0", monkeypatch)
+
+        result = layer._ft_compiled_offload_forward(layer, 123)
+        assert torch.equal(result, torch.zeros(1))
+
+        om.release()
+
+    def test_error_message_includes_layer_label_and_shapes(self, monkeypatch):
+        from flextensor import custom_ops
+
+        layer = _AnyForwardLayer()
+        om = self._patch(layer, "decoder.7", monkeypatch)
+        custom_ops.install_active_loader(_GuardRecordingLoader(), om.compiled_offload_manager_id)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            layer._ft_compiled_offload_forward(layer, "scalar-arg")
+        message = str(exc_info.value)
+        assert "decoder.7" in message
+        assert "FT_EXTERNAL_COMPILE=0" in message
+
+        om.release()
 
 
 # =============================================================================
@@ -504,7 +793,7 @@ class TestAncestorGuard:
 
         assert not has_patched_ancestor(model, "layers.1.attn")
 
-        delattr(model.layers[0], "_ft_original_forward_func")
+        del model.layers[0]._ft_original_forward_func
 
     @pytest.mark.parametrize(
         "exc",

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compiler integration hooks for FlexTensor runtime boundaries."""
+"""PyTorch compiler helpers used at FlexTensor runtime boundaries."""
 
 import gc
 from collections.abc import Callable
@@ -47,6 +47,29 @@ def graph_break() -> None:
     if _dynamo is None:
         return
     _dynamo.graph_break()
+
+
+def is_torch_compiled_module(module: object) -> bool:
+    """Return whether ``module`` is a ``torch.compile`` ``OptimizedModule`` wrapper.
+
+    Detects the wrapper that ``torch.compile`` (and backends built on it, e.g.
+    ``torch_tensorrt``) returns, including subclasses. FlexTensor cannot
+    preprocess this wrapper: its self-referential ``__getattr__``/``__setattr__``
+    proxy to ``_orig_mod`` makes module tree-walking recurse without termination,
+    so ``offload()`` rejects it up front (compile *after* offload instead).
+
+    Uses ``isinstance`` against Dynamo's ``OptimizedModule`` when available.
+    Returns ``False`` when Dynamo is unavailable — there is no real compile
+    wrapper to detect, and a class-name check would false-positive on unrelated
+    types named ``OptimizedModule``.
+    """
+    if _dynamo is None:
+        return False
+    eval_frame = getattr(_dynamo, "eval_frame", None)
+    optimized_cls = getattr(eval_frame, "OptimizedModule", None) if eval_frame is not None else None
+    if optimized_cls is None:
+        return False
+    return isinstance(module, optimized_cls)
 
 
 def find_torch_compile_wrapper(target: object) -> object | None:

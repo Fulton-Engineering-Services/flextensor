@@ -461,6 +461,13 @@ class TensorManager:
         self.module_tracker: ModuleTracker | None = None
         self._non_offloaded_tensors_moved = False
         self._layer_stats_computed = False
+        # Compiled re-plan state. ``_first_loader_non_destructive`` and
+        # ``_replan_source_data``: without these, the first ``prepare_final_model``
+        # repoints ``param.data`` onto loader-1's rolling GPU views and orphans the
+        # true CPU weights, so the rebuild would copy stale rolling-buffer bytes and
+        # corrupt the model.
+        self._first_loader_non_destructive: bool = False
+        self._replan_source_data: dict[int, torch.Tensor] = {}
         # Retained so teardown can restore dict-container entries patched with views.
         self._profile_view_model: Any = None
         self.memory_transfer_stats: dict[int, float] | None = None
@@ -468,6 +475,25 @@ class TensorManager:
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
         self._profiling_suspender = ProfilingSuspender()
+
+    def arm_non_destructive_first_loader(self) -> None:
+        """Keep source weights intact on the first inference loader build.
+
+        Call before the INFERENCE transition when a post-compile strategy replan
+        may rebuild the loader from compiled timings (pre-replan loader).
+        One-shot: consumed by the first inference loader build.
+        """
+        self._first_loader_non_destructive = True
+
+    def clear_replan_state(self) -> None:
+        """Drop replan arming and any retained source-weight snapshot.
+
+        Called when compiled activation is torn down or restarted so a later
+        eager/view re-offload cannot keep an obsolete model-sized host copy or
+        build another non-destructive loader from a stale flag.
+        """
+        self._first_loader_non_destructive = False
+        self._replan_source_data = {}
 
     def _validate_profile_mode_combination(self) -> None:
         """Reject impossible direct-mode / loader-type / trace combinations."""
@@ -815,10 +841,18 @@ class TensorManager:
         self.trap_class = Trap
 
     def _select_infer_trap_class(self) -> type:
-        """Select appropriate trap class for inference mode based on direct_enabled setting."""
+        """Select the eager inference trap class.
+
+        Compiled-offload auto-patched units do **not** use this trap: their
+        forwards call ``pre_compute/post_compute`` helpers directly. Manual
+        ``offload_block`` keeps the eager traps (:class:`TrapInferDirect` /
+        :class:`TrapInfer`).
+        """
         return TrapInferDirect if self.direct_enabled else TrapInfer
 
-    def _create_loader(self, data: LoaderInputData, *, prepare_state: bool = True) -> None:
+    def _create_loader(
+        self, data: LoaderInputData, *, prepare_state: bool = True, release_tensor_memory: bool = True
+    ) -> None:
         """Create tensor layer loader from input data.
 
         This is the unified loader creation method that works with both fresh computation
@@ -829,15 +863,20 @@ class TensorManager:
             prepare_state: Whether to prepare and store the tensor manager state after
                 creating the loader. Set to False when loading from saved state
                 (state is already prepared).
+            release_tensor_memory: Forwarded to block loaders; when False the source
+                weights in ``tensors_map`` are preserved (used by the non-destructive
+                pre-replan loader). Ignored by the ``strategy`` loader.
         """
         self.trap_class = self._select_infer_trap_class()
 
         if self.loader_type == "strategy":
             self._setup_strategy_loader(data, prepare_state=prepare_state)
         elif self.loader_type == "raw_block_transfer":
-            self._setup_raw_block_loader(data, prepare_state=prepare_state)
+            self._setup_raw_block_loader(data, prepare_state=prepare_state, release_tensor_memory=release_tensor_memory)
         elif self.loader_type == "allocation_block_transfer":
-            self._setup_allocation_block_loader(data, prepare_state=prepare_state)
+            self._setup_allocation_block_loader(
+                data, prepare_state=prepare_state, release_tensor_memory=release_tensor_memory
+            )
         else:
             msg = f"Unknown loader type: {self.loader_type}"
             raise ValueError(msg)
@@ -854,12 +893,29 @@ class TensorManager:
         before state is serialized. The load-time equivalent is the
         unconditional rescue warning in
         :class:`flextensor.loaders.TensorStrategyLoader`.
+
+        When :meth:`arm_non_destructive_first_loader` was set (compiled replan
+        after ``offload_from_profile`` / SHM restore), preserves source weights
+        and snapshots them into ``_replan_source_data`` — same contract as
+        :meth:`prepare_infer_mode`.
         """
         self.load_strategy = self.tensor_manager_state.load_strategy
         self.stats = self.tensor_manager_state.stats
 
         loader_data = self.tensor_manager_state.to_loader_input_data()
-        self._create_loader(loader_data, prepare_state=False)
+        # Match prepare_infer_mode: destructive by default; keep sources when a
+        # post-compile replan may rebuild the loader from compiled timings.
+        release_tensor_memory = not self._first_loader_non_destructive
+        self._create_loader(
+            loader_data,
+            prepare_state=False,
+            release_tensor_memory=release_tensor_memory,
+        )
+        if self._first_loader_non_destructive:
+            # Snapshot before prepare_final_model repoints params onto rolling views.
+            self._replan_source_data = {tid: self.tensors_map[tid].data for tid in self.tensors_map}
+            # One-shot: later rebuilds / re-offloads must not inherit this arm.
+            self._first_loader_non_destructive = False
 
     def _setup_strategy_loader(self, data: LoaderInputData, *, prepare_state: bool = True) -> None:
         """Setup TensorStrategyLoader for 'strategy' loader type.
@@ -899,13 +955,18 @@ class TensorManager:
                 shm_block_name_map=None,
             )
 
-    def _setup_raw_block_loader(self, data: LoaderInputData, *, prepare_state: bool = True) -> None:
+    def _setup_raw_block_loader(
+        self, data: LoaderInputData, *, prepare_state: bool = True, release_tensor_memory: bool = True
+    ) -> None:
         """Setup RawBlockController loader for 'raw_block_transfer' loader type.
 
         Args:
             data: LoaderInputData containing loader configuration.
             prepare_state: Whether to prepare and store state after setup
                 (False when loading from saved state).
+            release_tensor_memory: When True (default) the controller frees each
+                source weight after copying into the CPU block. False preserves
+                ``tensors_map`` for a later compiled-duration replan rebuild.
         """
         label_to_size_map = data.label_to_size_map
         allocation_ordered = data.allocation_ordered
@@ -937,6 +998,7 @@ class TensorManager:
             self.load_strategy,
             label_to_block_id,
             host_pinner=self.host_pinner,
+            release_tensor_memory=release_tensor_memory,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -978,13 +1040,20 @@ class TensorManager:
             logger.warning("SHM enabled but shm_namespace is None — using PID-based block names (not shareable)")
         return None
 
-    def _setup_allocation_block_loader(self, data: LoaderInputData, *, prepare_state: bool = True) -> None:
+    def _setup_allocation_block_loader(
+        self, data: LoaderInputData, *, prepare_state: bool = True, release_tensor_memory: bool = True
+    ) -> None:
         """Setup AllocationBlockController loader for 'allocation_block_transfer' loader type.
 
         Args:
             data: LoaderInputData containing loader configuration.
             prepare_state: Whether to prepare and store state after setup
                 (False when loading from saved state).
+            release_tensor_memory: When True (default) the controller frees each
+                source weight in ``tensors_map`` after copying it into its pinned
+                CPU block. Pass False for a pre-replan loader that keeps source
+                weights intact so a later replan can rebuild a destructive loader
+                from compiled per-layer timings.
         """
         allocation_ordered = data.allocation_ordered
         label_to_block_id = data.label_to_block_id
@@ -1017,6 +1086,7 @@ class TensorManager:
             shm_block_name_map=data.shm_block_name_map,
             block_name_fn=block_name_fn,
             host_pinner=self.host_pinner,
+            release_tensor_memory=release_tensor_memory,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -1120,6 +1190,33 @@ class TensorManager:
                 format_memory_transfer_table(memory_stats),
             )
 
+        # Default: destructive first build. Re-plan arms ``_first_loader_non_destructive``
+        # so weights stay intact for the post-compile rebuild.
+        release_tensor_memory = not self._first_loader_non_destructive
+        self._compute_strategy_and_build_loader(release_tensor_memory=release_tensor_memory)
+
+        if self._first_loader_non_destructive:
+            # Snapshot original ``.data`` before ``prepare_final_model`` repoints
+            # params onto loader-1's rolling views.
+            self._replan_source_data = {tid: self.tensors_map[tid].data for tid in self.tensors_map}
+            # One-shot: later rebuilds / re-offloads must not inherit this arm.
+            self._first_loader_non_destructive = False
+
+    def _compute_strategy_and_build_loader(self, *, release_tensor_memory: bool = True) -> None:
+        """Compute the load strategy from ``self.stats`` and build the inference loader.
+
+        Shared by :meth:`prepare_infer_mode` (first build) and
+        :meth:`replan_from_compiled_durations` (corrected rebuild). Reads the
+        already-computed ``self.stats`` and ``self.memory_transfer_stats`` so the
+        re-plan can call it after rewriting per-layer durations, without
+        re-running discovery/profiling.
+
+        Args:
+            release_tensor_memory: Forwarded to the block loader. False builds a
+                non-destructive pre-replan loader that preserves ``tensors_map``
+                until a compiled-duration replan rebuilds the loader.
+        """
+        memory_stats = self.memory_transfer_stats
         max_gpu_mem_bytes = resolve_gpu_budget(self._max_gpu_mem_fraction, self.device_gpu, logger=logger)
         budget_reservation = reserve_strategy_invisible_gpu_budget(
             max_gpu_mem_bytes,
@@ -1177,7 +1274,150 @@ class TensorManager:
                 block_sizes=self.block_data.block_sizes,
             )
 
-        self._create_loader(loader_data, prepare_state=True)
+        self._create_loader(loader_data, prepare_state=True, release_tensor_memory=release_tensor_memory)
+
+    def _rewrite_durations_with_compiled(self, durations_by_label: dict[str, float]) -> tuple[list, int]:
+        """Return a new ``stats`` list with compiled durations, plus the rewrite count.
+
+        Labels absent from ``durations_by_label`` (or with a non-positive time)
+        keep their existing eager duration.
+        """
+        new_stats = []
+        rewritten = 0
+        for stat in self.stats:
+            compiled_ms = durations_by_label.get(stat.label)
+            if compiled_ms is not None and compiled_ms > 0:
+                new_stats.append(stat.model_copy(update={"duration": float(compiled_ms)}))
+                rewritten += 1
+            else:
+                new_stats.append(stat)
+        return new_stats, rewritten
+
+    def _restore_original_weights_before_replan(self) -> None:
+        """Repoint managed ``param.data`` to ``_replan_source_data`` originals.
+
+        Restores true CPU weights before the destructive rebuild, not stale
+        loader-1 rolling-buffer views.
+        """
+        restored = 0
+        for tid, original in self._replan_source_data.items():
+            param = self.tensors_map.get(tid)
+            if param is not None:
+                param.data = original
+                restored += 1
+        logger.info(
+            "FlexTensor re-plan: restored %d/%d params to original weights before rebuild.",
+            restored,
+            len(self._replan_source_data),
+        )
+
+    def replan_from_compiled_durations(
+        self,
+        durations_by_label: dict[str, float],
+        model,
+    ) -> bool:
+        """Recompute offload strategy from compiled per-layer timings and rebuild the loader.
+
+        Rewrites durations, rebuilds a destructive loader from intact weights,
+        repoints ``param.data``, and releases loader-1. Safe without recompile:
+        the graph reads ``param.data`` each call and drives the loader via
+        ``pre_compute/post_compute`` custom ops.
+
+        Args:
+            durations_by_label: ``label -> compiled compute time (ms)``.
+            model: Live model to repoint onto the rebuilt block views.
+
+        Returns:
+            True if replanned; False if nothing to do.
+        """
+        if not durations_by_label:
+            logger.warning("FlexTensor re-plan: no compiled durations supplied; keeping eager-profile strategy.")
+            return False
+        if not self.stats:
+            logger.warning("FlexTensor re-plan: no layer statistics available; cannot re-plan.")
+            return False
+        if not self._replan_source_data:
+            logger.warning(
+                "FlexTensor re-plan: original-weight snapshot is missing "
+                "(_first_loader_non_destructive was not armed before the first build); "
+                "refusing to rebuild to avoid corrupting weights. Keeping eager-profile strategy."
+            )
+            return False
+
+        new_stats, rewritten = self._rewrite_durations_with_compiled(durations_by_label)
+        if rewritten == 0:
+            logger.warning(
+                "FlexTensor re-plan: none of the %d compiled durations matched a profiled layer label; "
+                "keeping eager-profile strategy.",
+                len(durations_by_label),
+            )
+            return False
+
+        logger.info(
+            "FlexTensor re-plan: rewriting %d/%d layer durations with compiled timings and recomputing strategy.",
+            rewritten,
+            len(self.stats),
+        )
+        saved_stats = self.stats
+
+        self._restore_original_weights_before_replan()
+
+        # Release loader-1 before rebuild; restore already detached ``param.data``.
+        # Frees GPU blocks early so peak memory stays ~1x during re-plan.
+        old_loader = self.tensor_layer_loader
+        self._release_loader_blocks(old_loader)
+
+        # Recompute strategy + build the destructive inference loader from the
+        # (now-restored) source weights. ``self.model`` is temporarily set so the
+        # strategy-invisible GPU budget reservation sees the real residents.
+        self.model = model
+        try:
+            self.stats = new_stats
+            self._compute_strategy_and_build_loader(release_tensor_memory=True)
+            # Repoint the live model's params onto the rebuilt block views.
+            self.prepare_final_model(model)
+        except Exception as exc:
+            self.stats = saved_stats
+            raise RuntimeError(
+                "FlexTensor compiled-offload: replan failed after releasing the inference loader. "
+                "Inference is unsafe. Restart the process; free GPU memory and retry, or use "
+                "compiled view-profile (compile_fn + profile_mode='view') instead of replan."
+            ) from exc
+        finally:
+            self.model = None
+
+        # The rebuild has consumed the originals (offloaded weights were copied
+        # into the new blocks and emptied); drop the snapshot so the host memory
+        # it pinned can be reclaimed.
+        self._replan_source_data = {}
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return True
+
+    def _release_loader_blocks(self, loader) -> None:
+        """Release a loader's pinned CPU blocks and GPU allocations.
+
+        Re-plan helper: frees loader-1 before rebuild. Best-effort — failures
+        are logged, never raised.
+        """
+        if loader is None:
+            return
+        shutdown = getattr(loader, "shutdown", None)
+        if callable(shutdown):
+            try:
+                shutdown()
+            except Exception:  # best-effort cleanup must not abort inference
+                logger.exception("FlexTensor re-plan: error releasing the previous loader's CPU blocks.")
+        controller = getattr(loader, "allocation_controller", None)
+        release_gpu_blocks = getattr(controller, "release_gpu_blocks", None)
+        if callable(release_gpu_blocks):
+            try:
+                release_gpu_blocks()
+            except Exception:  # best-effort cleanup must not abort inference
+                logger.exception("FlexTensor re-plan: error releasing the previous loader's GPU blocks.")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def prepare_tensor_manager_state(
         self,

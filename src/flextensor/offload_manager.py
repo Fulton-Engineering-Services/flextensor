@@ -24,8 +24,13 @@ from torch import nn
 from torch.utils.hooks import RemovableHandle  # noqa: TC002 — beartype on @decorated __init__ evaluates this at runtime
 
 from flextensor.benchmark_tensor_mode import PreloadToDevice
-from flextensor.compiler_hooks import disable as _compiler_disable
-from flextensor.compiler_hooks import find_torch_compile_wrapper
+from flextensor.compile import CompiledOffload
+from flextensor.compiled_offload import build_compiled_offload_forward
+from flextensor.compiler_utils import disable as _compiler_disable
+from flextensor.compiler_utils import (
+    find_torch_compile_wrapper,
+    is_torch_compiled_module,
+)
 from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
@@ -406,6 +411,7 @@ class OffloadManager:
 
     def __init__(self, name: str):
         self.name = name
+        self._compiled = CompiledOffload(self)
         self.config = OffloadConfig()
         self._tensor_manager: TensorManagerProtocol | None = None
         self._initialized = False
@@ -415,6 +421,11 @@ class OffloadManager:
         self._model_proxy = None
         self._patched_modules: list[nn.Module] = []
         self._state_hook_handle: RemovableHandle | None = None
+
+    @property
+    def compiled_offload_manager_id(self) -> int:
+        """Stable id wired into compiled-offload custom ops for this manager."""
+        return self._compiled.manager_id
 
     def set_config(self, config: OffloadConfig):
         """Set configuration for the offload manager.
@@ -427,6 +438,39 @@ class OffloadManager:
         # Enable/disable instrumentation based on config
         registry = get_registry()
         registry.enabled = config.enable_instrumentation
+
+    @property
+    def compiled_offload_active(self) -> bool:
+        """Whether this manager's offload run uses the compiled-offload path."""
+        return self._compiled.active
+
+    @property
+    def compiled_replan_active(self) -> bool:
+        """Whether to re-plan strategy from compiled per-layer timings."""
+        return self._compiled.replan_active
+
+    @property
+    def compiled_profile_active(self) -> bool:
+        """Whether view-mode profile runs under ``compile_fn`` (no replan tail)."""
+        return self._compiled.profile_active
+
+    @property
+    def phase(self) -> OffloadPhase:
+        """Current offload lifecycle phase."""
+        return self._current_phase
+
+    @property
+    def eager_profiling_iters(self) -> int:
+        """Profiling forwards required before the PROFILING→INFERENCE transition."""
+        return self._eager_profiling_iters()
+
+    def _resolve_compiled_offload_activation(
+        self,
+        effective_config: OffloadConfig,
+        compile_fn: Callable[[nn.Module], nn.Module] | None,
+    ) -> bool:
+        """Resolve compiled-offload flags from config or ``compile_fn``."""
+        return self._compiled.resolve_activation(effective_config, compile_fn)
 
     def _resolve_profile_directory(self, profile_directory: str | None) -> str:
         """Resolve profile directory from argument or config.
@@ -527,8 +571,8 @@ class OffloadManager:
             >>> om = get_offload_manager()
             >>> config = OffloadConfig(include_patterns=["layers.*"])
             >>> model = om.offload(model, config=config)
-            >>> # Run discovery and profiling iterations
-            >>> for _ in range(config.pre_inference_iters):
+            >>> # Run discovery and profiling iterations (path-aware count)
+            >>> for _ in range(om.iters_before_inference):
             ...     model(input)
             >>> # Now in inference mode, get memory usage
             >>> usage = om.get_gpu_memory_usage()
@@ -676,9 +720,20 @@ class OffloadManager:
         # Make patched_forward look like the original for introspection
         patched_forward = functools.wraps(original_forward_func)(patched_forward)
 
+        # Discovery / profiling / non-compiled inference keep this forward
+        # outside the compiled graph so the offload trap and loader run eagerly.
+        # Compiled inference swaps to ``_ft_compiled_offload_forward`` later.
+        patched_forward = _compiler_disable(patched_forward)
+
         # Store original for restoration (using the UNBOUND function, not bound method)
         module._ft_original_forward_func = original_forward_func  # noqa: SLF001
         module._ft_offload_name = offload_name  # noqa: SLF001
+
+        if self._compiled.active:
+            module._ft_compiled_offload_forward = build_compiled_offload_forward(  # noqa: SLF001
+                original_forward_func,
+                offload_name,
+            )
 
         # Bind patched_forward as a method to the module.
         # This ensures it receives `self` when called.
@@ -686,6 +741,10 @@ class OffloadManager:
 
         # Track patched module for cleanup
         self._patched_modules.append(module)
+        if self._compiled.active:
+            # Stamped for multi-manager dispatch; the stable offload-unit name is
+            # closed over by ``_ft_compiled_offload_forward`` (not an index).
+            module._ft_manager_id = self._compiled.manager_id  # noqa: SLF001
 
     def _restore_module_forward(self, module: nn.Module) -> None:
         """Restore module's original forward method.
@@ -703,6 +762,70 @@ class OffloadManager:
         module.__dict__.pop("forward", None)
         module.__dict__.pop("_ft_original_forward_func", None)
         module.__dict__.pop("_ft_offload_name", None)
+        module.__dict__.pop("_ft_compiled_offload_forward", None)
+        module.__dict__.pop("_ft_manager_id", None)
+
+    def get_layer_label_by_idx(self) -> list[str]:
+        """Return ``_ft_offload_name`` of each patched module, in patch order.
+
+        Used for diagnostics / logging (e.g. loader install). Custom ops take
+        the offload-unit name directly (no index registry).
+        """
+        return [
+            module._ft_offload_name  # noqa: SLF001
+            for module in self._patched_modules
+            if hasattr(module, "_ft_offload_name")
+        ]
+
+    def _install_compiled_forwards(self) -> None:
+        """Swap each patched module's ``forward`` to the compile-transparent variant.
+
+        Called at the INFERENCE transition when compiled-offload is enabled
+        (``FT_EXTERNAL_COMPILE=1``). Discovery and profiling keep the default
+        eager ``patched_forward`` (trap + loader outside the compiled graph).
+        At inference, bind the pre-built ``_ft_compiled_offload_forward`` so
+        ``pre_compute`` / ``post_compute`` mark residency and the unit body can
+        compile as one subgraph. No-op unless compiled-offload is enabled.
+        """
+        if not self._compiled.active:
+            return
+        for module in self._patched_modules:
+            module._ft_manager_id = self._compiled.manager_id  # noqa: SLF001
+        swapped = 0
+        for module in self._patched_modules:
+            compiled_forward = getattr(module, "_ft_compiled_offload_forward", None)
+            if compiled_forward is None:
+                continue
+            module.forward = types.MethodType(compiled_forward, module)  # type: ignore[method-assign]
+            swapped += 1
+        LOGGER.info(
+            "FlexTensor compiled-offload: installed compile-transparent forwards on %d/%d patched modules",
+            swapped,
+            len(self._patched_modules),
+        )
+
+    def request_strategy_replan(self) -> int:
+        """Request a strategy replan after compute characteristics changed.
+
+        Needed when profile timings were **not** collected under compile — e.g.
+        after external ``torch.compile`` with ``external_compile=True``, or after
+        ``compile_fn`` with ``profile_mode='getter'``. Not required for the
+        default ``compile_fn`` + ``profile_mode='view'`` path (compiled
+        view-profile already built the strategy from compiled timings).
+
+        Arms a passive warm→measure→replan tail; each subsequent model forward
+        advances it via :meth:`update_state` until
+        :meth:`TensorManager.replan_from_compiled_durations` rebuilds the loader
+        and strategy from compiled per-layer timings.
+
+        Returns:
+            ``replan_iters``: model forwards to run before the replanned strategy
+            is active (``COMPILED_WARMUP_FORWARDS`` warmup +
+            ``profiling_iters`` measure). ``0`` when compiled-offload is off or
+            replan was not armed at activation (e.g. default ``compile_fn`` +
+            view-profile).
+        """
+        return self._compiled.request_strategy_replan()
 
     def _warn_if_compile_wrapped(self, target_phase: str) -> None:
         """Warn the user when a phase transition fires while ``OffloadModelProxy``
@@ -773,6 +896,17 @@ class OffloadManager:
         """
         self._tensor_manager.set_model(self._model)
         new_model = self._tensor_manager.initialize_warmup()
+        # Only skip discovery/profiling when a real profile state was restored.
+        # (MagicMock attributes are truthy and must not trigger this path.)
+        from flextensor.state_handler import TensorManagerState
+
+        if isinstance(getattr(self._tensor_manager, "tensor_manager_state", None), TensorManagerState):
+            # Profile was loaded via :func:`load_profile` / :func:`offload_from_profile`.
+            # ``initialize_warmup`` already wired the inference loader; skip
+            # discovery/profiling (compiled view-profile would arm
+            # ``ProfileBlockController`` forwards on the wrong loader).
+            self._transition_to_inference()
+            return
         self._swap_to_new_model(new_model, OffloadPhase.DISCOVERY)
 
     @_error_boundary
@@ -787,6 +921,7 @@ class OffloadManager:
         self._warn_if_compile_wrapped("PROFILING")
         new_model = self._tensor_manager.initialize_profile()
         self._swap_to_new_model(new_model, OffloadPhase.PROFILING)
+        self._compiled.on_enter_profile()
 
     @_error_boundary
     def _transition_to_inference(self):
@@ -798,6 +933,10 @@ class OffloadManager:
             self._warn_if_compile_wrapped("INFERENCE")
             new_model = self._tensor_manager.initialize_inference()
             self._swap_to_new_model(new_model, OffloadPhase.INFERENCE)
+            # Compiled-offload: swap each layer's forward to the compile-transparent
+            # variant, then let CompiledOffload install loader / compile_fn / replan.
+            self._install_compiled_forwards()
+            self._compiled.on_enter_inference()
         finally:
             # Dump instrumentation data if enabled and output directory is configured
             if (
@@ -813,7 +952,11 @@ class OffloadManager:
     def update_state(self):
         """Advance the phase state machine by one iteration.
 
-        No-op in ``NOT_INITIALIZED`` and ``INFERENCE`` phases.
+        In ``INFERENCE``, phase transitions are finished, but when compiled-offload
+        re-plan is armed this method still advances the passive tail (warm ->
+        measure -> re-plan) via :meth:`CompiledOffload.on_forward`.
+
+        No-op in ``NOT_INITIALIZED``.
 
         When profiling is suspended:
 
@@ -821,8 +964,22 @@ class OffloadManager:
           durations are unused and cleared at the transition anyway).
         - During PROFILING the counter is paused so that suppressed passes
           don't consume the ``profiling_iters`` budget.
+
+        Compiled-profile compile-warmup model forwards (while
+        ``profile_compile_warm_remaining > 0``) likewise do not advance the
+        PROFILING counter, so the logged ``profiling_iters`` measured samples
+        are collected in full after warmup.
         """
-        if self._current_phase in {OffloadPhase.NOT_INITIALIZED, OffloadPhase.INFERENCE}:
+        if self._current_phase == OffloadPhase.INFERENCE:
+            # In INFERENCE the phase state machine is done, but the passive
+            # compiled-offload tail (warm -> measure -> re-plan) rides the
+            # caller's forwards from here when armed (``compile_fn`` path at
+            # INFERENCE transition, or external compile via
+            # :meth:`request_strategy_replan`).
+            self._compiled.on_forward()
+            return
+
+        if self._current_phase == OffloadPhase.NOT_INITIALIZED:
             return
 
         if self._tensor_manager is None:
@@ -833,12 +990,39 @@ class OffloadManager:
         if self._tensor_manager.is_profiling_suspended() and self._current_phase == OffloadPhase.PROFILING:
             return
 
+        # Compile-warmup is one slot per model forward and must not consume the
+        # profiling_iters measure budget (see compiled-profile log contract).
+        if self._current_phase == OffloadPhase.PROFILING and self._compiled.profile_compile_warm_remaining > 0:
+            self._compiled.advance_profile_compile_warmup()
+            return
+
         self._iteration_count += 1
 
         if self._current_phase == OffloadPhase.DISCOVERY and self._iteration_count >= self.config.discovery_iters:
             self._transition_to_profile()
-        elif self._current_phase == OffloadPhase.PROFILING and self._iteration_count >= self.config.profiling_iters:
+        elif self._current_phase == OffloadPhase.PROFILING and self._iteration_count >= self._eager_profiling_iters():
             self._transition_to_inference()
+
+    def _eager_profiling_iters(self) -> int:
+        """Eager profiling budget for the PROFILING -> INFERENCE transition."""
+        return self._compiled.eager_profiling_iters()
+
+    @property
+    def iters_before_inference(self) -> int:
+        """Forwards to run before the model is ready to serve.
+
+        Unlike :attr:`OffloadConfig.pre_inference_iters` (static
+        ``discovery_iters + profiling_iters``), this reflects the active path:
+        path-specific eager seed / compile-warmup via
+        :meth:`CompiledOffload.eager_profiling_iters` and
+        :meth:`CompiledOffload.extra_iters_before_inference`.
+
+        Replan measure/warmup forwards are **not** included here; drive them
+        with :meth:`request_strategy_replan` after INFERENCE when needed.
+        """
+        return (
+            self.config.discovery_iters + self._eager_profiling_iters() + self._compiled.extra_iters_before_inference()
+        )
 
     def init(self, config: OffloadConfig | None = None):
         if config is not None:
@@ -850,6 +1034,7 @@ class OffloadManager:
         self,
         model: nn.Module,
         config: OffloadConfig | None = None,
+        compile_fn: Callable[[nn.Module], nn.Module] | None = None,
     ) -> nn.Module:
         """Offload modules in the model based on config patterns.
 
@@ -859,7 +1044,33 @@ class OffloadManager:
 
         Args:
             model: PyTorch model to patch
-            config: OffloadConfig to use for offload
+            config: OffloadConfig to use for offload. Set
+                ``config.external_compile=True`` (or ``FT_EXTERNAL_COMPILE=1`` via
+                :func:`~flextensor.config.load_config``)
+                to enable the compile-transparent ``pre_compute/post_compute`` custom-op
+                forwards and auto-register the rolling loader at INFERENCE so the
+                caller can apply external per-unit ``torch.compile`` after the eager
+                forwards counted by :attr:`iters_before_inference` (one graph per
+                offloaded unit — not whole-model compile).
+            compile_fn: Optional per-unit compiler. When given, this activates the
+                compiled-offload path (no ``FT_EXTERNAL_COMPILE`` env var needed):
+                FlexTensor patches the offloaded units so the offload barriers are
+                visible to the compiler, and applies ``compile_fn`` to **each
+                offloaded unit** -- one compiled graph per unit
+                (``lambda m: torch.compile(m, fullgraph=True)``, a Torch-TensorRT
+                compile, an eager passthrough ``lambda m: m``, ...). Compiling at the
+                offload granularity is slot-alias safe by construction: each graph
+                reads exactly one rolling slot, so no graph can ever alias two
+                same-slot units (the monolithic-graph miscompile). The callable takes
+                one module and returns a callable module with the same forward
+                signature; if it raises on a unit, that unit is left eager.
+                With the default ``profile_mode='view'``, FlexTensor also runs
+                compiled view-profile under ``compile_fn``, so the offload strategy
+                is built from compiled timings and **no** post-INFERENCE replan is
+                needed. Call :meth:`request_strategy_replan` only when timings were
+                not collected under compile (``profile_mode='getter'``, or external
+                ``torch.compile`` after ``external_compile=True``). ``None``
+                (default) is exactly today's eager offload -- no behavior change.
 
         Returns:
             A wrapper around the model that tracks state transitions
@@ -874,29 +1085,62 @@ class OffloadManager:
                 model = MyModel().to("cpu").eval()
                 config = ft.OffloadConfig(include_patterns=["embed", "layers.*", "head"])
                 proxy = ft.offload(model, config)
+                om = ft.get_offload_manager()
 
                 x = torch.randn(batch, seq, dim, device="cuda", dtype=torch.bfloat16)
                 with torch.no_grad():
-                    for _ in range(config.discovery_iters + config.profiling_iters + 1):
+                    for _ in range(om.iters_before_inference + 1):
                         proxy(x)   # drives discovery -> profile -> inference
 
-            Combine with ``torch.compile`` — discovery must stay eager;
-            compile after it (``docs/how-to/torch-compile.md`` covers the
-            full two-process save / restore flow and why)::
+            Per-unit ``torch.compile`` via ``compile_fn`` (preferred; see
+            ``docs/how-to/torch-compile.md``). Whole-model ``torch.compile(proxy)``
+            is not supported across phase transitions::
 
-                proxy = ft.offload(model, config)
+                def compile_fn(module: torch.nn.Module) -> torch.nn.Module:
+                    return torch.compile(module, fullgraph=True)
+
+                proxy = ft.offload(model, config, compile_fn=compile_fn)
+                om = ft.get_offload_manager()
                 with torch.no_grad():
-                    for _ in range(config.discovery_iters):
-                        proxy(x)                       # discovery eager
+                    for _ in range(om.iters_before_inference):
+                        proxy(x)  # discovery + compiled view-profile -> INFERENCE
 
-                    compiled = torch.compile(proxy)
-                    for _ in range(config.profiling_iters):
-                        compiled(x)                    # profile under compile
-                    compiled(x)                        # inference under compile
+            For external per-unit compile after INFERENCE, set
+            ``OffloadConfig(external_compile=True)``, drive
+            ``om.iters_before_inference`` eager forwards, ``torch.compile`` each
+            offloaded unit, then :meth:`request_strategy_replan`.
         """
+        # Reject an already-compiled model up front, before any state mutation.
+        # ``torch.compile`` (and backends built on it, e.g. ``torch_tensorrt``)
+        # wrap the model in an ``OptimizedModule`` whose self-referential
+        # ``__getattr__``/``__setattr__`` proxy to ``_orig_mod`` makes FlexTensor's
+        # recursive module preprocessing loop without terminating (``RecursionError``),
+        # and whose captured graph predates -- and therefore ignores -- the offload
+        # patches. Fail fast with actionable guidance instead of crashing deep in
+        # preprocessing or silently serving a stale graph.
+        if is_torch_compiled_module(model):
+            raise RuntimeError(
+                "FlexTensor does not support offloading an already-compiled model "
+                f"(received a torch.compile wrapper: {type(model).__name__}). "
+                "Offload the eager model first. For FlexTensor-driven per-unit compile "
+                "use offload(model, config, compile_fn=<per-unit compiler>). For "
+                "external per-unit compile after INFERENCE use "
+                "OffloadConfig(external_compile=True), drive "
+                "om.iters_before_inference eager forwards, then torch.compile each "
+                "offloaded unit (e.g. each block). See docs/how-to/torch-compile.md."
+            )
+
+        # Resolve compiled-offload flags *before* init/patching so
+        # ``_patch_module_forward`` pre-builds compile-transparent forwards when active.
+        effective_config = config if config is not None else self.config
+        self._compiled.resolve_activation(effective_config, compile_fn)
+
         self.init(config)
 
-        self._tensor_manager.build_parameters_mapping(model)
+        # Arm a non-destructive first inference loader only when a post-compile
+        # replan is intended (``replan_active``); view-profile compile_fn must not
+        # retain another model-sized host copy.
+        self._compiled.arm_non_destructive_first_loader()
         # Save old model for hook transfer before overwriting
         old_model = self._model
         self._model = model
@@ -920,7 +1164,7 @@ class OffloadManager:
         """Register a compiler-disabled forward hook on ``self._model`` that
         advances phase state.
 
-        ``compiler_hooks.disable`` makes ``torch.compile`` emit a graph break at the hook's
+        ``compiler_utils.disable`` makes ``torch.compile`` emit a graph break at the hook's
         call-site and run the body eagerly, so ``update_state`` fires reliably
         even when ``OptimizedModule`` bypasses ``OffloadModelProxy.__call__``
         under ``torch.compile(proxy)``.
@@ -969,11 +1213,18 @@ class OffloadManager:
             name: Name of the offload block (used for tracking)
 
         Returns:
-            OffloadBlock context manager (Trap, WarmupTrap, TrapInfer, etc.)
+            OffloadBlock context manager (Trap, WarmupTrap, TrapInfer, …)
 
         Examples:
             >>> with om.offload_block("encoder"):
-            ...     output = encoder(input)
+            ...     output = encoder(hidden_states)
+
+        Note:
+            Compiled offload is driven by auto-patched forwards that call
+            ``pre_compute/post_compute`` directly. Manual ``offload_block`` stays
+            on the eager trap path (:class:`~flextensor.trap_tensor_mode.TrapInferDirect`
+            / :class:`~flextensor.trap_tensor_mode.TrapInfer`); do not wrap an
+            auto-patched compiled unit or transfers will double-schedule.
         """
         if self._tensor_manager is None:
             raise RuntimeError(
@@ -1005,7 +1256,11 @@ class OffloadManager:
         coordinator.wait_for_ready()
         state = coordinator.read_profile()
 
+        # Mirror ``offload()``: resolve compiled-offload flags before TensorManager
+        # creation and patching so followers get compile-transparent forwards.
+        self._compiled.resolve_activation(self.config, None)
         self._initialize_tensor_manager()
+        self._compiled.arm_non_destructive_first_loader()
         self._tensor_manager.shm_namespace = coordinator.namespace
         self._tensor_manager.restore_state(model, state)
 
@@ -1016,6 +1271,10 @@ class OffloadManager:
         self._offload_modules(self._model, self.config.include_patterns)
         self._exclude_modules(self._model, self.config.exclude_patterns)
         self._check_no_modules_patched()
+        # Follower jumps straight to INFERENCE without discovery/profiling
+        # forwards, so mirror the INFERENCE transition compiled-offload wiring.
+        self._install_compiled_forwards()
+        self._compiled.on_enter_inference()
 
         self._current_phase = OffloadPhase.INFERENCE
 
@@ -1135,6 +1394,10 @@ class OffloadManager:
             yield
 
     def release(self):
+        # Undo any compile_fn substitutions and tear down the compiled-offload
+        # tail before restoring forwards, so the model is left as it was handed in.
+        self._compiled.teardown()
+
         # Restore original forward methods for all patched modules
         for module in self._patched_modules:
             self._restore_module_forward(module)
@@ -1305,19 +1568,33 @@ def init(config: OffloadConfig | None = None, name: str = DEFAULT_MANAGER_NAME):
     om.init(config)
 
 
-def offload(model: nn.Module, config: OffloadConfig | None = None, name: str = DEFAULT_MANAGER_NAME) -> nn.Module:
+def offload(
+    model: nn.Module,
+    config: OffloadConfig | None = None,
+    name: str = DEFAULT_MANAGER_NAME,
+    compile_fn: Callable[[nn.Module], nn.Module] | None = None,
+) -> nn.Module:
     """Offload modules using the specified offload manager.
 
     Args:
         model: PyTorch model to patch.
         config: OffloadConfig to use for offload.
         name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+        compile_fn: Optional per-unit compiler. Passing it activates the
+            compiled-offload path without any ``FT_EXTERNAL_COMPILE`` env var: FlexTensor
+            applies ``compile_fn`` to **each offloaded unit** (one compiled graph
+            per unit -- slot-alias safe by construction). With default
+            ``profile_mode='view'``, compiled view-profile builds the strategy from
+            compiled timings so no post-INFERENCE replan is needed. Use
+            :meth:`OffloadManager.request_strategy_replan` only for getter-profile
+            or external-compile paths. ``None`` (default) is exactly today's eager
+            offload. See :meth:`OffloadManager.offload` for the full contract.
 
     Returns:
         The patched model.
     """
     om = get_offload_manager(name)
-    return om.offload(model, config)
+    return om.offload(model, config, compile_fn=compile_fn)
 
 
 def set_config(config: OffloadConfig, name: str = DEFAULT_MANAGER_NAME):
@@ -1363,6 +1640,7 @@ def offload_from_profile(
     profile_directory: str,
     config: OffloadConfig | None = None,
     name: str = DEFAULT_MANAGER_NAME,
+    compile_fn: Callable[[nn.Module], nn.Module] | None = None,
 ) -> nn.Module:
     """Initialize, load a saved profile, and offload the model in one step.
 
@@ -1376,13 +1654,14 @@ def offload_from_profile(
         profile_directory: Directory containing the saved profile.
         config: OffloadConfig to apply.
         name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+        compile_fn: Optional per-unit compiler (same as :func:`offload`).
 
     Returns:
         The offloaded model proxy, ready for inference.
     """
     init(config=config, name=name)
     load_profile(profile_directory, model=model, name=name)
-    return offload(model, config=config, name=name)
+    return offload(model, config=config, name=name, compile_fn=compile_fn)
 
 
 def offload_block(block_name: str, name: str = DEFAULT_MANAGER_NAME) -> Any:

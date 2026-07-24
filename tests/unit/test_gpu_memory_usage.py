@@ -145,7 +145,7 @@ class TestOffloadManagerGPUMemoryUsage:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model
@@ -192,7 +192,7 @@ class TestOffloadManagerGPUMemoryUsage:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         # Create offload manager (stays in discovery)
@@ -219,7 +219,7 @@ class TestOffloadManagerGPUMemoryUsage:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
 
@@ -275,7 +275,7 @@ class TestModuleLevelGetGPUMemoryUsage:
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
         mock_tensor_manager_cls.return_value = mock_tensor_manager
-        mock_tensor_manager.trap = lambda name: MockTrap(name)
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.initialize_profile.return_value = self.model
         mock_tensor_manager.initialize_inference.return_value = self.model

@@ -6,9 +6,11 @@
 module forwards, then Dynamo traces the patched graph.
 
 **Unsupported order**: ``torch.compile`` first, then offload.
-``torch.compile`` wraps the model in ``OptimizedModule`` whose internal
-structure causes infinite recursion in FlexTensor's module preprocessing
-(``_process_module`` traverses ``model.children()``).
+``torch.compile`` wraps the model in ``OptimizedModule`` whose self-referential
+proxy to ``_orig_mod`` would otherwise cause infinite recursion in FlexTensor's
+module preprocessing.  ``offload()`` detects the wrapper and raises a
+``RuntimeError``; compile each offloaded unit via
+``offload(model, config, compile_fn=...)`` instead.
 
 **Numerical note**: ``torch.compile`` with the ``inductor`` backend fuses
 kernels and may reorder floating-point operations, producing slightly
@@ -199,75 +201,114 @@ class TestOffloadThenCompile:
 
 
 class TestCompileThenOffload:
-    """torch.compile first, then FlexTensor offload().
+    """torch.compile first, then FlexTensor offload() -- explicitly rejected.
 
-    ``OptimizedModule``'s custom ``__setattr__`` proxy corrupts the
-    underlying model's ``_modules`` dict during FlexTensor's preprocessing.
-    Requires unwrapping ``_orig_mod`` in ``offload()`` to work (not yet
-    implemented).  The visited-set prevents recursion but does not prevent
-    attribute corruption.
+    ``torch.compile`` wraps the model in an ``OptimizedModule`` whose
+    self-referential ``__getattr__``/``__setattr__`` proxy to ``_orig_mod``
+    makes FlexTensor's recursive module preprocessing loop without terminating.
+    Rather than crash deep in preprocessing (``RecursionError``), ``offload()``
+    detects the wrapper at its entry point and raises an actionable
+    ``RuntimeError``.  Compile each offloaded unit via
+    ``offload(model, config, compile_fn=...)`` on the eager model instead.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AttributeError,
-        reason=(
-            "OptimizedModule.__setattr__ proxies attribute writes to _orig_mod, "
-            "corrupting the model's _modules dict during preprocessing. "
-            "Requires unwrapping _orig_mod in offload() entry point."
-        ),
-    )
-    def test_compile_then_offload_succeeds(self, device: torch.device) -> None:
-        """Offloading a pre-compiled model must not raise."""
+    def test_compile_then_offload_rejected(self, device: torch.device) -> None:
+        """Offloading a pre-compiled model is rejected with an actionable RuntimeError."""
         manager_name = f"test_cto_{uuid.uuid4().hex[:8]}"
         om = get_offload_manager(manager_name)
         config = _make_offload_config()
 
-        model, x = _create_model_and_input(device, on_cpu=True)
+        model, _x = _create_model_and_input(device, on_cpu=True)
         compiled = torch.compile(model, backend="inductor")
         try:
-            proxy = om.offload(compiled, config)
-            _run_offload_lifecycle(proxy, x)
-            assert om._current_phase == OffloadPhase.INFERENCE
+            with pytest.raises(RuntimeError, match="does not support offloading an already-compiled model"):
+                om.offload(compiled, config)
         finally:
             om.release()
 
-    @pytest.mark.xfail(
-        strict=True,
-        raises=AttributeError,
-        reason=(
-            "OptimizedModule.__setattr__ proxies attribute writes to _orig_mod, "
-            "corrupting the model's _modules dict during preprocessing. "
-            "Requires unwrapping _orig_mod in offload() entry point."
-        ),
-    )
-    def test_compile_then_offload_numerical_correctness(self, device: torch.device) -> None:
-        """Compile-then-offload must produce results close to offload-only."""
-        ref_name = f"test_cto_ref_{uuid.uuid4().hex[:8]}"
-        om_ref = get_offload_manager(ref_name)
-        config = _make_offload_config()
-        model_ref, x = _create_model_and_input(device, on_cpu=True)
-        proxy_ref = om_ref.offload(model_ref, config)
-        try:
-            _, _, res_ref = _run_offload_lifecycle(proxy_ref, x)
-        finally:
-            om_ref.release()
 
-        test_name = f"test_cto_num_{uuid.uuid4().hex[:8]}"
-        om = get_offload_manager(test_name)
+class TestExternalCompiledOffload:
+    """``OffloadConfig(external_compile=True)``: external per-unit compile after INFERENCE.
+
+    FlexTensor installs compile-transparent ``pre_compute/post_compute`` forwards and
+    registers the rolling loader at the INFERENCE transition; the caller compiles
+    each offloaded unit outside FlexTensor after the eager ``iters_before_inference``
+    forwards (one graph per unit — not whole-model compile).
+    """
+
+    def _compiled_offload_config(self, feedback_iters: int = FEEDBACK_ITERS) -> OffloadConfig:
+        return _make_offload_config(feedback_iters=feedback_iters).model_copy(update={"external_compile": True})
+
+    def test_external_compile_after_inference_numerical_correctness(self, device: torch.device) -> None:
+        """External per-unit compile after INFERENCE matches eager compiled-offload output."""
+        from flextensor.compile.module_swap import resolve_compile_targets
+        from flextensor.compiled_offload import bump_dynamo_limits_for_compiled_offload
+        from flextensor.custom_ops import get_active_loader
+
+        manager_name = f"test_extco_{uuid.uuid4().hex[:8]}"
+        om = get_offload_manager(manager_name)
+        config = self._compiled_offload_config()
+
         model, x = _create_model_and_input(device, on_cpu=True)
-        compiled = torch.compile(model, backend="inductor")
+        proxy = om.offload(model, config)
+
         try:
-            proxy = om.offload(compiled, config)
-            _, _, res_test = _run_offload_lifecycle(proxy, x)
+            with torch.no_grad():
+                for _ in range(om.iters_before_inference):
+                    proxy(x)
+            assert om._current_phase == OffloadPhase.INFERENCE
+            assert get_active_loader(om.compiled_offload_manager_id) is not None
+
+            res_eager = x
+            for _ in range(FEEDBACK_ITERS):
+                res_eager = proxy(res_eager)
+
+            root = om.model
+            assert root is not None
+            targets = resolve_compile_targets(root, om._patched_modules)
+            assert targets, "expected at least one offloaded unit to compile"
+            bump_dynamo_limits_for_compiled_offload(len(targets))
+            for setter, module in targets:
+                setter(torch.compile(module, backend="inductor"))
+
+            torch._dynamo.reset()
+            with torch.no_grad():
+                res_compiled = x
+                for _ in range(FEEDBACK_ITERS):
+                    res_compiled = proxy(res_compiled)
 
             torch.testing.assert_close(
-                res_ref.float(),
-                res_test.float(),
+                res_eager.float(),
+                res_compiled.float(),
                 rtol=RTOL,
                 atol=ATOL,
-                msg="Compile-then-offload output diverges from offload-only reference",
+                msg="External per-unit compile after compiled-offload INFERENCE diverges from eager",
             )
+        finally:
+            om.release()
+            torch._dynamo.reset()
+
+    def test_external_compile_transparent_forwards_not_dynamo_disabled(self, device: torch.device) -> None:
+        """INFERENCE forwards must stay traceable when compiled_offload is on."""
+        manager_name = f"test_extco_fwd_{uuid.uuid4().hex[:8]}"
+        om = get_offload_manager(manager_name)
+        config = self._compiled_offload_config()
+
+        model, x = _create_model_and_input(device, on_cpu=True)
+        proxy = om.offload(model, config)
+
+        try:
+            with torch.no_grad():
+                for _ in range(om.iters_before_inference):
+                    proxy(x)
+            assert om._current_phase == OffloadPhase.INFERENCE
+
+            for module in om._patched_modules:
+                bound = module.forward
+                func = getattr(bound, "__func__", bound)
+                assert not getattr(func, "_torchdynamo_disable", False), (
+                    f"{module} forward must not be Dynamo-disabled under compiled_offload"
+                )
         finally:
             om.release()
 

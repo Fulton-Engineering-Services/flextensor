@@ -7,7 +7,7 @@ from typing import Any, cast
 import torch
 from torch.overrides import TorchFunctionMode
 
-from flextensor.compiler_hooks import graph_break as _graph_break
+from flextensor.compiler_utils import graph_break as _graph_break
 
 
 class Trap(TorchFunctionMode):
@@ -340,6 +340,8 @@ class TrapDirect:
 
 
 class TrapInferDirect:
+    """Eager inference trap for manual ``offload_block`` (outside the compiled graph)."""
+
     def __init__(self, tensor_manager, trace_id, device_gpu):
         self.current_trace_id = trace_id
         self.device_gpu = device_gpu

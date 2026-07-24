@@ -237,6 +237,7 @@ def run_vllm_server_test(
     chat_request_timeout: int = 60,
     correctness_check: VllmCorrectnessCheck | None = None,
     benchmark_config: VllmBenchmarkConfig | None = None,
+    server_ready_timeout: int = 600,
 ) -> tuple[MemoryProfilingMetrics, dict, list[str]]:
     """Run a single vLLM server test and return metrics."""
     process = None
@@ -274,7 +275,7 @@ def run_vllm_server_test(
         )
 
         process, log_lines = start_vllm_server(server_case)
-        ready = wait_for_server(port=port, timeout=600, process=process)
+        ready = wait_for_server(port=port, timeout=server_ready_timeout, process=process)
 
         assert ready, f"Server failed to start within timeout ({offload_status})"
 

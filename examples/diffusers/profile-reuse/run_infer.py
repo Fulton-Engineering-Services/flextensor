@@ -88,7 +88,7 @@ def main():
         num_frames=args.num_frames,
     ).frames[0]
     export_to_video(frames, args.output, fps=16)
-    print(f"Video saved to {args.output}")  # noqa: T201
+    print(f"Video saved to {args.output}")
 
     flextensor.release("transformer")
     flextensor.release("transformer2")

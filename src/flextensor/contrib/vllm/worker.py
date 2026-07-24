@@ -13,6 +13,8 @@ See flextensor.config.OffloadConfig for configuration options (FT_* env vars).
 import atexit
 import importlib
 import logging
+import os
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any, cast
 
@@ -21,9 +23,11 @@ from vllm.utils.mem_constants import GiB_bytes
 from vllm.v1.worker.gpu_worker import Worker
 
 import flextensor
+from flextensor.compile import COMPILED_EAGER_PROFILE_FORWARDS
 from flextensor.config import load_config
 from flextensor.contrib.vllm._drafter_device import ensure_drafter_on_device
 from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_bridge
+from flextensor.offload_manager import OffloadPhase
 from flextensor.utils import config_field_was_set
 
 safely_install_flextensor_logging_bridge()
@@ -31,6 +35,50 @@ safely_install_flextensor_logging_bridge()
 importlib.import_module("flextensor.contrib.vllm.loader")
 
 LOGGER = logging.getLogger(__name__)
+
+_VLLM_DISABLE_COMPILE_CACHE = "VLLM_DISABLE_COMPILE_CACHE"
+_VLLM_USE_AOT_COMPILE = "VLLM_USE_AOT_COMPILE"
+
+
+def _configure_vllm_compile_env_for_compiled_offload() -> None:
+    """Align vLLM compile env with FlexTensor's deferred compile path.
+
+    Compilation is deferred until inference (see
+    ``_ft_set_compiled_offload_compile_enabled``), so the on-disk compile cache
+    must be disabled. Supported vLLM versions already default AOT off when the
+    cache is disabled, so leave ``VLLM_USE_AOT_COMPILE`` unset unless the user
+    set an explicit conflicting value — then warn and correct it. Likewise warn
+    before overriding an explicit cache setting.
+    """
+    existing_cache = os.environ.get(_VLLM_DISABLE_COMPILE_CACHE)
+    if existing_cache is not None and existing_cache != "1":
+        LOGGER.warning(
+            "FT-COMPILE-PATH: overriding explicit %s=%s -> 1 for compiled-offload "
+            "(on-disk compile cache must stay disabled until inference)",
+            _VLLM_DISABLE_COMPILE_CACHE,
+            existing_cache,
+        )
+    os.environ[_VLLM_DISABLE_COMPILE_CACHE] = "1"
+
+    existing_aot = os.environ.get(_VLLM_USE_AOT_COMPILE)
+    if existing_aot == "1":
+        LOGGER.warning(
+            "FT-COMPILE-PATH: correcting conflicting %s=1 -> 0 for compiled-offload "
+            "(AOT would run too early; disabling the compile cache already defaults "
+            "AOT off)",
+            _VLLM_USE_AOT_COMPILE,
+        )
+        os.environ[_VLLM_USE_AOT_COMPILE] = "0"
+
+    LOGGER.warning("FT-COMPILE-PATH: compiled-offload running under vLLM native fullgraph=True")
+
+
+# Compiled-offload: configure vLLM compile env at import time, before any
+# ``@support_torch_compile`` model class is instantiated. Use the same
+# ``load_config()`` path as runtime so env spellings and ``FT_CONFIG_FILE``
+# agree with OffloadManager activation.
+if load_config().external_compile:
+    _configure_vllm_compile_env_for_compiled_offload()
 
 # Default patterns for per-layer offloading in decoder-only and text-only
 # hybrid-wrapper vLLM models.
@@ -88,6 +136,46 @@ VLLM_PROFILING_ITER_FLOOR = 2
 
 def _GiB(b: int) -> float:  # noqa: N802
     return b / float(GiB_bytes)
+
+
+def _is_cudagraph_mode_none(mode: Any) -> bool:
+    """Return True when ``cudagraph_mode`` means CUDA graphs are disabled."""
+    if mode is None:
+        return False
+    if isinstance(mode, (int, float)) and int(mode) == 0:
+        return True
+    name = getattr(mode, "name", None)
+    if name is not None:
+        return str(name).upper() == "NONE"
+    text = str(mode).upper()
+    return text == "NONE" or text.endswith(".NONE")
+
+
+def _cudagraphs_disabled(vllm_config: Any) -> bool:
+    """Best-effort check that vLLM CUDA graphs are already off."""
+    compilation_config = getattr(vllm_config, "compilation_config", None)
+    if compilation_config is None:
+        return False
+    return _is_cudagraph_mode_none(getattr(compilation_config, "cudagraph_mode", None))
+
+
+def _warn_vllm_runtime_requirements(offload_config: Any, vllm_config: Any) -> None:
+    """Warn about unsupported vLLM runtime knobs for the active FlexTensor path.
+
+    * Plain offload: needs ``--enforce-eager`` (CUDA graphs + compile off).
+    * ``external_compile``: needs vLLM native compile (not eager), but CUDA
+      graphs are not supported yet — ask for ``cudagraph_mode: NONE``.
+    """
+    if getattr(offload_config, "external_compile", False):
+        if not _cudagraphs_disabled(vllm_config):
+            LOGGER.warning(
+                "FlexTensor compiled offload does not support CUDA graphs yet. "
+                'Pass --compilation-config \'{"cudagraph_mode": "NONE"}\'.'
+            )
+        return
+    model_config = getattr(vllm_config, "model_config", None)
+    if model_config is not None and not getattr(model_config, "enforce_eager", False):
+        LOGGER.warning("FlexTensor offloading requires eager mode. Add --enforce-eager flag.")
 
 
 _CUDA_GRAPH_WRAPPER_LOGGED = False
@@ -151,11 +239,17 @@ def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
     """
     # vLLM's first compile_or_warm_up_model() runs two forwards that already
     # count as FlexTensor discovery. Keep one additional explicit small-token
-    # discovery pass, while using two max-token profiling passes to bound
-    # startup cost.
+    # discovery pass, while using max-token profiling passes to bound startup
+    # cost. On the compiled-offload + re-plan path the eager seed is a fixed
+    # ``COMPILED_EAGER_PROFILE_FORWARDS`` count (independent of the measure
+    # window sized by ``profiling_iters``), so floor profiling_iters there too.
+    profiling_floor = VLLM_PROFILING_ITER_FLOOR
+    # ``offload_config`` already comes from ``load_config()`` (env + optional file).
+    if getattr(offload_config, "external_compile", False):
+        profiling_floor = max(profiling_floor, COMPILED_EAGER_PROFILE_FORWARDS)
     config_updates: dict[str, Any] = {
         "discovery_iters": max(offload_config.discovery_iters, VLLM_DISCOVERY_ITER_FLOOR),
-        "profiling_iters": max(offload_config.profiling_iters, VLLM_PROFILING_ITER_FLOOR),
+        "profiling_iters": max(offload_config.profiling_iters, profiling_floor),
     }
     if offload_config.include_patterns == ["*"]:
         config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
@@ -251,8 +345,8 @@ class FlexTensorOffloadWorker(Worker):
 
         if not self._offload_config.enabled:
             return
-        if not self.vllm_config.model_config.enforce_eager:
-            LOGGER.warning("FlexTensor offloading requires eager mode. Add --enforce-eager flag.")
+
+        _warn_vllm_runtime_requirements(self._offload_config, self.vllm_config)
 
         # Speculative-decoding drafter (e.g. MTP / Eagle) lives outside the
         # main model and is not reached by flextensor.offload(). FT's
@@ -279,40 +373,8 @@ class FlexTensorOffloadWorker(Worker):
             _GiB(self.model_runner.model_memory_usage),
         )
 
-    def warmup_and_profile_model(self) -> None:
-        """Run discovery and profiling iterations for FlexTensor offloading.
-
-        Executes discovery iterations to map parameters to traps, then runs
-        profiling iterations at max batch size to collect layer statistics
-        for the offloading strategy. Finally switches to inference mode.
-        """
-        self.compile_or_warm_up_model()
-        # vLLM's first compile_or_warm_up_model() runs 2 forward passes through
-        # the offloaded model; each one counts as a discovery iteration in the
-        # OffloadManager, so the loop below only tops up to discovery_iters.
-        compile_warm_iters = VLLM_COMPILE_WARMUP_FORWARD_COUNT
-
-        discovery_iters = self._offload_config.discovery_iters - compile_warm_iters
-        for i in range(discovery_iters):
-            LOGGER.info("FlexTensor: Discovery iteration %d/%d (num_tokens=1)", i + 1, discovery_iters)
-            self.model_runner._dummy_run(1, skip_eplb=True)  # noqa: SLF001
-
-        # Pause profiling around vLLM's mixed-batch warmup: durations are suppressed
-        # and the PROFILING counter is frozen, so only the explicit iterations below
-        # feed the profile. The context manager also guarantees resume on exception.
-        with flextensor.pause_profiling():
-            self.compile_or_warm_up_model()
-        max_num_tokens = min(self.model_runner.max_model_len, self.vllm_config.scheduler_config.max_num_batched_tokens)
-        profiling_iters = self._offload_config.profiling_iters
-        for i in range(profiling_iters):
-            LOGGER.info(
-                "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)", i + 1, profiling_iters, max_num_tokens
-            )
-            self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
-
-        LOGGER.info("FlexTensor: Switching to inference mode")
-        # Informational-only host-memory hint; psutil probes /proc which can fail
-        # on hardened containers (gVisor / distroless / restricted /proc).
+    def _ft_warn_host_memory_before_inference(self) -> None:
+        """Log a low-memory warning before the inference transition when probeable."""
         try:
             vm = psutil.virtual_memory()
             free_gib = vm.available / GiB_bytes
@@ -334,8 +396,126 @@ class FlexTensorOffloadWorker(Worker):
                 self._ft_host_mem_probe_warned = True
             else:
                 LOGGER.debug("FlexTensor: host-memory pre-check failed again (%s)", exc)
-        self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
-        self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
+
+    def _ft_run_compiled_offload_inference_tail(self, run_forwards: Callable[[int], None]) -> None:
+        """Run post-INFERENCE compiled-offload replan or compile warmup forwards."""
+        om = flextensor.get_offload_manager()
+        if om.compiled_offload_active and om.compiled_replan_active:
+            replan_iters = om.request_strategy_replan()
+            if replan_iters:
+                run_forwards(replan_iters)
+        elif om.compiled_offload_active:
+            run_forwards(VLLM_COMPILE_WARMUP_FORWARD_COUNT)
+
+    def warmup_and_profile_model(self) -> None:
+        """Run discovery and profiling iterations for FlexTensor offloading.
+
+        Executes discovery iterations to map parameters to traps, then runs
+        profiling iterations at max batch size to collect layer statistics
+        for the offloading strategy. Finally switches to inference mode.
+        """
+        max_num_tokens = min(self.model_runner.max_model_len, self.vllm_config.scheduler_config.max_num_batched_tokens)
+
+        def _run_forwards(n: int) -> None:
+            for _ in range(n):
+                self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
+
+        # vLLM-only: defer @support_torch_compile until after the INFERENCE transition
+        # (compile-transparent forwards + rolling loader are installed by OffloadManager).
+        self._ft_set_compiled_offload_compile_enabled(False)
+        self.compile_or_warm_up_model()
+        # vLLM's first compile_or_warm_up_model() runs 2 forward passes through
+        # the offloaded model; each one counts as a discovery iteration in the
+        # OffloadManager, so the loop below only tops up to discovery_iters.
+        compile_warm_iters = VLLM_COMPILE_WARMUP_FORWARD_COUNT
+
+        discovery_iters = self._offload_config.discovery_iters - compile_warm_iters
+        for i in range(discovery_iters):
+            LOGGER.info("FlexTensor: Discovery iteration %d/%d (num_tokens=1)", i + 1, discovery_iters)
+            self.model_runner._dummy_run(1, skip_eplb=True)  # noqa: SLF001
+
+        # Pause profiling around vLLM's mixed-batch warmup: durations are suppressed
+        # and the PROFILING counter is frozen, so only the explicit iterations below
+        # feed the profile. The context manager also guarantees resume on exception.
+        with flextensor.pause_profiling():
+            self.compile_or_warm_up_model()
+        om = flextensor.get_offload_manager()
+        eager_profiling_iters = om.eager_profiling_iters
+        for i in range(eager_profiling_iters):
+            LOGGER.info(
+                "FlexTensor: Profiling iteration %d/%d (max_num_tokens=%d)",
+                i + 1,
+                eager_profiling_iters,
+                max_num_tokens,
+            )
+            self.model_runner._dummy_run(max_num_tokens, skip_eplb=True)  # noqa: SLF001
+
+        LOGGER.info("FlexTensor: Switching to inference mode")
+        self._ft_warn_host_memory_before_inference()
+        if om.phase != OffloadPhase.INFERENCE:
+            raise RuntimeError(
+                "FlexTensor compiled-offload: warmup ended before PROFILING→INFERENCE "
+                f"(phase={om.phase.value}). Run {eager_profiling_iters} explicit profiling "
+                "forwards for the eager seed when the compiled replan path is active."
+            )
+        # Last profiling forward triggered INFERENCE: compile-transparent forwards
+        # and the rolling loader are installed by OffloadManager.
+        self._ft_set_compiled_offload_compile_enabled(True)
+        self._ft_run_compiled_offload_inference_tail(_run_forwards)
+
+    def _ft_set_compiled_offload_compile_enabled(self, enabled: bool) -> None:
+        """Flip ``do_not_compile`` on vLLM's compile wrappers.
+
+        vLLM compiles once and keeps that graph. Turn compile off for discovery/profiling,
+        then back on at INFERENCE once offload forwards and the rolling loader are ready.
+        """
+        om = flextensor.get_offload_manager()
+        if not om.compiled_offload_active:
+            return
+        root = getattr(om, "model", None)
+        if root is None:
+            return
+        if not enabled:
+            existing = getattr(self, "_ft_compile_gated_modules", None)
+            if existing is not None:
+                LOGGER.warning(
+                    "FlexTensor compiled-offload: compile gate already suppressed on %d module(s); "
+                    "ignoring duplicate disable (likely a retry after partial warmup)",
+                    len(existing),
+                )
+                return
+            # Disable: remember the modules we silence so we only re-enable those
+            # (modules already do_not_compile, e.g. NONE/ignored, stay untouched).
+            gated = [module for module in root.modules() if getattr(module, "do_not_compile", None) is False]
+            for module in gated:
+                module.do_not_compile = True
+            self._ft_compile_gated_modules = gated
+            LOGGER.info(
+                "FlexTensor compiled-offload: suppressed torch.compile on %d module(s) "
+                "for discovery/profiling; first compile deferred to inference",
+                len(gated),
+            )
+            return
+        gated = getattr(self, "_ft_compile_gated_modules", None)
+        if gated is None:
+            LOGGER.warning(
+                "FlexTensor compiled-offload: enable called without a prior disable gate; "
+                "leaving module compile flags unchanged",
+            )
+            return
+        for module in gated:
+            module.do_not_compile = False
+            # Defensive: the wrapper latches this after its first compile; ensure a
+            # fresh first-compile path at inference even if a stray forward slipped
+            # through with compilation enabled.
+            if getattr(module, "compiled", False):
+                module.compiled = False
+        self._ft_compile_gated_modules = None
+        LOGGER.info(
+            "FlexTensor compiled-offload: re-enabled torch.compile on %d module(s); "
+            "inference warmup will trigger the compile-transparent graph compile",
+            len(gated),
+        )
 
     def shutdown(self) -> None:
         super().shutdown()

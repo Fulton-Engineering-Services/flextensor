@@ -161,6 +161,27 @@ class OffloadConfig(BaseModel):
     Can also be set via the ``FT_PROFILING_ITERS`` env var.
     """
 
+    external_compile: bool = Field(default=False)
+    """Prepare offloaded layers for *external* per-unit ``torch.compile`` after INFERENCE.
+
+    Does **not** compile the model itself. It arms the custom-op / rolling-loader
+    path so a caller (e.g. vLLM or a script) can ``torch.compile`` each offloaded
+    unit after the INFERENCE transition. Pass ``compile_fn`` to
+    :func:`~flextensor.offload` for the integrated path instead.
+
+    Can also be set via ``FT_EXTERNAL_COMPILE``.
+
+    Requires a block ``transfer_mode`` (``allocation_block_transfer`` or
+    ``raw_block_transfer``); ``strategy`` is incompatible with the rolling-block
+    custom ops used by compiled offload.
+
+    With ``compile_fn`` and ``profile_mode='view'`` (default), FlexTensor
+    auto-runs compiled view-profile so the strategy is built from compiled
+    timings (no post-INFERENCE replan). Use
+    :meth:`~flextensor.OffloadManager.request_strategy_replan` after a non-view
+    profile or after external compile with ``external_compile=True``.
+    """
+
     warmup_iters: Annotated[int, _deprecated(_WARMUP_ITERS_MSG)] = Field(default=1, ge=0, deprecated=_WARMUP_ITERS_MSG)
     """Number of warmup iterations before profiling begins.
 
@@ -549,6 +570,14 @@ class OffloadConfig(BaseModel):
                 f"transfer_mode={self.transfer_mode!r}. Use profile_mode='getter' "
                 f"or 'view', or set transfer_mode='strategy'."
             )
+        if self.external_compile and self.transfer_mode not in block_loaders:
+            raise ValueError(
+                f"external_compile=True requires a block transfer_mode "
+                f"(allocation_block_transfer or raw_block_transfer); got "
+                f"transfer_mode={self.transfer_mode!r}. The compiled-offload "
+                f"path installs a PreallocatedLoader for pre_compute/post_compute "
+                f"custom ops, which transfer_mode='strategy' does not provide."
+            )
         return self
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
@@ -579,7 +608,19 @@ class OffloadConfig(BaseModel):
 
     @property
     def pre_inference_iters(self) -> int:
-        """Total iterations before inference (discovery + profiling)."""
+        """Total iterations before inference (discovery + profiling).
+
+        This is the plain-offload warmup length
+        (``discovery_iters + profiling_iters``). Prefer the path-aware
+        :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
+        when compiled offload / replan may be active: the config cannot know
+        those runtime options, and the external-compile replan path uses a
+        shorter eager seed than ``profiling_iters``.
+
+        .. deprecated::
+            Prefer :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
+            for path-aware budgets.
+        """
         return self.discovery_iters + self.profiling_iters
 
     @property

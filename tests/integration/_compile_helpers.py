@@ -22,19 +22,6 @@ from torch import nn
 
 from flextensor import OffloadConfig
 
-__all__ = [
-    "DEFAULT_MODULE_PATTERNS",
-    "Expert",
-    "ExpertLayer",
-    "SimpleModel",
-    "capture_cuda_graph",
-    "make_offload_config",
-    "make_simple_model",
-    "run_offload_lifecycle",
-    "set_seed",
-    "tensor_checksum",
-]
-
 DEFAULT_MODULE_PATTERNS: list[str] = ["input_projection", "layers.*", "output_projection"]
 
 
@@ -231,3 +218,40 @@ def capture_cuda_graph(
 
 # Re-export for callers that prefer a typed alias.
 LifecycleFn = Callable[..., tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
+def compile_transformer_blocks(
+    model: nn.Module,
+    *,
+    blocks_attr: str = "transformer_blocks",
+    backend: str = "inductor",
+    mode: str = "default",
+    fullgraph: bool = False,
+    trt_enabled_precisions: set[torch.dtype] | None = None,
+) -> nn.Module:
+    """Per-block ``torch.compile`` on ``model.<blocks_attr>`` (synthetic-DiT path).
+
+    Mirrors the ``scope=per-block`` branch of the diffusers benchmark helper so
+    each offloaded block is its own graph — slot-alias safe under rolling offload.
+    """
+    blocks = getattr(model, blocks_attr, None)
+    if blocks is None:
+        if backend == "inductor":
+            return torch.compile(model, mode=mode, fullgraph=fullgraph)
+        options = {"enabled_precisions": trt_enabled_precisions or {torch.float32}}
+        return torch.compile(model, backend="torch_tensorrt", options=options)
+
+    for idx in range(len(blocks)):
+        if backend == "inductor":
+            blocks[idx] = torch.compile(blocks[idx], mode=mode, fullgraph=fullgraph)
+        elif backend in ("torch_tensorrt", "tensorrt"):
+            options = {
+                "enabled_precisions": trt_enabled_precisions or {torch.float32},
+                "truncate_long_and_double": True,
+                "min_block_size": 1,
+            }
+            blocks[idx] = torch.compile(blocks[idx], backend="torch_tensorrt", options=options)
+        else:
+            msg = f"unsupported compile backend: {backend!r}"
+            raise ValueError(msg)
+    return model

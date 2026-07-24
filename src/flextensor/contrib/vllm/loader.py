@@ -130,7 +130,7 @@ class FlexTensorModelLoader(DefaultModelLoader):
                 torch.set_default_device(original_default_device)
 
         logger.info("FlexTensorModelLoader: Phase 2 - Process weights on GPU (if needed)")
-        self._process_weights_layer_by_layer(model, model_config, gpu_device, cpu_device)
+        self._process_weights_layer_by_layer(model, model_config, gpu_device, cpu_device, vllm_config)
 
         return model.eval()
 
@@ -168,6 +168,7 @@ class FlexTensorModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         gpu_device: torch.device,
         cpu_device: torch.device,
+        vllm_config: VllmConfig,
     ) -> None:
         """Process weights layer-by-layer on GPU to avoid OOM."""
         layers_to_process = self._find_layers_needing_gpu_processing(model)
@@ -176,13 +177,20 @@ class FlexTensorModelLoader(DefaultModelLoader):
             logger.info("FlexTensorModelLoader: No layers need GPU processing")
             return
 
-        logger.info("FlexTensorModelLoader: Processing %d layers on GPU", len(layers_to_process))
+        warmup_deep_gemm = self._deep_gemm_warmup_enabled()
+        logger.info(
+            "FlexTensorModelLoader: Processing %d layers on GPU (DeepGEMM warmup: %s)",
+            len(layers_to_process),
+            "on" if warmup_deep_gemm else "off",
+        )
         processed_count = 0
         for layer_name, layer_module in layers_to_process.items():
             try:
                 layer_module.to(gpu_device)
                 self._materialize_parameter_subclasses(layer_module)
                 self._process_layer_weights(layer_module, model_config, gpu_device)
+                if warmup_deep_gemm:
+                    self._warmup_layer_deep_gemm(layer_module, vllm_config)
                 layer_module.to(cpu_device)
                 torch.cuda.empty_cache()
                 processed_count += 1
@@ -193,6 +201,66 @@ class FlexTensorModelLoader(DefaultModelLoader):
                 raise
 
         logger.info("FlexTensorModelLoader: Processed %d layers", processed_count)
+        if warmup_deep_gemm:
+            self._log_deep_gemm_warmup_summary()
+
+    @staticmethod
+    def _deep_gemm_warmup_enabled() -> bool:
+        """Whether to warm DeepGEMM kernels during load (mirrors vLLM's gate)."""
+        try:
+            import vllm.envs as envs
+            from vllm.utils.deep_gemm import is_deep_gemm_supported
+        except Exception:
+            return False
+        try:
+            return envs.VLLM_DEEP_GEMM_WARMUP != "skip" and is_deep_gemm_supported()
+        except Exception:
+            logger.debug(
+                "FlexTensorModelLoader: DeepGEMM support probe failed; disabling warmup",
+                exc_info=True,
+            )
+            return False
+
+    @staticmethod
+    def _warmup_layer_deep_gemm(layer: nn.Module, vllm_config: VllmConfig) -> None:
+        """JIT DeepGEMM while this layer is transiently on GPU.
+
+        Under offload, weights return to CPU after load, so we warm each layer
+        during its transient GPU pass instead of vLLM's post-load warmup.
+        Failures are logged and loading continues; DeepGEMM compiles on first
+        real use instead.
+        """
+        try:
+            from vllm.model_executor.warmup.deep_gemm_warmup import (
+                deepgemm_fp8_gemm_nt_warmup,
+                deepgemm_grouped_fp8_gemm_nt_contiguous_warmup,
+            )
+
+            max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+            deepgemm_fp8_gemm_nt_warmup(layer, max_tokens)
+            deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(layer, max_tokens)
+        except Exception as exc:
+            logger.warning(
+                "FlexTensorModelLoader: per-layer DeepGEMM warmup failed (%s); "
+                "kernels will JIT lazily on first use instead.",
+                exc,
+            )
+
+    @staticmethod
+    def _log_deep_gemm_warmup_summary() -> None:
+        """Report how many DeepGEMM kernel shapes were JIT'd during load."""
+        try:
+            from vllm.model_executor.warmup.deep_gemm_warmup import (
+                FP8_GEMM_NT_WARMUP_CACHE,
+                GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE,
+            )
+        except Exception:
+            return
+        logger.info(
+            "FlexTensorModelLoader: DeepGEMM warmup JIT'd %d fp8-linear + %d grouped-MoE kernel shape(s) during load",
+            len(FP8_GEMM_NT_WARMUP_CACHE),
+            len(GROUPED_FP8_GEMM_NT_CONTIGUOUS_WARMUP_CACHE),
+        )
 
     def _materialize_parameter_subclasses(self, layer: nn.Module) -> None:
         """Replace loaded vLLM parameter wrappers with plain Parameters.

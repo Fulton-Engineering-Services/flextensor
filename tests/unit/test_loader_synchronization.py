@@ -1086,3 +1086,41 @@ class TestEventMapClearing:
             assert all("stale" not in r.getMessage().lower() for r in caplog.records), (
                 "no safety-net log should fire when maps are already empty"
             )
+
+
+class TestLoaderDynamoDisable:
+    """Inference loader enter/exit stay outside compiled subgraphs when traps run.
+
+    Discovery's :class:`~flextensor.loaders.WarmupDirectTensorLoader` is not covered:
+    it only runs under the Dynamo-disabled discovery ``patched_forward``, and
+    compiled inference drives :class:`~flextensor.loaders.PreallocatedLoader`
+    through custom ops rather than this loader.
+    """
+
+    def test_concrete_loader_enter_exit_are_dynamo_disabled(self) -> None:
+        import inspect
+
+        from flextensor import loaders as loaders_mod
+        from flextensor.loaders import Loader, WarmupDirectTensorLoader
+
+        marker = "_torchdynamo_disable"
+        concrete = [
+            obj
+            for obj in vars(loaders_mod).values()
+            if inspect.isclass(obj)
+            and issubclass(obj, Loader)
+            and obj is not Loader
+            and obj is not WarmupDirectTensorLoader
+            and not inspect.isabstract(obj)
+        ]
+        assert concrete, "expected at least one concrete Loader subclass"
+
+        for cls in concrete:
+            for name in ("enter", "exit"):
+                method = cls.__dict__.get(name)
+                if method is None:
+                    # Inherited from a base class; checked on the defining class.
+                    continue
+                assert getattr(method, marker, False), (
+                    f"{cls.__name__}.{name} must be wrapped with compiler_utils.disable so Dynamo runs it eagerly"
+                )

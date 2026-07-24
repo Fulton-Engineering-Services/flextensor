@@ -159,6 +159,27 @@ def _make_worker(
     return w
 
 
+def _compiled_offload_manager(
+    *,
+    replan_active: bool = False,
+    replan_iters: int = 0,
+    eager_profiling_iters: int | None = None,
+    profiling_iters: int = 2,
+) -> MagicMock:
+    from flextensor.compile import COMPILED_EAGER_PROFILE_FORWARDS
+    from flextensor.offload_manager import OffloadPhase
+
+    om = MagicMock()
+    om.compiled_offload_active = True
+    om.compiled_replan_active = replan_active
+    om.request_strategy_replan.return_value = replan_iters
+    if eager_profiling_iters is None:
+        eager_profiling_iters = COMPILED_EAGER_PROFILE_FORWARDS if replan_active else profiling_iters
+    om.eager_profiling_iters = eager_profiling_iters
+    om.phase = OffloadPhase.INFERENCE
+    return om
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -182,7 +203,14 @@ class TestWarmupAndProfileModelCallContract:
             max_num_batched_tokens=max_num_batched_tokens,
         )
 
-        with patch.object(worker_module.flextensor, "pause_profiling") as mock_pause:
+        with (
+            patch.object(worker_module.flextensor, "pause_profiling") as mock_pause,
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(profiling_iters=profiling_iters),
+            ),
+        ):
             mock_pause.return_value.__enter__ = MagicMock(return_value=None)
             mock_pause.return_value.__exit__ = MagicMock(return_value=False)
 
@@ -229,7 +257,14 @@ class TestWarmupAndProfileModelCallContract:
 
         w.compile_or_warm_up_model.side_effect = _compile_side_effect
 
-        with patch.object(worker_module.flextensor, "pause_profiling", return_value=_Ctx()) as mock_pause:
+        with (
+            patch.object(worker_module.flextensor, "pause_profiling", return_value=_Ctx()) as mock_pause,
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(profiling_iters=2, eager_profiling_iters=2),
+            ),
+        ):
             w.warmup_and_profile_model()
 
         # pause_profiling is called exactly once and wraps the second compile call.
@@ -297,7 +332,14 @@ class TestWarmupAndProfileModelCallContract:
             max_num_batched_tokens=4096,
         )
 
-        with patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()):
+        with (
+            patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()),
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(profiling_iters=1, eager_profiling_iters=1),
+            ),
+        ):
             w.warmup_and_profile_model()
 
         profiling_and_inference_calls = [
@@ -320,7 +362,14 @@ class TestWarmupAndProfileModelCallContract:
             max_num_batched_tokens=1024,
         )
 
-        with patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()):
+        with (
+            patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()),
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(profiling_iters=1, eager_profiling_iters=1),
+            ),
+        ):
             w.warmup_and_profile_model()
 
         discovery_calls = [c for c in w.model_runner._dummy_run.call_args_list if c == call(1, skip_eplb=True)]
@@ -359,6 +408,11 @@ class TestWarmupAndProfileModelCallContract:
         with (
             patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()),
             patch.object(worker_module.psutil, "virtual_memory", side_effect=exc),
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(profiling_iters=profiling_iters),
+            ),
         ):
             w.warmup_and_profile_model()
 
@@ -372,6 +426,31 @@ class TestWarmupAndProfileModelCallContract:
             f"warmup_and_profile_model must complete despite {type(exc).__name__} from psutil.virtual_memory; "
             f"expected trailing two _dummy_run({max_num_tokens}, skip_eplb=True) calls but got {actual}"
         )
+
+    def test_eager_profiling_seed_uses_three_forwards_when_replan_active(self, worker_module):
+        """Compiled-offload + replan needs the fixed eager seed, not profiling_iters."""
+        from flextensor.compile import COMPILED_EAGER_PROFILE_FORWARDS
+
+        w = _make_worker(
+            worker_module,
+            discovery_iters=3,
+            profiling_iters=2,
+            max_model_len=1024,
+            max_num_batched_tokens=1024,
+        )
+
+        with (
+            patch.object(worker_module.flextensor, "pause_profiling", return_value=MagicMock()),
+            patch.object(
+                worker_module.flextensor,
+                "get_offload_manager",
+                return_value=_compiled_offload_manager(replan_active=True, replan_iters=0),
+            ),
+        ):
+            w.warmup_and_profile_model()
+
+        max_calls = [c for c in w.model_runner._dummy_run.call_args_list if c == call(1024, skip_eplb=True)]
+        assert len(max_calls) == COMPILED_EAGER_PROFILE_FORWARDS
 
 
 class TestVllmModelContext:

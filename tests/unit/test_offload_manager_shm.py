@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from flextensor.config import OffloadConfig
 from flextensor.host_pinning import HostPinner
 from flextensor.loaders import AllocationBlockController
 from flextensor.offload_manager import OffloadManager, OffloadModelProxy, OffloadPhase
@@ -113,6 +114,122 @@ class TestInitializeFromShm:
         assert manager._state_hook_handle is not None
         tagged = [h for h in model._forward_hooks.values() if getattr(h, "_ft_state_update_hook", False)]
         assert len(tagged) == 1, f"expected exactly one tagged state-update hook on the model, found {len(tagged)}"
+
+    def test_follower_installs_compiled_loader_when_compiled_offload_active(self):
+        """SHM followers must register the rolling loader, not just compile forwards."""
+        from flextensor import custom_ops
+        from flextensor.loaders import PreallocatedLoader
+
+        class _RecordingLoader(PreallocatedLoader):
+            def __init__(self) -> None:
+                self.entered: list[str] = []
+                self.exited: list[str] = []
+
+            def enter(self, label: str) -> None:
+                self.entered.append(label)
+
+            def exit(self, label: str) -> None:
+                self.exited.append(label)
+
+            def preload(self) -> None:
+                return None
+
+            def prepare(self) -> None:
+                return None
+
+        manager = OffloadManager("test_shm_compiled_loader")
+        manager.set_config(OffloadConfig(external_compile=True))
+        coordinator = _FakeCoordinator(is_creator=False, namespace="ft_ns_compiled")
+        model = torch.nn.Linear(4, 4)
+
+        loader = _RecordingLoader()
+        mock_tm = MagicMock()
+        mock_tm.shm_namespace = None
+        mock_tm.tensor_layer_loader = loader
+        mock_tm.initialize_warmup.return_value = model
+        mock_tm.initialize_profile.return_value = model
+        mock_tm.initialize_inference.return_value = model
+
+        def fake_init_tm():
+            manager._tensor_manager = mock_tm
+
+        manager._initialize_tensor_manager = fake_init_tm
+
+        custom_ops.clear_active_loader()
+        try:
+            with (
+                patch.object(manager, "_offload_modules"),
+                patch.object(manager, "_exclude_modules"),
+                patch.object(manager, "_patch_module_forward"),
+            ):
+                manager._initialize_from_shm(coordinator, model)
+
+            mid = manager.compiled_offload_manager_id
+            assert custom_ops.get_active_loader(mid) is loader
+        finally:
+            custom_ops.clear_active_loader()
+
+    def test_follower_resolves_compiled_offload_from_config(self):
+        """Follower init must read compiled_offload from config, not require manual flags."""
+        manager = OffloadManager("test_shm_config_resolve")
+        manager.set_config(OffloadConfig(external_compile=True))
+        coordinator = _FakeCoordinator(is_creator=False, namespace="ft_ns_resolve")
+        model = torch.nn.Linear(4, 4)
+
+        mock_tm = MagicMock()
+        mock_tm.shm_namespace = None
+        mock_tm.initialize_warmup.return_value = model
+        mock_tm.initialize_profile.return_value = model
+        mock_tm.initialize_inference.return_value = model
+
+        def fake_init_tm():
+            manager._tensor_manager = mock_tm
+
+        manager._initialize_tensor_manager = fake_init_tm
+
+        with (
+            patch.object(manager, "_offload_modules"),
+            patch.object(manager, "_exclude_modules"),
+            patch.object(manager, "_patch_module_forward"),
+            patch.object(manager._compiled, "setup_external_compiled_offload") as mock_setup,
+        ):
+            manager._initialize_from_shm(coordinator, model)
+
+        assert manager.compiled_offload_active is True
+        mock_setup.assert_called_once()
+
+    def test_follower_external_compile_arms_non_destructive_first_loader(self):
+        """SHM + external_compile must preserve sources for a later replan."""
+        manager = OffloadManager("test_shm_arm_replan_sources")
+        manager.set_config(OffloadConfig(external_compile=True))
+        coordinator = _FakeCoordinator(is_creator=False, namespace="ft_ns_arm")
+        model = torch.nn.Linear(4, 4)
+
+        mock_tm = MagicMock()
+        mock_tm.shm_namespace = None
+        mock_tm._first_loader_non_destructive = False
+        mock_tm.arm_non_destructive_first_loader.side_effect = lambda: setattr(
+            mock_tm, "_first_loader_non_destructive", True
+        )
+        mock_tm.initialize_warmup.return_value = model
+        mock_tm.initialize_profile.return_value = model
+        mock_tm.initialize_inference.return_value = model
+
+        def fake_init_tm():
+            manager._tensor_manager = mock_tm
+
+        manager._initialize_tensor_manager = fake_init_tm
+
+        with (
+            patch.object(manager, "_offload_modules"),
+            patch.object(manager, "_exclude_modules"),
+            patch.object(manager, "_patch_module_forward"),
+            patch.object(manager._compiled, "setup_external_compiled_offload"),
+        ):
+            manager._initialize_from_shm(coordinator, model)
+
+        assert mock_tm._first_loader_non_destructive is True
+        assert manager.compiled_replan_active is True
 
 
 class TestBlockNameFn:

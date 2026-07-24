@@ -286,6 +286,7 @@ class TestFlexTensorModelLoader:
             model_config,
             gpu_device=torch.device("cuda", 0),
             cpu_device=torch.device("cpu"),
+            vllm_config=SimpleNamespace(scheduler_config=SimpleNamespace(max_num_batched_tokens=512)),
         )
 
         assert type(quant_linear.weight) is nn.Parameter
