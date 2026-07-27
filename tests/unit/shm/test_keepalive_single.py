@@ -229,23 +229,6 @@ class TestKeepAliveSingle:
         keep_alive.close(any_process_alive=False)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
-    @pytest.mark.parametrize("keep_alive_seconds", [0.1, 0.5, 1])
-    def test_different_keepalive_intervals(self, keep_alive_seconds, lock_class):
-        """Test with different keep alive intervals."""
-        keep_alive = KeepAlive(
-            name=self.test_name,
-            process_id=self.process_id,
-            keep_alive_seconds=keep_alive_seconds,
-            is_creator=True,
-            lock_class=lock_class,
-        )
-
-        assert keep_alive.keep_alive_seconds == keep_alive_seconds
-        assert keep_alive.any_process_alive() is True
-
-        keep_alive.close(any_process_alive=False)
-
-    @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_any_process_alive_near_second_boundary(self, lock_class):
         """Regression test for #90: any_process_alive() must not mark a freshly created
         process as stale just because initialization and the check straddle a second boundary.

@@ -52,8 +52,6 @@ class TestOffloadConfig:
         assert config.min_blocks == 4
         assert config.max_gpu_mem_fraction == 0.9
         assert config.external_compile is False
-        with pytest.warns(DeprecationWarning):
-            assert config.max_gpu_mem_bytes is None
 
     def test_max_gpu_mem_fraction_default(self):
         """Default max_gpu_mem_fraction is 0.9."""
@@ -100,18 +98,6 @@ class TestOffloadConfig:
         """Unknown pinned_memory_mode values are rejected with a helpful message."""
         with pytest.raises(ValidationError, match="pinned_memory_mode"):
             OffloadConfig(pinned_memory_mode="cuda_alloc")
-
-    def test_max_gpu_mem_bytes_deprecated_emits_warning(self):
-        """Setting max_gpu_mem_bytes emits DeprecationWarning."""
-        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
-            config = OffloadConfig(max_gpu_mem_bytes=10 * 1024**3)
-            assert config.max_gpu_mem_bytes == 10 * 1024**3
-        assert config.max_gpu_mem_fraction is None  # default suppressed
-
-    def test_max_gpu_mem_bytes_and_fraction_both_set_raises(self):
-        """Setting both fields raises ValueError."""
-        with pytest.raises(ValidationError, match="Cannot set both"):
-            OffloadConfig(max_gpu_mem_bytes=10 * 1024**3, max_gpu_mem_fraction=0.8)
 
     def test_custom_values(self):
         """Test setting custom values."""
@@ -244,23 +230,6 @@ class TestOffloadConfig:
         """Unknown profile_mode values are rejected by the Literal validator."""
         with pytest.raises(ValidationError, match="profile_mode"):
             OffloadConfig(profile_mode="bogus")
-
-    def test_max_gpu_mem_bytes_custom(self):
-        """Test setting custom max_gpu_mem_bytes value."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(max_gpu_mem_bytes=48 * 1024**3)
-            assert config.max_gpu_mem_bytes == 48 * 1024**3
-
-    def test_max_gpu_mem_bytes_zero(self):
-        """Test that max_gpu_mem_bytes=0 is accepted."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(max_gpu_mem_bytes=0)
-            assert config.max_gpu_mem_bytes == 0
-
-    def test_max_gpu_mem_bytes_validation_negative(self):
-        """Test that negative max_gpu_mem_bytes raises validation error."""
-        with pytest.raises(ValidationError), pytest.warns(DeprecationWarning):
-            OffloadConfig(max_gpu_mem_bytes=-1)
 
     def test_pre_inference_iters_property(self):
         """Test pre_inference_iters property calculation."""
@@ -437,15 +406,6 @@ class TestOffloadConfig:
         # at offload time. Reject at construction for parity with ``"class:"``.
         with pytest.raises(ValidationError, match="empty or whitespace-only"):
             OffloadConfig(include_patterns=[entry])
-
-    def test_deprecated_module_patterns_routes_through_validator(self):
-        # ``module_patterns`` is mapped to ``include_patterns`` by a model
-        # validator; the field validator on ``include_patterns`` then runs
-        # and catches malformed entries from the deprecated path too.
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            with pytest.raises(ValidationError, match="empty body"):
-                OffloadConfig(module_patterns=["class:"])
 
     def test_json_schema_has_field_descriptions(self):
         """All OffloadConfig fields must have descriptions in JSON Schema."""
@@ -783,21 +743,6 @@ class TestLoadConfigFromEnv:
         config = load_config_from_env()
         assert config.min_blocks == 3
 
-    def test_max_gpu_mem_bytes_from_env(self):
-        """Test loading max_gpu_mem_bytes from FT_MAX_GPU_MEM_BYTES env var."""
-        os.environ["FT_MAX_GPU_MEM_BYTES"] = str(48 * 1024**3)
-        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
-            config = load_config_from_env()
-            assert config.max_gpu_mem_bytes == 48 * 1024**3
-        assert config.max_gpu_mem_fraction is None
-
-    def test_max_gpu_mem_bytes_none_from_env(self):
-        """Test setting max_gpu_mem_bytes to None via FT_MAX_GPU_MEM_BYTES=none."""
-        os.environ["FT_MAX_GPU_MEM_BYTES"] = "none"
-        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
-            config = load_config_from_env()
-            assert config.max_gpu_mem_bytes is None
-
     def test_max_gpu_mem_fraction_from_env(self):
         """Test loading max_gpu_mem_fraction from FT_MAX_GPU_MEM_FRACTION env var."""
         os.environ["FT_MAX_GPU_MEM_FRACTION"] = "0.75"
@@ -809,13 +754,6 @@ class TestLoadConfigFromEnv:
         os.environ["FT_MAX_GPU_MEM_FRACTION"] = "none"
         config = load_config_from_env()
         assert config.max_gpu_mem_fraction is None
-
-    def test_max_gpu_mem_bytes_and_fraction_env_both_set_raises(self):
-        """Setting both FT_MAX_GPU_MEM_BYTES and FT_MAX_GPU_MEM_FRACTION raises."""
-        os.environ["FT_MAX_GPU_MEM_BYTES"] = str(20 * 1024**3)
-        os.environ["FT_MAX_GPU_MEM_FRACTION"] = "0.8"
-        with pytest.raises(ValidationError, match="Cannot set both"):
-            load_config_from_env()
 
     def test_all_int_fields(self):
         """Test loading all integer fields from environment."""
@@ -1204,38 +1142,6 @@ num_blocks = 8
         config = load_config_from_file(config_file)
         assert config.min_blocks == 3
 
-    def test_max_gpu_mem_bytes_from_yaml_file(self, tmp_path):
-        """Test loading max_gpu_mem_bytes from YAML file."""
-        config_file = tmp_path / "test.yaml"
-        config_file.write_text("""max_gpu_mem_bytes: 51539607552
-""")
-        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
-            config = load_config_from_file(config_file)
-            assert config.max_gpu_mem_bytes == 48 * 1024**3
-        assert config.max_gpu_mem_fraction is None
-
-    def test_max_gpu_mem_bytes_null_from_yaml_file(self, tmp_path):
-        """Test that max_gpu_mem_bytes defaults to None when absent from YAML file."""
-        config_file = tmp_path / "test.yaml"
-        config_file.write_text("""gpu_device: 0
-""")
-        config = load_config_from_file(config_file)
-        with pytest.warns(DeprecationWarning):
-            assert config.max_gpu_mem_bytes is None
-
-    def test_min_blocks_and_max_gpu_mem_bytes_from_json_file(self, tmp_path):
-        """Test loading min_blocks and max_gpu_mem_bytes from JSON file."""
-        config_file = tmp_path / "test.json"
-        config_file.write_text("""{
-    "min_blocks": 2,
-    "max_gpu_mem_bytes": 85899345920
-}""")
-        with pytest.warns(DeprecationWarning, match="max_gpu_mem_bytes"):
-            config = load_config_from_file(config_file)
-            assert config.max_gpu_mem_bytes == 80 * 1024**3
-        assert config.min_blocks == 2
-        assert config.max_gpu_mem_fraction is None
-
     def test_max_gpu_mem_fraction_from_yaml_file(self, tmp_path):
         """Test loading max_gpu_mem_fraction from YAML file."""
         config_file = tmp_path / "test.yaml"
@@ -1373,11 +1279,6 @@ class TestGetFieldTypes:
         assert field_types["discovery_iters"] is int
         assert field_types["num_blocks"] is int
         assert field_types["min_blocks"] is int
-
-    def test_optional_int_fields(self):
-        """Test that optional int fields (int | None) are correctly identified as int."""
-        field_types = _get_field_types()
-        assert field_types["max_gpu_mem_bytes"] is int
 
     def test_float_fields(self):
         """Test that float fields are correctly identified."""
@@ -1582,31 +1483,6 @@ class TestShmConfigFields:
         assert config.shm_namespace is None
         assert config.shm_wait_timeout == 0.0
 
-    def test_shm_enabled_replaces_use_shared_memory(self):
-        """shm_enabled is the canonical field; use_shared_memory is deprecated alias."""
-        config = OffloadConfig(shm_enabled=True)
-        assert config.shm_enabled is True
-        # Backward compat: use_shared_memory still readable (access warns, that's expected)
-        with pytest.warns(DeprecationWarning):
-            assert config.use_shared_memory is True
-
-    def test_use_shared_memory_sets_shm_enabled(self):
-        """Deprecated use_shared_memory sets shm_enabled."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(use_shared_memory=True)
-        assert config.shm_enabled is True
-
-    def test_use_shared_memory_warns_on_construction(self):
-        """Passing use_shared_memory emits DeprecationWarning at construction time."""
-        with pytest.warns(DeprecationWarning, match="use_shared_memory"):
-            OffloadConfig(use_shared_memory=True)
-
-    def test_use_shared_memory_warns_on_access(self):
-        """Reading use_shared_memory on an instance emits DeprecationWarning."""
-        config = OffloadConfig(shm_enabled=True)
-        with pytest.warns(DeprecationWarning, match="use_shared_memory"):
-            _ = config.use_shared_memory
-
     def test_shm_enabled_construction_no_warning(self):
         """Constructing with shm_enabled (the new field) emits no deprecation warning."""
         with warnings.catch_warnings():
@@ -1624,164 +1500,19 @@ class TestShmConfigFields:
         assert config.shm_wait_timeout == 300.0
 
 
-class TestModulePatternsDeprecation:
-    """Tests for deprecated module_patterns → include_patterns migration."""
-
-    def test_module_patterns_maps_to_include_patterns(self):
-        """Passing module_patterns sets include_patterns with a deprecation warning."""
-        with pytest.warns(DeprecationWarning, match="module_patterns"):
-            config = OffloadConfig(module_patterns=["layers.*", "head"])
-        assert config.include_patterns == ["layers.*", "head"]
-        assert config.module_patterns == ["layers.*", "head"]
-
-    def test_both_patterns_raises_value_error(self):
-        """Passing both module_patterns and include_patterns raises ValueError."""
-        with pytest.raises(ValueError, match="Cannot set both"):
-            OffloadConfig(include_patterns=["layers.*"], module_patterns=["head"])
-
-    def test_include_patterns_no_warning(self):
-        """Using include_patterns directly emits no deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = OffloadConfig(include_patterns=["layers.*"])
-        assert config.include_patterns == ["layers.*"]
-        assert not any("module_patterns" in str(warning.message) for warning in w)
-
-    def test_module_patterns_env_var(self, monkeypatch):
-        """FT_MODULE_PATTERNS env var maps to include_patterns with a warning."""
-        monkeypatch.setenv("FT_MODULE_PATTERNS", "layers.*,head")
-        with pytest.warns(DeprecationWarning, match="module_patterns"):
-            config = load_config_from_env()
-        assert config.include_patterns == ["layers.*", "head"]
-
-    def test_both_env_patterns_raises_value_error(self, monkeypatch):
-        """Setting both FT_MODULE_PATTERNS and FT_INCLUDE_PATTERNS raises ValueError."""
-        monkeypatch.setenv("FT_MODULE_PATTERNS", "old_pattern")
-        monkeypatch.setenv("FT_INCLUDE_PATTERNS", "layers.*")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config_from_env()
-
-    def test_module_patterns_none_no_warning(self):
-        """Passing module_patterns=None should not emit a warning or break validation."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = OffloadConfig(module_patterns=None)
-        assert config.include_patterns == ["*"]
-        assert not any("module_patterns" in str(warning.message) for warning in w)
-
-    def test_module_patterns_from_json_file(self, tmp_path):
-        """module_patterns in a JSON config file maps to include_patterns.
-
-        Regression: _get_field_types() classified list[str] | None as object,
-        so _process_data_dict silently dropped module_patterns before the
-        pydantic validator could migrate it to include_patterns.
-        """
-        import json
-
-        config_file = tmp_path / "test.json"
-        config_file.write_text(json.dumps({"module_patterns": ["layers.*", "head"]}))
-        with pytest.warns(DeprecationWarning, match="module_patterns"):
-            config = load_config_from_file(config_file)
-        assert config.include_patterns == ["layers.*", "head"]
-
-    def test_module_patterns_from_yaml_file(self, tmp_path):
-        """module_patterns in a YAML config file maps to include_patterns."""
-        config_file = tmp_path / "test.yaml"
-        config_file.write_text("module_patterns:\n  - layers.*\n  - head\n")
-        with pytest.warns(DeprecationWarning, match="module_patterns"):
-            config = load_config_from_file(config_file)
-        assert config.include_patterns == ["layers.*", "head"]
-
-    def test_module_patterns_from_ini_file(self, tmp_path):
-        """module_patterns in an INI config file maps to include_patterns.
-
-        INI files store lists as comma-separated strings, which need special
-        handling in _load_ini_file. module_patterns must survive through to
-        the pydantic validator.
-        """
-        config_file = tmp_path / "test.conf"
-        config_file.write_text("[flextensor]\nmodule_patterns = layers.*,head\n")
-        with pytest.warns(DeprecationWarning, match="module_patterns"):
-            config = load_config_from_file(config_file)
-        assert config.include_patterns == ["layers.*", "head"]
-
-    def test_get_field_types_classifies_optional_list_as_list(self):
-        """_get_field_types must classify list[str] | None as list, not object.
-
-        Regression: the Optional wrapper made the union type fall through
-        to object, silently dropping module_patterns from file configs.
-        """
-        ft = _get_field_types()
-        assert ft["module_patterns"] is list
-
-
-class TestKnapsackScaleDeprecation:
-    """Tests for deprecated knapsack_scale → transfer_budget_scale migration."""
-
-    def test_knapsack_scale_maps_to_transfer_budget_scale(self):
-        """Passing knapsack_scale sets transfer_budget_scale with a deprecation warning."""
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            config = OffloadConfig(knapsack_scale=2.0)
-        assert config.transfer_budget_scale == 2.0
-
-    def test_both_fields_raises_value_error(self):
-        """Passing both knapsack_scale and transfer_budget_scale raises ValueError."""
-        with pytest.raises(ValueError, match="Cannot set both"):
-            OffloadConfig(transfer_budget_scale=1.5, knapsack_scale=2.0)
-
-    def test_transfer_budget_scale_no_warning(self):
-        """Using transfer_budget_scale directly emits no deprecation warning."""
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = OffloadConfig(transfer_budget_scale=1.5)
-        assert config.transfer_budget_scale == 1.5
-        assert not any("knapsack_scale" in str(warning.message) for warning in w)
-
-    def test_knapsack_scale_warns_on_access(self):
-        """Reading knapsack_scale on an instance emits DeprecationWarning."""
-        config = OffloadConfig(transfer_budget_scale=1.5)
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            assert config.knapsack_scale == 1.5
-
-    def test_knapsack_scale_env_var(self, monkeypatch):
-        """FT_KNAPSACK_SCALE env var maps to transfer_budget_scale with a warning."""
-        monkeypatch.setenv("FT_KNAPSACK_SCALE", "2.5")
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            config = load_config_from_env()
-        assert config.transfer_budget_scale == 2.5
-
-    def test_both_env_vars_raises_value_error(self, monkeypatch):
-        """Setting both FT_KNAPSACK_SCALE and FT_TRANSFER_BUDGET_SCALE raises ValueError."""
-        monkeypatch.setenv("FT_KNAPSACK_SCALE", "1.5")
-        monkeypatch.setenv("FT_TRANSFER_BUDGET_SCALE", "2.0")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config_from_env()
-
-    def test_knapsack_scale_from_json_file(self, tmp_path):
-        """knapsack_scale in a JSON config file maps to transfer_budget_scale."""
-        import json
-
-        config_file = tmp_path / "test.json"
-        config_file.write_text(json.dumps({"knapsack_scale": 2.0}))
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            config = load_config_from_file(config_file)
-        assert config.transfer_budget_scale == 2.0
-
-    def test_knapsack_scale_from_yaml_file(self, tmp_path):
-        """knapsack_scale in a YAML config file maps to transfer_budget_scale."""
-        config_file = tmp_path / "test.yaml"
-        config_file.write_text("knapsack_scale: 2.0\n")
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            config = load_config_from_file(config_file)
-        assert config.transfer_budget_scale == 2.0
-
-    def test_knapsack_scale_from_ini_file(self, tmp_path):
-        """knapsack_scale in an INI config file maps to transfer_budget_scale."""
-        config_file = tmp_path / "test.conf"
-        config_file.write_text("[flextensor]\nknapsack_scale = 2.0\n")
-        with pytest.warns(DeprecationWarning, match="knapsack_scale"):
-            config = load_config_from_file(config_file)
-        assert config.transfer_budget_scale == 2.0
+class TestExpiredCompatibilityFields:
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "knapsack_scale",
+            "module_patterns",
+            "max_gpu_mem_bytes",
+            "use_shared_memory",
+        ],
+    )
+    def test_expired_field_is_not_exposed(self, field):
+        with pytest.raises(AttributeError):
+            getattr(OffloadConfig(), field)
 
 
 class TestRemovedFieldsRejection:
@@ -1984,34 +1715,6 @@ class TestModelCopyDeprecatedFieldSync:
         assert copied.profile_iters == 4
         assert copied.profiling_iters == 4
 
-    def test_model_copy_syncs_shm_enabled_to_use_shared_memory(self):
-        config = OffloadConfig(shm_enabled=False)
-        copied = config.model_copy(update={"shm_enabled": True})
-        assert copied.shm_enabled is True
-        assert copied.use_shared_memory is True
-
-    def test_model_copy_syncs_use_shared_memory_to_shm_enabled(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            config = OffloadConfig(use_shared_memory=False)
-        copied = config.model_copy(update={"use_shared_memory": True})
-        assert copied.use_shared_memory is True
-        assert copied.shm_enabled is True
-
-    def test_model_copy_syncs_transfer_budget_scale_to_knapsack_scale(self):
-        config = OffloadConfig(transfer_budget_scale=1.0)
-        copied = config.model_copy(update={"transfer_budget_scale": 0.8})
-        assert copied.transfer_budget_scale == 0.8
-        assert copied.knapsack_scale == 0.8
-
-    def test_model_copy_syncs_knapsack_scale_to_transfer_budget_scale(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            config = OffloadConfig(knapsack_scale=1.0)
-        copied = config.model_copy(update={"knapsack_scale": 0.6})
-        assert copied.knapsack_scale == 0.6
-        assert copied.transfer_budget_scale == 0.6
-
     def test_model_copy_explicit_both_sides_no_mirror(self):
         """When both sides of a pair are in the update with the same value, no mirroring happens."""
         config = OffloadConfig(discovery_iters=1)
@@ -2040,14 +1743,12 @@ class TestModelCopyDeprecatedFieldSync:
         assert copied.warmup_iters == 9
 
     def test_model_copy_multiple_pairs_updated(self):
-        config = OffloadConfig(discovery_iters=1, profiling_iters=10, shm_enabled=False)
-        copied = config.model_copy(update={"discovery_iters": 3, "profiling_iters": 2, "shm_enabled": True})
+        config = OffloadConfig(discovery_iters=1, profiling_iters=10)
+        copied = config.model_copy(update={"discovery_iters": 3, "profiling_iters": 2})
         assert copied.discovery_iters == 3
         assert copied.warmup_iters == 3
         assert copied.profiling_iters == 2
         assert copied.profile_iters == 2
-        assert copied.shm_enabled is True
-        assert copied.use_shared_memory is True
 
     def test_model_copy_unrelated_field_no_side_effects(self):
         """Updating include_patterns does not alter iter fields."""

@@ -5,8 +5,6 @@
 
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from flextensor.config import OffloadConfig
 from flextensor.shm.namespace import (
     SHM_PROTOCOL_VERSION,
@@ -140,17 +138,6 @@ class TestComputeShmNamespace:
             ns2 = compute_shm_namespace("/models/qwen", config)
 
         assert ns1 == ns2
-
-    def test_deprecated_bytes_path_no_gpu_query(self):
-        """Deprecated max_gpu_mem_bytes path uses raw bytes in hash, no GPU query."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
-
-        with patch("flextensor.utils.torch.cuda.get_device_properties") as mock_props:
-            ns = compute_shm_namespace("/models/qwen", config)
-
-        mock_props.assert_not_called()
-        assert ns.startswith("ft_")
 
     def test_latency_mode_no_gpu_query(self):
         """max_gpu_mem_fraction=None (latency mode) produces a valid namespace, no GPU query."""

@@ -28,12 +28,6 @@ from flextensor.utils import CLASS_PATTERN_PREFIX, NAME_PATTERN_PREFIX
 
 logger = logging.getLogger(__name__)
 
-_USE_SHARED_MEMORY_MSG = "`use_shared_memory` is deprecated. Use `shm_enabled` instead. Will be removed in v0.5."
-_MAX_GPU_MEM_BYTES_MSG = (
-    "`max_gpu_mem_bytes` is deprecated. Use `max_gpu_mem_fraction` instead. Will be removed in v0.3."
-)
-_MODULE_PATTERNS_MSG = "`module_patterns` is deprecated. Use `include_patterns` instead. Will be removed in v0.3."
-_KNAPSACK_SCALE_MSG = "`knapsack_scale` is deprecated. Use `transfer_budget_scale` instead. Will be removed in v0.3."
 _WARMUP_ITERS_MSG = "`warmup_iters` is deprecated. Use `discovery_iters` instead. Will be removed in v0.4.0."
 _PROFILE_ITERS_MSG = "`profile_iters` is deprecated. Use `profiling_iters` instead. Will be removed in v0.4.0."
 _ALL_WARMUP_ITERS_MSG = (
@@ -44,20 +38,14 @@ _DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
 ProfileMode = Literal["torch_function", "getter", "view"]
 
-# Bidirectional deprecated ↔ canonical field pairs.  Used by model_copy()
+# Bidirectional deprecated ↔ canonical field pairs. Used by model_copy()
 # to mirror updates so that Pydantic v2's validator-bypass doesn't desync
-# deprecated fields from their replacements.  One-directional deprecations
-# (module_patterns, max_gpu_mem_bytes) are excluded — their sync logic is
-# not a simple value mirror.
+# deprecated fields from their replacements.
 _DEPRECATED_FIELD_MIRRORS: dict[str, str] = {
     "discovery_iters": "warmup_iters",
     "warmup_iters": "discovery_iters",
     "profiling_iters": "profile_iters",
     "profile_iters": "profiling_iters",
-    "shm_enabled": "use_shared_memory",
-    "use_shared_memory": "shm_enabled",
-    "transfer_budget_scale": "knapsack_scale",
-    "knapsack_scale": "transfer_budget_scale",
 }
 
 _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
@@ -117,21 +105,11 @@ class OffloadConfig(BaseModel):
           ``pinned_memory=False`` on CPU-only hosts.
     """
 
-    use_shared_memory: Annotated[bool, _deprecated(_USE_SHARED_MEMORY_MSG)] = Field(
-        default=False, deprecated=_USE_SHARED_MEMORY_MSG
-    )
-    """Whether to use shared memory.
-
-    .. deprecated:: v0.1.0
-        Use :attr:`shm_enabled` instead. Will be removed in v0.3.
-    """
-
     shm_enabled: bool = Field(default=False)
     """Enable cross-process weight sharing via POSIX shared memory.
 
     When True, model weights are stored in shared memory so multiple processes
     (e.g., vLLM data-parallel replicas) share a single copy in CPU RAM.
-    Replaces the deprecated ``use_shared_memory`` field.
     Can also be set via the ``FT_SHM_ENABLED`` env var.
     """
 
@@ -207,15 +185,6 @@ class OffloadConfig(BaseModel):
     this value to meet the GPU memory target.
     """
 
-    knapsack_scale: Annotated[float, _deprecated(_KNAPSACK_SCALE_MSG)] = Field(
-        default=1.0, gt=0.0, deprecated=_KNAPSACK_SCALE_MSG
-    )
-    """Duration multiplier for transfer budget estimation (deprecated).
-
-    .. deprecated:: v0.2.0
-        Use :attr:`transfer_budget_scale` instead. Will be removed in v0.3.
-    """
-
     transfer_mode: str = Field(default="allocation_block_transfer")
     """Tensor loading mode. Block transfer loaders (``allocation_block_transfer``,
     ``raw_block_transfer``) do not support shared tensors between layers;
@@ -249,16 +218,6 @@ class OffloadConfig(BaseModel):
     the strategy never targets more than what is free. When ``None``, the strategy operates
     in *latency mode* (no memory constraint).
     Defaults to 0.9. Can also be set via the ``FT_MAX_GPU_MEM_FRACTION`` env var.
-    """
-
-    max_gpu_mem_bytes: Annotated[int | None, _deprecated(_MAX_GPU_MEM_BYTES_MSG)] = Field(
-        default=None, ge=0, deprecated=_MAX_GPU_MEM_BYTES_MSG
-    )
-    """Hard GPU memory limit in bytes (never exceed).
-
-    .. deprecated:: v0.1.0
-        Use :attr:`max_gpu_mem_fraction` instead. Will be removed in v0.3.
-        Env var ``FT_MAX_GPU_MEM_BYTES`` is similarly deprecated; use ``FT_MAX_GPU_MEM_FRACTION``.
     """
 
     profile_storage_dir: str | None = Field(default=None)
@@ -350,15 +309,6 @@ class OffloadConfig(BaseModel):
     Validated at construction; assignment / in-place mutation bypasses validation.
     """
 
-    module_patterns: Annotated[list[str] | None, _deprecated(_MODULE_PATTERNS_MSG)] = Field(
-        default=None, deprecated=_MODULE_PATTERNS_MSG
-    )
-    """Module path patterns to include for offloading.
-
-    .. deprecated:: v0.2.0
-        Use :attr:`include_patterns` instead. Will be removed in v0.3.
-    """
-
     enable_diagnostics: bool = Field(default=False)
     """Whether to log diagnostic information (per-trap duration statistics, block assignment table)
        after strategy computation.
@@ -418,74 +368,6 @@ class OffloadConfig(BaseModel):
                 data["profiling_iters"] = data["profile_iters"]
             elif has_profiling:
                 data["profile_iters"] = data["profiling_iters"]
-        return data
-
-    # Note: pydantic v2 runs mode="before" validators in reverse definition order.
-    # _sync_shm_fields (defined after this) runs first, then this validator.
-    # These two validators have no dependencies on each other, so ordering is harmless.
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_max_gpu_mem_bytes(cls, data: Any) -> Any:
-        """Handle deprecated max_gpu_mem_bytes field."""
-        if isinstance(data, dict):
-            bytes_set = "max_gpu_mem_bytes" in data
-            fraction_set = "max_gpu_mem_fraction" in data
-            if bytes_set and not fraction_set:
-                warnings.warn(_MAX_GPU_MEM_BYTES_MSG, DeprecationWarning, stacklevel=2)
-                data["max_gpu_mem_fraction"] = None  # suppress default; activate bytes path
-            elif bytes_set and fraction_set:
-                msg = "Cannot set both max_gpu_mem_bytes and max_gpu_mem_fraction"
-                raise ValueError(msg)
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def _sync_module_patterns(cls, data: Any) -> Any:
-        """Map deprecated module_patterns to include_patterns."""
-        if isinstance(data, dict) and "module_patterns" in data:
-            if data["module_patterns"] is None:
-                return data
-            if "include_patterns" in data:
-                msg = "Cannot set both `module_patterns` (deprecated) and `include_patterns`."
-                raise ValueError(msg)
-            warnings.warn(_MODULE_PATTERNS_MSG, DeprecationWarning, stacklevel=2)
-            data["include_patterns"] = data["module_patterns"]
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def _sync_shm_fields(cls, data: Any) -> Any:
-        """Sync deprecated use_shared_memory with shm_enabled."""
-        if isinstance(data, dict):
-            old_set = "use_shared_memory" in data
-            new_set = "shm_enabled" in data
-            if old_set and not new_set:
-                warnings.warn(_USE_SHARED_MEMORY_MSG, DeprecationWarning, stacklevel=2)
-                data["shm_enabled"] = data["use_shared_memory"]
-            elif new_set and not old_set:
-                data["use_shared_memory"] = data["shm_enabled"]
-            elif old_set and new_set:
-                if data["use_shared_memory"] != data["shm_enabled"]:
-                    msg = "Cannot set both `use_shared_memory` (deprecated) and `shm_enabled` to different values."
-                    raise ValueError(msg)
-                warnings.warn(_USE_SHARED_MEMORY_MSG, DeprecationWarning, stacklevel=2)
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
-    def _sync_knapsack_scale(cls, data: Any) -> Any:
-        """Sync deprecated knapsack_scale with transfer_budget_scale."""
-        if isinstance(data, dict):
-            old_set = "knapsack_scale" in data
-            new_set = "transfer_budget_scale" in data
-            if old_set and not new_set:
-                warnings.warn(_KNAPSACK_SCALE_MSG, DeprecationWarning, stacklevel=2)
-                data["transfer_budget_scale"] = data["knapsack_scale"]
-            elif new_set and not old_set:
-                data["knapsack_scale"] = data["transfer_budget_scale"]
-            elif old_set and new_set:
-                msg = "Cannot set both `knapsack_scale` (deprecated) and `transfer_budget_scale`."
-                raise ValueError(msg)
         return data
 
     @field_validator("include_patterns", "exclude_patterns", mode="before")
@@ -967,10 +849,7 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
                 msg,
             )
 
-    csv_to_list = lambda v: [p.strip() for p in v.split(",") if p.strip()]  # noqa: E731
     for migration in (
-        ("MODULE_PATTERNS", "INCLUDE_PATTERNS", _MODULE_PATTERNS_MSG, csv_to_list),
-        ("KNAPSACK_SCALE", "TRANSFER_BUDGET_SCALE", _KNAPSACK_SCALE_MSG, float),
         ("WARMUP_ITERS", "DISCOVERY_ITERS", _WARMUP_ITERS_MSG, int),
         ("PROFILE_ITERS", "PROFILING_ITERS", _PROFILE_ITERS_MSG, int),
     ):
@@ -979,10 +858,8 @@ def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, A
             config_dict[result[0]] = result[1]
 
     for field_name, field_type in field_types.items():
-        # module_patterns and knapsack_scale have dedicated env-var handling
-        # above (conflict check with env-var-specific error message +
-        # deprecation warning).
-        if field_type is object or field_name in ("module_patterns", "knapsack_scale", "warmup_iters", "profile_iters"):
+        # Deprecated iteration fields have dedicated env-var handling above.
+        if field_type is object or field_name in ("warmup_iters", "profile_iters"):
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"

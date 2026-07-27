@@ -161,23 +161,6 @@ class TestMaxGpuMemResolution:
         _, kwargs = mock_tm.call_args
         assert kwargs["max_gpu_mem_fraction"] is None
 
-    def test_deprecated_bytes_converted_to_fraction(self):
-        """Deprecated max_gpu_mem_bytes path: config syncs to max_gpu_mem_fraction."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
-        om = OffloadManager("test_deprecated_bytes")
-        om.set_config(config)
-
-        with (
-            patch("flextensor.offload_manager.AdaptiveStrategy"),
-            patch("flextensor.tensor_manager.TensorManager") as mock_tm,
-        ):
-            om._initialize_tensor_manager()
-
-        _, kwargs = mock_tm.call_args
-        # The deprecated bytes path syncs to max_gpu_mem_fraction via model_validator
-        assert "max_gpu_mem_fraction" in kwargs
-
     def test_fraction_uses_correct_gpu_device(self):
         """gpu_device index is forwarded to TensorManager."""
         config = OffloadConfig(gpu_device=1, max_gpu_mem_fraction=0.5)

@@ -48,17 +48,6 @@ class TestResolveGpuMemBytes:
         assert result is None
         mock_get.assert_not_called()
 
-    def test_deprecated_bytes_returned_when_fraction_none(self):
-        """When fraction is None due to deprecated bytes path, returns the bytes value."""
-        with pytest.warns(DeprecationWarning):
-            config = OffloadConfig(max_gpu_mem_bytes=20 * 1024**3)
-
-        with patch("flextensor.gpu_budget.torch.cuda.get_device_properties") as mock_get:
-            result = resolve_gpu_mem_bytes(config)
-
-        assert result == 20 * 1024**3
-        mock_get.assert_not_called()
-
     def test_cuda_query_failure_raises_runtime_error(self):
         """RuntimeError from get_device_properties is re-raised with context."""
         config = OffloadConfig(max_gpu_mem_fraction=0.9)

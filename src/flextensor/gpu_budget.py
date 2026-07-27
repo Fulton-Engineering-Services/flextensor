@@ -5,7 +5,7 @@
 import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 
@@ -89,8 +89,7 @@ def resolve_gpu_mem_bytes(config: Any, *, context: str = "") -> int | None:
     """Resolve GPU memory limit from config to an absolute byte count.
 
     If ``max_gpu_mem_fraction`` is set, queries GPU device properties and returns
-    ``int(total_memory * fraction)``. If ``None``, falls back to the deprecated
-    ``max_gpu_mem_bytes`` value (which may itself be ``None`` for latency mode).
+    ``int(total_memory * fraction)``. If ``None``, returns ``None`` for latency mode.
     """
     if config.max_gpu_mem_fraction is not None:
         try:
@@ -104,9 +103,7 @@ def resolve_gpu_mem_bytes(config: Any, *, context: str = "") -> int | None:
             ) from e
         return int(props.total_memory * config.max_gpu_mem_fraction)
 
-    # Fraction is None: either explicit latency mode or deprecated max_gpu_mem_bytes path.
-    # Read via model_dump to avoid triggering the deprecation accessor warning.
-    return cast("int | None", config.model_dump(warnings=False).get("max_gpu_mem_bytes"))
+    return None
 
 
 def tensor_needs_permanent_gpu_budget(tensor: torch.Tensor, device_gpu: torch.device) -> bool:

@@ -57,6 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot account for the compile path (`offload(model, compile_fn=...)`). Prefer
   the path-aware `OffloadManager.iters_before_inference`.
 
+### Removed
+
+- Removed the expired `OffloadConfig` aliases `knapsack_scale`,
+  `module_patterns`, `max_gpu_mem_bytes`, and `use_shared_memory`. Use
+  `transfer_budget_scale`, `include_patterns`, `max_gpu_mem_fraction`, and
+  `shm_enabled`, respectively. The corresponding deprecated `FT_*` environment
+  variables are no longer mapped to their replacements. To migrate
+  `max_gpu_mem_bytes=N`, set `max_gpu_mem_fraction=N / total_gpu_bytes`, or set
+  `max_gpu_mem_fraction=None` to use latency mode without a memory constraint.
+
 ### Fixed
 
 - Avoid raw CUDA OOM during inference setup by budgeting for available GPU

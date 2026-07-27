@@ -223,7 +223,6 @@ When `enabled=False`, FlexTensor passes through to normal PyTorch execution with
 | `shm_namespace` | str \| None | `None` | Base namespace for SHM blocks (auto-derived if None) |
 | `shm_wait_timeout` | float | `0.0` | Hard timeout (seconds) for followers waiting on creator |
 | `max_gpu_mem_fraction` | float \| None | `0.9` | GPU memory budget as a fraction of total device memory (e.g. `0.9` = 90%). `None` = latency mode (no constraint). |
-| `max_gpu_mem_bytes` | int \| None | `None` | Deprecated since v0.4 — use `max_gpu_mem_fraction` instead. Will be removed in v0.5. |
 
 #### Pinned Memory
 
@@ -285,23 +284,12 @@ config = OffloadConfig(
 )
 ```
 
-!!! note "Default changed in v0.4"
-    Before v0.4, `max_gpu_mem_fraction` did not exist and `max_gpu_mem_bytes` defaulted to `None`
-    (latency mode). As of v0.4, the default is `0.9` (memory mode). If your workload previously
-    relied on latency mode by default, set `max_gpu_mem_fraction=None` explicitly.
-
 This option can also be set via the `FT_MAX_GPU_MEM_FRACTION` environment variable:
 
 ```bash
 FT_MAX_GPU_MEM_FRACTION=0.8   # Use 80% of GPU memory (memory mode)
 FT_MAX_GPU_MEM_FRACTION=none   # Switch to latency mode (also accepts "null" or "")
 ```
-
-!!! warning "Deprecated: `max_gpu_mem_bytes`"
-    `max_gpu_mem_bytes` and its env var `FT_MAX_GPU_MEM_BYTES` are deprecated since v0.4 and will
-    be removed in v0.5. Replace any use of `max_gpu_mem_bytes=N` with
-    `max_gpu_mem_fraction=N / total_gpu_bytes`, or use `max_gpu_mem_fraction=0.9` to target 90%
-    of device memory portably.
 
 #### Shared Memory (Cross-Process Weight Sharing)
 
