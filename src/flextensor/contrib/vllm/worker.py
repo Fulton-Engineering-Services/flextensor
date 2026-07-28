@@ -30,6 +30,9 @@ from flextensor.contrib.vllm._logging import safely_install_flextensor_logging_b
 from flextensor.offload_manager import OffloadPhase
 from flextensor.utils import config_field_was_set
 
+# vLLM's V2 runner initializes attention metadata after FlexTensor's load-time profiling.
+os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
+
 safely_install_flextensor_logging_bridge()
 # Register FlexTensor's vLLM load_format side effect.
 importlib.import_module("flextensor.contrib.vllm.loader")

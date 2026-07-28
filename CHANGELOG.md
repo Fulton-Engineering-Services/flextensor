@@ -69,6 +69,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Restore `FlexTensorOffloadWorker` compatibility with vLLM 0.11.1–0.26.0 by
+  defaulting to vLLM's V1 model runner.
 - Avoid raw CUDA OOM during inference setup by budgeting for available GPU
   memory and permanent GPU tensors before finalizing offloaded models.
 - Better direct-offload support for custom kernels and cross-layer parameter getters.

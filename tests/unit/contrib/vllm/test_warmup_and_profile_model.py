@@ -28,6 +28,7 @@ is the whole point of the exercise.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -51,6 +52,7 @@ def worker_module():
     the real worker source file can be loaded and exercised without a vllm
     installation.
     """
+    v2_runner_env = os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
     stubs: dict[str, types.ModuleType] = {}
 
     def _stub(name: str, **attrs) -> types.ModuleType:
@@ -99,6 +101,11 @@ def worker_module():
 
         yield worker
     finally:
+        if v2_runner_env is None:
+            os.environ.pop("VLLM_USE_V2_MODEL_RUNNER", None)
+        else:
+            os.environ["VLLM_USE_V2_MODEL_RUNNER"] = v2_runner_env
+
         # Restore prior module state so other tests see the real / absent
         # vllm modules, not our stubs.
         for name, mod in previous.items():
@@ -183,6 +190,10 @@ def _compiled_offload_manager(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def test_worker_defaults_v2_model_runner_off(worker_module):
+    assert os.environ.get("VLLM_USE_V2_MODEL_RUNNER") == "0"
 
 
 class TestWarmupAndProfileModelCallContract:
