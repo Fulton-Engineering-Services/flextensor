@@ -31,6 +31,17 @@ from flextensor.config import (
 from flextensor.strategy import GreedyStrategy, KnapsackStrategy, NthLayerStrategy
 
 
+@pytest.fixture(autouse=True)
+def isolate_config_environment():
+    original_env = os.environ.copy()
+    for name in tuple(os.environ):
+        if name.startswith(("FT_", "CUSTOM_")) or name == "MY_CONFIG_FILE":
+            os.environ.pop(name)
+    yield
+    os.environ.clear()
+    os.environ.update(original_env)
+
+
 class TestOffloadConfig:
     """Test OffloadConfig class behavior."""
 
@@ -541,17 +552,6 @@ class TestParseNone:
 class TestLoadConfigFromEnv:
     """Test load_config_from_env function."""
 
-    def setup_method(self):
-        """Clear relevant environment variables before each test."""
-        # Save original environment
-        self.original_env = os.environ.copy()
-
-    def teardown_method(self):
-        """Restore original environment after each test."""
-        # Restore original environment
-        os.environ.clear()
-        os.environ.update(self.original_env)
-
     def test_load_with_no_env_vars(self):
         """Test loading config with no environment variables uses defaults."""
         config = load_config_from_env()
@@ -805,6 +805,35 @@ class TestLoadConfigFromEnv:
         # Should ignore the env var and use default (None)
         assert config.load_strategy is None
 
+    def test_unrecognized_ft_env_var_raises_with_suggestion(self):
+        os.environ["FT_ENABLE_DIAGNOSTCIS"] = "1"
+
+        with pytest.raises(ValueError, match="FT_ENABLE_DIAGNOSTCIS") as exc_info:
+            load_config_from_env()
+
+        assert str(exc_info.value) == (
+            "Unrecognized environment variable with FT_ prefix: "
+            "FT_ENABLE_DIAGNOSTCIS. Did you mean: FT_ENABLE_DIAGNOSTICS?"
+        )
+
+    def test_unrecognized_custom_env_var_raises(self):
+        os.environ["CUSTOM_UNKNOWN"] = "1"
+
+        with pytest.raises(
+            ValueError,
+            match="Unrecognized environment variable with CUSTOM_ prefix: CUSTOM_UNKNOWN",
+        ) as exc_info:
+            load_config_from_env(prefix="CUSTOM_")
+        assert "Did you mean" not in str(exc_info.value)
+
+    def test_removed_env_var_is_recognized_and_ignored(self, caplog):
+        os.environ["FT_RELEASE_TENSORS"] = "1"
+
+        with caplog.at_level(logging.WARNING, logger="flextensor.config"):
+            load_config_from_env()
+
+        assert "'release_tensors' was removed" in caplog.text
+
     def test_mixed_env_and_kwargs_with_validation(self):
         """Test mixed environment and kwargs with validation."""
         os.environ["FT_GPU_DEVICE"] = "1"
@@ -882,15 +911,6 @@ class TestLoadConfigFromEnv:
 
 class TestLoadConfigFromFile:
     """Test load_config_from_file function."""
-
-    def setup_method(self):
-        """Clear relevant environment variables before each test."""
-        self.original_env = os.environ.copy()
-
-    def teardown_method(self):
-        """Restore original environment after each test."""
-        os.environ.clear()
-        os.environ.update(self.original_env)
 
     def test_load_ini_file(self, tmp_path):
         """Test loading config from INI file."""
@@ -1306,15 +1326,6 @@ class TestGetFieldTypes:
 class TestLoadConfig:
     """Test unified load_config function with file + env + kwargs precedence."""
 
-    def setup_method(self):
-        """Clear relevant environment variables before each test."""
-        self.original_env = os.environ.copy()
-
-    def teardown_method(self):
-        """Restore original environment after each test."""
-        os.environ.clear()
-        os.environ.update(self.original_env)
-
     def test_env_only_no_file(self):
         """Test loading from env only when no file is specified."""
         os.environ["FT_GPU_DEVICE"] = "5"
@@ -1397,6 +1408,19 @@ gpu_device: 7
 
         config = load_config()
         assert config.enabled is True
+        assert config.gpu_device == 7
+
+    def test_file_from_custom_env_var_with_matching_prefix(self, tmp_path):
+        """Test loading a file from a custom env var under the validated prefix."""
+        config_file = tmp_path / "test.yaml"
+        config_file.write_text("gpu_device: 7\n")
+        os.environ["CUSTOM_CONFIG_PATH"] = str(config_file)
+
+        config = load_config(
+            env_prefix="CUSTOM_",
+            config_file_env_var="CUSTOM_CONFIG_PATH",
+        )
+
         assert config.gpu_device == 7
 
     def test_file_from_env_var_with_env_override(self, tmp_path):

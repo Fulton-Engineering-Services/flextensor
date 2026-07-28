@@ -8,6 +8,7 @@ including support for loading configuration from environment variables and files
 """
 
 import configparser
+import difflib
 import json
 import logging
 import os
@@ -33,6 +34,8 @@ _PROFILE_ITERS_MSG = "`profile_iters` is deprecated. Use `profiling_iters` inste
 _ALL_WARMUP_ITERS_MSG = (
     "`all_warmup_iters` is deprecated. Use `pre_inference_iters` instead. Will be removed in v0.4.0."
 )
+
+_REGISTERED_ENV_VARS: set[str] = set()
 
 ProfileMode = Literal["torch_function", "getter", "view"]
 
@@ -824,17 +827,61 @@ def _migrate_deprecated_env(
     return new_field, converted
 
 
-def _load_from_env(env_prefix: str, field_types: dict[str, type]) -> dict[str, Any]:
+def _register_env_var(name: str) -> None:
+    _REGISTERED_ENV_VARS.add(name)
+
+
+def _known_env_vars(
+    env_prefix: str,
+    field_types: dict[str, type],
+    config_file_env_var: str,
+) -> set[str]:
+    known = {f"{env_prefix}{field_name.upper()}" for field_name in field_types}
+    known.update(f"{env_prefix}{field_name.upper()}" for field_name in _REMOVED_FIELDS)
+    known.add(f"{env_prefix}CONFIG_FILE")
+    if config_file_env_var and config_file_env_var.startswith(env_prefix):
+        known.add(config_file_env_var)
+    known.update(name for name in _REGISTERED_ENV_VARS if name.startswith(env_prefix))
+    return known
+
+
+def _validate_env_vars(
+    env_prefix: str,
+    field_types: dict[str, type],
+    config_file_env_var: str,
+) -> None:
+    if not env_prefix:
+        return
+
+    known = _known_env_vars(env_prefix, field_types, config_file_env_var)
+    errors = []
+    for env_var_name in sorted(name for name in os.environ if name.startswith(env_prefix) and name not in known):
+        message = f"Unrecognized environment variable with {env_prefix} prefix: {env_var_name}"
+        suggestions = difflib.get_close_matches(env_var_name, sorted(known), n=1, cutoff=0.75)
+        if suggestions:
+            message += f". Did you mean: {suggestions[0]}?"
+        errors.append(message)
+    if errors:
+        raise ValueError("\n".join(errors))
+
+
+def _load_from_env(
+    env_prefix: str,
+    field_types: dict[str, type],
+    config_file_env_var: str,
+) -> dict[str, Any]:
     """Load configuration from environment variables.
 
     Args:
         env_prefix: Prefix for environment variable names
         field_types: Dictionary mapping field names to types
+        config_file_env_var: Environment variable used to select the config file
 
     Returns:
         Dictionary of configuration values
     """
     config_dict: dict[str, Any] = {}
+    _validate_env_vars(env_prefix, field_types, config_file_env_var)
 
     for field, (version, msg) in _REMOVED_FIELDS.items():
         env_var_name = f"{env_prefix}{field.upper()}"
@@ -940,7 +987,7 @@ def load_config(
 
     # Override with environment variables
     if use_env:
-        config_dict.update(_load_from_env(env_prefix, field_types))
+        config_dict.update(_load_from_env(env_prefix, field_types, config_file_env_var))
 
     # Override with kwargs (highest precedence)
     config_dict.update(kwargs)

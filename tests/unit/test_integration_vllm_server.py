@@ -149,7 +149,7 @@ def test_run_vllm_server_test_adds_output_env_for_offload_case(monkeypatch, tmp_
     _memory, metrics, _logs = run_vllm_server_test(case, output_dir=tmp_path)
 
     env_vars = dict(started_cases[0].extra_env_vars)
-    assert env_vars["FT_DEBUG_LOG_PATH"] == str(tmp_path / "debug.log")
+    assert "FT_DEBUG_LOG_PATH" not in env_vars
     assert env_vars["FT_INSTRUMENTATION_OUTPUT_DIR"] == str(tmp_path / "instrumentation")
     assert env_vars["FT_ENABLE_DIAGNOSTICS"] == "1"
     assert env_vars["FT_ENABLE_INSTRUMENTATION"] == "1"

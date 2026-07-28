@@ -262,12 +262,7 @@ def run_vllm_server_test(
             ("VLLM_NO_USAGE_STATS", "1"),
         )
         offload_output_env_vars = (
-            (
-                ("FT_DEBUG_LOG_PATH", str(output_dir / "debug.log")),
-                ("FT_INSTRUMENTATION_OUTPUT_DIR", str(instrumentation_dir)),
-            )
-            if offload_enabled
-            else ()
+            (("FT_INSTRUMENTATION_OUTPUT_DIR", str(instrumentation_dir)),) if offload_enabled else ()
         )
         server_case = replace(
             case,

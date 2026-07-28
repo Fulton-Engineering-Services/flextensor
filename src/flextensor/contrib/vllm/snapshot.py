@@ -22,6 +22,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, cast
 
+from flextensor.config import _register_env_var
+
+_SNAPSHOT_OUTPUT_DIR_ENV_VAR = "FT_VLLM_SNAPSHOT_OUTPUT_DIR"
+_register_env_var(_SNAPSHOT_OUTPUT_DIR_ENV_VAR)
+
 try:
     from vllm.utils.mem_utils import MemorySnapshot
     from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -151,9 +156,9 @@ class MemorySnapshotMixin:
         Writes to the directory specified by ``FT_VLLM_SNAPSHOT_OUTPUT_DIR``.
         If the environment variable is unset or empty, the dump is skipped.
         """
-        output_dir_str = os.environ.get("FT_VLLM_SNAPSHOT_OUTPUT_DIR", "")
+        output_dir_str = os.environ.get(_SNAPSHOT_OUTPUT_DIR_ENV_VAR, "")
         if not output_dir_str:
-            logger.debug("FT_VLLM_SNAPSHOT_OUTPUT_DIR not set, skipping snapshot dump")
+            logger.debug("%s not set, skipping snapshot dump", _SNAPSHOT_OUTPUT_DIR_ENV_VAR)
             return
 
         if not hasattr(self, "_snapshots"):

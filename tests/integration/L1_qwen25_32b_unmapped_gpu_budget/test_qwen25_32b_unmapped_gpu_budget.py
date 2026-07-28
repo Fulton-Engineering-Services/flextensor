@@ -72,7 +72,6 @@ def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_outpu
                 ("FT_ENABLE_DIAGNOSTICS", "1"),
                 ("FT_MAX_GPU_MEM_FRACTION", "0.95"),
                 ("FT_INCLUDE_PATTERNS", INCLUDE_PATTERNS),
-                ("FT_DEBUG_LOG_PATH", str(test_output_dir / "debug.log")),
             ),
         ).with_flextensor_offload()
         process, log_lines = start_vllm_server(

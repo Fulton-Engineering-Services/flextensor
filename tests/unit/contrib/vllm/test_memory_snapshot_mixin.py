@@ -26,6 +26,14 @@ import pytest
 import torch
 
 
+def test_snapshot_output_env_var_is_registered(tmp_path):
+    from flextensor.config import load_config_from_env
+
+    importlib.import_module("flextensor.contrib.vllm.snapshot")
+    with patch.dict("os.environ", {"FT_VLLM_SNAPSHOT_OUTPUT_DIR": str(tmp_path)}, clear=True):
+        load_config_from_env()
+
+
 @pytest.fixture()
 def mock_memory_snapshot():
     """Create a mock MemorySnapshot with realistic field values."""
