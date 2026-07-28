@@ -53,11 +53,6 @@ def restore_logging_state():
 def mock_cuda_device_properties():
     """Mock torch.cuda.get_device_properties to avoid requiring a real GPU.
 
-    OffloadConfig now includes max_gpu_mem_fraction=0.9 as its default, which causes
-    _initialize_tensor_manager to call torch.cuda.get_device_properties when resolving
-    the fraction to bytes. This fixture prevents that call from failing in CPU-only
-    test environments by supplying a fake 40 GB device.
-
     Tests that need to assert specific get_device_properties behaviour (e.g.
     TestMaxGpuMemResolution) override this fixture locally via their own patch context.
     """

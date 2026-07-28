@@ -97,6 +97,33 @@ def worker_module():
 class TestVllmDefaultPatternUpdates:
     """vLLM worker defaults must be layer-focused and MoE-safe."""
 
+    def test_omitted_max_gpu_mem_fraction_gets_vllm_fallback(self, worker_module) -> None:
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["custom.layers.*"],
+            exclude_patterns=[],
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert updates["max_gpu_mem_fraction"] == pytest.approx(0.9)
+
+    @pytest.mark.parametrize("value", [None, 0.75])
+    def test_explicit_max_gpu_mem_fraction_is_preserved(self, worker_module, value) -> None:
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["custom.layers.*"],
+            exclude_patterns=[],
+            max_gpu_mem_fraction=value,
+            model_fields_set={"max_gpu_mem_fraction"},
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert "max_gpu_mem_fraction" not in updates
+
     def test_wildcard_include_gets_vllm_layer_defaults(self, worker_module) -> None:
         config = SimpleNamespace(
             discovery_iters=1,

@@ -34,8 +34,6 @@ _ALL_WARMUP_ITERS_MSG = (
     "`all_warmup_iters` is deprecated. Use `pre_inference_iters` instead. Will be removed in v0.4.0."
 )
 
-_DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
-
 ProfileMode = Literal["torch_function", "getter", "view"]
 
 # Bidirectional deprecated ↔ canonical field pairs. Used by model_copy()
@@ -210,14 +208,14 @@ class OffloadConfig(BaseModel):
     Can also be set via the ``FT_MIN_BLOCKS`` env var.
     """
 
-    max_gpu_mem_fraction: float | None = Field(default=_DEFAULT_MAX_GPU_MEM_FRACTION, gt=0.0, le=1.0)
+    max_gpu_mem_fraction: float | None = Field(default=None, gt=0.0, le=1.0)
     """Target maximum GPU memory as a fraction of total device memory (e.g. 0.9 = 90%).
 
     When set, the strategy switches to *memory mode* and keeps peak GPU usage within this
     budget. At runtime, the fractional budget is capped by actual available GPU memory so
     the strategy never targets more than what is free. When ``None``, the strategy operates
-    in *latency mode* (no memory constraint).
-    Defaults to 0.9. Can also be set via the ``FT_MAX_GPU_MEM_FRACTION`` env var.
+    in *latency mode* with no explicit memory constraint. Defaults to ``None``.
+    Can also be set via the ``FT_MAX_GPU_MEM_FRACTION`` env var.
     """
 
     profile_storage_dir: str | None = Field(default=None)

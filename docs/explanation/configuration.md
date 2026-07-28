@@ -222,7 +222,7 @@ When `enabled=False`, FlexTensor passes through to normal PyTorch execution with
 | `shm_enabled` | bool | `False` | Enable cross-process weight sharing via POSIX shared memory |
 | `shm_namespace` | str \| None | `None` | Base namespace for SHM blocks (auto-derived if None) |
 | `shm_wait_timeout` | float | `0.0` | Hard timeout (seconds) for followers waiting on creator |
-| `max_gpu_mem_fraction` | float \| None | `0.9` | GPU memory budget as a fraction of total device memory (e.g. `0.9` = 90%). `None` = latency mode (no constraint). |
+| `max_gpu_mem_fraction` | float \| None | `None` | GPU memory budget as a fraction of total device memory (e.g. `0.9` = 90%). `None` = latency mode (no constraint). |
 
 #### Pinned Memory
 
@@ -261,34 +261,40 @@ FT_PINNED_MEMORY_MODE=torch            # PyTorch's pinned allocator (default)
 
 #### GPU Memory Limit
 
-`max_gpu_mem_fraction` controls how much of the GPU's total memory FlexTensor may use. It accepts a `float` in the range `(0.0, 1.0]`, where `0.9` means "use at most 90% of total device memory."
+`max_gpu_mem_fraction` controls how much of the GPU's total memory FlexTensor may use. It accepts `None` or a `float` in the range `(0.0, 1.0]`, where `0.9` means "use at most 90% of total device memory."
 
-When set to a fraction, the strategy operates in *memory mode* and keeps peak GPU usage within that budget. The fraction is resolved to an absolute byte count at runtime and then **capped by actual available GPU memory**. If other consumers (CUDA context, KV cache, framework buffers) have already used some GPU memory, the effective budget will be lower than `total * fraction`. This ensures the strategy never targets more memory than is actually free. The same config works portably across GPU SKUs with different memory capacities.
+The default is `None`: *latency mode*. FlexTensor applies no explicit GPU-memory
+cap and chooses the strategy for minimum offloading latency based on
+`transfer_budget_scale`:
+
+```python
+config = OffloadConfig()  # Latency-first default: no explicit memory cap
+```
+
+Set a fraction to opt into *memory mode*. The fraction is resolved to an
+absolute byte count at runtime and then **capped by actual available GPU
+memory**. If other consumers (CUDA context, KV cache, framework buffers) have
+already used some GPU memory, the effective budget will be lower than
+`total * fraction`. This ensures the strategy never targets more memory than is
+actually free. The same config works portably across GPU SKUs with different
+memory capacities.
+
+```python
+config = OffloadConfig(
+    max_gpu_mem_fraction=0.9,  # Memory mode: cap FlexTensor at 90%
+)
+```
 
 !!! note "Budget capping and minimum memory"
     If the budget is capped, a warning is logged with the adjusted value. If available
     GPU memory drops below 256 MiB, a `RuntimeError` is raised — see
     [Troubleshooting](../how-to/troubleshooting.md#step-4-check-for-insufficient-free-gpu-memory-error).
 
-```python
-config = OffloadConfig(
-    max_gpu_mem_fraction=0.9,  # Default: 90% of total GPU memory
-)
-```
-
-When set to `None`, the strategy switches to *latency mode* and optimises for throughput based on the `transfer_budget_scale` factor, with no explicit memory cap:
-
-```python
-config = OffloadConfig(
-    max_gpu_mem_fraction=None,  # Latency mode: no memory constraint
-)
-```
-
 This option can also be set via the `FT_MAX_GPU_MEM_FRACTION` environment variable:
 
 ```bash
 FT_MAX_GPU_MEM_FRACTION=0.8   # Use 80% of GPU memory (memory mode)
-FT_MAX_GPU_MEM_FRACTION=none   # Switch to latency mode (also accepts "null" or "")
+FT_MAX_GPU_MEM_FRACTION=none  # Use latency mode explicitly (also accepts "null" or "")
 ```
 
 #### Shared Memory (Cross-Process Weight Sharing)

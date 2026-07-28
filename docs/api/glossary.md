@@ -198,14 +198,14 @@ Built-in: `StrictRoundRobinAssignment`, `OptimizedRoundRobinAssignment`.
 ### Memory Mode
 
 Strategy operating mode activated by setting `max_gpu_mem_fraction` to a float
-(default: `0.9`, i.e. 90% of total GPU memory). The strategy keeps peak GPU
-usage within the specified budget.
+in the range `(0.0, 1.0]`. The strategy keeps peak GPU usage within the
+specified budget.
 
 ### Latency Mode
 
-Strategy operating mode activated by setting `max_gpu_mem_fraction=None`. The
-strategy optimises for throughput based on `transfer_budget_scale`, with no explicit
-memory cap.
+The default standalone strategy mode, activated by
+`max_gpu_mem_fraction=None`. The strategy optimises for minimum offloading
+latency based on `transfer_budget_scale`, with no explicit memory cap.
 
 ---
 

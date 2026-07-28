@@ -41,6 +41,9 @@ LOGGER = logging.getLogger(__name__)
 
 _VLLM_DISABLE_COMPILE_CACHE = "VLLM_DISABLE_COMPILE_CACHE"
 _VLLM_USE_AOT_COMPILE = "VLLM_USE_AOT_COMPILE"
+# FlexTensor applies this fraction to model weights only. It is not vLLM's
+# gpu_memory_utilization, which also covers KV cache and runtime allocations.
+_VLLM_DEFAULT_MAX_GPU_MEM_FRACTION = 0.9
 
 
 def _configure_vllm_compile_env_for_compiled_offload() -> None:
@@ -236,6 +239,7 @@ def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
 
     Returns:
         Config update dictionary with minimum vLLM warmup iteration counts,
+        a 0.9 model-weight GPU memory fraction when the user omitted that setting,
         default non-wildcard include patterns when the user did not customize
         includes, and MoE sidecar excludes when the user did not customize
         excludes.
@@ -254,6 +258,8 @@ def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
         "discovery_iters": max(offload_config.discovery_iters, VLLM_DISCOVERY_ITER_FLOOR),
         "profiling_iters": max(offload_config.profiling_iters, profiling_floor),
     }
+    if not config_field_was_set(offload_config, "max_gpu_mem_fraction"):
+        config_updates["max_gpu_mem_fraction"] = _VLLM_DEFAULT_MAX_GPU_MEM_FRACTION
     if offload_config.include_patterns == ["*"]:
         config_updates["include_patterns"] = VLLM_DEFAULT_INCLUDE_PATTERNS
     if offload_config.exclude_patterns == [] and not config_field_was_set(offload_config, "exclude_patterns"):

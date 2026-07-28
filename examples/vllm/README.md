@@ -95,6 +95,13 @@ Every `OffloadConfig` field can be set via an environment variable named `FT_` +
 | `FT_EXCLUDE_PATTERNS` | Comma-separated patterns to keep GPU-resident | see below |
 | `FT_ENABLE_DIAGNOSTICS` | Log Layer Duration Statistics and block assignment table after profiling | `false` |
 
+Unlike standalone `OffloadConfig`, which defaults to latency mode, the vLLM
+worker keeps an integration-specific `0.9` default when
+`FT_MAX_GPU_MEM_FRACTION` is omitted. Set it to `none` to request latency mode
+explicitly. The worker does not derive the FlexTensor weight budget from vLLM's
+`gpu_memory_utilization`, because that budget must also leave room for KV cache
+and runtime allocations.
+
 The worker defaults to vLLM-oriented patterns when `FT_INCLUDE_PATTERNS` /
 `FT_EXCLUDE_PATTERNS` are not customized: decoder-layer class includes, common
 embedding/norm/head paths, and excludes for known MoE sidecars and tiny

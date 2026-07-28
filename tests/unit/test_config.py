@@ -50,13 +50,13 @@ class TestOffloadConfig:
         assert config.profile_read_only is False
         assert config.load_strategy is None
         assert config.min_blocks == 4
-        assert config.max_gpu_mem_fraction == 0.9
+        assert config.max_gpu_mem_fraction is None
         assert config.external_compile is False
 
     def test_max_gpu_mem_fraction_default(self):
-        """Default max_gpu_mem_fraction is 0.9."""
+        """Default max_gpu_mem_fraction is None for latency-first mode."""
         config = OffloadConfig()
-        assert config.max_gpu_mem_fraction == 0.9
+        assert config.max_gpu_mem_fraction is None
 
     def test_max_gpu_mem_fraction_none_latency_mode(self):
         """Setting max_gpu_mem_fraction=None enables latency mode."""
@@ -1157,11 +1157,11 @@ num_blocks = 8
         assert config.max_gpu_mem_fraction is None
 
     def test_max_gpu_mem_fraction_default_when_absent_from_yaml(self, tmp_path):
-        """Test that max_gpu_mem_fraction defaults to 0.9 when not in YAML file."""
+        """Test that max_gpu_mem_fraction defaults to None when not in YAML file."""
         config_file = tmp_path / "test.yaml"
         config_file.write_text("gpu_device: 0\n")
         config = load_config_from_file(config_file)
-        assert config.max_gpu_mem_fraction == 0.9
+        assert config.max_gpu_mem_fraction is None
 
     def test_max_gpu_mem_fraction_from_json_file(self, tmp_path):
         """Test loading max_gpu_mem_fraction from JSON file."""

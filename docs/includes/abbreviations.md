@@ -12,7 +12,7 @@
 *[inference phase]: Third active phase — applies the computed offloading strategy for production execution. No timing collection.
 *[inner tensor field]: A tensor attached as an attribute to another tensor (e.g., weight.scale for FP8 dequantization). Must be discovered and offloaded together with its parent.
 *[transfer_budget_scale]: Multiplier on the time budget available for weight transfers (< 1 adds safety margin, > 1 allows more). Directly controls the budget in latency mode; used as the initial scale in memory mode.
-*[latency mode]: Strategy mode activated by max_gpu_mem_fraction=None — optimises for throughput with no explicit memory cap.
+*[latency mode]: Strategy mode activated by max_gpu_mem_fraction=None — optimises for minimum offloading latency with no explicit memory cap.
 *[manual trap]: An offload_block() context manager that the user places explicitly around model code, as opposed to auto trap / forward patching.
 *[memory block]: A pre-allocated GPU memory region used by block-based transfer modes for pipelined CPU-to-GPU copies.
 *[memory mode]: Strategy mode activated by setting max_gpu_mem_fraction to a float — keeps peak GPU usage within a budget.
