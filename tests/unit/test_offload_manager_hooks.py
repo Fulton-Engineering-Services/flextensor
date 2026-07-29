@@ -1062,7 +1062,7 @@ class TestStateUpdateHookLifecycle:
         om = OffloadManager("test_transition_handle")
         # Explicit skip_discovery=False: this test exercises the
         # discovery -> profile -> inference state machine separately;
-        # the default (True) collapses discovery into profile during
+        # skip_discovery=True collapses discovery into profile during
         # ``offload()`` itself, which the assertions below don't cover.
         config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, skip_discovery=False)
         proxy = om.offload(warmup_model, config=config)
@@ -1155,7 +1155,7 @@ class TestCompileWrappedTransitionWarning:
         om = OffloadManager("test_compile_wrap_warn")
         # Explicit skip_discovery=False: the test asserts the warning fires
         # on the first proxy(x) call (the discovery -> PROFILING transition);
-        # the default (True) does that transition inside ``offload()``,
+        # skip_discovery=True does that transition inside ``offload()``,
         # before the torch.compile wrap is in place.
         config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, skip_discovery=False)
         proxy = om.offload(warmup_model, config=config)
@@ -1228,7 +1228,7 @@ class TestTransitionRollback:
         om = OffloadManager("test_rollback")
         # Explicit skip_discovery=False: the test asserts ``om._model is
         # warmup_model`` post-offload and rolls back on a failed
-        # _transition_to_profile; the default (True) collapses that
+        # _transition_to_profile; skip_discovery=True collapses that
         # transition into ``offload()`` itself.
         config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, skip_discovery=False)
         proxy = om.offload(warmup_model, config=config)

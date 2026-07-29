@@ -25,33 +25,33 @@ This learning process happens transparently during the first few iterations of m
 ## State Progression
 
 ```
-skip_discovery=True (default), skip honored:
+skip_discovery=False (default):
+    NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
+                            ↓           ↓
+                      (discovery_iters) (profiling_iters)
+
+skip_discovery=True, skip honored:
     NOT_INITIALIZED → (DISCOVERY) → PROFILING → INFERENCE
                                           ↓
                                    (profiling_iters)
     DISCOVERY is entered and left inside offload() without consuming any
     forwards; no discovery iterations are driven.
-
-skip_discovery=False:
-    NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
-                            ↓           ↓
-                      (discovery_iters) (profiling_iters)
 ```
 
 The `OffloadManager` tracks the current phase internally and transitions
 automatically based on iteration counts configured via `OffloadConfig`.
-Under the default `skip_discovery=True` the DISCOVERY phase is skipped
-entirely and layer statistics are derived statically from the patched
-modules inside `offload()`; only `profiling_iters` forwards are needed to
-reach INFERENCE. Use `OffloadManager.iters_before_inference` for the
-runtime-actual count.
+Under the default `skip_discovery=False` the DISCOVERY phase runs for
+`discovery_iters` forwards before profiling. Set `skip_discovery=True`
+to derive layer statistics statically from patched modules inside
+`offload()` and skip discovery forwards. Use
+`OffloadManager.iters_before_inference` for the runtime-actual count.
 
 ```python
-# Default (skip DISCOVERY, static layer stats)
-config = OffloadConfig(profiling_iters=10)
+# Default (run DISCOVERY, then profile)
+config = OffloadConfig(discovery_iters=1, profiling_iters=10)
 
-# Manual `offload_block()` path — DISCOVERY must run to capture blocks
-config = OffloadConfig(skip_discovery=False, discovery_iters=1, profiling_iters=10)
+# Skip DISCOVERY via static layer stats (auto-trap / include_patterns path)
+config = OffloadConfig(skip_discovery=True, profiling_iters=10)
 ```
 
 ## Discovery Phase
@@ -296,7 +296,8 @@ import flextensor
 from flextensor import OffloadConfig, offload
 
 # Configuration affects internal phase duration.
-# Under the default `skip_discovery=True` only `profiling_iters` fires.
+# Under the default `skip_discovery=False`, `discovery_iters` and
+# `profiling_iters` both fire.
 config = OffloadConfig(
     profiling_iters=5,
     include_patterns=["layers.*"],

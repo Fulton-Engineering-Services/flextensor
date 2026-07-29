@@ -46,8 +46,9 @@ config = OffloadConfig(
 # Patch the model
 model = flextensor.offload(model, config=config)
 
-# Use normally — the first few forwards warm the manager. Under the
-# default `skip_discovery=True` that is just `profiling_iters` forwards;
+# Use normally — the first few forwards warm the manager
+# (`discovery_iters` + `profiling_iters` under the default
+# `skip_discovery=False`; set `skip_discovery=True` to skip discovery).
 # `flextensor.get_offload_manager().iters_before_inference` is path-aware and
 # always returns the right count if you need to know it.
 for batch in dataloader:
@@ -93,7 +94,7 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head,class:SharedExpertMLP" python my_script
 The most commonly tuned options are:
 
 - **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards plus `class:` selectors, default `["*"]`; use specific patterns such as `class:*DecoderLayer` or `model.layers.*` for better per-layer pipelining)
-- **`skip_discovery`** — skip the discovery phase and jump straight to profiling (default `True`; the manager derives tensor-to-layer mappings statically from the patched modules). Set to `False` only if the model uses manual `offload_block()` blocks.
+- **`skip_discovery`** — skip the discovery phase and jump straight to profiling (default `False`; when `True`, the manager derives tensor-to-layer mappings statically from the patched modules). Leave at `False` if the model uses manual `offload_block()` blocks.
 - **`profiling_iters`** — iterations for timing measurement (default `10`)
 - **`discovery_iters`** — only consulted when `skip_discovery=False` (default `1`)
 

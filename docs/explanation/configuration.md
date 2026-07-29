@@ -327,15 +327,15 @@ These options can also be set via `FT_SHM_ENABLED`, `FT_SHM_NAMESPACE`, and
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `skip_discovery` | bool | `True` | Skip DISCOVERY and derive tensor-to-layer mappings statically from patched modules. Set to `False` when the model uses manual `offload_block()` blocks — `offload_block()` raises under the default. |
+| `skip_discovery` | bool | `False` | Skip DISCOVERY and derive tensor-to-layer mappings statically from patched modules. Leave at `False` when the model uses manual `offload_block()` blocks — `offload_block()` raises when this is `True`. |
 | `discovery_iters` | int | `1` | Iterations to discover parameter-to-trap mappings. Only consulted when `skip_discovery=False`. |
 | `profiling_iters` | int | `10` | Iterations to measure execution timing |
 
 FlexTensor learns your model's behavior during initial iterations:
 
 ```
-Under skip_discovery=True (default): PROFILING (profiling_iters) → INFERENCE
-Under skip_discovery=False:          DISCOVERY (discovery_iters) → PROFILING (profiling_iters) → INFERENCE
+Under skip_discovery=False (default): DISCOVERY (discovery_iters) → PROFILING (profiling_iters) → INFERENCE
+Under skip_discovery=True:            PROFILING (profiling_iters) → INFERENCE
 Remaining iterations in both cases:  Optimized execution with learned strategy
 ```
 
@@ -345,9 +345,10 @@ instead of summing the config fields by hand.
 
 #### Tuning Iteration Counts
 
-**`skip_discovery`**: Leave at `True` (default) for the auto-trap path
-(offloading via `include_patterns`). Only set `False` if your model uses
-manual `offload_block()` blocks; then tune `discovery_iters`:
+**`skip_discovery`**: Leave at `False` (default) so DISCOVERY runs —
+required for manual `offload_block()` blocks. Set `True` for the
+auto-trap path (offloading via `include_patterns`) to cut startup time.
+When keeping discovery, tune `discovery_iters`:
 
 - Dynamic control flow affecting parameter access patterns → 2-3 iterations
 - Variable-length inputs that change which parameters are used → 2-3 iterations

@@ -76,16 +76,16 @@ def _build_tensor_manager(model: nn.Module) -> TensorManager:
 
 
 class TestSkipDiscoveryConfig:
-    def test_default_is_true(self) -> None:
-        assert OffloadConfig().skip_discovery is True
+    def test_default_is_false(self) -> None:
+        assert OffloadConfig().skip_discovery is False
 
-    def test_round_trip_false(self) -> None:
-        config = OffloadConfig(skip_discovery=False)
-        assert config.skip_discovery is False
+    def test_round_trip_true(self) -> None:
+        config = OffloadConfig(skip_discovery=True)
+        assert config.skip_discovery is True
 
     def test_model_copy_preserves_value(self) -> None:
-        config = OffloadConfig().model_copy(update={"skip_discovery": False})
-        assert config.skip_discovery is False
+        config = OffloadConfig().model_copy(update={"skip_discovery": True})
+        assert config.skip_discovery is True
 
     def test_accepts_zero_profiling_iters_under_both_defaults(self) -> None:
         """``profiling_iters=0`` is functionally equivalent to ``profiling_iters=1``.
@@ -564,12 +564,12 @@ class TestSkipDiscoveryEnvVar:
         os.environ.clear()
         os.environ.update(self._original_env)
 
-    def test_ft_skip_discovery_false_overrides_default(self) -> None:
+    def test_ft_skip_discovery_false_round_trips(self) -> None:
         os.environ["FT_SKIP_DISCOVERY"] = "0"
         config = load_config_from_env()
         assert config.skip_discovery is False
 
-    def test_ft_skip_discovery_true_round_trips(self) -> None:
+    def test_ft_skip_discovery_true_overrides_default(self) -> None:
         os.environ["FT_SKIP_DISCOVERY"] = "1"
         config = load_config_from_env()
         assert config.skip_discovery is True
@@ -688,7 +688,7 @@ class TestSetConfigRejectsOneShotFieldChange:
 class TestOffloadBlockGuard:
     """``offload_block()`` is the manual-mode entry point.
 
-    With ``skip_discovery=True`` (the default), tensors inside manual blocks
+    With ``skip_discovery=True``, tensors inside manual blocks
     cannot be discovered statically, so the call must raise. Auto-trap (the
     patched-forward path) bypasses this guard internally.
     """
@@ -702,12 +702,12 @@ class TestOffloadBlockGuard:
             om._tensor_manager = mock_tm
         return om
 
-    def test_raises_when_skip_discovery_default_true(self) -> None:
+    def test_raises_when_skip_discovery_true(self) -> None:
         om = self._make_manager(skip_discovery=True)
         with pytest.raises(RuntimeError, match="skip_discovery"):
             om.offload_block("encoder")
 
-    def test_allows_when_skip_discovery_explicit_false(self) -> None:
+    def test_allows_when_skip_discovery_false(self) -> None:
         om = self._make_manager(skip_discovery=False)
         # Should not raise; just delegates to tensor_manager.trap.
         om.offload_block("encoder")

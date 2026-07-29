@@ -142,19 +142,20 @@ class OffloadConfig(BaseModel):
     Can also be set via the ``FT_DISCOVERY_ITERS`` env var.
     """
 
-    skip_discovery: bool = Field(default=True)
+    skip_discovery: bool = Field(default=False)
     """Skip the discovery phase and jump directly to profiling.
 
-    Tensor-to-layer mappings are discovered statically from modules patched
-    via ``include_patterns`` instead of being inferred from discovery-phase
-    iterations. Falls back to the discovery phase if no modules are patched;
-    a ``WARNING`` is logged and ``OffloadManager.skip_discovery_honored``
-    flips to ``False`` so the fallback is detectable without log scraping.
+    When ``True``, tensor-to-layer mappings are discovered statically from
+    modules patched via ``include_patterns`` instead of being inferred from
+    discovery-phase iterations. Falls back to the discovery phase if no
+    modules are patched; a ``WARNING`` is logged and
+    ``OffloadManager.skip_discovery_honored`` flips to ``False`` so the
+    fallback is detectable without log scraping.
 
-    Set to ``False`` when the model uses manual ``offload_block()`` blocks in
-    its forward — discovery iterations are required to capture tensors that
-    forward patching cannot enumerate. ``offload_block()`` raises a
-    ``RuntimeError`` when this option is left at the default ``True``.
+    Leave at the default ``False`` for manual ``offload_block()`` blocks.
+    ``offload_block()`` raises when the skip is honored; the no-patched-
+    modules fallback still allows manual blocks. Set ``True`` only on the
+    auto-trap (``include_patterns``) path to cut startup time.
 
     .. note:: Minimum-iteration contract
 
@@ -571,9 +572,9 @@ class OffloadConfig(BaseModel):
 
         It still overcounts on three runtime paths the config cannot see:
 
-        - **``skip_discovery=True`` (default) honored**: the manager
-          short-circuits DISCOVERY→PROFILING inside ``offload()``, so
-          ``discovery_iters`` forwards are never consumed.
+        - **``skip_discovery=True`` honored**: the manager short-circuits
+          DISCOVERY→PROFILING inside ``offload()``, so ``discovery_iters``
+          forwards are never consumed.
         - **Compiled offload**: uses a fixed eager seed
           (``COMPILED_EAGER_PROFILE_FORWARDS``) shorter than
           ``profiling_iters``.

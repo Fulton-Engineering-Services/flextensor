@@ -110,13 +110,13 @@ An `offload_block()` context manager that the user places explicitly around mode
 code. Used when forward patching is not feasible — for example, when custom logic
 sits between module calls.
 
-Requires `skip_discovery=False` on the `OffloadConfig`; the default
+Requires `skip_discovery=False` on the `OffloadConfig` (the default);
 `skip_discovery=True` short-circuits DISCOVERY and never captures
 tensor mappings that only manual blocks can enumerate, so
-`offload_block()` raises a `RuntimeError` under the default.
+`offload_block()` raises a `RuntimeError`.
 
 ```python
-config = OffloadConfig(skip_discovery=False, ...)
+config = OffloadConfig(...)  # skip_discovery=False by default
 model = flextensor.offload(model, config=config)
 manager = flextensor.get_offload_manager()
 with manager.offload_block("layer_0"):

@@ -120,10 +120,9 @@ def _synthetic_compile_fn_config(
 ) -> OffloadConfig:
     # ``skip_discovery=False`` here so the compile-path arithmetic
     # ``iters_before_inference == discovery_iters + PROFILE_COMPILE_WARMUP_FORWARDS
-    # + profiling_iters`` this suite pins holds. Under the default
-    # ``skip_discovery=True`` the discovery component drops to zero — that
-    # equivalence is covered by unit tests in
-    # ``tests/unit/test_offload_manager_phase.py``.
+    # + profiling_iters`` this suite pins holds. With ``skip_discovery=True``
+    # the discovery component drops to zero — that equivalence is covered
+    # by unit tests in ``tests/unit/test_offload_manager_phase.py``.
     kwargs: dict = {
         "discovery_iters": DISCOVERY_ITERS,
         "profiling_iters": PROFILING_ITERS,

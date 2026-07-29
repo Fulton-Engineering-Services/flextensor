@@ -130,8 +130,8 @@ def make_offload_config(
     """Build the ``OffloadConfig`` shape every compile/CUDA-graph suite uses.
 
     ``skip_discovery=False`` is pinned explicitly because ``run_offload_lifecycle``
-    below drives ``warmup_iters`` eager forwards through DISCOVERY; under the
-    default ``skip_discovery=True`` those forwards would land in PROFILING
+    below drives ``warmup_iters`` eager forwards through DISCOVERY; with
+    ``skip_discovery=True`` those forwards would land in PROFILING
     instead and skew the phase accounting these suites assert.
     """
     return OffloadConfig(

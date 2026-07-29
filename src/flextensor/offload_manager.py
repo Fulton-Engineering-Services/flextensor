@@ -1336,12 +1336,11 @@ class OffloadManager:
 
         Examples:
             Basic eager offload (see ``docs/quick-start.md`` for a runnable
-            end-to-end example). With the default ``skip_discovery=True``
-            and patched modules reachable from ``model``, ``offload()``
-            short-circuits past the discovery phase. ``profiling_iters``
-            forwards drive the state machine into ``INFERENCE`` (the
-            post-forward hook transitions on the Nth call); the extra
-            iteration below runs the first real inference forward::
+            end-to-end example). With the default ``skip_discovery=False``,
+            ``discovery_iters`` + ``profiling_iters`` forwards drive the
+            state machine into ``INFERENCE`` (the post-forward hook
+            transitions on the Nth call); the extra iteration below runs
+            the first real inference forward::
 
                 import torch
                 import flextensor as ft
@@ -1481,10 +1480,9 @@ class OffloadManager:
 
         Raises:
             RuntimeError: If ``offload()`` has not been called yet, or if
-                ``OffloadConfig.skip_discovery`` is ``True`` (the default).
-                Manual offload blocks require discovery-phase iterations to
-                map their tensors; set ``skip_discovery=False`` on the config
-                when the model uses manual blocks.
+                ``skip_discovery`` was honored. Manual blocks need discovery;
+                leave ``skip_discovery=False`` (the default). Allowed on the
+                no-patched-modules fallback.
 
         Examples:
             >>> with om.offload_block("encoder"):

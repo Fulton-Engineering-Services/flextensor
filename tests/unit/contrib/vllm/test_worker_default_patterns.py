@@ -228,7 +228,7 @@ class TestVllmSkipDiscoveryPin:
             profiling_iters=1,
             include_patterns=["*"],
             exclude_patterns=[],
-            skip_discovery=True,  # OffloadConfig default in this MR
+            skip_discovery=True,  # caller opted in; worker must still veto
         )
 
         updates = worker_module._vllm_config_updates(config)

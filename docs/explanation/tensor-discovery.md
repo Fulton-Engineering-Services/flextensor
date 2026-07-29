@@ -137,10 +137,10 @@ This strategy has a direct, structural relationship: each patched module knows e
 
 ### When It Works
 
-This strategy applies when you use manual traps (context managers) instead of forward patching. **Requires `skip_discovery=False`** — the default `skip_discovery=True` short-circuits DISCOVERY and never captures the tensor mappings that manual blocks enumerate, so `offload_block()` raises a `RuntimeError` under the default:
+This strategy applies when you use manual traps (context managers) instead of forward patching. **Requires `skip_discovery=False`** (the default) — setting `skip_discovery=True` short-circuits DISCOVERY and never captures the tensor mappings that manual blocks enumerate, so `offload_block()` raises a `RuntimeError`:
 
 ```python
-config = OffloadConfig(skip_discovery=False, ...)
+config = OffloadConfig(...)  # skip_discovery=False by default
 manager = get_offload_manager()
 model = manager.offload(model, config)
 

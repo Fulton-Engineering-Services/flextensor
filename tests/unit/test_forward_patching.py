@@ -156,7 +156,7 @@ class TestForwardPatching:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
     def test_view_mode_swaps_only_trapped_layers(self):
-        """Under the default ``profile_mode='view'`` + ``skip_discovery=True``
+        """Under ``profile_mode='view'`` with ``skip_discovery=True``
         the trapped layers' ``param.data`` is rebound to a view into the
         rotating profile block. While a layer's trap is active the view
         holds that layer's weights; layers outside ``include_patterns``

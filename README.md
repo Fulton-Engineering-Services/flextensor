@@ -53,9 +53,10 @@ config = OffloadConfig(
 # Patch the model
 model = flextensor.offload(model, config=config)
 
-# Use normally — the first few iterations warm the manager (under the
-# default `skip_discovery=True` that is just `profiling_iters` forwards;
-# query `flextensor.get_offload_manager().iters_before_inference` for
+# Use normally — the first few iterations warm the manager
+# (`discovery_iters` + `profiling_iters` under the default
+# `skip_discovery=False`; query
+# `flextensor.get_offload_manager().iters_before_inference` for
 # the exact path-aware count).
 for batch in dataloader:
     output = model(batch)  # FlexTensor handles everything

@@ -70,7 +70,7 @@ model = offload(model, config=config)
 
 Execute your model until it transitions to inference. Use the path-aware
 `iters_before_inference` count — it accounts for `skip_discovery` (default
-`True`), compiled offload, and replan paths:
+`False`), compiled offload, and replan paths:
 
 ```python
 om = flextensor.get_offload_manager()
@@ -412,8 +412,9 @@ model = flextensor.offload(model, config=config)
 om = flextensor.get_offload_manager()
 
 # First `om.iters_before_inference` iterations are measurement phases.
-# Under the default `skip_discovery=True` that is just `profiling_iters`;
-# with `skip_discovery=False` it is `discovery_iters + profiling_iters`.
+# Under the default `skip_discovery=False` that is
+# `discovery_iters + profiling_iters`; with `skip_discovery=True` it is
+# just `profiling_iters`.
 warmup = om.iters_before_inference
 for i, batch in enumerate(dataloader):
     output = model(batch)

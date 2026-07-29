@@ -518,7 +518,7 @@ def test_offload_lifecycle_preserves_raw_parameter_access_on_cuda(skip_discovery
 
     ``skip_discovery=False`` exercises the ``WarmupTrapDirect`` discovery
     iteration that materializes raw parameter storage during warmup;
-    ``skip_discovery=True`` (the default) skips discovery entirely and
+    ``skip_discovery=True`` skips discovery entirely and
     relies on the static layer-stats seed. Both paths must land in
     inference with parameters visible on CUDA to the raw ``forward`` reads.
     """

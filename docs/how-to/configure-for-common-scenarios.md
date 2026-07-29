@@ -75,7 +75,7 @@ model = offload(model, config=config)
 
 Key choices:
 
-- Under the default `skip_discovery=True` the discovery phase is bypassed, so `profiling_iters` alone drives startup cost.
+- Under the default `skip_discovery=False`, `discovery_iters + profiling_iters` drive startup cost. Set `skip_discovery=True` to bypass discovery when using forward patching.
 - `profiling_iters=3` reduces the startup cost before reaching inference phase.
 - This produces a less accurate offloading strategy than higher iteration counts, so it is not recommended for production.
 

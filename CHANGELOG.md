@@ -39,11 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `transfer_mode="strategy"`). See
   [Profile mode](docs/explanation/configuration.md#profile-phase-mode).
 - LTX 2.3 LipDub and Outpaint examples.
-- `OffloadConfig.skip_discovery` (default `True`) — builds tensor-to-layer
-  mappings statically from forward-patched modules instead of running discovery
-  iterations, cutting startup time. `OffloadManager.skip_discovery_honored`
-  reports whether the skip actually fired: `None` until the first `offload()`
-  determines it, `False` when the manager fell back to discovery.
+- `OffloadConfig.skip_discovery` (default `False`) — when set to `True`,
+  builds tensor-to-layer mappings statically from forward-patched modules
+  instead of running discovery iterations, cutting startup time. Leave at
+  `False` (discovery runs) for manual `offload_block()` blocks;
+  `offload_block()` raises `RuntimeError` when `skip_discovery=True`.
+  `OffloadManager.skip_discovery_honored` reports whether the skip actually
+  fired: `None` until the first `offload()` determines it, `False` when the
+  manager fell back to discovery. Prefer
+  `OffloadManager.iters_before_inference` over summing
+  `discovery_iters + profiling_iters` by hand.
 
 ### Changed
 
@@ -60,10 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The private `_direct_mode` `TensorManager` parameter is superseded by the new
   public `profile_mode` selector. It remains as an internal flag and is forced to
   `False` when `profile_mode="torch_function"`.
-- **BREAKING:** `OffloadConfig.skip_discovery` defaults to `True`. Models using
-  manual `offload_block()` blocks must set `skip_discovery=False`; otherwise
-  `offload_block()` raises `RuntimeError`. Replace warmup loops over
-  `discovery_iters + profiling_iters` with `OffloadManager.iters_before_inference`.
 - Live changes to one-shot configuration now raise or warn instead of being
   silently ignored. `OffloadManager.set_config` raises for `skip_discovery` and
   warns for the other fields baked into the active `TensorManager` at the first
