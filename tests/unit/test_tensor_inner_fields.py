@@ -119,6 +119,7 @@ def test_tensor_inner_fields_in_offload_block():
         discovery_iters=1,
         profiling_iters=1,
         include_patterns=[],
+        skip_discovery=False,
     )
 
     model = om.offload(model, config=config)

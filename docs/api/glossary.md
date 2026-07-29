@@ -110,7 +110,15 @@ An `offload_block()` context manager that the user places explicitly around mode
 code. Used when forward patching is not feasible — for example, when custom logic
 sits between module calls.
 
+Requires `skip_discovery=False` on the `OffloadConfig`; the default
+`skip_discovery=True` short-circuits DISCOVERY and never captures
+tensor mappings that only manual blocks can enumerate, so
+`offload_block()` raises a `RuntimeError` under the default.
+
 ```python
+config = OffloadConfig(skip_discovery=False, ...)
+model = flextensor.offload(model, config=config)
+manager = flextensor.get_offload_manager()
 with manager.offload_block("layer_0"):
     x = model.layer_0(x)
 ```
@@ -150,10 +158,17 @@ See: [Internal Phases](../explanation/phases.md)
 
 ### Discovery Phase
 
-First active phase. Runs for `discovery_iters` iterations. Discovers which parameters
-belong to which traps via direct module ownership, direct getter access, or
-`WarmupTrap` operation interception depending on mode. Also referred to as the
-"parameter discovery phase."
+First active phase. It is driven when `skip_discovery=False`, and also when
+`skip_discovery=True` was requested but no patched modules were reachable —
+the manager then falls back to a real discovery phase and
+`OffloadManager.skip_discovery_honored` reads `False`. When the skip does
+fire, no discovery *forwards* are consumed: `offload()` still enters
+`DISCOVERY` briefly before transitioning to `PROFILING`, so a diagnostic dump
+sampled between the two can legitimately observe that phase. When driven, runs
+for `discovery_iters` iterations and
+discovers which parameters belong to which traps via direct module
+ownership, direct getter access, or `WarmupTrap` operation interception
+depending on mode. Also referred to as the "parameter discovery phase."
 
 ### Profiling Phase
 

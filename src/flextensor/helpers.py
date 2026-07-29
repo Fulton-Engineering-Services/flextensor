@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping  # noqa: TC003
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +14,50 @@ from flextensor.types import GPUMemoryUsage
 
 if TYPE_CHECKING:
     from flextensor.offload_manager import TensorManagerProtocol as _TensorManagerProtocol
+
+
+def format_tensor_id_hint(
+    tensor_ids: Iterable[int],
+    id_to_name: Mapping[int, str] | None = None,
+    *,
+    head: int = 8,
+) -> str:
+    """Format a tensor-id collection for log hints with optional name resolution.
+
+    Sorts the ids, formats up to ``head`` of them inline (resolving each via
+    ``id_to_name`` when supplied), and collapses any remainder to
+    ``", ... (N more)"``. Used by warning paths that want to point operators
+    at specific affected tensors without dumping arbitrarily long id lists.
+
+    Names make the hint actionable: ``lm_head.weight (id=140234517123920)``
+    is greppable in the source; the raw integer is not.
+
+    Args:
+        tensor_ids: Tensor ids to format. Sorted for stable log output.
+        id_to_name: Optional id → parameter-name mapping used to resolve each
+            id to a greppable name. Ids missing from the mapping fall back to
+            the bare ``id=<int>`` form.
+        head: Maximum number of ids to format inline before collapsing the
+            remainder into a ``", ... (N more)"`` suffix.
+
+    Returns:
+        A comma-separated hint string, empty when *tensor_ids* is empty.
+
+    Example:
+        >>> format_tensor_id_hint([2, 1], {1: "lm_head.weight"}, head=1)
+        'lm_head.weight (id=1), ... (1 more)'
+    """
+    sorted_ids = sorted(tensor_ids)
+
+    def fmt(tid: int) -> str:
+        if id_to_name is not None and (name := id_to_name.get(tid)):
+            return f"{name} (id={tid})"
+        return f"id={tid}"
+
+    hint = ", ".join(fmt(tid) for tid in sorted_ids[:head])
+    if len(sorted_ids) > head:
+        hint += f", ... ({len(sorted_ids) - head} more)"
+    return hint
 
 
 class TrapNestingGuard:
@@ -47,6 +92,10 @@ class TrapNestingGuard:
 
     def release(self) -> None:
         self._active = False
+
+    def is_active(self) -> bool:
+        """Whether a trap is currently active (between acquire and release)."""
+        return self._active
 
 
 class ProfilingSuspender:

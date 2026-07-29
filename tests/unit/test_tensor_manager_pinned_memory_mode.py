@@ -159,7 +159,7 @@ def test_initialize_warmup_routes_host_pinner_through_to_pin_processor(_fake_cud
 
     # Stub lifecycle pieces we don't need: they freeze tensors_map (which
     # complicates assertions) and require real CUDA in places.
-    monkeypatch.setattr(tm, "_move_non_offloaded_tensors_to_gpu", lambda: None)
+    monkeypatch.setattr(tm, "_move_non_offloaded_tensors_to_gpu", lambda *a, **kw: None)
     monkeypatch.setattr(tm, "prepare_model_ids", lambda *a, **kw: None)
     monkeypatch.setattr(tm, "prepare_warmup_mode", lambda: None)
 

@@ -37,6 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `transfer_mode="strategy"`). See
   [Profile mode](docs/explanation/configuration.md#profile-phase-mode).
 - LTX 2.3 LipDub and Outpaint examples.
+- `OffloadConfig.skip_discovery` (default `True`) — builds tensor-to-layer
+  mappings statically from forward-patched modules instead of running discovery
+  iterations, cutting startup time. `OffloadManager.skip_discovery_honored`
+  reports whether the skip actually fired: `None` until the first `offload()`
+  determines it, `False` when the manager fell back to discovery.
 
 ### Changed
 
@@ -53,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The private `_direct_mode` `TensorManager` parameter is superseded by the new
   public `profile_mode` selector. It remains as an internal flag and is forced to
   `False` when `profile_mode="torch_function"`.
+- **BREAKING:** `OffloadConfig.skip_discovery` defaults to `True`. Models using
+  manual `offload_block()` blocks must set `skip_discovery=False`; otherwise
+  `offload_block()` raises `RuntimeError`. Replace warmup loops over
+  `discovery_iters + profiling_iters` with `OffloadManager.iters_before_inference`.
+- Live changes to one-shot configuration now raise or warn instead of being
+  silently ignored. `OffloadManager.set_config` raises for `skip_discovery` and
+  warns for the other fields baked into the active `TensorManager` at the first
+  `offload()`; call `release()` and re-`offload()` to apply them.
 
 ### Deprecated
 
@@ -79,6 +92,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Avoid raw CUDA OOM during inference setup by budgeting for available GPU
   memory and permanent GPU tensors before finalizing offloaded models.
 - Better direct-offload support for custom kernels and cross-layer parameter getters.
+- Tensors missed by profiling coverage gaps, and tensors read outside their
+  owning layer, are promoted to GPU instead of causing device-mismatch crashes.
+  Each promotion is reported so the reduced offload coverage stays visible, and
+  an out-of-memory promotion names the tensor and its size.
+- Zero iteration counts and repeated `offload()` no longer serve from stale
+  state. Iteration budgets account for the forward each phase always consumes,
+  and a second `offload()` runs a fresh cycle instead of replaying the previous
+  model's plan or skipping its include/exclude placement.
+- Cleanup no longer strands GPU tensors or corrupts weights. A trap that fails
+  partway through exit still releases the tensors it holds, and releasing a
+  preloaded tensor no longer frees storage shared with the model.
 
 ## [0.2.1] — 2026-05-19
 

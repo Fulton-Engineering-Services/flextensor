@@ -199,19 +199,71 @@ class TestTensorManagerProfilingControl:
         assert c.tensor_measurements["layer0"] == [{1, 2}]
         assert "layer0" not in c.duration_measurements
 
-    def test_record_tensors_ignores_suspension(self):
-        """Discovery's tensor-to-layer mapping is a hard prerequisite for every
-        later phase, so ``record_tensors`` does not consult the suspender."""
+    def test_record_tensors_ignores_suspension_by_default(self):
+        """Default ``respect_suspension=False`` preserves DISCOVERY semantics.
+
+        Discovery's tensor-to-layer mapping is a hard prerequisite for
+        every later phase, so the default call (used by ``WarmupTrap``)
+        must record even while suspended.
+        """
         tm = _make_tm()
         tm.suspend_profiling()
         tm.record_tensors("layer0", {1, 2})
         c = tm.layer_statistics_collector
         assert c.tensor_measurements["layer0"] == [{1, 2}]
 
+    def test_record_tensors_respects_suspension_when_opted_in(self):
+        """``respect_suspension=True`` mirrors ``record_all``'s suspension gate.
+
+        Used by ``Trap.__exit__`` on the tainted branch (PROFILING phase):
+        a paused iteration must not widen per-layer tensor sets via the
+        rescue path either, otherwise the suspension contract leaks on
+        data-dependent models (MoE / conditional branches / mixed-batch
+        shapes).
+        """
+        tm = _make_tm()
+        tm.suspend_profiling()
+        tm.record_tensors("layer0", {1, 2}, respect_suspension=True)
+        c = tm.layer_statistics_collector
+        assert "layer0" not in c.tensor_measurements
+
+    def test_record_tensors_respects_suspension_records_when_not_suspended(self):
+        """``respect_suspension=True`` is a no-op outside suspension."""
+        tm = _make_tm()
+        tm.record_tensors("layer0", {1, 2}, respect_suspension=True)
+        c = tm.layer_statistics_collector
+        assert c.tensor_measurements["layer0"] == [{1, 2}]
+
+    def test_record_tensors_respect_suspension_does_not_widen_tensor_set(self):
+        """Regression: opt-in suspension respect must not widen per-label sets.
+
+        Companion to ``test_record_all_does_not_widen_tensor_set_when_suspended`` —
+        pins the same invariant for the tainted-exit call site, which
+        ``Trap.__exit__`` reaches via ``respect_suspension=True``.
+        """
+        tm = _make_tm()
+
+        tm.record_tensors("layer0", {1, 2}, respect_suspension=True)
+
+        tm.suspend_profiling()
+        tm.record_tensors("layer0", {3, 4}, respect_suspension=True)
+        tm.resume_profiling()
+
+        c = tm.layer_statistics_collector
+        union = c.get_union_tensor_ids()
+        assert union["layer0"] == {1, 2}
+
     def test_record_tensors_noop_without_collector(self):
         tm = _make_tm()
         tm.layer_statistics_collector = None
         tm.record_tensors("layer0", {1})
+
+    def test_record_tensors_noop_without_collector_with_respect_suspension(self):
+        """The collector-None guard runs before the suspension check."""
+        tm = _make_tm()
+        tm.layer_statistics_collector = None
+        tm.suspend_profiling()
+        tm.record_tensors("layer0", {1}, respect_suspension=True)
 
     # --- record_duration ---
 

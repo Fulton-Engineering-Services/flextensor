@@ -11,6 +11,7 @@ from flextensor.tensor_discovery import (
     ModuleTracker,
     _any_prefix_matches,
     _should_offload_param,
+    detect_cross_module_reads,
     discover_untraced_tensors_for_layers,
     get_inner_tensor_field_ids,
     get_non_offloaded_tensor_ids,
@@ -1732,6 +1733,84 @@ class TestEmptyIncludePatterns:
         with caplog.at_level(logging.WARNING, logger="flextensor.tensor_discovery"):
             validate_include_patterns(None)
         assert "include_patterns is an empty list" not in caplog.text
+
+
+class TestDetectCrossModuleReads:
+    """Regression coverage for the attribute-stored cross-reference detector.
+
+    Beartype-shaped contract test and cycle safety: a dict model (no module
+    tree) must not trip the type guard, and ``torch.compile`` back-refs
+    (``_orig_mod`` and friends) must not recurse forever.
+    """
+
+    def test_none_input_returns_empty_set(self):
+        assert detect_cross_module_reads(None, {}) == set()
+
+    def test_dict_model_returns_empty_set(self):
+        """Dict models have no module hierarchy; detector must short-circuit cleanly.
+
+        Reproduces the beartype violation that fired in
+        ``L0_offload_validation``'s ``run_single_test.py`` when the experiment
+        passes a tensor-name → tensor dict as the model.
+        """
+        model_dict = {"layers.0.foo.weight": torch.zeros(2, 2)}
+
+        assert detect_cross_module_reads(model_dict, {}) == set()
+
+    def test_cyclic_module_graph_does_not_recurse(self):
+        """Cyclic back-references (typical of torch.compile wrappers) must not crash.
+
+        Reproduces the ``RecursionError`` previously hit by
+        ``L0_torch_compile::TestCompileThenOffload`` when the detector walked
+        ``named_modules(remove_duplicate=False)`` over a wrapper holding an
+        ``_orig_mod`` reference whose target referred back to the wrapper.
+        """
+
+        class CyclicWrapper(torch.nn.Module):
+            def __init__(self, inner: torch.nn.Module) -> None:
+                super().__init__()
+                self._orig_mod = inner
+
+        inner = torch.nn.Linear(4, 4)
+        wrapper = CyclicWrapper(inner)
+        inner.back_ref = wrapper  # closes the cycle via direct attribute assignment
+
+        result = detect_cross_module_reads(wrapper, {})
+        assert result == set()
+
+    def test_multi_parent_module_is_detected(self):
+        """A module registered under two parents flags its label's tensor IDs.
+
+        This is the genuine attribute-stored cross-reference shape (e.g. a
+        shared expert reachable through two routers). The runtime fallback
+        in :func:`flextensor.tensor_manager._make_tensor_getter` handles the
+        complementary call-site shape that this detector cannot see.
+        """
+
+        class Inner(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+        class Outer(torch.nn.Module):
+            def __init__(self, inner: Inner) -> None:
+                super().__init__()
+                self.inner = inner
+
+        class Root(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.inner = Inner()
+                self.outer = Outer(self.inner)
+
+        root = Root()
+        root.inner._ft_original_forward_func = type(root.inner).forward  # noqa: SLF001
+        root.inner._ft_offload_name = "inner"  # noqa: SLF001
+
+        inner_weight_id = id(root.inner.weight)
+        label_to_tensor_ids = {"inner": {inner_weight_id}}
+
+        assert detect_cross_module_reads(root, label_to_tensor_ids) == {inner_weight_id}
 
 
 # =============================================================================

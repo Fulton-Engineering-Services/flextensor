@@ -121,11 +121,21 @@ class TestForwardPatching:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
     def test_patched_module_state_dict(self):
-        """Test that state_dict() works correctly with patched modules."""
+        """Forward patching is transparent to ``state_dict()`` in discovery mode.
+
+        ``skip_discovery=False`` keeps the manager in DISCOVERY after
+        ``offload()`` — the model is forward-patched but ``param.data`` is
+        not yet replaced (that happens in the view-mode profile path, which
+        is exercised by ``test_view_mode_swaps_only_trapped_layers``).
+        """
         model = ModelWithLayers()
         om = OffloadManager("test_state_dict")
         config = OffloadConfig(
-            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["layer1", "layer2"]
+            enabled=True,
+            skip_discovery=False,
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["layer1", "layer2"],
         )
 
         # Get state_dict before patching
@@ -141,6 +151,59 @@ class TestForwardPatching:
         # Values should match (offload may move tensors to CUDA, so compare on CPU)
         for key in state_dict_before:
             assert torch.equal(state_dict_before[key].cpu(), state_dict_after[key].cpu())
+
+        om.release()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
+    def test_view_mode_swaps_only_trapped_layers(self):
+        """Under the default ``profile_mode='view'`` + ``skip_discovery=True``
+        the trapped layers' ``param.data`` is rebound to a view into the
+        rotating profile block. While a layer's trap is active the view
+        holds that layer's weights; layers outside ``include_patterns``
+        are never swapped and keep their original values.
+        """
+        model = ModelWithLayers()
+        snapshot = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
+
+        om = OffloadManager("test_view_mode")
+        config = OffloadConfig(
+            enabled=True,
+            profiling_iters=1,
+            include_patterns=["layer1", "layer2"],  # layer3 stays excluded
+        )
+
+        captured: dict[str, torch.Tensor] = {}
+
+        def grab(key: str):
+            def _pre(module, _inputs):
+                captured[key] = module.weight.detach().clone().cpu()
+
+            return _pre
+
+        # Pre-hook on the inner Linear: the parent SimpleLayer's trap is
+        # active when this fires, so ``.weight`` points at the populated view.
+        model.layer1.linear.register_forward_pre_hook(grab("layer1.linear.weight"))
+        model.layer2.linear.register_forward_pre_hook(grab("layer2.linear.weight"))
+
+        proxy = om.offload(model, config=config)
+
+        x = torch.randn(1, 10, device="cuda")
+        with torch.no_grad():
+            proxy(x)
+
+        # Trapped layers: the view was populated with the right weights
+        # while the layer's trap was active.
+        assert torch.equal(captured["layer1.linear.weight"], snapshot["layer1.linear.weight"])
+        assert torch.equal(captured["layer2.linear.weight"], snapshot["layer2.linear.weight"])
+
+        # Excluded layer: not patched and not swapped to a view.
+        # ``MoveUnmappedTensorsToGPUProcessor`` may have moved ``.data`` to
+        # GPU but the values must still equal the originals.
+        after = model.state_dict()
+        for name, orig in snapshot.items():
+            if name.startswith(("layer1.", "layer2.")):
+                continue
+            assert torch.equal(orig, after[name].cpu()), f"{name} corrupted by view-mode patching"
 
         om.release()
 

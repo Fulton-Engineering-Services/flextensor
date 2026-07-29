@@ -39,6 +39,7 @@ def _make_mock_tensor_manager(
     tm.layer_statistics_collector = Mock()
     tm.module_tracker = Mock() if with_module_tracker else None
     tm.is_traced.return_value = False
+    tm.is_current_trap_tainted.return_value = False
 
     if with_loader:
         tm.tensor_layer_loader = Mock()

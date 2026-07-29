@@ -11,7 +11,7 @@ import logging
 import os
 from contextlib import contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from torch import nn
@@ -199,12 +199,14 @@ class TestPatchedForwardErrorBoundary:
         om._current_phase = OffloadPhase.DISCOVERY
         om._iteration_count = 1
 
-        # Mock offload_block to be a no-op context manager so we test only the error boundary
+        # Patched forward calls _tensor_manager.trap directly (bypasses
+        # offload_block to avoid the user-facing skip_discovery guard).
         @contextmanager
         def noop_block(name: str):
             yield
 
-        om.offload_block = noop_block  # type: ignore[assignment]
+        om._tensor_manager = MagicMock()
+        om._tensor_manager.trap = noop_block
         om._patch_module_forward(module, "model.layers.5")
 
         with (
@@ -232,7 +234,8 @@ class TestPatchedForwardErrorBoundary:
         def noop_block(name: str):
             yield
 
-        om.offload_block = noop_block  # type: ignore[assignment]
+        om._tensor_manager = MagicMock()
+        om._tensor_manager.trap = noop_block
         om._patch_module_forward(module, "test_block")
 
         with (

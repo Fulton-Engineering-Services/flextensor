@@ -715,6 +715,60 @@ def get_offload_module_tensor_ids(
     return label_to_tensor_ids
 
 
+def detect_cross_module_reads(
+    model: torch.nn.Module | dict | None,
+    label_to_tensor_ids: dict[str, set[int]],
+) -> set[int]:
+    """Return tensor IDs of offload-patched modules registered under multiple parents.
+
+    Catches the *attribute-stored* cross-reference shape, where one offload-patched
+    module is exposed as a child of more than one parent (e.g. a shared expert
+    referenced by two routers). The vLLM ``logits_processor(lm_head, …)`` shape —
+    where ``lm_head`` is passed as a positional argument, not stored — is **not**
+    detected here; it is caught at runtime by the getter fallback.
+
+    Feed the result into
+    :meth:`TensorManager._move_non_offloaded_tensors_to_gpu` via
+    ``extra_pin_ids`` to pin those tensors permanently on GPU.
+
+    Args:
+        model: The model to inspect. ``None`` or a ``dict`` model (no module
+            hierarchy) returns an empty set.
+        label_to_tensor_ids: Output of :func:`get_offload_module_tensor_ids`
+            for the same model.
+
+    Returns:
+        Set of tensor IDs to pin permanently on GPU.
+    """
+    if model is None or isinstance(model, dict):
+        return set()
+
+    # Walk modules with the default cycle-safe traversal (remove_duplicate=True);
+    # ``remove_duplicate=False`` recurses indefinitely on torch.compile back-refs.
+    # Multi-parent detection is done explicitly via direct ``_modules`` slots.
+    child_to_parents: dict[int, set[int]] = {}
+    module_to_label: dict[int, str] = {}
+    for _, module in model.named_modules():
+        if is_offload_patched_module(module):
+            label = get_offload_name(module)
+            if label is not None:
+                module_to_label[id(module)] = label
+        for child in module._modules.values():  # noqa: SLF001 - direct child slot access is intentional
+            if child is None:
+                continue
+            child_to_parents.setdefault(id(child), set()).add(id(module))
+
+    cross_ref_ids: set[int] = set()
+    for cid, parents in child_to_parents.items():
+        if len(parents) <= 1:
+            continue
+        label = module_to_label.get(cid)
+        if label is None:
+            continue
+        cross_ref_ids.update(label_to_tensor_ids.get(label, set()))
+    return cross_ref_ids
+
+
 # Attribute-probe failures we swallow when walking arbitrary modules / tensor
 # subclasses. ``hasattr`` / ``getattr(..., default)`` only catch
 # ``AttributeError``; anything else escapes and crashes FT mid-traversal.

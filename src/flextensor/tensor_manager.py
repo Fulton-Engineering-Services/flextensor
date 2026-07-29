@@ -14,6 +14,7 @@ from typing_extensions import deprecated as _deprecated
 from flextensor._logging import ensure_diagnostics_visible, get_diagnostics_logger
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, TensorBenchmarkMode
 from flextensor.collectors import (
+    IterativeLayerStatistics,
     IterativeLayerStatisticsCollector,
     IterativeLayerStatisticsFilter,
     LayerStatistics,
@@ -21,7 +22,7 @@ from flextensor.collectors import (
 )
 from flextensor.config import ProfileMode
 from flextensor.gpu_budget import reserve_strategy_invisible_gpu_budget, resolve_gpu_budget
-from flextensor.helpers import ProfilingSuspender, TrapNestingGuard
+from flextensor.helpers import ProfilingSuspender, TrapNestingGuard, format_tensor_id_hint
 from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
 from flextensor.instrumentation import instrumentable
 from flextensor.layer_statistics_analyzer import report_profiling_quality
@@ -32,6 +33,7 @@ from flextensor.loaders import (
     RawBlockController,
     TensorLayerLoader,
     TensorStrategyLoader,
+    UntimedTrapRescuer,
     WarmupDirectTensorLoader,
 )
 from flextensor.memory_transfer_benchmark import (
@@ -62,6 +64,7 @@ from flextensor.strategy_operations import (
 from flextensor.tensor import TraceTensor
 from flextensor.tensor_discovery import (
     ModuleTracker,
+    detect_cross_module_reads,
     discover_untraced_tensors_for_layers,
     get_non_offloaded_tensor_ids,
     get_offload_module_tensor_ids,
@@ -198,17 +201,40 @@ def _make_tensor_getter(tensor_ref, tensor_manager, missing_fields):
                 tensor = new_tensor
                 for missing_field in missing_fields:
                     _apply_missing_field(tensor_ref, new_tensor, missing_field, tensor_manager)
-            elif isinstance(tensor_manager.device_gpu, torch.device):
-                tensor_names = getattr(tensor_manager, "tensor_id_to_name_map", {})
-                tensor_name = (
-                    tensor_names.get(tensor_id, "<unknown>") if isinstance(tensor_names, dict) else "<unknown>"
-                )
-                msg = (
-                    "FlexTensor missing materialized tensor for traced parameter "
-                    f"{tensor_name} (id={tensor_id}). This usually means a cross-layer dependency "
-                    "was not recorded before profiling/inference. Disable skip discovery or seed the dependency."
-                )
-                raise RuntimeError(msg)
+            elif isinstance(tensor_manager.device_gpu, torch.device) and tensor_ref.device != tensor_manager.device_gpu:
+                # Cross-layer access fallback: mutate ``.data`` so the
+                # branch doesn't re-fire and taint the active trap's
+                # duration sample. ``prepare_infer_mode`` drains
+                # ``observed_cross_refs`` from layer_stats so the strategy
+                # loader skips this id.
+                #
+                # Report on first observation only: during INFERENCE (and on
+                # the restored-profile path) ``_report_cross_layer_access``
+                # never runs, so without this the promotion is invisible --
+                # each one permanently pins a CPU master weight to GPU.
+                first_observation = tensor_id not in tensor_manager.observed_cross_refs
+                if first_observation:
+                    logger.warning(
+                        "Cross-layer tensor access: %s was read outside its owning layer and is now "
+                        "permanently GPU-resident (offload coverage reduced by %.2f MiB). "
+                        "Check include_patterns, or seed the dependency so the tensor is traced.",
+                        format_tensor_id_hint({tensor_id}, tensor_manager.tensor_id_to_name_map),
+                        tensor_ref.nbytes / (1024 * 1024),
+                    )
+                try:
+                    tensor_ref.data = tensor_ref.data.to(device=tensor_manager.device_gpu)
+                except torch.cuda.OutOfMemoryError as e:
+                    raise torch.cuda.OutOfMemoryError(
+                        f"Out of GPU memory promoting cross-layer tensor "
+                        f"{format_tensor_id_hint({tensor_id}, tensor_manager.tensor_id_to_name_map)} "
+                        f"({tensor_ref.nbytes / (1024 * 1024):.2f} MiB) to {tensor_manager.device_gpu}. "
+                        f"This tensor is read outside its owning layer, so it cannot stay offloaded. "
+                        f"Lower max_gpu_mem_fraction or exclude it via exclude_patterns."
+                    ) from e
+                tensor_manager.observed_cross_refs.add(tensor_id)
+                tensor_manager.traced_tensors.discard(tensor_id)
+                tensor_manager.mark_current_trap_tainted()
+                tensor = tensor_ref
         return tensor
 
     return getter
@@ -408,7 +434,10 @@ class TensorManager:
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
-        self.device_gpu = device_gpu
+        # Normalize at the boundary so every downstream consumer (loaders,
+        # rescuer, device comparisons) gets a concrete ``torch.device`` rather
+        # than having to re-handle the ``str`` form.
+        self.device_gpu: torch.device = torch.device(device_gpu) if isinstance(device_gpu, str) else device_gpu
         self.tensor_statistics_map: dict[int, TensorStatistics] = {}
         self.tensors_map: Any = {}
         self.trap_class: Any = None
@@ -475,6 +504,22 @@ class TensorManager:
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
         self._profiling_suspender = ProfilingSuspender()
+        self.skip_discovery_requested: bool = False
+        # True only while a profile restored from *outside* this manager
+        # (``load_profile`` / ``offload_from_profile``) is waiting to be
+        # consumed. ``tensor_manager_state`` alone cannot express this: the
+        # loader setup also stores state as a side effect of a normal cycle
+        # reaching INFERENCE, so branching on it would make a second
+        # ``offload()`` replay the previous model's plan.
+        self._state_restored_from_profile: bool = False
+        self.layer_stats: list[IterativeLayerStatistics] | None = None
+        # True only while ``layer_stats`` holds a static seed built by
+        # ``_build_layer_stats_from_forward_patching``. Tracked explicitly
+        # rather than inferred from ``layer_stats is None`` so a second
+        # offload cycle cannot mistake the previous cycle's stats for a seed.
+        self._layer_stats_seeded_statically: bool = False
+        self.observed_cross_refs: set[int] = set()
+        self._active_trap_tainted: bool = False
 
     def arm_non_destructive_first_loader(self) -> None:
         """Keep source weights intact on the first inference loader build.
@@ -557,7 +602,7 @@ class TensorManager:
             for name, tensor in model.items():
                 self.tensor_id_to_name_map[id(tensor)] = name
 
-    def _move_non_offloaded_tensors_to_gpu(self):
+    def _move_non_offloaded_tensors_to_gpu(self, *, extra_pin_ids: set[int] | None = None):
         """Move non-offloaded tensors to GPU and remove them from offload tracking.
 
         Identifies tensors not matching include_patterns or matching
@@ -572,6 +617,19 @@ class TensorManager:
 
         This method is idempotent — safe to call multiple times. Guarded by
         the _non_offloaded_tensors_moved flag.
+
+        Args:
+            extra_pin_ids: Optional set of tensor IDs to additionally pin
+                permanently on GPU. Ids present in ``tensors_map`` are
+                popped from it and from ``traced_tensors``; ids absent
+                are silently skipped — source them from the same
+                ``tensors_map`` you were tracking.
+                :func:`flextensor.tensor_discovery.detect_cross_module_reads`
+                feeds this with children whose parent chain has multiple
+                offloaded parents (shared expert / multi-router shapes);
+                the vLLM ``logits_processor(lm_head, …)`` positional-arg
+                shape is *not* detected there and is instead handled at
+                runtime by the ``_make_tensor_getter`` fallback.
         """
         if self._non_offloaded_tensors_moved:
             return
@@ -582,6 +640,8 @@ class TensorManager:
             self.include_patterns,
             self.exclude_patterns,
         )
+        if extra_pin_ids:
+            non_offloaded_ids = set(non_offloaded_ids) | set(extra_pin_ids)
         if non_offloaded_ids:
             non_offloaded_tensors = [self.tensors_map[tid] for tid in non_offloaded_ids if tid in self.tensors_map]
             non_offloaded_bytes = sum(t.nelement() * t.element_size() for t in non_offloaded_tensors)
@@ -610,10 +670,56 @@ class TensorManager:
 
     def set_model(self, model):
         self.model = model
+        # A new model invalidates the once-per-model preprocessing guard.
+        # ``_move_non_offloaded_tensors_to_gpu`` is idempotent *per model*; left
+        # set, it returns immediately and the new model's non-matching
+        # parameters are never moved to GPU, so they stay on CPU and fail the
+        # first GPU forward. ``set_model`` is the one seam that runs exactly
+        # once per offload cycle and never mid-cycle.
+        self._non_offloaded_tensors_moved = False
+        # That method freezes ``tensors_map`` when it completes; it mutates the
+        # map (``pop``) on the next pass, so hand back a mutable copy. The
+        # entries themselves are replaced by ``preprocess_model``.
+        if isinstance(self.tensors_map, types.MappingProxyType):
+            self.tensors_map = dict(self.tensors_map)
         self.build_parameters_mapping(self.model)
 
+    @property
+    def state_restored_from_profile(self) -> bool:
+        """Whether a profile restored from outside this manager awaits consumption.
+
+        ``True`` only between a ``load_profile`` / ``offload_from_profile``
+        restore and the ``initialize_inference`` that consumes it.
+
+        Read this rather than testing ``tensor_manager_state``: a normal cycle
+        reaching INFERENCE also stores state, so that attribute cannot tell a
+        restored profile apart from a previous live cycle.
+        """
+        return self._state_restored_from_profile
+
+    def set_skip_discovery(self, skip_discovery: bool) -> None:
+        """Configure the manager to skip discovery iterations.
+
+        When enabled and forward patching is in use, layer statistics are built
+        directly from the patched modules during ``initialize_warmup`` instead
+        of being collected from discovery-phase iterations.
+
+        Stored on :attr:`skip_discovery_requested` and read once by
+        :meth:`initialize_warmup`. Must be called before ``initialize_warmup``
+        to take effect; calling it later does not change behaviour.
+
+        Args:
+            skip_discovery: If True, bypass discovery iterations and discover
+                tensor-to-layer mappings statically from forward-patched modules.
+        """
+        self.skip_discovery_requested = skip_discovery
+
     def initialize_warmup(self):
-        if self.tensor_manager_state is not None:
+        # Only an externally restored profile short-circuits to inference. A
+        # previous live cycle also leaves ``tensor_manager_state`` populated,
+        # and branching on that would make a second ``offload()`` on this
+        # manager serve the *previous* model's plan and tensor IDs.
+        if self._state_restored_from_profile:
             self.prepare_infer_load_mode()
             final_model = self.prepare_final_model(self.model)  # patch model
             self.model = final_model
@@ -628,14 +734,42 @@ class TensorManager:
                 host_pinner=self.host_pinner,
                 move_top_level_buffers_to_gpu=self.move_top_level_buffers_to_gpu,
             )
-            self._move_non_offloaded_tensors_to_gpu()
+            cross_ref_pin_ids = detect_cross_module_reads(
+                self.model,
+                get_offload_module_tensor_ids(
+                    self.model,
+                    self.tensors_map,
+                    include_patterns=self.include_patterns,
+                    exclude_patterns=self.exclude_patterns,
+                ),
+            )
+            if cross_ref_pin_ids:
+                pin_bytes = sum(
+                    self.tensors_map[tid].numel() * self.tensors_map[tid].element_size()
+                    for tid in cross_ref_pin_ids
+                    if tid in self.tensors_map
+                )
+                logger.warning(
+                    "Cross-module reference pin: %d tensor(s) (%.2f MiB) force-pinned to GPU [tensors: %s].",
+                    len(cross_ref_pin_ids),
+                    pin_bytes / (1024 * 1024),
+                    format_tensor_id_hint(cross_ref_pin_ids, self.tensor_id_to_name_map),
+                )
+            self._move_non_offloaded_tensors_to_gpu(extra_pin_ids=cross_ref_pin_ids)
         self.prepare_model_ids(self.model)  # TODO: Move to preprocess_model after remove benchmark context
 
         self.prepare_warmup_mode()
+
+        if self.skip_discovery_requested and has_offload_modules(self.model):
+            self.layer_stats = self._build_layer_stats_from_forward_patching()
+            self._layer_stats_seeded_statically = True
+            for layer_stat in self.layer_stats:
+                self.layer_statistics_collector.add_tensors(layer_stat.label, layer_stat.tensor_ids)
+
         return self.model
 
     def initialize_profile(self):
-        if self.tensor_manager_state is not None:
+        if self._state_restored_from_profile:
             return self.model
         self._move_non_offloaded_tensors_to_gpu()
         profile_model = self.model
@@ -655,9 +789,12 @@ class TensorManager:
         return profile_model
 
     def initialize_inference(self):
-        if self.tensor_manager_state is not None:
+        if self._state_restored_from_profile:
             final_model = self.model
             self.model = None
+            # The restore has been consumed; a later ``offload()`` on this
+            # manager must run a fresh discovery/profile cycle.
+            self._state_restored_from_profile = False
         else:
             self.prepare_infer_mode()
             final_model = self.prepare_final_model(self.model)  # patch model
@@ -680,10 +817,78 @@ class TensorManager:
     def set_model_ids(self, tensors_ids):
         self.model_ids = tensors_ids
 
+    def _build_layer_stats_from_forward_patching(self) -> list[IterativeLayerStatistics]:
+        """Build layer statistics from forward-patched modules to skip discovery.
+
+        Discovers tensors directly from patched modules without running
+        discovery iterations. Only meaningful when ``has_offload_modules(self.model)``
+        is true; the caller (``initialize_warmup``) already enforces that
+        precondition.
+
+        Uses ``duration=0.0`` (not ``None``) so the entries carry a usable
+        duration wherever they are consumed. The placeholders persist for the
+        whole profiling phase — ``_compute_profile_layer_stats`` does not
+        rebuild a statically seeded list — and are read only by
+        ``TensorLayerLoader`` / ``UntimedTrapRescuer``, which use ``tensor_ids``
+        alone. ``prepare_infer_mode`` later discards this list entirely and
+        rebuilds from ``layer_statistics_collector``, which by then holds the
+        real measurements the strategy consumes.
+
+        Patched modules whose tensor manifest is empty (e.g. every parameter
+        excluded by ``exclude_patterns``, or all params shared with another
+        layer and deduplicated upstream) are dropped from the returned list
+        and logged at ``WARNING`` so the user can correct their patterns
+        rather than silently lose offload coverage for that label.
+
+        Returns:
+            List of :class:`IterativeLayerStatistics` populated from patched
+            modules. Empty when ``self.model`` is ``None`` or no patched
+            modules are found.
+        """
+        if self.model is None:
+            return []
+
+        label_to_tensor_ids = get_offload_module_tensor_ids(
+            self.model,
+            self.tensors_map,
+            include_patterns=self.include_patterns,
+            exclude_patterns=self.exclude_patterns,
+        )
+
+        stats: list[IterativeLayerStatistics] = []
+        dropped_labels: list[str] = []
+        for label, tensor_ids in label_to_tensor_ids.items():
+            if tensor_ids:
+                stats.append(IterativeLayerStatistics(label=label, tensor_ids=tensor_ids, duration=0.0))
+            else:
+                dropped_labels.append(label)
+
+        if dropped_labels:
+            logger.warning(
+                "skip_discovery: %d patched module(s) had no offloadable tensors and were "
+                "excluded from layer_stats. Their traps will fall through the rescuer at "
+                "profile time (best case) or device-mismatch at runtime (worst case). "
+                "Labels: %s. Check include_patterns / exclude_patterns.",
+                len(dropped_labels),
+                ", ".join(sorted(dropped_labels)),
+            )
+
+        return stats
+
     def prepare_warmup_mode(self):
         self.layer_statistics_collector = IterativeLayerStatisticsCollector()
         # Fresh discovery cycle -> the next profile setup must rebuild stats.
+        # Drop the previous cycle's list too: a second ``offload()`` reuses this
+        # TensorManager, and keeping stale stats here would wire the profile
+        # loader with the previous model's tensor IDs.
         self._layer_stats_computed = False
+        self._layer_stats_seeded_statically = False
+        self.layer_stats = None
+        # Same reasoning: these are CPython ``id()`` values from the previous
+        # cycle's (now freed) tensors, so ids can be recycled. A stale entry
+        # would suppress the new tensor's promotion warning and silently drop
+        # it from layer_stats in ``prepare_infer_mode``.
+        self.observed_cross_refs.clear()
         if self._use_direct_warmup_model():
             label_to_tensor_ids = get_offload_module_tensor_ids(
                 self.model,
@@ -715,6 +920,27 @@ class TensorManager:
             and has_offload_modules(self.model)
         )
 
+    def _build_untimed_rescuer(self) -> UntimedTrapRescuer:
+        """Build an :class:`UntimedTrapRescuer` for the strategy loader.
+
+        Narrows the rescue scope to ``self.model_ids`` so unrelated
+        ``tensors_map`` entries don't get force-pinned as a side effect.
+
+        Raises:
+            RuntimeError: ``layer_stats`` is ``None`` (callers must populate
+                it before constructing the rescuer).
+        """
+        layer_stats = self.layer_stats
+        if layer_stats is None:
+            raise RuntimeError("layer_stats must be populated before rescuer construction")
+        return UntimedTrapRescuer(
+            layer_stats,
+            self.tensors_map,
+            self.device_gpu,
+            reachable_tensor_ids=self.model_ids,
+            id_to_name_map=self.tensor_id_to_name_map,
+        )
+
     def prepare_profile_direct_mode_model(self, model):
         """Return the profile-phase model for ``profile_mode`` in {``view``, ``getter``}.
 
@@ -735,19 +961,31 @@ class TensorManager:
             return self.prepare_model(model)
         return model
 
-    def _compute_profile_layer_stats(self) -> None:
+    def _compute_profile_layer_stats(self) -> list[IterativeLayerStatistics]:
         """Materialize ``self.layer_stats`` for profile and unregister the module tracker.
 
         Idempotent: safe to call from any profile-setup path
         (``prepare_profile_direct_mode_model`` view, ``prepare_profile_direct_mode``
         getter, ``prepare_profile_mode`` torch_function).
+
+        Returns:
+            The materialized layer statistics. Never ``None`` — callers pass
+            this straight into loaders that require a concrete list.
         """
         if self._layer_stats_computed:
-            return
+            return self.layer_stats or []
 
-        self.layer_stats = self.layer_statistics_collector.get_layer_stats()
+        # When skip_discovery is honored, layer_stats were seeded statically by
+        # _build_layer_stats_from_forward_patching() during initialize_warmup;
+        # do not overwrite them here. ``prepare_warmup_mode`` clears both the
+        # seed flag and the list, so this cannot pick up a previous cycle's stats.
+        if not self._layer_stats_seeded_statically:
+            self.layer_stats = self.layer_statistics_collector.get_layer_stats()
+
+        # Applied to both paths: ``TensorLayerLoader.enter`` indexes
+        # ``tensors_map`` unguarded, so every id here must be a known tensor.
         self.layer_stats = IterativeLayerStatisticsFilter().filter_by_tensor_ids(
-            self.layer_stats,
+            self.layer_stats or [],
             set(self.tensors_map.keys()),
         )
         if self.enable_untraced_tensor_discovery:
@@ -766,6 +1004,7 @@ class TensorManager:
             self.module_tracker = None
 
         self._layer_stats_computed = True
+        return self.layer_stats or []
 
     def _prepare_view_profile_model(self, profile_model):
         """Build the view-mode profile controller and patch ``profile_model`` with its views.
@@ -776,11 +1015,11 @@ class TensorManager:
         slot. ``prepare_profile_direct_mode`` later wires the matching trap
         class against the same instance.
         """
-        self._compute_profile_layer_stats()
+        layer_stats = self._compute_profile_layer_stats()
 
         gpu_budget_bytes = resolve_gpu_budget(self._max_gpu_mem_fraction, self.device_gpu)
         controller = ProfileBlockController(
-            self.layer_stats,
+            layer_stats,
             self.tensors_map,
             self.device_gpu,
             pinned_memory=self.pinned_memory,
@@ -823,9 +1062,16 @@ class TensorManager:
             self.trap_class = TrapProfileView
             return
 
-        self._compute_profile_layer_stats()
+        layer_stats = self._compute_profile_layer_stats()
 
-        self.tensor_layer_loader = TensorLayerLoader(self.layer_stats, self.tensors_map, self.device_gpu)
+        # TODO: When profile direct mode switches to using view models (prepare_view_model),
+        # this TensorLayerLoader may need to be replaced with a view-compatible loader
+        self.tensor_layer_loader = TensorLayerLoader(
+            layer_stats,
+            self.tensors_map,
+            self.device_gpu,
+            rescuer=self._build_untimed_rescuer(),
+        )
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
 
         self.trap_class = TrapDirect
@@ -835,8 +1081,13 @@ class TensorManager:
 
         Single-call setup (the ``torch_function`` path doesn't patch the model).
         """
-        self._compute_profile_layer_stats()
-        self.tensor_layer_loader = TensorLayerLoader(self.layer_stats, self.tensors_map, self.device_gpu)
+        layer_stats = self._compute_profile_layer_stats()
+        self.tensor_layer_loader = TensorLayerLoader(
+            layer_stats,
+            self.tensors_map,
+            self.device_gpu,
+            rescuer=self._build_untimed_rescuer(),
+        )
         self.tensor_layer_loader.set_model_ids(self.model_ids)  # TODO: Fix me, remove
         self.trap_class = Trap
 
@@ -868,6 +1119,11 @@ class TensorManager:
                 pre-replan loader). Ignored by the ``strategy`` loader.
         """
         self.trap_class = self._select_infer_trap_class()
+
+        # Release profile-time rescuer pins before the inference loader takes over.
+        if self.tensor_layer_loader is not None:
+            self.tensor_layer_loader.shutdown()
+            self.tensor_layer_loader = None
 
         if self.loader_type == "strategy":
             self._setup_strategy_loader(data, prepare_state=prepare_state)
@@ -1147,6 +1403,26 @@ class TensorManager:
         """
         return self.memory_transfer_stats
 
+    def _report_cross_layer_access(self) -> None:
+        """Warn about tensors that triggered the getter fallback during profiling.
+
+        Each id was read from outside its declared layer window. Each
+        access issues an inline H2D copy and taints the *currently active
+        trap* if one was open at the time (see
+        :meth:`mark_current_trap_tainted`); accesses outside any trap
+        window do not taint a duration sample.
+        """
+        if not self.observed_cross_refs:
+            return
+        logger.warning(
+            "Cross-layer tensor access detected: %d tensor(s) read outside their "
+            "declared layer window during profiling; each read issued an inline H2D "
+            "copy and, when it happened inside an active trap, tainted that trap's "
+            "duration sample. Tensors: %s",
+            len(self.observed_cross_refs),
+            format_tensor_id_hint(self.observed_cross_refs, self.tensor_id_to_name_map),
+        )
+
     def prepare_infer_mode(self):
         """Prepare inference mode from fresh profiling data.
 
@@ -1161,6 +1437,7 @@ class TensorManager:
         self._teardown_profile_block_controller()
 
         report_profiling_quality(self.layer_statistics_collector, self.enable_diagnostics)
+        self._report_cross_layer_access()
 
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
         # Remove tensors that are not parameters!
@@ -1172,6 +1449,15 @@ class TensorManager:
             self.layer_stats,
             difference,
         )
+
+        # Drop runtime-detected cross-module refs: their ``.data`` is
+        # already GPU-resident (mutated by the getter fallback), so any
+        # strategy_map entry would cost a per-cycle D2D alloc/copy/free.
+        if self.observed_cross_refs:
+            self.layer_stats = IterativeLayerStatisticsFilter().filter_excluding_tensor_ids(
+                self.layer_stats,
+                self.observed_cross_refs,
+            )
 
         # Remove duplicates
         self.layer_stats = IterativeLayerStatisticsFilter().filter_by_tensor_ids(
@@ -1562,17 +1848,26 @@ class TensorManager:
         if self.layer_statistics_collector is not None:
             self.layer_statistics_collector.clear_duration_measurements()
 
-    def record_tensors(self, label: str, tensor_ids: list[int] | set[int]) -> None:
-        """Record tensor IDs for a DISCOVERY-phase trap exit.
+    def record_tensors(
+        self,
+        label: str,
+        tensor_ids: list[int] | set[int],
+        *,
+        respect_suspension: bool = False,
+    ) -> None:
+        """Record tensor IDs without a duration sample.
 
-        Discovery captures only the tensor-to-layer mapping — ``WarmupTrap``
-        does not measure per-iteration durations, so there is no duration
-        sample to record here. Suspension is not consulted because the
-        mapping is a hard prerequisite for every later phase.
+        Whether to skip recording while profiling is suspended:
 
-        No-op if no collector is active.
+        * **DISCOVERY** (default, ``WarmupTrap``): always record.
+        * **PROFILING** (``Trap`` tainted branch): skip while suspended.
+
+        No-op if no collector is active, or if ``respect_suspension`` is
+        ``True`` while profiling is currently suspended.
         """
         if self.layer_statistics_collector is None:
+            return
+        if respect_suspension and self.is_profiling_suspended():
             return
         self.layer_statistics_collector.add_tensors(label, tensor_ids)
 
@@ -1603,6 +1898,34 @@ class TensorManager:
 
     def trap(self, name):
         return self.trap_class(self, name, self.device_gpu)
+
+    def is_current_trap_tainted(self) -> bool:
+        """Whether the active trap window has been marked tainted."""
+        return self._active_trap_tainted
+
+    def reset_current_trap_taint(self) -> None:
+        """Clear the taint flag after a trap consumes it, so the next window starts clean."""
+        self._active_trap_tainted = False
+
+    def _is_trap_active(self) -> bool:
+        """Whether a profile or warmup trap window is currently open.
+
+        Inference traps intentionally do not acquire the nesting guard, so
+        this returns ``False`` during inference.
+        """
+        return self.trap_nesting_guard.is_active()
+
+    def mark_current_trap_tainted(self) -> None:
+        """Mark the active trap window as corrupted; its duration sample will be dropped.
+
+        Called by :func:`_make_tensor_getter` when a cross-module reference
+        forces an inline CPU->GPU copy. No-op when no trap is active (see
+        :meth:`_is_trap_active`) — getter calls outside a trap window must
+        not poison a future trap's duration sample.
+        """
+        if not self._is_trap_active():
+            return
+        self._active_trap_tainted = True
 
     def release_memory(self):
         if self.tensor_layer_loader is not None:

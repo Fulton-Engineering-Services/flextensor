@@ -151,18 +151,29 @@ class IterativeLayerStatisticsCollector:
         self.add_tensors(label, tensor_ids)
         self.add_duration(label, duration_ms)
 
+    def _labels_with_durations(self) -> list[str]:
+        """Labels that have both tensor and duration measurements.
+
+        Used by :meth:`get_median_duration_ms` and :meth:`get_min_duration_ms`
+        to skip labels with no duration samples (otherwise ``np.median``/
+        ``np.min`` would error on an empty list). :meth:`get_layer_stats`
+        deliberately keeps those labels with ``duration=None`` and lets
+        :func:`flextensor.tensor_manager.compute_layer_statistics` drop them
+        before they reach the strategy. Preserves insertion order from
+        ``tensor_measurements``.
+        """
+        return [label for label in self.tensor_measurements if label in self.duration_measurements]
+
     def get_median_duration_ms(self) -> dict[str, float]:
         median_duration_ms: dict[str, float] = {}
-        for label in self.tensor_measurements:
-            if label in self.duration_measurements:
-                median_duration_ms[label] = np.median(self.duration_measurements[label])
+        for label in self._labels_with_durations():
+            median_duration_ms[label] = np.median(self.duration_measurements[label])
         return median_duration_ms
 
     def get_min_duration_ms(self) -> dict[str, float]:
         min_duration_ms: dict[str, float] = {}
-        for label in self.tensor_measurements:
-            if label in self.duration_measurements:
-                min_duration_ms[label] = np.min(self.duration_measurements[label])
+        for label in self._labels_with_durations():
+            min_duration_ms[label] = np.min(self.duration_measurements[label])
         return min_duration_ms
 
     def get_union_tensor_ids(self) -> dict[str, set[int]]:

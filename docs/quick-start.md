@@ -38,18 +38,20 @@ model = YourModel()
 
 # Configure offloading
 config = OffloadConfig(
-    gpu_device=0,              # GPU to use
-    discovery_iters=1,            # Iterations for parameter discovery
-    profiling_iters=10,          # Iterations for timing measurement
+    gpu_device=0,                   # GPU to use
+    profiling_iters=10,             # Iterations for timing measurement
     include_patterns=["layers.*"],  # Which modules to offload
 )
 
 # Patch the model
 model = flextensor.offload(model, config=config)
 
-# Use normally - first discovery_iters + profiling_iters iterations are discovery/profiling
+# Use normally — the first few forwards warm the manager. Under the
+# default `skip_discovery=True` that is just `profiling_iters` forwards;
+# `flextensor.get_offload_manager().iters_before_inference` is path-aware and
+# always returns the right count if you need to know it.
 for batch in dataloader:
-    output = model(batch)  # FlexTensor handles everything
+    output = model(batch)  # FlexTensor handles everything (discovery→profile→inference)
 ```
 
 !!! warning "Single-thread only"
@@ -91,8 +93,9 @@ FT_INCLUDE_PATTERNS="layers.*,embed,head,class:SharedExpertMLP" python my_script
 The most commonly tuned options are:
 
 - **`include_patterns`** — which modules to offload (supports `*` and `?` wildcards plus `class:` selectors, default `["*"]`; use specific patterns such as `class:*DecoderLayer` or `model.layers.*` for better per-layer pipelining)
-- **`discovery_iters`** — iterations for tensor discovery (default `1`)
+- **`skip_discovery`** — skip the discovery phase and jump straight to profiling (default `True`; the manager derives tensor-to-layer mappings statically from the patched modules). Set to `False` only if the model uses manual `offload_block()` blocks.
 - **`profiling_iters`** — iterations for timing measurement (default `10`)
+- **`discovery_iters`** — only consulted when `skip_discovery=False` (default `1`)
 
 See [Configuration](explanation/configuration.md) for the full list of options and explanations.
 
@@ -109,7 +112,7 @@ config = OffloadConfig(
     profile_read_only=False,  # Allow saving profiles
 )
 model = om.offload(model, config=config)
-for _ in range(config.discovery_iters + config.profiling_iters):
+for _ in range(om.iters_before_inference):
     model(sample_input)
 om.save_profile("/tmp/profiles/my_model")
 

@@ -29,7 +29,6 @@ model = YourModel()
 # Configure offloading
 config = OffloadConfig(
     gpu_device=0,
-    discovery_iters=1,
     profiling_iters=10,
     include_patterns=["embed", "layers.*", "head"],
 )

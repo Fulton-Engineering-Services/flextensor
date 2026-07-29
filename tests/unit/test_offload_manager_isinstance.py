@@ -70,6 +70,38 @@ class TestOffloadProxyInstanceOf:
         """Setup test fixtures."""
         self.x = torch.randn(4, 10)
 
+    @pytest.mark.parametrize("skip_discovery", [False, True])
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_isinstance_nn_module_under_both_discovery_paths(
+        self, mock_strategy_cls, mock_tensor_manager_cls, skip_discovery
+    ):
+        """Proxy identity must hold under the shipping default too.
+
+        The rest of this file pins ``skip_discovery=False``; without this case
+        the proxy's ``isinstance`` behavior would be untested on the path most
+        users actually take.
+        """
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        model = BaseModel()
+        # With skip_discovery honored, offload() short-circuits straight to
+        # PROFILING, so the profile/inference entry points are reached during
+        # offload() itself and must return a real Module.
+        mock_tensor_manager.initialize_warmup.return_value = model
+        mock_tensor_manager.initialize_profile.return_value = model
+        mock_tensor_manager.initialize_inference.return_value = model
+
+        om = OffloadManager(f"test_isinstance_skip_{skip_discovery}")
+        config = OffloadConfig(enabled=True, skip_discovery=skip_discovery)
+
+        proxy_model = om.offload(model, config=config)
+
+        assert isinstance(proxy_model, nn.Module)
+        assert isinstance(proxy_model, BaseModel)
+
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
     def test_isinstance_nn_module(self, mock_strategy_cls, mock_tensor_manager_cls):
@@ -83,7 +115,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -104,7 +136,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -127,7 +159,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -149,7 +181,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -175,7 +207,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -201,7 +233,7 @@ class TestOffloadProxyInstanceOf:
 
         om = OffloadManager("test")
         # Use empty include_patterns to not wrap any modules (original behavior when module_paths=None)
-        config = OffloadConfig(enabled=True, include_patterns=[])
+        config = OffloadConfig(enabled=True, include_patterns=[], skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -233,7 +265,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -263,7 +295,7 @@ class TestOffloadProxyInstanceOf:
         mock_tensor_manager.initialize_inference.return_value = inference_model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(CustomModel(), config=config)
@@ -339,7 +371,7 @@ class TestOffloadProxyHuggingFaceCompatibility:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -379,7 +411,7 @@ class TestOffloadProxyHuggingFaceCompatibility:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -421,7 +453,7 @@ class TestOffloadProxyCallable:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -450,7 +482,7 @@ class TestOffloadProxyCallable:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Get output from original model
         with torch.no_grad():

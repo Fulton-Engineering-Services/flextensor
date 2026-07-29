@@ -574,7 +574,8 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, include_patterns=["submoduleL1.submoduleL2"])
+        # skip_discovery=False is required to call offload_block() directly.
+        config = OffloadConfig(enabled=True, include_patterns=["submoduleL1.submoduleL2"], skip_discovery=False)
         om.offload(self.model, config=config)
 
         # Get trap from offload_block
@@ -655,7 +656,15 @@ class TestOffloadManagerStateMachine:
             "submoduleL2",
             "module_list.*",
         ]
-        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=patterns)
+        # skip_discovery=False keeps the test focused on patching, not on the skip path's
+        # auto-jump to profiling (which would try to use mocked initialize_profile output).
+        config = OffloadConfig(
+            enabled=True,
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=patterns,
+            skip_discovery=False,
+        )
         om.offload(self.model, config=config)
 
         # Count how many modules were patched
@@ -736,7 +745,9 @@ class TestOffloadManagerStateMachine:
         mock_tensor_manager.initialize_warmup.return_value = self.model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        # skip_discovery=False keeps the manager in DISCOVERY after offload(),
+        # which is what this test asserts.
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Verify default pattern is ["*"]
         assert config.include_patterns == ["*"]
@@ -851,18 +862,51 @@ class TestEagerProfilingBudget:
         assert om_high._compiled.measure_forwards() == 25
 
     def test_manager_iters_before_inference_plain_path(self):
-        """Plain path: discovery_iters + profiling_iters (matches config)."""
+        """Plain path (``skip_discovery=False``): discovery_iters + profiling_iters."""
         om = OffloadManager("test_iters_plain")
-        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=7)
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=7, skip_discovery=False)
         om._compiled.active = False
         om._compiled.replan_active = False
         assert om.iters_before_inference == 9
         assert om.iters_before_inference == om.config.pre_inference_iters
 
+    def test_manager_iters_before_inference_skip_discovery_honored(self):
+        """``skip_discovery=True`` honored: only profiling_iters, no discovery forwards."""
+        om = OffloadManager("test_iters_skip_honored")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=7, skip_discovery=True)
+        om._compiled.active = False
+        om._compiled.replan_active = False
+        # The skip only drops the discovery component once it is *known* to have
+        # fired; the fixture bypasses ``_transition_to_warmup``, so set it here.
+        # Undetermined (``None``) deliberately budgets for discovery instead.
+        om._skip_discovery_honored = True
+        assert om.skip_discovery_honored is True
+        assert om.iters_before_inference == 7
+        # And diverges from the static ``pre_inference_iters`` upper bound —
+        # this is exactly the divergence the reviewer of #50 flagged.
+        assert om.iters_before_inference != om.config.pre_inference_iters
+
+    def test_manager_iters_before_inference_skip_discovery_fallback(self):
+        """``skip_discovery=True`` but not honored: full discovery still runs."""
+        om = OffloadManager("test_iters_skip_fallback")
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=7, skip_discovery=True)
+        om._compiled.active = False
+        om._compiled.replan_active = False
+        # Simulate the fallback branch (no patched modules reachable at
+        # ``_transition_to_warmup`` → manager falls back to full discovery).
+        om._skip_discovery_honored = False
+        assert om.iters_before_inference == 9
+
     def test_manager_iters_before_inference_compile_path(self):
-        """Compile path without compile_fn: eager seed only (no replan tail in count)."""
+        """Compile path without compile_fn: eager seed only (no replan tail in count).
+
+        ``skip_discovery=False`` here so ``discovery_iters=2`` is included and
+        this test continues to pin the compile-path arithmetic it was written
+        for. A skip-discovery variant of the same shape is asserted in
+        :meth:`test_manager_iters_before_inference_skip_discovery_honored`.
+        """
         om = OffloadManager("test_iters_compile")
-        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=50)
+        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=50, skip_discovery=False)
         om._compiled.active = True
         om._compiled.replan_active = True
         assert om.iters_before_inference == 2 + COMPILED_EAGER_PROFILE_FORWARDS
@@ -873,7 +917,9 @@ class TestEagerProfilingBudget:
         from flextensor.compile.lifecycle import PROFILE_COMPILE_WARMUP_FORWARDS
 
         om = OffloadManager("test_iters_compile_fn_view")
-        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="view")
+        om.config = OffloadConfig(
+            enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="view", skip_discovery=False
+        )
         om._compiled.active = True
         om._compiled.replan_active = False
         om._compiled.profile_active = True
@@ -883,7 +929,9 @@ class TestEagerProfilingBudget:
     def test_manager_iters_before_inference_compile_fn_non_view_uses_eager_seed(self):
         """compile_fn + non-view: eager seed only; replan measure is post-INFERENCE."""
         om = OffloadManager("test_iters_compile_fn_getter")
-        om.config = OffloadConfig(enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="getter")
+        om.config = OffloadConfig(
+            enabled=True, discovery_iters=2, profiling_iters=10, profile_mode="getter", skip_discovery=False
+        )
         om._compiled.active = True
         om._compiled.replan_active = True
         om._compiled.profile_active = False

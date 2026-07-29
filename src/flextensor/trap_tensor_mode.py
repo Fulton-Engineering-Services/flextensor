@@ -23,12 +23,16 @@ class Trap(TorchFunctionMode):
 
     def __enter__(self):
         _graph_break()
+        self._nesting_guard.acquire(self.current_trace_id)
         try:
-            self._nesting_guard.acquire(self.current_trace_id)
+            self.tensor_manager.reset_current_trap_taint()
             self.tensor_layer_loader.enter(self.current_trace_id)
             self.start_event.record()
             return super().__enter__()
         except BaseException:
+            # Release the guard so the next trap doesn't fail with a misleading
+            # "Nested traps are not supported" error masking the real cause.
+            self._nesting_guard.release()
             # Pair the enter-side break: if __enter__ raises, __exit__ never
             # runs, so we emit the matching exit-side break here to keep
             # Dynamo from waiting on a continuation that will never arrive.
@@ -36,17 +40,31 @@ class Trap(TorchFunctionMode):
             raise
 
     def __exit__(self, _type, _value, _traceback):
-        self.end_event.record()
-        self.end_event.synchronize()
-        duration_ms = self.start_event.elapsed_time(self.end_event)
+        try:
+            try:
+                self.end_event.record()
+                self.end_event.synchronize()
+                duration_ms = self.start_event.elapsed_time(self.end_event)
+            finally:
+                # Hand the label's GPU copies back even when the timing calls raise
+                # -- ``synchronize()`` surfaces a fault from the wrapped forward, and
+                # skipping ``exit`` there would strand the copies in ``cpu_to_gpu_map``,
+                # leave ``_active_counts`` nonzero, and leave ``param.data`` pointing at
+                # storage the loader believes it still owns.
+                self.tensor_layer_loader.exit(self.current_trace_id)
 
-        self.tensor_layer_loader.exit(self.current_trace_id)
-
-        self.tensor_manager.record_all(self.current_trace_id, self.tensors_ids, duration_ms)
-        self._nesting_guard.release()
-
-        _graph_break()
-        super().__exit__(_type, _value, _traceback)
+            if self.tensor_manager.is_current_trap_tainted():
+                # Rescue tainted this window: drop the corrupted duration, keep
+                # the mapping. respect_suspension=True since we're in PROFILING.
+                self.tensor_manager.record_tensors(self.current_trace_id, self.tensors_ids, respect_suspension=True)
+            else:
+                self.tensor_manager.record_all(self.current_trace_id, self.tensors_ids, duration_ms)
+            self.tensor_manager.reset_current_trap_taint()
+        finally:
+            # Release on failure too, so the next trap doesn't see a stale guard.
+            self._nesting_guard.release()
+            _graph_break()
+            super().__exit__(_type, _value, _traceback)
 
     def __torch_function__(self, func, _types, args, kwargs=None):
         # rewrite args
@@ -318,25 +336,41 @@ class TrapDirect:
 
     def __enter__(self):
         _graph_break()
+        self._nesting_guard.acquire(self.current_trace_id)
         try:
-            self._nesting_guard.acquire(self.current_trace_id)
+            self.tensor_manager.reset_current_trap_taint()
             self.tensor_layer_loader.enter(self.current_trace_id)
             self.start_event.record()
             return self
         except BaseException:
+            # Release the guard so the next trap doesn't fail with a misleading
+            # "Nested traps are not supported" error masking the real cause.
+            self._nesting_guard.release()
             # See Trap.__enter__: pair the graph break on the failure path.
             _graph_break()
             raise
 
     def __exit__(self, _type, _value, _traceback):
-        self.end_event.record()
-        self.end_event.synchronize()
-        duration_ms = self.start_event.elapsed_time(self.end_event)
-        self.tensor_manager.record_duration(self.current_trace_id, duration_ms)
-
-        self.tensor_layer_loader.exit(self.current_trace_id)
-        self._nesting_guard.release()
-        _graph_break()
+        try:
+            try:
+                self.end_event.record()
+                self.end_event.synchronize()
+                duration_ms = self.start_event.elapsed_time(self.end_event)
+                if not self.tensor_manager.is_current_trap_tainted():
+                    # Skip the duration sample when a cross-module rescue tainted this window.
+                    self.tensor_manager.record_duration(self.current_trace_id, duration_ms)
+            finally:
+                # Hand the label's GPU copies back even when the timing calls raise
+                # -- ``synchronize()`` surfaces a fault from the wrapped forward, and
+                # skipping ``exit`` there would strand the copies in ``cpu_to_gpu_map``,
+                # leave ``_active_counts`` nonzero, and leave ``param.data`` pointing at
+                # storage the loader believes it still owns.
+                self.tensor_layer_loader.exit(self.current_trace_id)
+            self.tensor_manager.reset_current_trap_taint()
+        finally:
+            # Release on failure too, so the next trap doesn't see a stale guard.
+            self._nesting_guard.release()
+            _graph_break()
 
 
 class TrapInferDirect:

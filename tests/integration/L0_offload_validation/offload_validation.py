@@ -834,6 +834,9 @@ class OffloadManagerExperiment:
             transfer_budget_scale=self.config.transfer_budget_scale,
             num_blocks=self.config.n_blocks,
             pinned_memory=self.config.pinned_memory,
+            # Keep the discovery phase active so the WARMUP_ITERS loop below
+            # measures discovery-phase timing rather than profiling.
+            skip_discovery=False,
         )
 
         manager_name = f"test_{uuid.uuid4().hex[:8]}"

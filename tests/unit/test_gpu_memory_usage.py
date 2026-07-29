@@ -133,6 +133,55 @@ class TestOffloadManagerGPUMemoryUsage:
         self.model.eval()
         self.x = torch.randn(4, 10)
 
+    @pytest.mark.parametrize("skip_discovery", [False, True])
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_get_gpu_memory_usage_after_driving_iters_before_inference(
+        self,
+        _mock_strategy_cls,
+        mock_tensor_manager_cls,
+        skip_discovery,
+    ):
+        """Driving ``iters_before_inference`` forwards must reach INFERENCE.
+
+        ``skip_discovery`` changes when INFERENCE is reached (the discovery
+        component drops out), and ``get_gpu_memory_usage()`` raises outside
+        INFERENCE — so this pins the two together on both paths. Uses the
+        path-aware ``om.iters_before_inference`` rather than the static
+        ``config.pre_inference_iters``.
+        """
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager.is_profiling_suspended.return_value = False
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = lambda name, args=(), kwargs=None: MockTrap(name)
+        mock_tensor_manager.initialize_warmup.return_value = self.model
+        mock_tensor_manager.initialize_profile.return_value = self.model
+        mock_tensor_manager.initialize_inference.return_value = self.model
+
+        expected_usage = GPUMemoryUsage(
+            blocks_bytes=1024,
+            unmapped_tensors_bytes=512,
+            total_bytes=1536,
+        )
+        mock_tensor_manager.get_gpu_memory_usage.return_value = expected_usage
+
+        om = OffloadManager(f"test_memory_skip_{skip_discovery}")
+        config = OffloadConfig(
+            enabled=True,
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["linear"],
+            skip_discovery=skip_discovery,
+        )
+        model = om.offload(self.model, config=config)
+
+        for _ in range(om.iters_before_inference):
+            with torch.no_grad():
+                _ = model(self.x)
+
+        assert om._current_phase == OffloadPhase.INFERENCE
+        assert om.get_gpu_memory_usage().total_bytes == expected_usage.total_bytes
+
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
     def test_get_gpu_memory_usage_in_inference_state(
@@ -160,7 +209,9 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager and transition to inference
         om = OffloadManager("test_memory")
-        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"], skip_discovery=False
+        )
         model = om.offload(self.model, config=config)
 
         # Run through discovery and profiling to reach inference
@@ -197,7 +248,9 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager (stays in discovery)
         om = OffloadManager("test_warmup_error")
-        config = OffloadConfig(enabled=True, discovery_iters=5, profiling_iters=5, include_patterns=["linear"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=5, profiling_iters=5, include_patterns=["linear"], skip_discovery=False
+        )
         om.offload(self.model, config=config)
 
         # Verify we're in discovery phase
@@ -225,7 +278,9 @@ class TestOffloadManagerGPUMemoryUsage:
 
         # Create offload manager and transition to profiling
         om = OffloadManager("test_profile_error")
-        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=5, include_patterns=["linear"])
+        config = OffloadConfig(
+            enabled=True, discovery_iters=1, profiling_iters=5, include_patterns=["linear"], skip_discovery=False
+        )
         model = om.offload(self.model, config=config)
 
         # Run discovery to transition to profiling
@@ -290,7 +345,7 @@ class TestModuleLevelGetGPUMemoryUsage:
 
         # Use the simplified API with default manager
         config = flextensor.OffloadConfig(
-            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"]
+            enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"], skip_discovery=False
         )
         model = flextensor.offload(self.model, config=config)
 

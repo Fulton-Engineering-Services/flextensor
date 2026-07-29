@@ -49,6 +49,14 @@ _DEPRECATED_FIELD_MIRRORS: dict[str, str] = {
     "profile_iters": "profiling_iters",
 }
 
+# The deprecated side of ``_DEPRECATED_FIELD_MIRRORS`` (that dict is
+# bidirectional, so it also contains the canonical names — those must stay in
+# the dump). ``model_copy`` re-validation dumps the instance and would
+# otherwise present both sides of a mirror pair to the ``mode='before'``
+# synchronizers, which reject that as an ambiguous double-set. Excluding these
+# on dump makes the re-parse see a canonical-only dict.
+_DEPRECATED_FIELD_NAMES: frozenset[str] = frozenset({"warmup_iters", "profile_iters"})
+
 _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
     "release_tensors": ("v0.2.0", "GPU tensors are now always released after layer execution."),
     "enable_direct_mode": ("v0.2.0", "Direct mode is now always enabled."),
@@ -132,6 +140,38 @@ class OffloadConfig(BaseModel):
     """Number of discovery-phase iterations before profiling begins.
 
     Can also be set via the ``FT_DISCOVERY_ITERS`` env var.
+    """
+
+    skip_discovery: bool = Field(default=True)
+    """Skip the discovery phase and jump directly to profiling.
+
+    Tensor-to-layer mappings are discovered statically from modules patched
+    via ``include_patterns`` instead of being inferred from discovery-phase
+    iterations. Falls back to the discovery phase if no modules are patched;
+    a ``WARNING`` is logged and ``OffloadManager.skip_discovery_honored``
+    flips to ``False`` so the fallback is detectable without log scraping.
+
+    Set to ``False`` when the model uses manual ``offload_block()`` blocks in
+    its forward — discovery iterations are required to capture tensors that
+    forward patching cannot enumerate. ``offload_block()`` raises a
+    ``RuntimeError`` when this option is left at the default ``True``.
+
+    .. note:: Minimum-iteration contract
+
+        Because ``OffloadManager.update_state()`` runs as a post-forward hook,
+        the PROFILING→INFERENCE transition can only fire *after* the first
+        profile forward completes. Any transition — including
+        ``profiling_iters=0`` — therefore always sees at least one profile
+        forward's worth of collector data. Setting ``profiling_iters=0`` and
+        ``profiling_iters=1`` produce the same runtime behavior; both are
+        low-quality strategy inputs (``report_profiling_quality`` warns).
+        The only way to reach INFERENCE without any profile forward is to
+        restore a saved profile via ``load_profile`` / ``offload_from_profile``.
+
+    The value is read once when the underlying ``TensorManager`` is first
+    constructed (during the first ``offload()`` call). Calling ``set_config``
+    with a different ``skip_discovery`` afterwards raises ``RuntimeError``;
+    call ``release()`` and re-``offload()`` to pick up a new value.
     """
 
     profiling_iters: int = Field(default=10, ge=0)
@@ -467,44 +507,88 @@ class OffloadConfig(BaseModel):
         """Return a copy, mirroring updates to deprecated field counterparts.
 
         Pydantic v2's ``model_copy(update=...)`` bypasses ``mode='before'``
-        validators, so deprecated fields desync from their canonical
-        replacements.  This override mirrors each updated field to its
-        counterpart before delegating to the base implementation.
+        *and* ``mode='after'`` validators, so:
 
-        See ``_DEPRECATED_FIELD_MIRRORS`` for the set of mirrored pairs.
+        - Deprecated fields desync from their canonical replacements.
+          Fix: mirror each updated field to its counterpart before
+          delegating to the base implementation (see
+          ``_DEPRECATED_FIELD_MIRRORS``).
+        - Invariants enforced by ``@model_validator`` (e.g.
+          ``_validate_block_range``'s ``num_blocks`` vs ``min_blocks``) can be
+          violated by the update dict. Fix: re-parse the resulting instance
+          through the full validator chain so every ``OffloadConfig`` the
+          runtime consumes upholds them. vLLM's worker uses
+          ``model_copy(update=...)`` in production to apply per-worker
+          overrides — that path in particular must not smuggle in an illegal
+          combination.
+
+        The re-parse runs on a full ``model_dump()``, which would otherwise
+        mark *every* field as explicitly set. ``model_fields_set`` is therefore
+        restored from the copy afterwards so
+        :func:`flextensor.utils.config_field_was_set` keeps reporting genuine
+        user intent — the vLLM worker relies on it to decide whether to apply
+        its default include/exclude patterns.
 
         Raises:
-            ValueError: If both sides of a pair appear in *update* with
-                differing values.
+            ValueError: If both sides of a deprecated-field pair appear in
+                *update* with differing values, or if the resulting config
+                fails any ``@model_validator``.
         """
-        if update:
-            synced_update = dict(update)
-            for key, mirror in _DEPRECATED_FIELD_MIRRORS.items():
-                if key in synced_update and mirror in synced_update:
-                    if synced_update[key] != synced_update[mirror]:
-                        msg = f"Cannot set both `{key}` and `{mirror}` to different values"
-                        raise ValueError(msg)
-                elif key in synced_update:
-                    synced_update[mirror] = synced_update[key]
-            return super().model_copy(update=synced_update, deep=deep)
-        return super().model_copy(deep=deep)
+        if not update:
+            return super().model_copy(deep=deep)
+
+        synced_update = dict(update)
+        for key, mirror in _DEPRECATED_FIELD_MIRRORS.items():
+            if key in synced_update and mirror in synced_update:
+                if synced_update[key] != synced_update[mirror]:
+                    msg = f"Cannot set both `{key}` and `{mirror}` to different values"
+                    raise ValueError(msg)
+            elif key in synced_update:
+                synced_update[mirror] = synced_update[key]
+
+        copied = super().model_copy(update=synced_update, deep=deep)
+        # Re-parse to catch invariants that ``model_copy`` bypasses.
+        # Exclude deprecated field names so the ``mode='before'``
+        # synchronizers don't see both sides of a mirror pair (they'd
+        # reject that as a double-set).
+        revalidated = type(self).model_validate(copied.model_dump(exclude=set(_DEPRECATED_FIELD_NAMES)))
+        # ``model_validate`` on a full dump marks every field as explicitly
+        # set; restore the real set so ``config_field_was_set`` stays honest.
+        object.__setattr__(revalidated, "__pydantic_fields_set__", set(copied.model_fields_set))
+        return revalidated
 
     @property
     def pre_inference_iters(self) -> int:
-        """Total iterations before inference (discovery + profiling).
+        """Static config-level upper bound on iterations before inference.
 
-        This is the plain-offload warmup length
-        (``discovery_iters + profiling_iters``). Prefer the path-aware
+        Returns ``max(1, discovery_iters) + max(1, profiling_iters)``. Both
+        counts accept ``0``, but ``OffloadManager.update_state`` runs as a
+        post-forward hook, so every phase it drives consumes at least one
+        forward. Summing the raw values would return *less* than
         :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
-        when compiled offload / replan may be active: the config cannot know
-        those runtime options, and the external-compile replan path uses a
-        shorter eager seed than ``profiling_iters``.
+        at ``profiling_iters=0`` or ``discovery_iters=0`` — which would stop
+        this property being an upper bound at all.
+
+        It still overcounts on three runtime paths the config cannot see:
+
+        - **``skip_discovery=True`` (default) honored**: the manager
+          short-circuits DISCOVERY→PROFILING inside ``offload()``, so
+          ``discovery_iters`` forwards are never consumed.
+        - **Compiled offload**: uses a fixed eager seed
+          (``COMPILED_EAGER_PROFILE_FORWARDS``) shorter than
+          ``profiling_iters``.
+        - **External compile + replan**: replan measure/warmup happens
+          *after* INFERENCE, not before.
+
+        Prefer :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
+        for the runtime-actual count. Use this value only when a static,
+        pre-``offload()`` upper bound is needed.
 
         .. deprecated::
             Prefer :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
             for path-aware budgets.
         """
-        return self.discovery_iters + self.profiling_iters
+        return max(1, self.discovery_iters) + max(1, self.profiling_iters)
 
     @property
     @_deprecated(_ALL_WARMUP_ITERS_MSG, category=None)

@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, PreloadToDevice, TensorBenchmarkMode
-from flextensor.collectors import LayerStatistics, TensorStatistics
+from flextensor.collectors import IterativeLayerStatistics, LayerStatistics, TensorStatistics
 from flextensor.host_pinning import HostPinner
 from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.strategy import KnapsackStrategy
@@ -572,8 +572,11 @@ class TestUntracedTensorDiscoveryBranch:
             profile_mode="getter",
         )
         tm.layer_statistics_collector = MagicMock()
-        fake_stats = [MagicMock()]
-        tm.layer_statistics_collector.get_layer_stats.return_value = fake_stats
+        # ``UntimedTrapRescuer`` type-checks ``list[IterativeLayerStatistics]``;
+        # the collector produces the same type in production.
+        tm.layer_statistics_collector.get_layer_stats.return_value = [
+            IterativeLayerStatistics(label="layer_0", tensor_ids=set(), duration=10.0),
+        ]
         tm.model = MagicMock()
         tm.tensor_id_to_name_map = {}
         tm.module_tracker = None
@@ -583,8 +586,12 @@ class TestUntracedTensorDiscoveryBranch:
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
     @patch("flextensor.tensor_manager.discover_untraced_tensors_for_layers")
     def test_discovery_called_when_enabled(self, mock_discover, mock_filter, _mock_loader) -> None:
-        mock_filter.return_value.filter_by_tensor_ids.return_value = [_make_layer("layer_0")]
-        mock_discover.return_value = [_make_layer("layer_0")]
+        mock_filter.return_value.filter_by_tensor_ids.return_value = [
+            IterativeLayerStatistics(label="layer_0", tensor_ids=set(), duration=10.0),
+        ]
+        mock_discover.return_value = [
+            IterativeLayerStatistics(label="layer_0", tensor_ids=set(), duration=10.0),
+        ]
         tm = self._prepare_tm(discovery_enabled=True)
         tm.prepare_profile_direct_mode()
         mock_discover.assert_called_once()
@@ -593,7 +600,9 @@ class TestUntracedTensorDiscoveryBranch:
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
     @patch("flextensor.tensor_manager.discover_untraced_tensors_for_layers")
     def test_discovery_skipped_when_disabled(self, mock_discover, mock_filter, _mock_loader) -> None:
-        mock_filter.return_value.filter_by_tensor_ids.return_value = [_make_layer("layer_0")]
+        mock_filter.return_value.filter_by_tensor_ids.return_value = [
+            IterativeLayerStatistics(label="layer_0", tensor_ids=set(), duration=10.0),
+        ]
         tm = self._prepare_tm(discovery_enabled=False)
         tm.prepare_profile_direct_mode()
         mock_discover.assert_not_called()
@@ -860,7 +869,11 @@ class TestInitializeProfileSavedStateShortCircuit:
     def test_view_mode_with_saved_state_skips_controller_setup(self) -> None:
         tm = _make_tm(profile_mode="view")
         tm.model = MagicMock(name="user_model")
+        # The short-circuit keys off the *externally restored* marker, not on
+        # ``tensor_manager_state`` alone — a live cycle reaching INFERENCE also
+        # populates that attribute and must not short-circuit.
         tm.tensor_manager_state = MagicMock(name="loaded_state")
+        tm._state_restored_from_profile = True
         tm._move_non_offloaded_tensors_to_gpu = MagicMock()
         tm.prepare_profile_direct_mode_model = MagicMock()
         tm.prepare_profile_direct_mode = MagicMock()

@@ -151,7 +151,7 @@ class TestOffloadProxySubscriptable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -187,7 +187,7 @@ class TestOffloadProxySubscriptable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -212,7 +212,7 @@ class TestOffloadProxySubscriptable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -243,7 +243,7 @@ class TestOffloadProxyIterable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -270,7 +270,7 @@ class TestOffloadProxyIterable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -298,7 +298,7 @@ class TestOffloadProxyIterable:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -327,7 +327,7 @@ class TestOffloadProxyContextManager:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -360,7 +360,7 @@ class TestOffloadProxyContextManager:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -396,7 +396,7 @@ class TestOffloadProxyContainerProtocol:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -430,7 +430,7 @@ class TestOffloadProxyCustomCall:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -467,7 +467,7 @@ class TestOffloadProxySlicing:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -500,7 +500,7 @@ class TestOffloadProxyComparisonOps:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -536,7 +536,7 @@ class TestOffloadProxyBoolConversion:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -573,7 +573,7 @@ class TestOffloadProxyIntrospection:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -612,7 +612,7 @@ class TestOffloadProxyIntrospection:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -642,7 +642,7 @@ class TestOffloadProxyIntrospection:
         mock_tensor_manager.initialize_warmup.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)

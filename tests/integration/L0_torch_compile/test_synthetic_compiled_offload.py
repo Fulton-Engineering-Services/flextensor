@@ -118,6 +118,12 @@ def _synthetic_compile_fn_config(
     memory_pressure: bool = False,
     profile_mode: str = "view",
 ) -> OffloadConfig:
+    # ``skip_discovery=False`` here so the compile-path arithmetic
+    # ``iters_before_inference == discovery_iters + PROFILE_COMPILE_WARMUP_FORWARDS
+    # + profiling_iters`` this suite pins holds. Under the default
+    # ``skip_discovery=True`` the discovery component drops to zero — that
+    # equivalence is covered by unit tests in
+    # ``tests/unit/test_offload_manager_phase.py``.
     kwargs: dict = {
         "discovery_iters": DISCOVERY_ITERS,
         "profiling_iters": PROFILING_ITERS,
@@ -125,6 +131,7 @@ def _synthetic_compile_fn_config(
         "min_blocks": NUM_BLOCKS,
         "include_patterns": ["transformer_blocks.*"],
         "profile_mode": profile_mode,
+        "skip_discovery": False,
     }
     if memory_pressure:
         kwargs["max_gpu_mem_fraction"] = _memory_pressure_fraction(model, budget_ratio=WEIGHT_BUDGET_RATIO)

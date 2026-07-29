@@ -23,7 +23,6 @@ config = OffloadConfig()
 # Tuned configuration for specific requirements
 config = OffloadConfig(
     gpu_device=0,
-    discovery_iters=1,
     profiling_iters=10,
 )
 
@@ -328,22 +327,31 @@ These options can also be set via `FT_SHM_ENABLED`, `FT_SHM_NAMESPACE`, and
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `discovery_iters` | int | `1` | Iterations to discover parameter-to-trap mappings |
+| `skip_discovery` | bool | `True` | Skip DISCOVERY and derive tensor-to-layer mappings statically from patched modules. Set to `False` when the model uses manual `offload_block()` blocks — `offload_block()` raises under the default. |
+| `discovery_iters` | int | `1` | Iterations to discover parameter-to-trap mappings. Only consulted when `skip_discovery=False`. |
 | `profiling_iters` | int | `10` | Iterations to measure execution timing |
 
 FlexTensor learns your model's behavior during initial iterations:
 
 ```
-First N iterations:  DISCOVERY (discovery_iters) → PROFILING (profiling_iters) → INFERENCE
-Remaining iterations: Optimized execution with learned strategy
+Under skip_discovery=True (default): PROFILING (profiling_iters) → INFERENCE
+Under skip_discovery=False:          DISCOVERY (discovery_iters) → PROFILING (profiling_iters) → INFERENCE
+Remaining iterations in both cases:  Optimized execution with learned strategy
 ```
+
+Use `OffloadManager.iters_before_inference` for the exact path-aware
+count (accounts for `skip_discovery`, compiled offload, and replan paths)
+instead of summing the config fields by hand.
 
 #### Tuning Iteration Counts
 
-**`discovery_iters`**: Usually 1 is sufficient. Increase if your model has:
+**`skip_discovery`**: Leave at `True` (default) for the auto-trap path
+(offloading via `include_patterns`). Only set `False` if your model uses
+manual `offload_block()` blocks; then tune `discovery_iters`:
 
-- Dynamic control flow affecting parameter access patterns
-- Variable-length inputs that change which parameters are used
+- Dynamic control flow affecting parameter access patterns → 2-3 iterations
+- Variable-length inputs that change which parameters are used → 2-3 iterations
+- Static shapes → 1 iteration
 
 **`profiling_iters`**: More iterations = more accurate timing estimates. Consider:
 
@@ -353,10 +361,10 @@ Remaining iterations: Optimized execution with learned strategy
 
 ```python
 # Production deployment (accurate profiling)
-config = OffloadConfig(discovery_iters=1, profiling_iters=20)
+config = OffloadConfig(profiling_iters=20)
 
 # Development/debugging (fast iteration)
-config = OffloadConfig(discovery_iters=1, profiling_iters=3)
+config = OffloadConfig(profiling_iters=3)
 ```
 
 ### Transfer Modes
@@ -477,10 +485,10 @@ config = OffloadConfig(
     profile_read_only=False,  # Allow saving profiles (default)
 )
 
-# First run: discovery → profiling → save → inference
+# First run: (discovery →) profiling → save → inference
 om = flextensor.get_offload_manager()
 model = om.offload(model, config=config)
-for _ in range(config.discovery_iters + config.profiling_iters):
+for _ in range(om.iters_before_inference):
     model(sample_input)
 om.save_profile()  # Saves to profile_storage_dir
 
@@ -534,7 +542,7 @@ For ready-to-use starting configurations covering memory-constrained systems, pe
 |----------|-------------|----------------|
 | **Core** | `enabled`, `gpu_device` | Set based on deployment |
 | **Memory** | `pinned_memory`, `max_gpu_mem_fraction`, `shm_enabled` | Balance memory vs. performance |
-| **Profiling** | `discovery_iters`, `profiling_iters` | More iters = more accurate |
+| **Profiling** | `discovery_iters` (only when `skip_discovery=False`), `profiling_iters` | More iters = more accurate |
 | **Transfer** | `transfer_mode`, `num_blocks`, `min_blocks` | Default works for most cases |
 | **Debug** | `enable_diagnostics`, `enable_instrumentation` | Only when troubleshooting |
 

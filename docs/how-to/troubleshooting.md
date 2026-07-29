@@ -68,10 +68,13 @@ model = offload(model, config=config)
 
 #### 2. Run Your Model Through Discovery and Profiling
 
-Execute your model for the configured number of discovery and profiling iterations:
+Execute your model until it transitions to inference. Use the path-aware
+`iters_before_inference` count — it accounts for `skip_discovery` (default
+`True`), compiled offload, and replan paths:
 
 ```python
-for _ in range(config.discovery_iters + config.profiling_iters):
+om = flextensor.get_offload_manager()
+for _ in range(om.iters_before_inference):
     output = model(input_data)
 ```
 
@@ -404,13 +407,17 @@ For a detailed explanation of how tensor discovery works, see [Tensor Discovery]
 Discovery and profiling iterations are intentionally slower—overhead measurements are only meaningful after all discovery and profiling iterations complete:
 
 ```python
-config = OffloadConfig(discovery_iters=1, profiling_iters=10)
+config = OffloadConfig(profiling_iters=10)
 model = flextensor.offload(model, config=config)
+om = flextensor.get_offload_manager()
 
-# First discovery_iters + profiling_iters iterations are measurement phases
+# First `om.iters_before_inference` iterations are measurement phases.
+# Under the default `skip_discovery=True` that is just `profiling_iters`;
+# with `skip_discovery=False` it is `discovery_iters + profiling_iters`.
+warmup = om.iters_before_inference
 for i, batch in enumerate(dataloader):
     output = model(batch)
-    if i == config.discovery_iters + config.profiling_iters:
+    if i == warmup:
         print("Inference phase reached — timing is now production overhead")
 ```
 

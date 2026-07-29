@@ -240,16 +240,27 @@ def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
     Returns:
         Config update dictionary with minimum vLLM warmup iteration counts,
         a 0.9 model-weight GPU memory fraction when the user omitted that setting,
+        ``skip_discovery=False`` (vLLM manages its own warmup schedule and
+        relies on the DISCOVERY→PROFILING transition landing between
+        ``compile_or_warm_up_model()`` and the explicit max-token loop —
+        see :meth:`FlexTensorOffloadWorker.warmup_and_profile_model`),
         default non-wildcard include patterns when the user did not customize
         includes, and MoE sidecar excludes when the user did not customize
         excludes.
     """
-    # vLLM's first compile_or_warm_up_model() runs two forwards that already
-    # count as FlexTensor discovery. Keep one additional explicit small-token
+    # vLLM's first ``compile_or_warm_up_model()`` runs two forwards that count
+    # as FlexTensor discovery iterations. Keep one additional explicit small-token
     # discovery pass, while using max-token profiling passes to bound startup
     # cost. On the compiled-offload + re-plan path the eager seed is a fixed
     # ``COMPILED_EAGER_PROFILE_FORWARDS`` count (independent of the measure
     # window sized by ``profiling_iters``), so floor profiling_iters there too.
+    #
+    # ``skip_discovery=False`` is required here regardless of the OffloadConfig
+    # default: with ``skip_discovery=True`` the manager short-circuits to
+    # PROFILING inside ``offload()``, so the two vLLM warmup forwards land in
+    # the profile budget instead of DISCOVERY. At ``profiling_iters=2`` (the
+    # vLLM floor) the state machine reaches INFERENCE before the explicit
+    # max-token loop even starts, so zero max-token forwards are profiled.
     profiling_floor = VLLM_PROFILING_ITER_FLOOR
     # ``offload_config`` already comes from ``load_config()`` (env + optional file).
     if getattr(offload_config, "external_compile", False):
@@ -257,6 +268,7 @@ def _vllm_config_updates(offload_config: Any) -> dict[str, Any]:
     config_updates: dict[str, Any] = {
         "discovery_iters": max(offload_config.discovery_iters, VLLM_DISCOVERY_ITER_FLOOR),
         "profiling_iters": max(offload_config.profiling_iters, profiling_floor),
+        "skip_discovery": False,
     }
     if not config_field_was_set(offload_config, "max_gpu_mem_fraction"):
         config_updates["max_gpu_mem_fraction"] = _VLLM_DEFAULT_MAX_GPU_MEM_FRACTION

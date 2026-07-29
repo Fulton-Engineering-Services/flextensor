@@ -615,6 +615,11 @@ class TensorManagerStateHandler:
         tm.traced_tensors = set(tm.tensors_map.keys())
 
         tm.tensor_manager_state = state
+        # Mark the state as externally restored so ``initialize_warmup`` takes
+        # the short-circuit. The flag — not ``tensor_manager_state`` itself —
+        # is the signal, because a normal cycle reaching INFERENCE also stores
+        # state and must not be mistaken for a restored profile.
+        tm._state_restored_from_profile = True  # noqa: SLF001
         tm.set_model(model)
 
         return validation_result

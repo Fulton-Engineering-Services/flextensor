@@ -67,7 +67,6 @@ Use this configuration during development when you need fast iteration and start
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    discovery_iters=1,
     profiling_iters=3,            # Minimal profiling for fast startup
 )
 
@@ -76,6 +75,7 @@ model = offload(model, config=config)
 
 Key choices:
 
+- Under the default `skip_discovery=True` the discovery phase is bypassed, so `profiling_iters` alone drives startup cost.
 - `profiling_iters=3` reduces the startup cost before reaching inference phase.
 - This produces a less accurate offloading strategy than higher iteration counts, so it is not recommended for production.
 
@@ -89,7 +89,6 @@ Use this configuration when deploying to a stable environment where startup time
 from flextensor import OffloadConfig, offload
 
 config = OffloadConfig(
-    discovery_iters=1,
     profiling_iters=20,           # Accurate initial profiling
 )
 

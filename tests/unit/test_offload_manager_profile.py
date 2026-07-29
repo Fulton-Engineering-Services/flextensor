@@ -85,7 +85,7 @@ class TestOffloadManagerSaveProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], skip_discovery=False)
         om.offload(self.model, config=config)
 
         profile_dir = tmp_path / "new_profile_dir"
@@ -110,7 +110,7 @@ class TestOffloadManagerSaveProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], skip_discovery=False)
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -150,7 +150,7 @@ class TestOffloadManagerLoadProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], skip_discovery=False)
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -173,7 +173,7 @@ class TestOffloadManagerLoadProfile:
         mock_tensor_manager.trap = MagicMock()
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"])
+        config = OffloadConfig(enabled=True, include_patterns=["linear1"], skip_discovery=False)
         om.offload(self.model, config=config)
 
         profile_dir = str(tmp_path / "profile")
@@ -435,7 +435,9 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.trap = MagicMock()
 
         profile_dir = str(tmp_path / "config_profile")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir)
+        config = OffloadConfig(
+            enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir, skip_discovery=False
+        )
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -457,7 +459,9 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.trap = MagicMock()
 
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path")
+        config = OffloadConfig(
+            enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path", skip_discovery=False
+        )
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -500,6 +504,7 @@ class TestProfileDirectoryFromConfig:
             enabled=True,
             include_patterns=["linear1"],
             profile_storage_dir="/some/path",
+            skip_discovery=False,
         )
         om = OffloadManager("test")
         om.offload(self.model, config=config)
@@ -523,7 +528,9 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.trap = MagicMock()
 
         profile_dir = str(tmp_path / "config_profile")
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir)
+        config = OffloadConfig(
+            enabled=True, include_patterns=["linear1"], profile_storage_dir=profile_dir, skip_discovery=False
+        )
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 
@@ -545,7 +552,9 @@ class TestProfileDirectoryFromConfig:
         mock_tensor_manager.initialize_warmup.return_value = self.model
         mock_tensor_manager.trap = MagicMock()
 
-        config = OffloadConfig(enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path")
+        config = OffloadConfig(
+            enabled=True, include_patterns=["linear1"], profile_storage_dir="/config/path", skip_discovery=False
+        )
         om = OffloadManager("test")
         om.offload(self.model, config=config)
 

@@ -127,7 +127,13 @@ def make_offload_config(
     num_blocks: int = 4,
     pinned_memory: bool = True,
 ) -> OffloadConfig:
-    """Build the ``OffloadConfig`` shape every compile/CUDA-graph suite uses."""
+    """Build the ``OffloadConfig`` shape every compile/CUDA-graph suite uses.
+
+    ``skip_discovery=False`` is pinned explicitly because ``run_offload_lifecycle``
+    below drives ``warmup_iters`` eager forwards through DISCOVERY; under the
+    default ``skip_discovery=True`` those forwards would land in PROFILING
+    instead and skew the phase accounting these suites assert.
+    """
     return OffloadConfig(
         include_patterns=module_patterns if module_patterns is not None else DEFAULT_MODULE_PATTERNS,
         discovery_iters=warmup_iters * feedback_iters,
@@ -135,6 +141,7 @@ def make_offload_config(
         transfer_mode=transfer_mode,
         num_blocks=num_blocks,
         pinned_memory=pinned_memory,
+        skip_discovery=False,
     )
 
 

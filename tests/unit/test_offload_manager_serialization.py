@@ -74,6 +74,37 @@ class TestOffloadProxyStateDictAccess:
         """Setup test fixtures."""
         self.x = torch.randn(4, 10)
 
+    @pytest.mark.parametrize("skip_discovery", [False, True])
+    @patch("flextensor.tensor_manager.TensorManager")
+    @patch("flextensor.strategy.KnapsackStrategy")
+    def test_state_dict_round_trip_under_both_discovery_paths(
+        self, mock_strategy_cls, mock_tensor_manager_cls, skip_discovery
+    ):
+        """``state_dict`` round-trip must hold under the shipping default too.
+
+        The rest of this file pins ``skip_discovery=False``; without this case
+        proxy serialization would be untested on the path most users take.
+        """
+        mock_tensor_manager = MagicMock()
+        mock_tensor_manager_cls.return_value = mock_tensor_manager
+        mock_tensor_manager.trap = MagicMock(return_value=MagicMock(__enter__=MagicMock(), __exit__=MagicMock()))
+
+        model = SimpleLinearModel()
+        original_state_dict = model.state_dict()
+        mock_tensor_manager.initialize_warmup.return_value = model
+        mock_tensor_manager.initialize_profile.return_value = model
+        mock_tensor_manager.initialize_inference.return_value = model
+
+        om = OffloadManager(f"test_state_dict_skip_{skip_discovery}")
+        config = OffloadConfig(enabled=True, skip_discovery=skip_discovery)
+
+        proxy_model = om.offload(model, config=config)
+        proxy_state_dict = proxy_model.state_dict()
+
+        assert set(proxy_state_dict) == set(original_state_dict)
+        for key, value in original_state_dict.items():
+            assert torch.equal(proxy_state_dict[key], value)
+
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
     def test_state_dict_accessible(self, mock_strategy_cls, mock_tensor_manager_cls):
@@ -90,7 +121,7 @@ class TestOffloadProxyStateDictAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -122,7 +153,7 @@ class TestOffloadProxyStateDictAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -161,7 +192,7 @@ class TestOffloadProxyStateDictAccess:
         mock_tensor_manager.initialize_inference.return_value = inference_model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1)
+        config = OffloadConfig(enabled=True, discovery_iters=1, profiling_iters=1, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(SimpleLinearModel(), config=config)
@@ -208,7 +239,7 @@ class TestOffloadProxyTorchSave:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -248,7 +279,7 @@ class TestOffloadProxyTorchSave:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -283,7 +314,7 @@ class TestOffloadProxyTorchSave:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -341,7 +372,7 @@ class TestOffloadProxyParametersAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -373,7 +404,7 @@ class TestOffloadProxyParametersAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -402,7 +433,7 @@ class TestOffloadProxyParametersAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -434,7 +465,7 @@ class TestOffloadProxyParametersAccess:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -495,7 +526,7 @@ class TestOffloadProxyPickleSerialization:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -553,7 +584,7 @@ class TestOffloadProxyHuggingFaceSerialization:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)
@@ -596,7 +627,7 @@ class TestOffloadProxyHuggingFaceSerialization:
         mock_tensor_manager.initialize_inference.return_value = model
 
         om = OffloadManager("test")
-        config = OffloadConfig(enabled=True)
+        config = OffloadConfig(enabled=True, skip_discovery=False)
 
         # Offload the model
         proxy_model = om.offload(model, config=config)

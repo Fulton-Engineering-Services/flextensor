@@ -194,8 +194,15 @@ class LipDubFlexTensorService:
         self.profile_dir = Path(args.profile_dir)
         self.config = OffloadConfig(
             include_patterns=args.include_patterns or DEFAULT_INCLUDE_PATTERNS,
+            # ``skip_discovery=False`` because ``drive_profile`` below
+            # explicitly loops over ``args.discovery_iters`` to build a
+            # saved profile. Under the ``skip_discovery=True`` default,
+            # the DISCOVERY phase would be short-circuited inside
+            # ``offload()`` and the loop would execute in PROFILING /
+            # INFERENCE instead of DISCOVERY.
             discovery_iters=args.discovery_iters,
             profiling_iters=args.profiling_iters,
+            skip_discovery=False,
             min_blocks=args.min_blocks,
             num_blocks=args.num_blocks,
             max_gpu_mem_fraction=args.max_gpu_mem_fraction,

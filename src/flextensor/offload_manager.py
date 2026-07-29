@@ -36,6 +36,7 @@ from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.tensor_discovery import (
+    has_offload_modules,
     has_patched_ancestor,
     is_offload_patched_module,
     select_offload_unit_paths,
@@ -319,6 +320,51 @@ DEFAULT_MANAGER_NAME: str = "default"
 OFFLOAD_MANAGER_MAP = {}
 _MANAGER_MAP_LOCK = threading.Lock()
 
+# Config fields consumed by ``_initialize_tensor_manager`` when it constructs
+# the TensorManager. That runs only once per manager, so a later ``set_config``
+# cannot reapply any of them — ``set_config`` warns instead of silently
+# accepting the change. ``skip_discovery`` is handled separately (it raises).
+_TENSOR_MANAGER_ONESHOT_FIELDS: tuple[str, ...] = (
+    "enabled",
+    "enable_diagnostics",
+    "exclude_patterns",
+    "gpu_device",
+    "include_patterns",
+    "load_strategy",
+    "max_gpu_mem_fraction",
+    "min_blocks",
+    "num_blocks",
+    "pinned_memory",
+    "pinned_memory_mode",
+    "profile_mode",
+    "shm_enabled",
+    "transfer_budget_scale",
+    "transfer_mode",
+)
+
+
+def _one_shot_value_differs(old: Any, new: Any) -> bool:
+    """Compare two one-shot config values, tolerating value-less objects.
+
+    ``Strategy`` implementations define no ``__eq__``, so ``!=`` falls back to
+    identity. That makes ``config.model_copy(deep=True)`` — which clones the
+    strategy — look like a user-initiated change and emit a spurious warning.
+    Compare same-typed instances by their attributes instead, so a clone is
+    equal while a genuinely different strategy still differs.
+
+    Args:
+        old: Value captured by the active ``TensorManager``.
+        new: Value from the incoming config.
+
+    Returns:
+        ``True`` if the values represent a real change.
+    """
+    if old is new:
+        return False
+    if type(old) is type(new) and hasattr(old, "__dict__") and not isinstance(old, (str, bytes)):
+        return bool(vars(old) != vars(new))
+    return bool(old != new)
+
 
 def _safe_remove_hook_handle(handle: RemovableHandle, *, context: str) -> None:
     """Remove a hook handle, logging at WARNING if removal raises.
@@ -421,6 +467,17 @@ class OffloadManager:
         self._model_proxy = None
         self._patched_modules: list[nn.Module] = []
         self._state_hook_handle: RemovableHandle | None = None
+        # Whether the most recent ``_transition_to_warmup`` honored a
+        # requested ``skip_discovery=True``. Set to ``False`` when the
+        # warning-and-fallback path fires (no patched modules) so callers
+        # have a programmatic signal — log scraping is unreliable in
+        # production loggers that route stderr to JSON.
+        # ``None`` until a warmup transition determines it; reset to ``None`` by
+        # ``release()``. See the :attr:`skip_discovery_honored` property.
+        self._skip_discovery_honored: bool | None = None
+        # One-shot config values as captured by the live TensorManager; see
+        # ``_warn_on_one_shot_field_changes``. Empty until one is constructed.
+        self._tensor_manager_oneshot_snapshot: dict[str, Any] = {}
 
     @property
     def compiled_offload_manager_id(self) -> int:
@@ -430,14 +487,94 @@ class OffloadManager:
     def set_config(self, config: OffloadConfig):
         """Set configuration for the offload manager.
 
+        Most fields take effect on the next phase transition or on the
+        operation that reads them. The fields in
+        :data:`_TENSOR_MANAGER_ONESHOT_FIELDS` are baked into the active
+        :class:`TensorManager` when it is constructed at the first
+        ``offload()`` call — ``_initialize_tensor_manager`` does not run
+        again — so changing them here cannot affect the live manager. To
+        honor a new value, ``release()`` the current manager and
+        re-``offload()``.
+
+        ``skip_discovery`` is the one field that *raises* rather than warns:
+        the live ``TensorManager`` would keep its captured value while
+        ``self.config.skip_discovery`` reported the new one, and
+        ``offload_block()``'s guard reads the live config — so a ``True→False``
+        flip would silently permit manual blocks while the manager stays in
+        skip-mode and never captured their tensor mappings. Every other
+        one-shot field emits a ``UserWarning`` naming it.
+
         Args:
             config: OffloadConfig instance with settings
+
+        Raises:
+            RuntimeError: If ``skip_discovery`` differs from the value the
+                active ``TensorManager`` captured at first ``offload()``.
+
+        Warns:
+            UserWarning: If any other one-shot field differs from the value
+                the active ``TensorManager`` captured.
         """
+        if self._tensor_manager is not None:
+            captured = self._tensor_manager_oneshot_snapshot
+            old_skip = captured.get("skip_discovery", getattr(self.config, "skip_discovery", None))
+            new_skip = getattr(config, "skip_discovery", None)
+            if old_skip != new_skip:
+                raise RuntimeError(
+                    f"OffloadManager.set_config: cannot change skip_discovery from "
+                    f"{old_skip} to {new_skip} after the TensorManager has been "
+                    f"created (during the first offload() call). skip_discovery is "
+                    f"a one-shot flag; the manager captured its value at init and "
+                    f"cannot pick up a change here. Silently allowing the change "
+                    f"would let offload_block() calls execute under skip-mode "
+                    f"internals that never captured their tensor mappings. To "
+                    f"honor the new value, call release() and re-offload()."
+                )
+            self._warn_on_one_shot_field_changes(config)
         self.config = config
 
         # Enable/disable instrumentation based on config
         registry = get_registry()
         registry.enabled = config.enable_instrumentation
+
+    def _warn_on_one_shot_field_changes(self, config: OffloadConfig) -> None:
+        """Warn for one-shot fields that differ from the live manager's captured values.
+
+        Args:
+            config: The incoming config being applied.
+        """
+        # Fall back to the current config when no snapshot exists (a manager
+        # installed without going through ``_initialize_tensor_manager``).
+        # Treating a missing snapshot as "captured None" would report every
+        # field as changed.
+        captured = self._tensor_manager_oneshot_snapshot or {
+            name: getattr(self.config, name, None) for name in _TENSOR_MANAGER_ONESHOT_FIELDS
+        }
+        changed = [
+            name
+            for name in _TENSOR_MANAGER_ONESHOT_FIELDS
+            if _one_shot_value_differs(captured.get(name), getattr(config, name, None))
+        ]
+        if not changed:
+            return
+        message = (
+            f"OffloadManager.set_config: {', '.join(sorted(changed))} "
+            f"{'is' if len(changed) == 1 else 'are'} baked into the active TensorManager at the "
+            f"first offload() call; the live manager keeps its original value(s) while self.config "
+            f"reports the new one(s). Call release() and re-offload() to apply them."
+        )
+        # ``include_patterns``/``exclude_patterns`` are the exception: ``offload()``
+        # re-runs ``_offload_modules``/``_exclude_modules`` from ``self.config``
+        # after this call, so the *patching* honors the new values while the
+        # TensorManager's captured copy (used for tensor mapping) does not.
+        # Name that split rather than claiming they are ignored outright.
+        pattern_fields = sorted(set(changed) & {"include_patterns", "exclude_patterns"})
+        if pattern_fields:
+            message += (
+                f" Note: {', '.join(pattern_fields)} additionally take effect for module patching on the "
+                f"next offload() while the TensorManager's captured copy does not, so the two can diverge."
+            )
+        warnings.warn(message, UserWarning, stacklevel=3)
 
     @property
     def compiled_offload_active(self) -> bool:
@@ -461,8 +598,15 @@ class OffloadManager:
 
     @property
     def eager_profiling_iters(self) -> int:
-        """Profiling forwards required before the PROFILING→INFERENCE transition."""
-        return self._eager_profiling_iters()
+        """Profiling forwards required before the PROFILING→INFERENCE transition.
+
+        Floored at ``1``. :meth:`update_state` runs as a post-forward hook, so
+        the transition cannot fire until one profile forward has completed —
+        the raw ``profiling_iters=0`` would advertise a budget that can never
+        reach INFERENCE, and this property is driven directly as a loop bound
+        (see :meth:`FlexTensorOffloadWorker.warmup_and_profile_model`).
+        """
+        return max(1, self._eager_profiling_iters())
 
     def _resolve_compiled_offload_activation(
         self,
@@ -557,15 +701,15 @@ class OffloadManager:
 
         Returns the memory used by GPU transfer blocks and unmapped tensors
         that were moved to GPU. This method should be called after the manager
-        has transitioned to inference mode (after discovery and profiling phases).
+        has transitioned to inference mode.
 
         Returns:
             GPUMemoryUsage: Memory breakdown with per-component bytes and MB values.
                 See `GPUMemoryUsage` for field details.
 
         Raises:
-            RuntimeError: If called before inference mode (before all discovery
-                and profiling iterations have completed)
+            RuntimeError: If called before the manager has transitioned to
+                inference mode.
 
         Examples:
             >>> om = get_offload_manager()
@@ -639,6 +783,15 @@ class OffloadManager:
                 max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,
                 profile_mode=self.config.profile_mode,
             )
+            self._tensor_manager.set_skip_discovery(self.config.skip_discovery)
+
+        # Snapshot exactly what the manager captured. ``set_config`` diffs
+        # against this rather than against ``self.config``, which it overwrites
+        # on every call — otherwise re-applying an already-diverged config
+        # would compare equal and warn only once.
+        self._tensor_manager_oneshot_snapshot = {
+            name: getattr(self.config, name, None) for name in (*_TENSOR_MANAGER_ONESHOT_FIELDS, "skip_discovery")
+        }
 
     def _transfer_hooks(self, old_model: nn.Module | None, new_model: nn.Module):  # noqa: C901
         """Transfer hooks from old model to new model, preserving module hierarchy.
@@ -711,7 +864,19 @@ class OffloadManager:
 
         def patched_forward(self_module, *args, **kwargs):
             try:
-                with offload_manager.offload_block(offload_name):
+                # Bypass the public ``offload_block()`` so the user-facing
+                # ``skip_discovery`` guard does not block auto-trap usage, but
+                # keep its null-manager check: a patched forward can outlive
+                # ``release()`` (which clears ``_tensor_manager``), and an
+                # AttributeError on NoneType would be far less legible.
+                tensor_manager = offload_manager._tensor_manager  # noqa: SLF001
+                if tensor_manager is None:
+                    raise RuntimeError(
+                        f"Tensor manager not initialized while running the patched forward for "
+                        f"{offload_name!r}. The module's forward is still patched after release(); "
+                        f"call offload() again, or restore the original forward."
+                    )
+                with tensor_manager.trap(offload_name):
                     return original_forward_func(self_module, *args, **kwargs)
             except Exception:
                 _log_diagnostic_snapshot(f"forward({offload_name})", offload_manager)
@@ -893,21 +1058,92 @@ class OffloadManager:
         """Transition to discovery phase.
 
         Method name kept to align with ``TensorManager.initialize_warmup()``.
+
+        If ``skip_discovery`` is enabled and at least one patched module is
+        reachable from ``self._model`` (`has_offload_modules`), immediately
+        transitions to profiling.
+
+        If ``skip_discovery=True`` but no patched modules are reachable, logs a
+        ``WARNING``, flips :attr:`skip_discovery_honored` to ``False`` so
+        callers have a programmatic signal, and falls through to the discovery
+        phase. When ``skip_discovery=False``, proceeds to discovery normally
+        with no warning.
         """
         self._tensor_manager.set_model(self._model)
         new_model = self._tensor_manager.initialize_warmup()
-        # Only skip discovery/profiling when a real profile state was restored.
-        # (MagicMock attributes are truthy and must not trigger this path.)
-        from flextensor.state_handler import TensorManagerState
-
-        if isinstance(getattr(self._tensor_manager, "tensor_manager_state", None), TensorManagerState):
+        # Only skip discovery/profiling when a profile was restored from
+        # *outside* this manager. Testing ``tensor_manager_state`` is not
+        # enough: a normal cycle reaching INFERENCE stores one too, so a second
+        # ``offload()`` would replay the previous model's plan and tensor IDs.
+        #
+        # ``is True`` rather than truthiness — a MagicMock attribute is truthy
+        # and must not trigger this path (the same reason the previous
+        # ``isinstance`` check existed).
+        if getattr(self._tensor_manager, "state_restored_from_profile", False) is True:
             # Profile was loaded via :func:`load_profile` / :func:`offload_from_profile`.
             # ``initialize_warmup`` already wired the inference loader; skip
             # discovery/profiling (compiled view-profile would arm
             # ``ProfileBlockController`` forwards on the wrong loader).
+            #
+            # No discovery phase runs here, so the skip is vacuously honored.
+            # Assign explicitly: a stale ``False`` carried over from a previous
+            # cycle would let ``offload_block()`` past its guard on a path that
+            # never captured manual-block tensor mappings.
+            self._skip_discovery_honored = True
             self._transition_to_inference()
             return
         self._swap_to_new_model(new_model, OffloadPhase.DISCOVERY)
+
+        if self.config.skip_discovery:
+            # Use ``has_offload_modules(self._model)`` rather than the captured
+            # ``self._patched_modules`` list so this gate matches the one used
+            # by ``TensorManager.initialize_warmup`` — the two signals can
+            # desync after model swaps / rebuilds.
+            if has_offload_modules(self._model):
+                self._skip_discovery_honored = True
+                self._transition_to_profile()
+            else:
+                self._skip_discovery_honored = False
+                LOGGER.warning(
+                    "skip_discovery=True but no patched modules are reachable "
+                    "from the active model; falling back to the discovery phase. "
+                    "Check include_patterns or move offload() ahead of any wrapper "
+                    "that hides matching modules. Inspect "
+                    "``OffloadManager.skip_discovery_honored`` to detect this case "
+                    "programmatically."
+                )
+        else:
+            self._skip_discovery_honored = True
+
+    @property
+    def skip_discovery_honored(self) -> bool | None:
+        """Whether the most recent warmup honored the requested ``skip_discovery``.
+
+        Three states, so "not determined yet" is distinguishable from "the skip
+        fired" — conflating them made the signal easy to misread:
+
+        - ``None`` — undetermined. No warmup transition has run: before the
+          first ``offload()``, and again after ``release()``.
+        - ``True`` — the warmup honored the request. Either
+          ``skip_discovery=False`` was configured (nothing to skip), or the
+          skip-path short-circuit fired and profiling started immediately.
+        - ``False`` — ``skip_discovery=True`` was requested but no patched
+          modules were reachable, so the manager fell back to the discovery
+          phase.
+
+        Lets callers detect the fallback without relying on log scraping in
+        production loggers that route stderr to JSON. Test for the fallback
+        explicitly with ``manager.skip_discovery_honored is False``; truthiness
+        alone treats the undetermined state as a fallback.
+
+        .. versionchanged:: v0.3.0
+            Was ``bool``, defaulting to ``True`` before any transition. Now
+            returns ``None`` until determined. Callers doing
+            ``if not manager.skip_discovery_honored`` should switch to
+            ``is False`` to keep the pre-``offload()`` reading out of the
+            fallback branch.
+        """
+        return self._skip_discovery_honored
 
     @_error_boundary
     def _transition_to_profile(self):
@@ -1013,16 +1249,39 @@ class OffloadManager:
 
         Unlike :attr:`OffloadConfig.pre_inference_iters` (static
         ``discovery_iters + profiling_iters``), this reflects the active path:
-        path-specific eager seed / compile-warmup via
-        :meth:`CompiledOffload.eager_profiling_iters` and
-        :meth:`CompiledOffload.extra_iters_before_inference`.
+
+        - ``discovery_iters`` is *excluded* when ``skip_discovery=True`` was
+          honored (the manager short-circuits from DISCOVERY straight to
+          PROFILING inside ``offload()``, so no discovery forwards are
+          consumed). It is included when ``skip_discovery=False``, or when
+          ``skip_discovery=True`` was requested but no patched modules were
+          reachable and the manager fell back to full discovery — see
+          :attr:`skip_discovery_honored`.
+        - The profile budget uses the path-specific eager seed via
+          :meth:`CompiledOffload.eager_profiling_iters` and
+          :meth:`CompiledOffload.extra_iters_before_inference`.
+
+        Both active components are floored at ``1``. :meth:`update_state` runs
+        as a post-forward hook and compares ``_iteration_count >= budget``, so
+        each phase it drives consumes at least one forward regardless of the
+        configured count. Returning the raw ``0`` (reachable with
+        ``profiling_iters=0``, or ``discovery_iters=0`` while discovery is
+        active — both are ``ge=0``) would make the documented drive loop stop
+        short and strand the model in DISCOVERY or PROFILING, serving through
+        the profile-mode model with no error and no warning.
 
         Replan measure/warmup forwards are **not** included here; drive them
         with :meth:`request_strategy_replan` after INFERENCE when needed.
         """
-        return (
-            self.config.discovery_iters + self._eager_profiling_iters() + self._compiled.extra_iters_before_inference()
-        )
+        # ``is True`` rather than truthiness: while undetermined (``None``) the
+        # skip has not fired, so budget for discovery. Over-counting costs a
+        # spare forward; under-counting strands the model mid-phase.
+        discovery_active = not (self.config.skip_discovery and self._skip_discovery_honored is True)
+        discovery_component = max(1, self.config.discovery_iters) if discovery_active else 0
+        # Already floored by the property — single source of truth for the
+        # profile budget so the two accessors cannot drift apart.
+        profile_component = self.eager_profiling_iters
+        return discovery_component + profile_component + self._compiled.extra_iters_before_inference()
 
     def init(self, config: OffloadConfig | None = None):
         if config is not None:
@@ -1077,7 +1336,12 @@ class OffloadManager:
 
         Examples:
             Basic eager offload (see ``docs/quick-start.md`` for a runnable
-            end-to-end example)::
+            end-to-end example). With the default ``skip_discovery=True``
+            and patched modules reachable from ``model``, ``offload()``
+            short-circuits past the discovery phase. ``profiling_iters``
+            forwards drive the state machine into ``INFERENCE`` (the
+            post-forward hook transitions on the Nth call); the extra
+            iteration below runs the first real inference forward::
 
                 import torch
                 import flextensor as ft
@@ -1215,6 +1479,13 @@ class OffloadManager:
         Returns:
             OffloadBlock context manager (Trap, WarmupTrap, TrapInfer, …)
 
+        Raises:
+            RuntimeError: If ``offload()`` has not been called yet, or if
+                ``OffloadConfig.skip_discovery`` is ``True`` (the default).
+                Manual offload blocks require discovery-phase iterations to
+                map their tensors; set ``skip_discovery=False`` on the config
+                when the model uses manual blocks.
+
         Examples:
             >>> with om.offload_block("encoder"):
             ...     output = encoder(hidden_states)
@@ -1229,6 +1500,21 @@ class OffloadManager:
         if self._tensor_manager is None:
             raise RuntimeError(
                 "Tensor manager not initialized. Call offload() on a model first to initialize the manager."
+            )
+        # Gate on what actually happened, not on what was requested: when
+        # skip_discovery was requested but no patched modules were reachable,
+        # the manager fell back to a real discovery phase, which is exactly
+        # what manual blocks need. Blocking there would reject the one
+        # topology the fallback exists to keep working.
+        #
+        # ``is not False`` deliberately: allow manual blocks only when the
+        # fallback is *known* to have happened. While undetermined (``None``)
+        # no discovery has run, so permitting them would be unsafe.
+        if self.config is not None and self.config.skip_discovery and self._skip_discovery_honored is not False:
+            raise RuntimeError(
+                "offload_block() is not supported when OffloadConfig.skip_discovery is True. "
+                "Manual offload blocks require discovery-phase iterations to map their tensors. "
+                "Set skip_discovery=False on the config when the model uses manual offload_block() calls."
             )
         return self._tensor_manager.trap(name)
 
@@ -1407,6 +1693,12 @@ class OffloadManager:
             self._tensor_manager.release_memory()
             self._tensor_manager.shutdown()
             self._tensor_manager = None
+        # Nothing has captured a value any more; the next offload() re-snapshots.
+        self._tensor_manager_oneshot_snapshot = {}
+        # No warmup transition owns this any more. Leaving the previous cycle's
+        # verdict in place would make ``skip_discovery_honored`` and
+        # ``iters_before_inference`` answer for a manager that no longer exists.
+        self._skip_discovery_honored = None
         self._initialized = False
         self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._model_proxy = None

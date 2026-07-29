@@ -512,7 +512,17 @@ def test_warmup_direct_trap_records_cross_layer_parameter_access() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA support")
-def test_offload_lifecycle_preserves_raw_parameter_access_on_cuda() -> None:
+@pytest.mark.parametrize("skip_discovery", [False, True])
+def test_offload_lifecycle_preserves_raw_parameter_access_on_cuda(skip_discovery: bool) -> None:
+    """End-to-end raw-parameter access under both discovery paths.
+
+    ``skip_discovery=False`` exercises the ``WarmupTrapDirect`` discovery
+    iteration that materializes raw parameter storage during warmup;
+    ``skip_discovery=True`` (the default) skips discovery entirely and
+    relies on the static layer-stats seed. Both paths must land in
+    inference with parameters visible on CUDA to the raw ``forward`` reads.
+    """
+
     class RawLayer(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -541,6 +551,7 @@ def test_offload_lifecycle_preserves_raw_parameter_access_on_cuda() -> None:
         include_patterns=["layer1", "layer2"],
         pinned_memory=False,
         max_gpu_mem_fraction=0.5,
+        skip_discovery=skip_discovery,
     )
 
     proxy = ft.offload(model, config)

@@ -62,8 +62,13 @@ def test_external_compiled_offload_arms_replan():
 
 
 def test_eager_profiling_budget_uses_full_iters_when_compiled_profile():
+    # ``skip_discovery=False`` so ``discovery_iters`` is included in the
+    # ``iters_before_inference`` arithmetic this test pins. Under the
+    # ``skip_discovery=True`` default the discovery component drops to
+    # zero — the skip variants of ``iters_before_inference`` are covered
+    # in ``tests/unit/test_offload_manager_phase.py``.
     om = OffloadManager("test_eager_budget")
-    om.config = OffloadConfig(enabled=True, profiling_iters=12)
+    om.config = OffloadConfig(enabled=True, profiling_iters=12, skip_discovery=False)
     co = om._compiled
     co.active = True
     co.replan_active = False

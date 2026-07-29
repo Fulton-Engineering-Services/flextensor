@@ -11,6 +11,7 @@ import torch
 from flextensor.allocation_block import AllocationBlock, AllocationManager
 from flextensor.compiler_utils import disable as _compiler_disable
 from flextensor.compiler_utils import is_compiling as _is_compiling
+from flextensor.helpers import format_tensor_id_hint
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
 from flextensor.strategy_operations import find_transfers_for_preload
@@ -92,6 +93,21 @@ def _compute_untimed_traced_preload(
     for layer_stat in layer_stats:
         for tensor_info in layer_stat.tensors:
             layer_tensor_ids.add(tensor_info.tensor_id)
+    return {tid for tid in tensors_map if tid not in layer_tensor_ids}
+
+
+def _compute_untimed_traced_preload_iterative(
+    layer_stats: list[IterativeLayerStatistics],
+    tensors_map: Mapping[int, torch.Tensor],
+) -> set[int]:
+    """IDs in ``tensors_map`` absent from every iterative layer's ``tensor_ids``.
+
+    Iterative-stats counterpart of :func:`_compute_untimed_traced_preload`;
+    feeds :class:`UntimedTrapRescuer`.
+    """
+    layer_tensor_ids: set[int] = set()
+    for stat in layer_stats:
+        layer_tensor_ids.update(stat.tensor_ids)
     return {tid for tid in tensors_map if tid not in layer_tensor_ids}
 
 
@@ -360,6 +376,108 @@ class WarmupDirectTensorLoader(Loader):
         self._accessed_by_label.clear()
 
 
+class UntimedTrapRescuer:
+    """Force-pin traced-but-untimed tensors to GPU for a loader's lifetime.
+
+    "Traced but untimed" = present in ``tensors_map`` but absent from every
+    layer's ``tensor_ids``. The rescuer copies them to GPU once at
+    construction and is consulted by :meth:`TensorLayerLoader.get` on a
+    cache miss.
+
+    Complements the runtime cross-module fallback in
+    :func:`flextensor.tensor_manager._make_tensor_getter`, which stays as
+    the safety net for positional-argument reads (e.g. vLLM
+    ``logits_processor(lm_head, …)``) that the static handoff cannot see.
+    ``UntimedTrapRescuer`` only covers ids the strategy has *no* row for;
+    the view-mode profile path (``ProfileBlockController`` +
+    :class:`flextensor.tensor_processors.MoveUnmappedTensorsToGPUProcessor`)
+    handles unmapped placement instead and does not use this rescuer.
+
+    Trade-off: permanent GPU residence for rescued ids, in exchange for no
+    per-trap H2D copy and no trap-duration taint.
+    """
+
+    def __init__(
+        self,
+        layer_stats: list[IterativeLayerStatistics],
+        tensors_map: Mapping[int, torch.Tensor],
+        device_gpu: torch.device,
+        *,
+        reachable_tensor_ids: set[int] | None = None,
+        del_tensor_func: Callable[[torch.Tensor], None] = clear_and_delete_tensor,
+        id_to_name_map: Mapping[int, str] | None = None,
+    ) -> None:
+        self.device_gpu = device_gpu
+        self.pinned: dict[int, torch.Tensor] = {}
+        self.owned_ids: set[int] = set()
+        self.del_tensor = del_tensor_func
+
+        rescue_ids = _compute_untimed_traced_preload_iterative(layer_stats, tensors_map)
+        if reachable_tensor_ids is not None:
+            rescue_ids &= reachable_tensor_ids
+        if not rescue_ids:
+            return
+
+        rescue_bytes = sum(tensors_map[tid].numel() * tensors_map[tid].element_size() for tid in rescue_ids)
+
+        try:
+            for tensor_id in rescue_ids:
+                tensor = tensors_map[tensor_id]
+                if tensor.device != device_gpu:
+                    self.pinned[tensor_id] = tensor.to(device=device_gpu, copy=True)
+                    self.owned_ids.add(tensor_id)
+                else:
+                    self.pinned[tensor_id] = tensor
+        except torch.cuda.OutOfMemoryError as e:
+            self.shutdown()
+            raise torch.cuda.OutOfMemoryError(
+                f"GPU out of memory during untimed-trap rescue: pinning {len(rescue_ids)} tensor(s) "
+                f"({rescue_bytes / 1024**3:.2f} GiB) missed by profile coverage."
+            ) from e
+        torch.cuda.synchronize()
+
+        LOGGER.warning(
+            "Untimed-trap rescue activated: %d tensor(s) (%.2f MiB) force-pinned to GPU "
+            "[tensors: %s]. Likely a profile-coverage gap.",
+            len(rescue_ids),
+            rescue_bytes / (1024 * 1024),
+            format_tensor_id_hint(rescue_ids, id_to_name_map),
+        )
+
+    def get(self, tensor_id: int) -> torch.Tensor | None:
+        """Return the rescued GPU copy for ``tensor_id``, or ``None``."""
+        return self.pinned.get(tensor_id)
+
+    def pin(self, tensor_id: int, tensor: torch.Tensor) -> None:
+        """Adopt ``tensor`` into the pinned set as passthrough (shared storage).
+
+        Runtime callers (currently ``TensorLayerLoader.exit``) only ever
+        adopt tensors already owned by the model, so the rescuer must not
+        run ``del_tensor_func`` on them at shutdown — the model still
+        references the same storage. Owned copies are only produced by
+        ``__init__``; there is no supported path for a caller to transfer
+        ownership after construction.
+        """
+        self.pinned[tensor_id] = tensor
+
+    def shutdown(self) -> None:
+        """Drop references to all rescued GPU tensors. Idempotent.
+
+        Owned entries (fresh copies) go through ``del_tensor_func``;
+        passthrough entries share storage with the model, so only the
+        local reference is dropped.
+        """
+        if not self.pinned:
+            return
+        for tensor_id in list(self.pinned.keys()):
+            gpu_tensor = self.pinned.pop(tensor_id)
+            if tensor_id in self.owned_ids:
+                self.del_tensor(gpu_tensor)
+            else:
+                del gpu_tensor
+        self.owned_ids.clear()
+
+
 @instrumentable
 class TensorLayerLoader(Loader):
     """
@@ -378,7 +496,19 @@ class TensorLayerLoader(Loader):
         tensors_map: Mapping[int, torch.Tensor],
         device_gpu: torch.device,
         delete_tensor_func: Callable[[torch.Tensor], None] = clear_and_delete_tensor,
+        *,
+        rescuer: UntimedTrapRescuer | None = None,
     ) -> None:
+        """Construct a layer-scoped tensor loader.
+
+        Args:
+            layer_stats: Per-layer tensor-id manifests driving enter/exit.
+            tensors_map: Canonical id -> tensor table (CPU master copies).
+            device_gpu: Target GPU device.
+            delete_tensor_func: Per-tensor release callable used in ``exit``.
+            rescuer: Optional :class:`UntimedTrapRescuer` consulted by
+                :meth:`get` on a cache miss. Defaults to ``None``.
+        """
         self.layer_stats = layer_stats
         self.tensors_map = tensors_map
         self.layer_stats_map: dict[str, list[int]] = {}
@@ -397,6 +527,7 @@ class TensorLayerLoader(Loader):
         self._data_binder = _RawTensorDataBinder(tensors_map)
 
         self.model_ids: set[int] = set()
+        self.rescuer = rescuer
 
     def set_model_ids(self, tensor_ids: set[int]) -> None:
         self.model_ids = tensor_ids
@@ -446,6 +577,10 @@ class TensorLayerLoader(Loader):
 
             count = self._active_counts.get(tensor_id, 0)
             if count <= 0:
+                # ``enter`` saw the canonical already on GPU and skipped it;
+                # adopt into the rescuer so ``get`` keeps finding it.
+                if self.rescuer is not None:
+                    self.rescuer.pin(tensor_id, self.tensors_map[tensor_id])
                 continue
             if count > 1:
                 self._active_counts[tensor_id] = count - 1
@@ -464,11 +599,12 @@ class TensorLayerLoader(Loader):
             del self.cpu_to_gpu_map[tensor_id]
 
     def get(self, tensor_id: int) -> torch.Tensor | None:
-        """Get tensor by ID if loaded."""
-        tensor = None
+        """Get tensor by ID if loaded, falling back to the rescuer."""
         if tensor_id in self.cpu_to_gpu_map:
-            tensor = self.cpu_to_gpu_map[tensor_id]
-        return tensor
+            return self.cpu_to_gpu_map[tensor_id]
+        if self.rescuer is not None:
+            return self.rescuer.get(tensor_id)
+        return None
 
     def release_memory(self) -> None:
         """Release memory (placeholder implementation)."""
@@ -479,6 +615,11 @@ class TensorLayerLoader(Loader):
                 self.del_tensor(gpu_tensor)
             del self.cpu_to_gpu_map[tensor_id]
         self._active_counts.clear()
+
+    def shutdown(self) -> None:
+        """Release loader resources, including any rescuer-pinned tensors."""
+        if self.rescuer is not None:
+            self.rescuer.shutdown()
 
 
 @instrumentable
@@ -544,9 +685,17 @@ class TensorStrategyLoader(Loader):
                 id_hint,
             )
         self.preload_ids |= rescue_ids
+        # Ids whose ``cpu_to_gpu_map`` entry is the canonical model tensor rather
+        # than a loader-owned copy. Freeing one of these would corrupt the model's
+        # weights silently, so ``release_for_label`` must never ``del_tensor`` them.
+        self._passthrough_preload_ids: set[int] = set()
         for tensor_id, tensor in self.tensors_map.items():
             if tensor_id in self.preload_ids:
-                gpu_tensor = tensor.to(device=device_gpu, copy=True)
+                if tensor.device == device_gpu:
+                    gpu_tensor = tensor
+                    self._passthrough_preload_ids.add(tensor_id)
+                else:
+                    gpu_tensor = tensor.to(device=device_gpu, copy=True)
                 self.cpu_to_gpu_map[tensor_id] = gpu_tensor
 
         torch.cuda.synchronize()
@@ -603,6 +752,11 @@ class TensorStrategyLoader(Loader):
         release_strategy = self.release_strategy_map[label]
         for tensor_info in release_strategy:
             if tensor_info.tensor_id in self.cpu_to_gpu_map:
+                if tensor_info.tensor_id in self._passthrough_preload_ids:
+                    # Passthrough entry: the map holds the canonical model tensor,
+                    # not a loader-owned copy. Deleting its storage would silently
+                    # corrupt the model's weights rather than fail loudly.
+                    continue
                 gpu_tensor = self.cpu_to_gpu_map[tensor_info.tensor_id]
                 self.del_tensor(gpu_tensor)
                 del self.cpu_to_gpu_map[tensor_info.tensor_id]

@@ -209,6 +209,70 @@ class TestVllmDefaultPatternUpdates:
         assert updates["profiling_iters"] == COMPILED_EAGER_PROFILE_FORWARDS
 
 
+class TestVllmSkipDiscoveryPin:
+    """vLLM worker must pin ``skip_discovery=False`` regardless of user config.
+
+    Rationale: :meth:`FlexTensorOffloadWorker.warmup_and_profile_model` is
+    hand-scheduled against the DISCOVERY→PROFILING transition landing between
+    the first ``compile_or_warm_up_model()`` (2 forwards) and the explicit
+    max-token profile loop. With ``skip_discovery=True`` the manager
+    short-circuits directly to PROFILING inside ``offload()``, so vLLM's
+    warmup forwards land in the profile budget — at ``profiling_iters=2``
+    (the vLLM floor) the state machine reaches INFERENCE before the
+    max-token loop even starts and zero max-token samples are profiled.
+    """
+
+    def test_skip_discovery_false_when_user_did_not_set(self, worker_module) -> None:
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["*"],
+            exclude_patterns=[],
+            skip_discovery=True,  # OffloadConfig default in this MR
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert updates["skip_discovery"] is False
+
+    def test_skip_discovery_false_overrides_explicit_true(self, worker_module) -> None:
+        """Even when the caller explicitly opts in, the vLLM worker must veto.
+
+        The worker's warmup schedule is baked around a discovery→profile
+        transition; honoring the caller's ``True`` here would silently
+        collapse the profile budget for max-token forwards.
+        """
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["*"],
+            exclude_patterns=[],
+            skip_discovery=True,
+            model_fields_set={"skip_discovery"},
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert updates["skip_discovery"] is False, (
+            "vLLM worker must veto skip_discovery=True; leaving it True would "
+            "route compile_or_warm_up_model forwards into the profile budget "
+            "(profiling_iters=2 floor → zero max-token samples profiled)"
+        )
+
+    def test_skip_discovery_false_preserved_when_user_already_false(self, worker_module) -> None:
+        config = SimpleNamespace(
+            discovery_iters=1,
+            profiling_iters=1,
+            include_patterns=["*"],
+            exclude_patterns=[],
+            skip_discovery=False,
+        )
+
+        updates = worker_module._vllm_config_updates(config)
+
+        assert updates["skip_discovery"] is False
+
+
 @dataclass
 class _FakeCompileModule:
     """Stand-in for a ``@support_torch_compile`` module exposing ``do_not_compile``."""

@@ -45,16 +45,18 @@ model = YourModel()
 
 # Configure offloading
 config = OffloadConfig(
-    gpu_device=0,              # GPU to use
-    discovery_iters=1,            # Iterations for tensor discovery
-    profiling_iters=10,          # Iterations for timing measurement
+    gpu_device=0,                   # GPU to use
+    profiling_iters=10,             # Iterations for timing measurement
     include_patterns=["layers.*"],  # Which modules to offload
 )
 
 # Patch the model
 model = flextensor.offload(model, config=config)
 
-# Use normally - first discovery_iters + profiling_iters iterations are discovery/profiling
+# Use normally — the first few iterations warm the manager (under the
+# default `skip_discovery=True` that is just `profiling_iters` forwards;
+# query `flextensor.get_offload_manager().iters_before_inference` for
+# the exact path-aware count).
 for batch in dataloader:
     output = model(batch)  # FlexTensor handles everything
 ```

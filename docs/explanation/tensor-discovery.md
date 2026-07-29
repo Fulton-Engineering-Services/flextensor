@@ -137,9 +137,10 @@ This strategy has a direct, structural relationship: each patched module knows e
 
 ### When It Works
 
-This strategy applies when you use manual traps (context managers) instead of forward patching:
+This strategy applies when you use manual traps (context managers) instead of forward patching. **Requires `skip_discovery=False`** — the default `skip_discovery=True` short-circuits DISCOVERY and never captures the tensor mappings that manual blocks enumerate, so `offload_block()` raises a `RuntimeError` under the default:
 
 ```python
+config = OffloadConfig(skip_discovery=False, ...)
 manager = get_offload_manager()
 model = manager.offload(model, config)
 
@@ -303,9 +304,14 @@ Check the tensor mapping after discovery:
 manager = get_offload_manager()
 model = manager.offload(model, config)
 
-# Run discovery
-for i in range(config.discovery_iters):
-    model(dummy_input)
+# Run discovery. Needed when `skip_discovery=False`, and also when
+# `skip_discovery=True` was requested but no patched modules were reachable —
+# the manager then falls back to a real discovery phase and
+# `skip_discovery_honored` is False. Only when the skip actually fired are
+# layer stats built statically at `offload()` time and this loop unnecessary.
+if not (config.skip_discovery and manager.skip_discovery_honored):
+    for _ in range(config.discovery_iters):
+        model(dummy_input)
 
 # Examine layer statistics
 # Note: _tensor_manager is an internal attribute intended for debugging only.

@@ -29,6 +29,7 @@ from flextensor.config import (
     load_config_from_file,
 )
 from flextensor.strategy import GreedyStrategy, KnapsackStrategy, NthLayerStrategy
+from flextensor.utils import config_field_was_set
 
 
 @pytest.fixture(autouse=True)
@@ -280,6 +281,11 @@ class TestOffloadConfig:
 
     def test_edge_values_profiling_iters_zero(self):
         """Test profiling_iters at boundary value 0."""
+        # profiling_iters=0 round-trips under either skip_discovery value; no
+        # validator relates the two. OffloadManager.iters_before_inference
+        # floors the profile budget at 1 so the documented drive loop can still
+        # reach INFERENCE — see
+        # tests/unit/test_skip_discovery.py::TestItersBeforeInferenceFloor.
         config = OffloadConfig(profiling_iters=0)
         assert config.profiling_iters == 0
 
@@ -1783,3 +1789,43 @@ class TestModelCopyDeprecatedFieldSync:
         assert copied.warmup_iters == 5
         assert copied.profiling_iters == 10
         assert copied.profile_iters == 10
+
+
+class TestModelCopyPreservesFieldsSet:
+    """``model_copy(update=...)`` must not inflate ``model_fields_set``.
+
+    ``model_copy`` re-parses through ``model_validate`` to re-assert the
+    ``@model_validator`` invariants that ``model_copy`` bypasses. Re-parsing a
+    full ``model_dump()`` would mark *every* field as explicitly set, which
+    silently breaks :func:`flextensor.utils.config_field_was_set` — the
+    "did the user customize this?" signal the vLLM worker uses to decide
+    whether to apply its default include/exclude patterns.
+    """
+
+    def test_unset_field_stays_unset_after_copy(self) -> None:
+        config = OffloadConfig(discovery_iters=1)
+        copied = config.model_copy(update={"profiling_iters": 3})
+
+        assert not config_field_was_set(copied, "exclude_patterns"), (
+            "re-parsing the full dump marked an untouched field as explicitly "
+            "set; config_field_was_set can no longer distinguish user intent"
+        )
+
+    def test_copy_does_not_mark_every_field_set(self) -> None:
+        config = OffloadConfig(discovery_iters=1)
+        copied = config.model_copy(update={"profiling_iters": 3})
+
+        assert len(copied.model_fields_set) < len(type(config).model_fields)
+
+    def test_explicitly_set_and_updated_fields_are_reported_set(self) -> None:
+        config = OffloadConfig(discovery_iters=1)
+        copied = config.model_copy(update={"profiling_iters": 3})
+
+        assert config_field_was_set(copied, "discovery_iters")
+        assert config_field_was_set(copied, "profiling_iters")
+
+    def test_copy_still_enforces_validators(self) -> None:
+        """The re-parse must keep rejecting invariant violations."""
+        config = OffloadConfig(num_blocks=4, min_blocks=2)
+        with pytest.raises(ValidationError):
+            config.model_copy(update={"num_blocks": 1, "min_blocks": 8})

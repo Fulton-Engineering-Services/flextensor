@@ -25,18 +25,33 @@ This learning process happens transparently during the first few iterations of m
 ## State Progression
 
 ```
-NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
-                       ↓           ↓
-                 (discovery_iters) (profiling_iters)
+skip_discovery=True (default), skip honored:
+    NOT_INITIALIZED → (DISCOVERY) → PROFILING → INFERENCE
+                                          ↓
+                                   (profiling_iters)
+    DISCOVERY is entered and left inside offload() without consuming any
+    forwards; no discovery iterations are driven.
+
+skip_discovery=False:
+    NOT_INITIALIZED → DISCOVERY → PROFILING → INFERENCE
+                            ↓           ↓
+                      (discovery_iters) (profiling_iters)
 ```
 
-The `OffloadManager` tracks the current phase internally and transitions automatically based on iteration counts configured via `OffloadConfig`:
+The `OffloadManager` tracks the current phase internally and transitions
+automatically based on iteration counts configured via `OffloadConfig`.
+Under the default `skip_discovery=True` the DISCOVERY phase is skipped
+entirely and layer statistics are derived statically from the patched
+modules inside `offload()`; only `profiling_iters` forwards are needed to
+reach INFERENCE. Use `OffloadManager.iters_before_inference` for the
+runtime-actual count.
 
 ```python
-config = OffloadConfig(
-    discovery_iters=1,    # Iterations in discovery phase
-    profiling_iters=10,  # Iterations in profiling phase
-)
+# Default (skip DISCOVERY, static layer stats)
+config = OffloadConfig(profiling_iters=10)
+
+# Manual `offload_block()` path — DISCOVERY must run to capture blocks
+config = OffloadConfig(skip_discovery=False, discovery_iters=1, profiling_iters=10)
 ```
 
 ## Discovery Phase
@@ -277,21 +292,25 @@ While users don't interact with phases directly, they can influence phase behavi
 ### Example
 
 ```python
-from flextensor import OffloadConfig, get_offload_manager, offload
+import flextensor
+from flextensor import OffloadConfig, offload
 
-# Configuration affects internal phase duration
+# Configuration affects internal phase duration.
+# Under the default `skip_discovery=True` only `profiling_iters` fires.
 config = OffloadConfig(
-    discovery_iters=1,
     profiling_iters=5,
     include_patterns=["layers.*"],
 )
 
 model = offload(model, config=config)
 
-# First discovery_iters + profiling_iters iterations: internal learning
+# First `iters_before_inference` iterations: internal learning
 # Subsequent iterations: optimized inference
-for batch in dataloader:
+om = flextensor.get_offload_manager()
+for i, batch in enumerate(dataloader):
     output = model(batch)
+    if i + 1 == om.iters_before_inference:
+        print(f"FlexTensor now serving from {om.phase.value}")
 ```
 
 ## Profiling Data Control

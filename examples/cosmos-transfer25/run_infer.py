@@ -152,14 +152,18 @@ def _run_phase_passes(
 
     The net manager advances on its own ``forward`` hook (one call per diffusion
     step). The text encoder runs via ``compute_text_embeddings_online`` (not
-    ``forward``), so its hook never fires -- advance it manually, once per
-    generation (i.e. one iteration per ``discovery_iters + profiling_iters``).
+    ``forward``), so its hook never fires -- advance it manually. The number of
+    passes matches ``manager.iters_before_inference``, which is path-aware:
+    under the default ``skip_discovery=True`` (with patched modules) DISCOVERY
+    is short-circuited inside ``offload()`` and only ``profiling_iters`` passes
+    are needed; under ``skip_discovery=False`` the full
+    ``discovery_iters + profiling_iters`` sequence runs.
     """
     manager = flextensor.get_offload_manager(manager_name)
     phase_root = output_dir / "_flextensor_phase"
     phase_root.mkdir(parents=True, exist_ok=True)
 
-    total_passes = manager.config.discovery_iters + manager.config.profiling_iters
+    total_passes = manager.iters_before_inference
     for pass_index in range(total_passes):
         pass_dir = phase_root / f"pass_{pass_index}"
         pass_dir.mkdir(parents=True, exist_ok=True)
