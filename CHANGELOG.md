@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-07-29
+
 ### Added
 
 - Support compiled offload with ``pre_compute/post_compute`` custom ops so ``torch.compile``
@@ -287,7 +289,8 @@ memory snapshot collection during worker lifecycle.
 **Known limitations** — inference only (no training or backward pass); no data parallelism;
 no MoE support; not thread-safe (one thread per manager instance).
 
-[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ai-dynamo/flextensor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ai-dynamo/flextensor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ai-dynamo/flextensor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ai-dynamo/flextensor/releases/tag/v0.1.0
