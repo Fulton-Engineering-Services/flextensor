@@ -113,6 +113,44 @@ class TestMultiprocessConditionSingle:
         condition.close()
         condition.unlink()
 
+    @pytest.mark.parametrize(
+        ("method_name", "initially_ready"),
+        [("wait_for_ready", True), ("notify_ready", False)],
+    )
+    def test_ready_method_keeps_validated_resources_if_fields_are_cleared(self, method_name, initially_ready):
+        """A concurrent close cannot replace resources after validation."""
+        condition = MultiprocessCondition.__new__(MultiprocessCondition)
+        condition.name = self.test_name
+
+        class NotificationList:
+            ready = initially_ready
+
+            def is_ready(self):
+                return self.ready
+
+            def set_ready(self):
+                self.ready = True
+
+            def get_list(self):
+                return []
+
+        notification_list = NotificationList()
+        condition.notification_list = notification_list
+
+        class ClosingRaceLock:
+            def __enter__(self):
+                condition.lock = None
+                condition.notification_list = None
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+        condition.lock = ClosingRaceLock()
+
+        getattr(condition, method_name)()
+
+        assert notification_list.ready
+
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_semaphore_protection(self, lock_class):
         """Test that semaphore properly protects critical sections."""

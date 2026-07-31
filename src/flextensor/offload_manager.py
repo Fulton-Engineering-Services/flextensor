@@ -463,8 +463,8 @@ class OffloadManager:
         self._initialized = False
         self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._iteration_count = 0
-        self._model = None
-        self._model_proxy = None
+        self._model: nn.Module | None = None
+        self._model_proxy: OffloadModelProxy | None = None
         self._patched_modules: list[nn.Module] = []
         self._state_hook_handle: RemovableHandle | None = None
         # Whether the most recent ``_transition_to_warmup`` honored a
@@ -675,12 +675,16 @@ class OffloadManager:
         """
         if self._tensor_manager is None:
             self._initialize_tensor_manager()
+        # Keep a stable local so mypy can narrow the optional attribute after the guard.
+        tensor_manager = self._tensor_manager
 
         resolved_dir = self._resolve_profile_directory(profile_directory)
         target_model = model if model is not None else self._model
         if target_model is None:
             raise RuntimeError("No model provided and no model has been offloaded yet.")
-        self._tensor_manager.load_profile(resolved_dir, target_model)
+        if tensor_manager is None:
+            raise RuntimeError("Tensor manager initialization failed")
+        tensor_manager.load_profile(resolved_dir, target_model)
 
     def benchmark_transfers(self):
         """Benchmark weight transfer speeds."""
@@ -1069,8 +1073,12 @@ class OffloadManager:
         phase. When ``skip_discovery=False``, proceeds to discovery normally
         with no warning.
         """
-        self._tensor_manager.set_model(self._model)
-        new_model = self._tensor_manager.initialize_warmup()
+        # Keep a stable local so mypy can narrow the optional attribute after the guard.
+        tensor_manager = self._tensor_manager
+        if tensor_manager is None or self._model is None:
+            raise RuntimeError("OffloadManager is not initialized")
+        tensor_manager.set_model(self._model)
+        new_model = tensor_manager.initialize_warmup()
         # Only skip discovery/profiling when a profile was restored from
         # *outside* this manager. Testing ``tensor_manager_state`` is not
         # enough: a normal cycle reaching INFERENCE stores one too, so a second
@@ -1079,7 +1087,7 @@ class OffloadManager:
         # ``is True`` rather than truthiness — a MagicMock attribute is truthy
         # and must not trigger this path (the same reason the previous
         # ``isinstance`` check existed).
-        if getattr(self._tensor_manager, "state_restored_from_profile", False) is True:
+        if getattr(tensor_manager, "state_restored_from_profile", False) is True:
             # Profile was loaded via :func:`load_profile` / :func:`offload_from_profile`.
             # ``initialize_warmup`` already wired the inference loader; skip
             # discovery/profiling (compiled view-profile would arm
@@ -1544,13 +1552,17 @@ class OffloadManager:
         # creation and patching so followers get compile-transparent forwards.
         self._compiled.resolve_activation(self.config, None)
         self._initialize_tensor_manager()
+        # Keep a stable local so mypy can narrow the optional attribute after the guard.
+        tensor_manager = self._tensor_manager
+        if tensor_manager is None:
+            raise RuntimeError("Tensor manager initialization failed")
         self._compiled.arm_non_destructive_first_loader()
-        self._tensor_manager.shm_namespace = coordinator.namespace
-        self._tensor_manager.restore_state(model, state)
+        tensor_manager.shm_namespace = coordinator.namespace
+        tensor_manager.restore_state(model, state)
 
-        self._model = self._tensor_manager.initialize_warmup()
-        self._model = self._tensor_manager.initialize_profile()
-        self._model = self._tensor_manager.initialize_inference()
+        self._model = tensor_manager.initialize_warmup()
+        self._model = tensor_manager.initialize_profile()
+        self._model = tensor_manager.initialize_inference()
 
         self._offload_modules(self._model, self.config.include_patterns)
         self._exclude_modules(self._model, self.config.exclude_patterns)

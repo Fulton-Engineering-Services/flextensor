@@ -147,18 +147,22 @@ class MultiprocessCondition:
 
     def wait_for_ready(self) -> None:
         """Block until notify_ready() is called."""
+        lock = self.lock
+        notification_list = self.notification_list
+        if lock is None or notification_list is None:
+            raise RuntimeError("MultiprocessCondition is closed")
         pid = os.getpid()
         notification_lock = None
-        with self.lock:
-            if self.notification_list.is_ready():
+        with lock:
+            if notification_list.is_ready():
                 return
             lock_name = f"{self.name}_{pid}"
             # Always use SemaphoreLock for notifications, create and lock it
             notification_lock = SemaphoreLock(lock_name, locked=True, non_blocking=False)
-            self.notification_list.append(f"{pid}")
+            notification_list.append(f"{pid}")
 
         try:
-            while not self.notification_list.is_ready():
+            while not notification_list.is_ready():
                 notification_lock.acquire(non_blocking=False)
         finally:
             if notification_lock is not None:
@@ -169,9 +173,13 @@ class MultiprocessCondition:
 
     def notify_ready(self) -> None:
         """Signal all waiting processes that the condition is ready."""
-        with self.lock:
-            self.notification_list.set_ready()
-            pids = self.notification_list.get_list()
+        lock = self.lock
+        notification_list = self.notification_list
+        if lock is None or notification_list is None:
+            raise RuntimeError("MultiprocessCondition is closed")
+        with lock:
+            notification_list.set_ready()
+            pids = notification_list.get_list()
             for waiter_pid in pids:
                 if not waiter_pid:
                     continue

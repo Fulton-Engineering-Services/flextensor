@@ -158,6 +158,24 @@ class TestFlexibleSharedMemorySingle:
 
         fsm.close()
 
+    def test_try_acquire_lock_keeps_reference_across_retries(self):
+        """A concurrent close cannot replace the lock between retry attempts."""
+        fsm = FlexibleSharedMemory.__new__(FlexibleSharedMemory)
+
+        class ClosingRaceLock:
+            attempts = 0
+
+            def acquire(self, *, non_blocking):
+                assert non_blocking
+                self.attempts += 1
+                fsm.main_lock = None
+                if self.attempts == 1:
+                    raise BlockingIOError
+
+        fsm.main_lock = ClosingRaceLock()
+
+        assert fsm._try_acquire_lock(max_attempts=2)
+
     def test_notification_condition_integration(self):
         """Test integration with MultiprocessCondition."""
         fsm = FlexibleSharedMemory(

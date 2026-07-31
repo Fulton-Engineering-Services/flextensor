@@ -49,6 +49,9 @@ class BaseLock(ABC):
 
     _init_non_blocking: bool
 
+    @abstractmethod
+    def __init__(self, name: str, locked: bool = True, non_blocking: bool = False) -> None: ...
+
     def __enter__(self):
         """Enter context manager - acquire lock."""
         self.acquire(non_blocking=self._init_non_blocking)
@@ -97,7 +100,7 @@ class SemaphoreLock(BaseLock):
     The underlying POSIX semaphore is managed by the kernel for thread/process safety.
     """
 
-    def __init__(self, name: str, locked: bool = True, non_blocking: bool = False):
+    def __init__(self, name: str, locked: bool = True, non_blocking: bool = False) -> None:
         """Initialize semaphore lock.
 
         Args:
@@ -203,7 +206,7 @@ class ProcessFileLock(BaseLock):
     _registry_lock: ClassVar[_thread.LockType] = threading.Lock()
     _thread_locks: ClassVar[dict[str, _thread.LockType]] = {}
 
-    def __init__(self, path: str, locked: bool = True, non_blocking: bool = False):
+    def __init__(self, path: str, locked: bool = True, non_blocking: bool = False) -> None:
         """Initialize file lock.
 
         Args:

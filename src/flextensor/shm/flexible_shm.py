@@ -207,6 +207,7 @@ class KeepAlive:
         )
         self.create_lock = is_creator
         self.stop_event = threading.Event()  # Event to signal thread to stop
+        self.keep_alive_thread: threading.Thread | None = None
         self.lock_class = lock_class
 
         try:
@@ -420,10 +421,13 @@ class FlexibleSharedMemory:
         Returns:
             bool: True if lock was acquired, False otherwise
         """
+        lock = self.main_lock
+        if lock is None:
+            return False
 
         for attempt in range(max_attempts):
             try:
-                self.main_lock.acquire(non_blocking=True)  # Non-blocking
+                lock.acquire(non_blocking=True)  # Non-blocking
             except (posix_ipc.BusyError, BlockingIOError):
                 # Lock is busy, wait a bit and retry
                 if attempt < max_attempts - 1:
@@ -456,9 +460,10 @@ class FlexibleSharedMemory:
 
     def _cleanup_with_coordination(self) -> None:
         """Clean up resources after acquiring lock."""
+        if self.keep_alive is None or self.shm is None or self.main_lock is None:
+            raise RuntimeError("FlexibleSharedMemory is closed")
         # Stop our keep_alive so any_process_alive doesn't count us
-        if self.keep_alive is not None:
-            self.keep_alive.stop()
+        self.keep_alive.stop()
 
         any_process_alive = self.keep_alive.any_process_alive()
         self.keep_alive.close(any_process_alive=any_process_alive)
