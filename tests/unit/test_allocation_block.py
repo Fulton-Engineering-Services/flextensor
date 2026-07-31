@@ -127,6 +127,29 @@ class TestMakeBaseBlockPinning:
     def _block_with_pinner(self, pinner: HostPinner) -> AllocationBlock:
         return AllocationBlock(device="cpu", host_pinner=pinner, pinned_memory=True)
 
+    def test_large_pinned_shm_scales_lock_timeout(self, monkeypatch):
+        """A follower gets enough lock time for the creator to pin a large block."""
+        captured_constructor_args = {}
+
+        class _SpyShm:
+            def __init__(self, **kwargs):
+                captured_constructor_args.update(kwargs)
+                self.block = MagicMock()
+                self.block.buf = bytearray(1)
+                self.shm_creator = True
+
+        monkeypatch.setattr(allocation_block_module, "FlexibleSharedMemory", _SpyShm)
+        block = AllocationBlock(
+            device="cpu",
+            host_pinner=HostPinner(),
+            pinned_memory=True,
+            shm_block_name="large_pinned_shm",
+        )
+
+        block._make_base_block(6 * 1024**3, device="cpu", pin_memory=True)
+
+        assert captured_constructor_args["lock_acquire_timeout"] == 6.0
+
     def test_host_register_failure_propagates(self):
         """A genuine cudaHostRegister failure must propagate as RuntimeError
         — silent fallback would mask RLIMIT_MEMLOCK / pinned-pool

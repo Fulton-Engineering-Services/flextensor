@@ -24,6 +24,7 @@ import contextlib
 import fcntl
 import tempfile
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
@@ -231,6 +232,7 @@ class ProcessFileLock(BaseLock):
 
         self.fd: object | None = None
         self._init_non_blocking = non_blocking
+        self._held = False
 
         # Open file (or create) - kept open for the lifetime of the lock
         self.fd = Path(self.path).open("a+")  # noqa: SIM115
@@ -305,15 +307,13 @@ class ProcessFileLock(BaseLock):
         Raises:
             BlockingIOError: If timeout expires.
         """
-        import time
-
-        start_time = time.time()
+        start_time = time.monotonic()
         while True:
             try:
                 fcntl.flock(self.fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return
             except BlockingIOError:
-                if time.time() - start_time >= timeout:
+                if time.monotonic() - start_time >= timeout:
                     raise BlockingIOError(f"Failed to acquire lock within {timeout} seconds") from None
                 time.sleep(0.01)
 
@@ -338,13 +338,18 @@ class ProcessFileLock(BaseLock):
         if self.fd is None:
             msg = "ProcessFileLock is closed"
             raise ValueError(msg)
+        if timeout is not None and timeout < 0:
+            raise ValueError("timeout must be non-negative or None")
 
+        deadline = None if timeout is None else time.monotonic() + timeout
         self._acquire_thread_lock(non_blocking, timeout)
         try:
-            self._acquire_file_lock(non_blocking, timeout)
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            self._acquire_file_lock(non_blocking, remaining)
         except BaseException:
             self._thread_lock.release()
             raise
+        self._held = True
 
     def release(self):
         """Release the lock without closing the file.
@@ -354,8 +359,10 @@ class ProcessFileLock(BaseLock):
         will silently succeed (LOCK_UN on an unlocked file is a no-op, and releasing
         an unheld thread lock is also safe).
         """
-        if self.fd is None:
+        if self.fd is None or not self._held:
             return
+
+        self._held = False
 
         # Release file lock first
         with contextlib.suppress(OSError):

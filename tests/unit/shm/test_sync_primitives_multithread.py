@@ -245,6 +245,48 @@ class TestSyncPrimitivesMultithread:
         lock.close()
         lock.unlink()
 
+    def test_failed_process_file_lock_close_does_not_release_holder(self):
+        """Closing a timed-out contender must not release another instance's thread lock."""
+        holder = ProcessFileLock(self.test_name, locked=True)
+        contender = ProcessFileLock(self.test_name, locked=False)
+
+        try:
+            with pytest.raises(BlockingIOError):
+                contender.acquire(timeout=0.0)
+
+            assert holder._thread_lock.locked()  # noqa: SLF001
+            contender.close()
+            assert holder._thread_lock.locked()  # noqa: SLF001
+        finally:
+            contender.close()
+            holder.release()
+            holder.unlink()
+
+    def test_negative_timeout_is_rejected(self):
+        """Negative values cannot silently select an indefinite wait."""
+        lock = ProcessFileLock(self.test_name, locked=False)
+        try:
+            with pytest.raises(ValueError, match="non-negative"):
+                lock.acquire(timeout=-1.0)
+        finally:
+            lock.unlink()
+
+    def test_timeout_covers_thread_and_file_lock_waits(self, monkeypatch):
+        """The timeout is one deadline across both acquisition phases."""
+        lock = ProcessFileLock(self.test_name, locked=False)
+        file_timeouts = []
+        clock = iter([10.0, 10.12])
+        monkeypatch.setattr(time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(lock, "_acquire_thread_lock", lambda *_: None)
+        monkeypatch.setattr(lock, "_acquire_file_lock", lambda _, timeout: file_timeouts.append(timeout))
+
+        try:
+            lock.acquire(timeout=0.2)
+            assert file_timeouts == pytest.approx([0.08])
+        finally:
+            lock.release()
+            lock.unlink()
+
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_concurrent_context_manager_and_explicit(self, lock_class):
         """Test mixing context manager and explicit acquire/release."""

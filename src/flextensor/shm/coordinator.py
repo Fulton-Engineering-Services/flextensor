@@ -15,7 +15,7 @@ from flextensor.state_handler import TensorManagerState, TensorManagerStateHandl
 
 logger = logging.getLogger(__name__)
 
-# Coordination block stores only the CoordBlockHeader (~72 B).
+# Coordination block stores only the CoordBlockHeader (~80 B).
 # KeepAlive and MultiprocessCondition are separate SHM segments managed by FlexibleSharedMemory.
 _COORD_BLOCK_SIZE = 256  # bytes — header + room for future fields
 
@@ -37,18 +37,24 @@ class ShmCoordinator:
 
     Args:
         namespace: Rank-scoped SHM namespace (e.g., "ft_abc123_tp0_pp0").
+        keep_alive_seconds: Timeout for process liveness detection.
     """
 
-    def __init__(self, namespace: str) -> None:
+    def __init__(self, namespace: str, keep_alive_seconds: int | float = 30) -> None:
         self.namespace = namespace
         self._coord_shm: FlexibleSharedMemory | None = None
         self._profile_shm: FlexibleSharedMemory | None = None
         self.is_creator = False
+        self._creator_pid: int | None = None
 
         crd_name = coord_block_name(namespace)
 
         try:
-            self._coord_shm = FlexibleSharedMemory(name=crd_name, shm_size=0)
+            self._coord_shm = FlexibleSharedMemory(
+                name=crd_name,
+                shm_size=0,
+                keep_alive_seconds=keep_alive_seconds,
+            )
             # Connected — follower path
             self.is_creator = False
             try:
@@ -59,7 +65,11 @@ class ShmCoordinator:
                 raise
             logger.info("ShmCoordinator: follower attached to %s", namespace)
         except FileNotFoundError:
-            self._coord_shm = FlexibleSharedMemory(name=crd_name, shm_size=_COORD_BLOCK_SIZE)
+            self._coord_shm = FlexibleSharedMemory(
+                name=crd_name,
+                shm_size=_COORD_BLOCK_SIZE,
+                keep_alive_seconds=keep_alive_seconds,
+            )
             # Check actual creation status to handle TOCTOU race
             self.is_creator = self._coord_shm.shm_creator
             if self.is_creator:
@@ -74,7 +84,9 @@ class ShmCoordinator:
         header = CoordBlockHeader(
             flextensor_version=__version__,
             protocol_version=SHM_PROTOCOL_VERSION,
+            creator_pid=shm.pid,
         )
+        self._creator_pid = shm.pid
         # block guaranteed non-None by _require_block
         header.write_to(shm.block.buf, offset=0)  # type: ignore[arg-type, union-attr]
 
@@ -86,6 +98,7 @@ class ShmCoordinator:
             expected_version=__version__,
             expected_protocol=SHM_PROTOCOL_VERSION,
         )
+        self._creator_pid = header.creator_pid
 
     def write_profile(self, state: TensorManagerState) -> None:
         """Write profile to SHM (creator only).
@@ -149,9 +162,9 @@ class ShmCoordinator:
 
     def is_creator_alive(self) -> bool:
         """Check if the creator process is still alive via heartbeat."""
-        if self._coord_shm is None or self._coord_shm.keep_alive is None:
+        if self._coord_shm is None or self._coord_shm.keep_alive is None or self._creator_pid is None:
             return False
-        return self._coord_shm.keep_alive.any_process_alive()
+        return self._coord_shm.keep_alive.is_process_alive(self._creator_pid)
 
     def close(self) -> None:
         """Release SHM resources."""

@@ -17,12 +17,14 @@ class TestCoordBlockHeader:
         header = CoordBlockHeader(
             flextensor_version=flextensor.__version__,
             protocol_version=1,
+            creator_pid=4_294_967_297,
         )
         buf = bytearray(COORD_HEADER_SIZE + 256)
         header.write_to(buf, offset=0)
         loaded = CoordBlockHeader.read_from(buf, offset=0)
         assert loaded.flextensor_version == flextensor.__version__
         assert loaded.protocol_version == 1
+        assert loaded.creator_pid == 4_294_967_297
 
     def test_version_mismatch_raises(self):
         """Mismatched FlexTensor version raises clear error."""
@@ -68,6 +70,19 @@ class TestCoordBlockHeader:
             expected_version=flextensor.__version__,
             expected_protocol=1,
         )
+
+    def test_protocol_v3_requires_creator_pid(self):
+        """Protocol v3 rejects a header without creator identity."""
+        header = CoordBlockHeader(
+            flextensor_version=flextensor.__version__,
+            protocol_version=3,
+        )
+
+        with pytest.raises(RuntimeError, match="creator PID"):
+            header.validate(
+                expected_version=flextensor.__version__,
+                expected_protocol=3,
+            )
 
     def test_header_at_nonzero_offset(self):
         """Header can be written and read at an arbitrary offset."""

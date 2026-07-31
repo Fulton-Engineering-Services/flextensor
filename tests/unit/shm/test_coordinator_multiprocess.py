@@ -91,21 +91,23 @@ def follower_process(namespace: str, result_queue: multiprocessing.Queue) -> Non
         result_queue.put({"success": False, "error": f"{type(e).__name__}: {e}", "is_creator": False})
 
 
-def short_lived_creator_process(ns: str, rq: multiprocessing.Queue, ready_event, close_event, closed_event) -> None:
-    """Creator that exits after the checker has connected."""
+def short_lived_creator_process(
+    ns: str,
+    rq: multiprocessing.Queue,
+    ready_event,
+    close_event,
+    keep_alive_seconds: float = 30,
+) -> None:
+    """Creator that exits without unregistering after the checker has connected."""
     try:
-        coord = ShmCoordinator(ns)
-        coord.write_profile(_make_minimal_state())
+        coord = ShmCoordinator(ns, keep_alive_seconds=keep_alive_seconds)
         coord.notify_ready()
         ready_event.set()
         if not close_event.wait(timeout=EVENT_TIMEOUT):
             raise TimeoutError("Timed out waiting for parent to release short-lived creator")
-        coord.close()
         rq.put({"success": True, "role": "creator"})
-        closed_event.set()
     except (FileNotFoundError, FileExistsError, OSError) as e:
         rq.put({"success": False, "error": f"{type(e).__name__}: {e}", "role": "creator"})
-        closed_event.set()
 
 
 def liveness_checker_process(
@@ -113,6 +115,7 @@ def liveness_checker_process(
     rq: multiprocessing.Queue,
     connected_event: EventType,
     creator_closed_event: EventType,
+    keep_alive_seconds: float = 30,
 ) -> None:
     """Connect, signal ``connected_event``, wait on ``creator_closed_event``, then check liveness.
 
@@ -121,16 +124,37 @@ def liveness_checker_process(
     ``is_creator_alive()`` is called *after* the creator has exited.
     """
     try:
-        coord = ShmCoordinator(ns)
+        coord = ShmCoordinator(ns, keep_alive_seconds=keep_alive_seconds)
         coord.wait_for_ready()
         connected_event.set()
         if not creator_closed_event.wait(timeout=EVENT_TIMEOUT):
             raise TimeoutError("Timed out waiting for creator to close")
+        time.sleep(keep_alive_seconds * 2)
         alive = coord.is_creator_alive()
         coord.close()
         rq.put({"success": True, "role": "checker", "creator_alive": alive})
     except (FileNotFoundError, FileExistsError, OSError) as e:
         rq.put({"success": False, "error": f"{type(e).__name__}: {e}", "role": "checker"})
+
+
+def live_follower_process(
+    ns: str,
+    rq: multiprocessing.Queue,
+    connected_event: EventType,
+    close_event: EventType,
+    keep_alive_seconds: float,
+) -> None:
+    """Keep another follower heartbeat fresh until the liveness check finishes."""
+    try:
+        coord = ShmCoordinator(ns, keep_alive_seconds=keep_alive_seconds)
+        coord.wait_for_ready()
+        connected_event.set()
+        if not close_event.wait(timeout=EVENT_TIMEOUT):
+            raise TimeoutError("Timed out waiting for parent to release live follower")
+        coord.close()
+        rq.put({"success": True, "role": "live_follower"})
+    except (FileNotFoundError, FileExistsError, OSError) as e:
+        rq.put({"success": False, "error": f"{type(e).__name__}: {e}", "role": "live_follower"})
 
 
 class TestShmCoordinatorMultiprocess:
@@ -226,53 +250,63 @@ class TestShmCoordinatorMultiprocess:
                     proc.terminate()
                     proc.join(timeout=EVENT_TIMEOUT)
 
-    def test_is_creator_alive_returns_bool_after_close(self, namespace):
-        """Smoke test: is_creator_alive() returns a bool after creator close, no crash.
-
-        This test does NOT exercise stale-timeout detection — the default
-        keep-alive window is much longer than this test's wall time, so
-        ``creator_alive`` is typically True when the follower checks it.
-        Until ``ShmCoordinator`` exposes a ``keep_alive_seconds`` knob, this
-        test cannot exercise real stale-detection (where the API returns False
-        because the heartbeat has gone stale); it only guards that the
-        coordinator survives a creator exit and the follower's API call returns
-        a bool without raising.
-        """
+    def test_creator_liveness_detection(self, namespace):
+        """Follower detects a creator whose heartbeat has gone stale."""
+        keep_alive_seconds = 0.5
         result_queue = multiprocessing.Queue()
         creator_ready = multiprocessing.Event()
         creator_close = multiprocessing.Event()
         creator_closed = multiprocessing.Event()
         checker_connected = multiprocessing.Event()
+        live_follower_connected = multiprocessing.Event()
+        live_follower_close = multiprocessing.Event()
 
         creator_proc = multiprocessing.Process(
             target=short_lived_creator_process,
-            args=(namespace, result_queue, creator_ready, creator_close, creator_closed),
+            args=(namespace, result_queue, creator_ready, creator_close, keep_alive_seconds),
         )
         checker_proc = multiprocessing.Process(
             target=liveness_checker_process,
-            args=(namespace, result_queue, checker_connected, creator_closed),
+            args=(namespace, result_queue, checker_connected, creator_closed, keep_alive_seconds),
+        )
+        live_follower_proc = multiprocessing.Process(
+            target=live_follower_process,
+            args=(
+                namespace,
+                result_queue,
+                live_follower_connected,
+                live_follower_close,
+                keep_alive_seconds,
+            ),
         )
 
         try:
             creator_proc.start()
             wait_for_event(creator_ready, "short-lived coordinator creator startup", proc=creator_proc)
+            live_follower_proc.start()
+            wait_for_event(live_follower_connected, "live coordinator follower connection", proc=live_follower_proc)
             checker_proc.start()
             wait_for_event(checker_connected, "coordinator liveness checker connection", proc=checker_proc)
             creator_close.set()
 
             creator_proc.join(timeout=EVENT_TIMEOUT)
             assert_clean_exit(creator_proc, "short-lived creator")
+            creator_closed.set()
             checker_proc.join(timeout=EVENT_TIMEOUT)
             assert_clean_exit(checker_proc, "liveness checker")
+            live_follower_close.set()
+            live_follower_proc.join(timeout=EVENT_TIMEOUT)
+            assert_clean_exit(live_follower_proc, "live follower")
 
-            results = drain_results(result_queue, expected_count=2)
+            results = drain_results(result_queue, expected_count=3)
             assert all(r["success"] for r in results), f"Failed: {format_failed_results(results)}"
 
             checker_result = next(r for r in results if r.get("role") == "checker")
-            assert isinstance(checker_result["creator_alive"], bool)
+            assert checker_result["creator_alive"] is False
         finally:
             creator_close.set()
-            for proc in [creator_proc, checker_proc]:
+            live_follower_close.set()
+            for proc in [creator_proc, checker_proc, live_follower_proc]:
                 if proc.is_alive():
                     proc.terminate()
                     proc.join(timeout=EVENT_TIMEOUT)

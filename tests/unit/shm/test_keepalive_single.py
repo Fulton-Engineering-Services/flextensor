@@ -8,6 +8,23 @@ from unittest.mock import patch
 import pytest
 
 from flextensor.shm import KeepAlive, ProcessFileLock, SemaphoreLock
+from flextensor.shm.flexible_shm import KeepAliveDict
+
+
+def test_prepare_slot_rejects_exhausted_timestamp_view():
+    keep_alive_dict = object.__new__(KeepAliveDict)
+    keep_alive_dict.dict = {111: 0}
+    keep_alive_dict.shm_view = [0.0]
+    keep_alive_dict.size = 8
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"timestamp slots exhausted: process_id=222, slot=1, timestamp_capacity=1",
+    ):
+        keep_alive_dict.prepare_slot(222)
+
+    assert keep_alive_dict.dict == {111: 0}
+    assert keep_alive_dict.shm_view == [0.0]
 
 
 class TestKeepAliveSingle:
@@ -58,6 +75,253 @@ class TestKeepAliveSingle:
                     pass
         except ImportError:
             pass
+
+    def test_real_dict_capacity_error_is_actionable(self):
+        """Dictionary storage exhaustion must use the keep-alive capacity error."""
+        keep_alive_dict = KeepAliveDict(
+            name=f"{self.test_name}_d",
+            size=8,
+            is_creator=True,
+            meta_name=f"{self.test_name}_m",
+        )
+
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match=r"mapping storage exhausted: process_id=12345, slot=0, keep_alive_dict_size=8",
+            ):
+                keep_alive_dict.prepare_slot(self.process_id)
+
+            assert list(keep_alive_dict.shm_view) == [0.0]
+        finally:
+            keep_alive_dict.unlink()
+
+    def test_capacity_error_is_not_relabelled_as_lock_failure(self, monkeypatch):
+        """KeepAlive initialization must preserve capacity diagnostics and close resources."""
+        instances = []
+        original_init = KeepAliveDict.__init__
+
+        def capture_instance(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            instances.append(self)
+
+        monkeypatch.setattr(KeepAliveDict, "__init__", capture_instance)
+
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match=r"mapping storage exhausted: process_id=12345, slot=0, keep_alive_dict_size=8",
+            ):
+                KeepAlive(
+                    name=self.test_name,
+                    process_id=self.process_id,
+                    keep_alive_dict_size=8,
+                    is_creator=True,
+                )
+
+            assert instances[0]._closed is True  # noqa: SLF001
+        finally:
+            if instances:
+                instances[0].unlink()
+
+    def test_lock_construction_failure_closes_keep_alive_dict(self, monkeypatch):
+        """A lock construction error must close the dictionary opened earlier."""
+        instances = []
+        original_init = KeepAliveDict.__init__
+
+        def capture_instance(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            instances.append(self)
+
+        monkeypatch.setattr(KeepAliveDict, "__init__", capture_instance)
+
+        try:
+            with (
+                patch.object(ProcessFileLock, "__init__", side_effect=OSError("lock construction failed")),
+                pytest.raises(OSError, match="lock construction failed"),
+            ):
+                KeepAlive(
+                    name=self.test_name,
+                    process_id=self.process_id,
+                    is_creator=True,
+                )
+
+            assert instances[0]._closed is True  # noqa: SLF001
+        finally:
+            if instances:
+                instances[0].unlink()
+
+    @pytest.mark.parametrize("keep_alive_seconds", [0, -1, float("nan"), float("inf")])
+    def test_invalid_keep_alive_seconds_is_rejected(self, keep_alive_seconds):
+        """An invalid interval must fail before starting a busy-loop heartbeat thread."""
+        with (
+            patch.object(KeepAlive, "_start_keep_alive_thread"),
+            pytest.raises(ValueError, match="positive"),
+        ):
+            KeepAlive(
+                name=self.test_name,
+                process_id=self.process_id,
+                keep_alive_seconds=keep_alive_seconds,
+                is_creator=True,
+            )
+
+    def test_thread_start_failure_removes_registered_process(self):
+        """A failed participant must not leave a live-looking heartbeat behind."""
+        creator = KeepAlive(
+            name=self.test_name,
+            process_id=self.process_id,
+            is_creator=True,
+        )
+        failed_process_id = self.process_id + 1
+
+        try:
+            with (
+                patch.object(KeepAlive, "_start_keep_alive_thread", side_effect=RuntimeError("thread start failed")),
+                pytest.raises(RuntimeError, match="thread start failed"),
+            ):
+                KeepAlive(
+                    name=self.test_name,
+                    process_id=failed_process_id,
+                    is_creator=False,
+                )
+
+            with creator.lock:
+                assert failed_process_id not in creator.keep_alive_dict
+        finally:
+            creator.close(any_process_alive=False)
+
+    def test_slot_failure_preserves_existing_process(self):
+        """Failed slot allocation must not remove another live registration."""
+        creator = KeepAlive(
+            name=self.test_name,
+            process_id=self.process_id,
+            is_creator=True,
+        )
+
+        try:
+            with (
+                patch.object(KeepAliveDict, "prepare_slot", side_effect=RuntimeError("capacity exhausted")),
+                pytest.raises(RuntimeError, match="capacity exhausted"),
+            ):
+                KeepAlive(
+                    name=self.test_name,
+                    process_id=self.process_id,
+                    is_creator=False,
+                )
+
+            with creator.lock:
+                assert self.process_id in creator.keep_alive_dict
+        finally:
+            creator.close(any_process_alive=False)
+
+    def test_thread_start_failure_preserves_existing_process(self):
+        """Failed thread startup must preserve the existing process heartbeat."""
+        with patch("flextensor.shm.flexible_shm.time.time", return_value=100):
+            creator = KeepAlive(
+                name=self.test_name,
+                process_id=self.process_id,
+                is_creator=True,
+            )
+
+            try:
+                with (
+                    patch.object(
+                        KeepAlive,
+                        "_start_keep_alive_thread",
+                        side_effect=RuntimeError("thread start failed"),
+                    ),
+                    pytest.raises(RuntimeError, match="thread start failed"),
+                ):
+                    KeepAlive(
+                        name=self.test_name,
+                        process_id=self.process_id,
+                        is_creator=False,
+                    )
+
+                with creator.lock:
+                    creator.keep_alive_dict.set_by_slot(creator.slot, 200)
+                with patch("flextensor.shm.flexible_shm.time.time", return_value=200):
+                    assert creator.is_process_alive(self.process_id) is True
+            finally:
+                creator.close(any_process_alive=False)
+
+    def test_thread_start_failure_does_not_refresh_stale_process(self):
+        """Failed thread startup must not make a stale registration look alive."""
+        with patch("flextensor.shm.flexible_shm.time.time", return_value=100):
+            creator = KeepAlive(
+                name=self.test_name,
+                process_id=self.process_id,
+                keep_alive_seconds=10,
+                is_creator=True,
+            )
+
+        creator.stop_event.set()
+        creator.keep_alive_thread.join(timeout=2)
+        creator.keep_alive_thread = None
+
+        try:
+            with (
+                patch("flextensor.shm.flexible_shm.time.time", return_value=200),
+                patch.object(KeepAlive, "_start_keep_alive_thread", side_effect=RuntimeError("thread start failed")),
+                pytest.raises(RuntimeError, match="thread start failed"),
+            ):
+                KeepAlive(
+                    name=self.test_name,
+                    process_id=self.process_id,
+                    keep_alive_seconds=10,
+                    is_creator=False,
+                )
+
+            with patch("flextensor.shm.flexible_shm.time.time", return_value=200):
+                assert creator.is_process_alive(self.process_id) is False
+        finally:
+            creator.close(any_process_alive=False)
+
+    @pytest.mark.parametrize("closed_index", [0, 1])
+    def test_duplicate_process_registration_survives_one_close(self, closed_index):
+        """One instance closing must not remove another instance's live registration."""
+        instances = [
+            KeepAlive(
+                name=self.test_name,
+                process_id=self.process_id,
+                keep_alive_seconds=100,
+                is_creator=True,
+            ),
+            KeepAlive(
+                name=self.test_name,
+                process_id=self.process_id,
+                keep_alive_seconds=100,
+                is_creator=False,
+            ),
+        ]
+        closed = instances.pop(closed_index)
+        remaining = instances[0]
+
+        closed.close(any_process_alive=True)
+        try:
+            assert remaining.is_process_alive(self.process_id) is True
+        finally:
+            remaining.close(any_process_alive=False)
+
+    def test_is_process_alive_checks_only_requested_pid(self):
+        """A stale requested PID is dead even while another heartbeat is fresh."""
+        keep_alive = KeepAlive(
+            name=self.test_name,
+            process_id=self.process_id,
+            keep_alive_seconds=100,
+            is_creator=True,
+        )
+
+        try:
+            with keep_alive.lock:
+                other_slot = keep_alive.keep_alive_dict.prepare_slot(self.process_id + 1)
+                keep_alive.keep_alive_dict.set_by_slot(keep_alive.slot, time.time() - 200)
+                keep_alive.keep_alive_dict.set_by_slot(other_slot, time.time())
+
+            assert keep_alive.is_process_alive(self.process_id) is False
+            assert keep_alive.is_process_alive(self.process_id + 1) is True
+        finally:
+            keep_alive.close(any_process_alive=False)
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_keepalive_initialization(self, lock_class):

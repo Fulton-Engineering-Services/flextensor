@@ -214,6 +214,8 @@ class MultiprocessCondition:
             self.notification_list = None
         if self.lock is not None:
             self.lock.unlink()
+            self.lock.close()
+            self.lock = None
 
     def close_lock(self) -> None:
         """Close only the lock resource."""

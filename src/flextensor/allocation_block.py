@@ -7,9 +7,12 @@ from typing_extensions import Self
 
 from flextensor.host_pinning import HostPinner
 from flextensor.shm import FlexibleSharedMemory, ProcessFileLock
+from flextensor.shm.flexible_shm import LOCK_ACQUIRE_TIMEOUT
 from flextensor.utils import is_dense_layout
 
 logger = logging.getLogger(__name__)
+
+_PINNED_SHM_GIB_PER_SECOND = 1.0
 
 
 class AllocationBlock:
@@ -123,11 +126,18 @@ class AllocationBlock:
     def _make_base_block(self, nbytes: int, device: str = "cpu", pin_memory: bool = False):
         if self.shm_block_name is not None and device == "cpu":
             # Use shared memory
+            # ponytail: assumes >=1 GiB/s host registration; tune this constant if slower hosts appear.
+            lock_acquire_timeout = (
+                max(LOCK_ACQUIRE_TIMEOUT, nbytes / (1024**3 * _PINNED_SHM_GIB_PER_SECOND))
+                if pin_memory
+                else LOCK_ACQUIRE_TIMEOUT
+            )
             self.shm_block = FlexibleSharedMemory(
                 name=self.shm_block_name,
                 shm_size=nbytes,
                 pinned_memory=pin_memory,
                 lock_class=self.lock_class,
+                lock_acquire_timeout=lock_acquire_timeout,
             )
             self.is_memory_creator = self.shm_block.shm_creator
             if self.is_memory_creator == self.load_from_shm:

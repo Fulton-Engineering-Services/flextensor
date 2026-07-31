@@ -110,6 +110,52 @@ class TestFlexibleSharedMemorySingle:
 
         fsm.close()
 
+    def test_main_lock_acquisition_uses_custom_timeout_and_closes_on_failure(self):
+        """A busy main lock reports the segment and honors its configured timeout."""
+        with (
+            mock.patch.object(
+                ProcessFileLock,
+                "acquire",
+                autospec=True,
+                side_effect=BlockingIOError,
+            ) as acquire,
+            mock.patch.object(
+                ProcessFileLock,
+                "close",
+                autospec=True,
+                side_effect=ProcessFileLock.close,
+            ) as close,
+            pytest.raises(BlockingIOError, match=rf"{self.test_name}.*17.0 seconds"),
+        ):
+            FlexibleSharedMemory(
+                name=self.test_name,
+                shm_size=self.test_size,
+                pinned_memory=False,
+                lock_class=ProcessFileLock,
+                lock_acquire_timeout=17.0,
+            )
+
+        acquire.assert_called_once_with(mock.ANY, non_blocking=False, timeout=17.0)
+        close.assert_called_once_with(mock.ANY)
+
+    def test_capacity_failure_does_not_poison_retry(self):
+        """A failed creator removes undersized auxiliary segments before retry."""
+        with pytest.raises(RuntimeError):
+            FlexibleSharedMemory(
+                name=self.test_name,
+                shm_size=self.test_size,
+                keep_alive_dict_size=8,
+                pinned_memory=False,
+            )
+
+        fsm = FlexibleSharedMemory(
+            name=self.test_name,
+            shm_size=self.test_size,
+            keep_alive_dict_size=128 * 1024,
+            pinned_memory=False,
+        )
+        fsm.close()
+
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_memory_block_access(self, lock_class):
         """Test accessing the memory block."""

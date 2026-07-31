@@ -2,9 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Single-process unit tests for MultiprocessCondition class."""
 
+import contextlib
 import os
 import time
 
+import posix_ipc
 import pytest
 
 from flextensor.shm import MultiprocessCondition, ProcessFileLock, SemaphoreLock
@@ -227,8 +229,26 @@ class TestMultiprocessConditionSingle:
         # unlink() before close() should work and prevent reconnection
         condition.unlink()
 
+        assert condition.notification_list is None
+        assert condition.lock is None
+        condition.unlink()
+
         with pytest.raises((FileNotFoundError, ValueError)):
             MultiprocessCondition(name=self.test_name, is_creator=False, lock_class=lock_class)
+
+    def test_unlink_closes_semaphore_lock_handle(self):
+        """Unlinking a condition must not leave its semaphore handle usable."""
+        condition = MultiprocessCondition(name=self.test_name, is_creator=True, lock_class=SemaphoreLock)
+        lock = condition.lock
+
+        try:
+            condition.unlink()
+
+            with pytest.raises(posix_ipc.ExistentialError, match="closed"):
+                lock.acquire(non_blocking=True)
+        finally:
+            with contextlib.suppress(posix_ipc.ExistentialError):
+                lock.close()
 
     @pytest.mark.parametrize("lock_class", [SemaphoreLock, ProcessFileLock])
     def test_unlink_after_close_is_noop(self, lock_class):
