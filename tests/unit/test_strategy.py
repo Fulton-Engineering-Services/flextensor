@@ -559,6 +559,18 @@ class TestGreedyStrategy:
         result = strategy.compute([])
         assert result.strategy_map == {}
 
+    def test_no_selected_tensors_has_no_empty_blocks(self):
+        """A strategy with no selected tensors does not allocate empty blocks."""
+        tensor = create_tensor_stats(1, 1024, load_time_ms=1.0)
+        layer = create_layer_stats("layer_0", [tensor], duration=1.0)
+
+        result = GreedyStrategy(n_blocks=4).compute([layer])
+
+        assert result.strategy_map == {}
+        assert result.block_data is not None
+        assert result.block_data.allocation_ordered == {}
+        assert result.block_data.block_sizes == {}
+
     def test_scale_increases_offloading(self):
         """Higher scale makes offloading more aggressive (more layers offloaded)."""
         tensor = create_tensor_stats(1, 10 * 1024 * 1024, load_time_ms=5.0)

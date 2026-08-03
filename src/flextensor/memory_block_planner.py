@@ -119,7 +119,7 @@ class MemoryBlockPlanner:
             best_block = min(available_blocks, key=lambda b: len(blocks[b]))
             blocks[best_block].append(layer)
 
-        return blocks
+        return {block_id: layers for block_id, layers in blocks.items() if layers}
 
     def allocate_blocks(self, num_blocks: int, block_capacity: int | None = None) -> dict[int, list[str]]:
         """
@@ -232,6 +232,9 @@ class MemoryBlockPlanner:
         Returns:
             Tuple of (minimum_blocks, allocation)
         """
+        if not self.layers:
+            return 0, {}
+
         # Binary search for minimum number of blocks
         left = 1
         right = len(self.layers)  # Worst case: one layer per block

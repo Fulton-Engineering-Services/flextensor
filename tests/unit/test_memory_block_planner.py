@@ -70,8 +70,10 @@ class TestOptimizeBlockDistribution:
 
 class TestEdgeCases:
     def test_empty_input(self):
+        """Empty input requires neither blocks nor adjacency edges."""
         planner = MemoryBlockPlanner(OrderedDict())
         assert planner.find_minimum_blocks_sequential() == 0
+        assert planner.find_minimum_blocks() == (0, {})
         assert planner.adjacency_graph == {}
 
     def test_single_layer(self):
