@@ -41,6 +41,7 @@ dependencies = [
 
 [dependency-groups]
 test = [
+    "mutmut>=3.6.0",
     "pytest>=9.0.3",
     "pytest-cov>=4.0.0",
     "mypy>=1.10",
@@ -145,6 +146,27 @@ omit = ["tests/integration/*"]
 
 [tool.coverage.report]
 fail_under = 60
+
+[tool.mutmut]
+# Line-level coverage filtering is omitted because its in-process cleanup cannot
+# safely reload FlexTensor's beartype.claw and PyTorch imports.
+source_paths = ["src"]
+only_mutate = [
+    "src/flextensor/strategy/*",
+    "src/flextensor/gpu_budget.py",
+    "src/flextensor/memory_block_planner.py",
+]
+pytest_add_cli_args_test_selection = [
+    "tests/unit/test_strategy.py",
+    "tests/unit/test_strategy_utils.py",
+    "tests/unit/test_adaptive_strategy.py",
+    "tests/unit/test_global_offload_strategy.py",
+    "tests/unit/test_global_tensor_selection_strategy.py",
+    "tests/unit/test_memory_block_planner.py",
+    "tests/unit/test_resolve_gpu_budget.py",
+    "tests/unit/test_unmapped_gpu_budget.py",
+    "tests/unit/test_resolve_gpu_mem_bytes.py",
+]
 
 [tool.uv]
 managed = true

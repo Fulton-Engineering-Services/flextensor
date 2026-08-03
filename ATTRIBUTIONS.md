@@ -1953,6 +1953,224 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   - `Donate`: https://palletsprojects.com/donate
   - `Source`: https://github.com/pallets/jinja/
 
+## libcst (1.9.0)
+### Licenses
+```
+All contributions towards LibCST are MIT licensed.
+
+        Some Python files have been derived from the standard library and are therefore
+        PSF licensed. Modifications on these files are dual licensed (both MIT and
+        PSF). These files are:
+
+        - libcst/_parser/base_parser.py
+        - libcst/_parser/parso/utils.py
+        - libcst/_parser/parso/pgen2/generator.py
+        - libcst/_parser/parso/pgen2/grammar_parser.py
+        - libcst/_parser/parso/python/py_token.py
+        - libcst/_parser/parso/python/tokenize.py
+        - libcst/_parser/parso/tests/test_fstring.py
+        - libcst/_parser/parso/tests/test_tokenize.py
+        - libcst/_parser/parso/tests/test_utils.py
+        - native/libcst/src/tokenizer/core/mod.rs
+        - native/libcst/src/tokenizer/core/string_types.rs
+
+        Some Python files have been taken from dataclasses and are therefore Apache
+        licensed. Modifications on these files are licensed under Apache 2.0 license.
+        These files are:
+
+        - libcst/_add_slots.py
+
+        -------------------------------------------------------------------------------
+
+        MIT License
+
+        Copyright (c) Meta Platforms, Inc. and affiliates.
+
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+
+        -------------------------------------------------------------------------------
+
+        PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2
+
+        1. This LICENSE AGREEMENT is between the Python Software Foundation
+        ("PSF"), and the Individual or Organization ("Licensee") accessing and
+        otherwise using this software ("Python") in source or binary form and
+        its associated documentation.
+
+        2. Subject to the terms and conditions of this License Agreement, PSF hereby
+        grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
+        analyze, test, perform and/or display publicly, prepare derivative works,
+        distribute, and otherwise use Python alone or in any derivative version,
+        provided, however, that PSF's License Agreement and PSF's notice of copyright,
+        i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+        2011, 2012, 2013, 2014, 2015 Python Software Foundation; All Rights Reserved"
+        are retained in Python alone or in any derivative version prepared by Licensee.
+
+        3. In the event Licensee prepares a derivative work that is based on
+        or incorporates Python or any part thereof, and wants to make
+        the derivative work available to others as provided herein, then
+        Licensee hereby agrees to include in any such work a brief summary of
+        the changes made to Python.
+
+        4. PSF is making Python available to Licensee on an "AS IS"
+        basis.  PSF MAKES NO REPRESENTATIONS OR WARRANTIES, EXPRESS OR
+        IMPLIED.  BY WAY OF EXAMPLE, BUT NOT LIMITATION, PSF MAKES NO AND
+        DISCLAIMS ANY REPRESENTATION OR WARRANTY OF MERCHANTABILITY OR FITNESS
+        FOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT
+        INFRINGE ANY THIRD PARTY RIGHTS.
+
+        5. PSF SHALL NOT BE LIABLE TO LICENSEE OR ANY OTHER USERS OF PYTHON
+        FOR ANY INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES OR LOSS AS
+        A RESULT OF MODIFYING, DISTRIBUTING, OR OTHERWISE USING PYTHON,
+        OR ANY DERIVATIVE THEREOF, EVEN IF ADVISED OF THE POSSIBILITY THEREOF.
+
+        6. This License Agreement will automatically terminate upon a material
+        breach of its terms and conditions.
+
+        7. Nothing in this License Agreement shall be deemed to create any
+        relationship of agency, partnership, or joint venture between PSF and
+        Licensee.  This License Agreement does not grant permission to use PSF
+        trademarks or trade name in a trademark sense to endorse or promote
+        products or services of Licensee, or any third party.
+
+        8. By copying, installing or otherwise using Python, Licensee
+        agrees to be bound by the terms and conditions of this License
+        Agreement.
+
+        -------------------------------------------------------------------------------
+
+        APACHE LICENSE, VERSION 2.0
+
+        http://www.apache.org/licenses/LICENSE-2.0
+```
+
+  - `licenses/LICENSE`:
+```
+All contributions towards LibCST are MIT licensed.
+
+Some Python files have been derived from the standard library and are therefore
+PSF licensed. Modifications on these files are dual licensed (both MIT and
+PSF). These files are:
+
+- libcst/_parser/base_parser.py
+- libcst/_parser/parso/utils.py
+- libcst/_parser/parso/pgen2/generator.py
+- libcst/_parser/parso/pgen2/grammar_parser.py
+- libcst/_parser/parso/python/py_token.py
+- libcst/_parser/parso/python/tokenize.py
+- libcst/_parser/parso/tests/test_fstring.py
+- libcst/_parser/parso/tests/test_tokenize.py
+- libcst/_parser/parso/tests/test_utils.py
+- native/libcst/src/tokenizer/core/mod.rs
+- native/libcst/src/tokenizer/core/string_types.rs
+
+Some Python files have been taken from dataclasses and are therefore Apache
+licensed. Modifications on these files are licensed under Apache 2.0 license.
+These files are:
+
+- libcst/_add_slots.py
+
+-------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+PYTHON SOFTWARE FOUNDATION LICENSE VERSION 2
+
+1. This LICENSE AGREEMENT is between the Python Software Foundation
+("PSF"), and the Individual or Organization ("Licensee") accessing and
+otherwise using this software ("Python") in source or binary form and
+its associated documentation.
+
+2. Subject to the terms and conditions of this License Agreement, PSF hereby
+grants Licensee a nonexclusive, royalty-free, world-wide license to reproduce,
+analyze, test, perform and/or display publicly, prepare derivative works,
+distribute, and otherwise use Python alone or in any derivative version,
+provided, however, that PSF's License Agreement and PSF's notice of copyright,
+i.e., "Copyright (c) 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+2011, 2012, 2013, 2014, 2015 Python Software Foundation; All Rights Reserved"
+are retained in Python alone or in any derivative version prepared by Licensee.
+
+3. In the event Licensee prepares a derivative work that is based on
+or incorporates Python or any part thereof, and wants to make
+the derivative work available to others as provided herein, then
+Licensee hereby agrees to include in any such work a brief summary of
+the changes made to Python.
+
+4. PSF is making Python available to Licensee on an "AS IS"
+basis.  PSF MAKES NO REPRESENTATIONS OR WARRANTIES, EXPRESS OR
+IMPLIED.  BY WAY OF EXAMPLE, BUT NOT LIMITATION, PSF MAKES NO AND
+DISCLAIMS ANY REPRESENTATION OR WARRANTY OF MERCHANTABILITY OR FITNESS
+FOR ANY PARTICULAR PURPOSE OR THAT THE USE OF PYTHON WILL NOT
+INFRINGE ANY THIRD PARTY RIGHTS.
+
+5. PSF SHALL NOT BE LIABLE TO LICENSEE OR ANY OTHER USERS OF PYTHON
+FOR ANY INCIDENTAL, SPECIAL, OR CONSEQUENTIAL DAMAGES OR LOSS AS
+A RESULT OF MODIFYING, DISTRIBUTING, OR OTHERWISE USING PYTHON,
+OR ANY DERIVATIVE THEREOF, EVEN IF ADVISED OF THE POSSIBILITY THEREOF.
+
+6. This License Agreement will automatically terminate upon a material
+breach of its terms and conditions.
+
+7. Nothing in this License Agreement shall be deemed to create any
+relationship of agency, partnership, or joint venture between PSF and
+Licensee.  This License Agreement does not grant permission to use PSF
+trademarks or trade name in a trademark sense to endorse or promote
+products or services of Licensee, or any third party.
+
+8. By copying, installing or otherwise using Python, Licensee
+agrees to be bound by the terms and conditions of this License
+Agreement.
+
+-------------------------------------------------------------------------------
+
+APACHE LICENSE, VERSION 2.0
+
+http://www.apache.org/licenses/LICENSE-2.0
+```
+
+### URLs
+  - `Documentation`: https://libcst.readthedocs.io/en/latest/
+  - `Github`: https://github.com/Instagram/LibCST
+  - `Changelog`: https://github.com/Instagram/LibCST/blob/main/CHANGELOG.md
+
 ## librt (0.8.1)
 ### Licenses
 License: `MIT`
@@ -2228,6 +2446,65 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   - `Homepage`: https://github.com/mypyc/librt
   - `Issues`: https://github.com/mypyc/mypyc/issues
 
+## linkify-it-py (2.1.0)
+### Licenses
+License: `MIT`
+
+  - `licenses/LICENSE`:
+```
+MIT License
+
+Copyright (c) 2020 tsutsu3
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===============================================================================
+
+Original Javascript version:
+
+Copyright (c) 2015 Vitaly Puzrin.
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### URLs
+  - `Homepage`: https://github.com/tsutsu3/linkify-it-py
+
 ## Markdown (3.10.2)
 ### Licenses
 License: `BSD-3-Clause`
@@ -2273,6 +2550,65 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   - `Issue Tracker`: https://github.com/Python-Markdown/markdown/issues
   - `Changelog`: https://python-markdown.github.io/changelog/
 
+## markdown-it-py (4.2.0)
+### Licenses
+License: `MIT License`
+
+  - `licenses/LICENSE`:
+```
+MIT License
+
+Copyright (c) 2020 ExecutableBookProject
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+  - `licenses/LICENSE.markdown-it`:
+```
+Copyright (c) 2014 Vitaly Puzrin, Alex Kocharin.
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### URLs
+  - `Documentation`: https://markdown-it-py.readthedocs.io
+  - `Homepage`: https://github.com/executablebooks/markdown-it-py
+
 ## MarkupSafe (3.0.3)
 ### Licenses
 License: `BSD-3-Clause`
@@ -2315,6 +2651,96 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   - `Changes`: https://markupsafe.palletsprojects.com/page/changes/
   - `Source`: https://github.com/pallets/markupsafe/
   - `Chat`: https://discord.gg/pallets
+
+## mdit-py-plugins (0.6.1)
+### Licenses
+License: `MIT License`
+
+  - `licenses/LICENSE`:
+```
+MIT License
+
+Copyright (c) 2020 ExecutableBookProject
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### URLs
+  - `Documentation`: https://mdit-py-plugins.readthedocs.io
+  - `Homepage`: https://github.com/executablebooks/mdit-py-plugins
+
+## mdurl (0.1.2)
+### Licenses
+License: `MIT License`
+
+  - `LICENSE`:
+```
+Copyright (c) 2015 Vitaly Puzrin, Alex Kocharin.
+Copyright (c) 2021 Taneli Hukkinen
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+.parse() is based on Joyent's node.js `url` code:
+
+Copyright Joyent, Inc. and other Node contributors. All rights reserved.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to
+deal in the Software without restriction, including without limitation the
+rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+sell copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+IN THE SOFTWARE.
+```
+
+### URLs
+  - `Homepage`: https://github.com/executablebooks/mdurl
 
 ## mergedeep (1.3.4)
 ### Licenses
@@ -2657,6 +3083,33 @@ DAMAGE.
   - `Source`: https://github.com/fredrik-johansson/mpmath
   - `Tracker`: https://github.com/fredrik-johansson/mpmath/issues
   - `Documentation`: http://mpmath.org/doc/current/
+
+## mutmut (3.6.0)
+### Licenses
+License: `BSD-3-Clause`
+
+  - `licenses/LICENSE`:
+```
+Copyright (c) 2016, Anders Hovmöller
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+* Neither the name of mutmut nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+### URLs
+  - `Changelog`: https://github.com/boxed/mutmut/blob/main/HISTORY.rst
+  - `Documentation`: https://mutmut.readthedocs.io/en/latest/
+  - `Homepage`: https://github.com/boxed/mutmut
+  - `Issues`: https://github.com/boxed/mutmut/issues
+  - `Repository`: https://github.com/boxed/mutmut
 
 ## mypy (1.19.1)
 ### Licenses
@@ -12994,6 +13447,41 @@ SOFTWARE.
   - `Repository`: https://github.com/waylan/pyyaml-env-tag
   - `Bug Tracker`: https://github.com/waylan/pyyaml-env-tag/issues
 
+## PyYAML-ft (8.0.0)
+### Licenses
+License: `MIT`
+
+  - `licenses/LICENSE`:
+```
+Copyright (c) 2017-2021 Ingy döt Net
+Copyright (c) 2006-2016 Kirill Simonov
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### URLs
+  - `Bug Tracker`: https://github.com/Quansight-Labs/pyyaml-ft/issues
+  - `CI`: https://github.com/Quansight-Labs/pyyaml-ft/actions
+  - `Documentation`: https://pyyaml.org/wiki/PyYAMLDocumentation
+  - `Mailing lists`: http://lists.sourceforge.net/lists/listinfo/yaml-core
+  - `Source Code`: https://github.com/Quansight-Labs/pyyaml-ft
+
 ## requests (2.32.5)
 ### Licenses
 License: `Apache-2.0`
@@ -13180,6 +13668,37 @@ License: `Apache-2.0`
 ### URLs
   - `Documentation`: https://requests.readthedocs.io
   - `Source`: https://github.com/psf/requests
+
+## rich (15.0.0)
+### Licenses
+License: `MIT`
+
+  - `licenses/LICENSE`:
+```
+Copyright (c) 2020 Will McGugan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### URLs
+  - `Documentation`: https://rich.readthedocs.io/en/latest/
+  - `Homepage`: https://github.com/Textualize/rich
 
 ## scipy (1.17.1)
 ### Licenses
@@ -15106,6 +15625,42 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   - `Issues`: https://github.com/scipy/scipy-stubs/issues
   - `Changelog`: https://github.com/scipy/scipy-stubs/releases
 
+## setproctitle (1.3.7)
+### Licenses
+License: `BSD-3-Clause`
+
+  - `licenses/LICENSE`:
+```
+BSD 3-Clause License
+
+Copyright (c) 2009, Daniele Varrazzo <daniele.varrazzo@gmail.com>
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
 ## setuptools (82.0.0)
 ### Licenses
 License: `MIT`
@@ -16024,6 +16579,76 @@ SOFTWARE.
 
 ### URLs
   - `Source`: https://github.com/sympy/sympy
+
+## textual (8.2.8)
+### Licenses
+License: `MIT`
+
+  - `licenses/LICENSE`:
+```
+MIT License
+
+Copyright (c) 2021 Will McGugan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### URLs
+  - `Bug Tracker`: https://github.com/Textualize/textual/issues
+  - `Documentation`: https://textual.textualize.io/
+  - `Homepage`: https://github.com/Textualize/textual
+  - `Repository`: https://github.com/Textualize/textual
+
+## toml (0.10.2)
+### Licenses
+License: `MIT`
+
+  - `LICENSE`:
+```
+The MIT License
+
+Copyright 2013-2019 William Pearson
+Copyright 2015-2016 Julien Enselme
+Copyright 2016 Google Inc.
+Copyright 2017 Samuel Vasko
+Copyright 2017 Nate Prewitt
+Copyright 2017 Jack Evans
+Copyright 2019 Filippo Broggini
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
 
 ## tomli (2.4.0)
 ### Licenses
@@ -17528,6 +18153,63 @@ SOFTWARE.
   - `Documentation`: https://pydantic.github.io/typing-inspection/dev/
   - `Source`: https://github.com/pydantic/typing-inspection
   - `Changelog`: https://github.com/pydantic/typing-inspection/blob/main/HISTORY.md
+
+## uc-micro-py (2.0.0)
+### Licenses
+License: `MIT`
+
+  - `licenses/LICENSE`:
+```
+MIT License
+
+Copyright (c) 2020 tsutsu3
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+===============================================================================
+
+Original Javascript version:
+
+Copyright Mathias Bynens <https://mathiasbynens.be/>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE
+LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+### URLs
+  - `Homepage`: https://github.com/tsutsu3/uc.micro-py
 
 ## urllib3 (2.6.3)
 ### Licenses
