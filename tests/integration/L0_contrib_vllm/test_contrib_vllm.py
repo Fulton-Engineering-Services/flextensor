@@ -5,6 +5,7 @@
 
 import json
 import re
+import shutil
 from pathlib import Path
 
 import pytest
@@ -35,6 +36,7 @@ def test_output_dir(request) -> Path:
     test_dir = Path(__file__).parent
     sanitized_name = sanitize_test_name(request.node.name)
     output_dir = test_dir / "test_results" / sanitized_name
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 
@@ -136,6 +138,11 @@ class TestContribVLLM:
         # Assertions
         assert offload_memory.weights_memory_gib > 0, (
             f"weights_memory should be non-zero with offloading, got {offload_memory.weights_memory_gib}"
+        )
+        assert memory_reduction > 0, (
+            "Expected offloading to reduce weights memory, "
+            f"but baseline={baseline_memory.weights_memory_gib:.2f} GiB and "
+            f"offload={offload_memory.weights_memory_gib:.2f} GiB"
         )
 
         # Save combined metrics
@@ -295,6 +302,11 @@ class TestContribVLLM:
         assert len(block_assignment_headers) == 1, (
             f"Expected exactly 1 'BLOCK ASSIGNMENT:' header, got {len(block_assignment_headers)}: "
             f"{block_assignment_headers}"
+        )
+        memory_transfer_headers = [line for line in log_lines if "Memory Transfer Statistics" in line]
+        assert len(memory_transfer_headers) == 1, (
+            f"Expected exactly 1 'Memory Transfer Statistics' header, got {len(memory_transfer_headers)}: "
+            f"{memory_transfer_headers}"
         )
 
     @pytest.mark.gpu_vram_40g

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# Integration test requirements for L0_contrib_vllm_quantization
+# Integration test requirements for L1_contrib_vllm_quantization
 # Model under test: https://huggingface.co/Qwen/Qwen3-32B
 # vLLM FP8 online dynamic quantization docs:
 # https://docs.vllm.ai/en/v0.22.0/features/quantization/fp8/

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -157,6 +158,7 @@ def test_output_dir(request: pytest.FixtureRequest) -> Path:
     """Return a unique output directory for the current test case."""
     test_dir = Path(__file__).parent
     output_dir = test_dir / "test_results" / sanitize_test_name(request.node.name)
+    shutil.rmtree(output_dir, ignore_errors=True)
     output_dir.mkdir(parents=True, exist_ok=True)
     return output_dir
 

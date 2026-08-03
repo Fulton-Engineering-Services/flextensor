@@ -8,7 +8,7 @@ from dataclasses import replace
 
 import pytest
 
-from tests.integration.L0_contrib_vllm_qwen_moe import test_qwen3_6_bf16 as qwen_bf16
+from tests.integration.L1_contrib_vllm_qwen_moe import test_qwen3_6_bf16 as qwen_bf16
 
 
 def test_qwen3_6_bf16_case_with_moe_backend_replaces_backend() -> None:

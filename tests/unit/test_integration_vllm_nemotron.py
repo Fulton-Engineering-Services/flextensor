@@ -3,7 +3,7 @@
 """Unit-style tests for Nemotron vLLM integration smoke configurations."""
 
 from tests.integration._vllm_utils import assert_moe_backend_selection
-from tests.integration.L0_contrib_vllm_nemotron.test_nemotron3_nano import (
+from tests.integration.L1_contrib_vllm_nemotron.test_nemotron3_nano import (
     NEMOTRON_3_NANO_FP8_REQUIRED_MOE_BACKENDS,
     NEMOTRON_3_NANO_FP8_SMOKE_CASE,
 )
