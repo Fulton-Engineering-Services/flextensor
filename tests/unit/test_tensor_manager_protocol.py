@@ -36,19 +36,21 @@ def _make_state_for_model(model: torch.nn.Module, loader_type: str) -> TensorMan
         )
         for index, (name, tensor) in enumerate(model.named_parameters())
     ]
+    block_loader = loader_type in {"allocation_block_transfer", "raw_block_transfer"}
+    logical_bytes = sum(stat.size_bytes for stat in tensor_stats)
     return TensorManagerState(
         loader_type=loader_type,
         tensor_id_to_name_map={stat.tensor_id: stat.name for stat in tensor_stats},
-        allocation_ordered={},
-        label_to_size_map={},
-        block_sizes={},
+        allocation_ordered={0: ["layer_0"]} if block_loader else {},
+        label_to_size_map={"layer_0": logical_bytes} if loader_type == "raw_block_transfer" else {},
+        block_sizes={0: logical_bytes} if block_loader else {},
         load_strategy={"layer_0": tensor_stats},
-        release_strategy={"layer_0": tensor_stats},
-        label_to_block_id={},
+        release_strategy={} if block_loader else {"layer_0": tensor_stats},
+        label_to_block_id={"layer_0": 0} if block_loader else {},
         stats=[LayerStatistics(label="layer_0", tensors=tensor_stats, duration=1.0)],
-        transfer_to_compute_map={},
-        view_tensors_ids=[],
-        view_tensors_names=[],
+        transfer_to_compute_map={"layer_0": "layer_0"} if block_loader else {},
+        view_tensors_ids=[stat.tensor_id for stat in tensor_stats] if block_loader else [],
+        view_tensors_names=[stat.name for stat in tensor_stats] if block_loader else [],
         gpu_tensors_names=[],
         shm_block_name_map=None,
     )

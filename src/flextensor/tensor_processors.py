@@ -690,7 +690,7 @@ class MoveBuffersToGPUTensorProcessor(TensorProcessor):
             return module
 
         # Move all buffers in this module to GPU
-        for buffer_name, buffer in module.named_buffers(recurse=False):
+        for buffer_name, buffer in module.named_buffers(recurse=False, remove_duplicate=False):
             new_buffer = self.move_to_gpu.process(buffer)
             module.register_buffer(buffer_name, new_buffer)
 

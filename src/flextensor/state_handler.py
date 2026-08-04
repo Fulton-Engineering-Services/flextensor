@@ -7,12 +7,14 @@ import json
 import logging
 import pathlib
 import struct
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
 
 from flextensor.collectors import LayerStatistics, TensorStatistics
+from flextensor.model_state_capture import capture_model_state
 from flextensor.tensor_processors import preprocess_model
 from flextensor.utils import atomic_write_json
 
@@ -70,7 +72,7 @@ class TensorManagerState:
 
     # Schema version for serialization. Bump when the persisted structure changes.
     # See CHANGELOG.md for version history.
-    SCHEMA_VERSION: ClassVar[int] = 2
+    SCHEMA_VERSION: ClassVar[int] = 3
 
     loader_type: str
     tensor_id_to_name_map: dict[int, str]
@@ -87,6 +89,127 @@ class TensorManagerState:
     view_tensors_names: list[str]
     gpu_tensors_names: list[str]
     shm_block_name_map: dict[str, str] | None
+
+    def validate_internal(self) -> None:  # noqa: C901
+        """Validate consistency that does not depend on a live model or runtime."""
+
+        def mismatch(detail: str) -> ValueError:
+            return ValueError(f"Saved state mismatch: {detail}. Re-profile the model.")
+
+        if self.loader_type not in {"strategy", "allocation_block_transfer", "raw_block_transfer"}:
+            raise ValueError(f"Unknown loader type: {self.loader_type}")
+        inventory_names = list(self.tensor_id_to_name_map.values())
+        duplicate_names = sorted(name for name, count in Counter(inventory_names).items() if count > 1)
+        if duplicate_names:
+            raise mismatch(f"tensor_id_to_name_map inventory names must be unique; duplicates={duplicate_names}")
+
+        statistics = [stat for stats in self.load_strategy.values() for stat in stats]
+        statistics.extend(stat for stats in self.release_strategy.values() for stat in stats)
+        statistics.extend(stat for layer in self.stats for stat in layer.tensors)
+        for stat in statistics:
+            inventory_name = self.tensor_id_to_name_map.get(stat.tensor_id)
+            if inventory_name != stat.name:
+                raise mismatch(
+                    "TensorStatistics tensor_id/name pair disagrees with tensor_id_to_name_map: "
+                    f"tensor_id={stat.tensor_id}, name={stat.name!r}, inventory_name={inventory_name!r}"
+                )
+
+        if len(self.view_tensors_ids) != len(self.view_tensors_names):
+            raise mismatch("view_tensors_ids and view_tensors_names must have equal lengths")
+        if len(set(self.view_tensors_ids)) != len(self.view_tensors_ids) or len(set(self.view_tensors_names)) != len(
+            self.view_tensors_names
+        ):
+            raise mismatch("view_tensors_ids and view_tensors_names must each be unique")
+        for tensor_id, name in zip(self.view_tensors_ids, self.view_tensors_names, strict=True):
+            if self.tensor_id_to_name_map.get(tensor_id) != name:
+                raise mismatch(
+                    "view_tensors_ids/view_tensors_names pair disagrees with tensor_id_to_name_map: "
+                    f"tensor_id={tensor_id}, name={name!r}"
+                )
+
+        saved_names = set(inventory_names)
+        referenced_names = {stat.name for stat in statistics}
+        referenced_names.update(self.view_tensors_names)
+        referenced_names.update(self.gpu_tensors_names)
+        invalid_references = sorted(referenced_names - saved_names)
+        if invalid_references:
+            raise mismatch(f"state references names outside saved inventory: {invalid_references}")
+
+        managed_names = {stat.name for stats in self.load_strategy.values() for stat in stats}
+        managed_names.update(self.view_tensors_names)
+        final_gpu_names = saved_names - managed_names
+        explicit_gpu_names = set(self.gpu_tensors_names)
+        if explicit_gpu_names != final_gpu_names:
+            raise mismatch(
+                "gpu_tensors_names does not match computed final-GPU inventory: "
+                f"missing={sorted(final_gpu_names - explicit_gpu_names)}, "
+                f"unexpected={sorted(explicit_gpu_names - final_gpu_names)}"
+            )
+
+        if self.loader_type == "strategy":
+            if self.release_strategy:
+                loaded_names = {stat.name for stats in self.load_strategy.values() for stat in stats}
+                released_names = {stat.name for stats in self.release_strategy.values() for stat in stats}
+                missing_release_names = sorted(loaded_names - released_names)
+                if missing_release_names:
+                    raise mismatch(f"release_strategy has no release mapping for {missing_release_names}")
+            return
+
+        load_stats = {label: stats for label, stats in self.load_strategy.items() if stats}
+        labels_by_name: dict[str, set[str]] = {}
+        for label, stats in load_stats.items():
+            for name in {stat.name for stat in stats}:
+                labels_by_name.setdefault(name, set()).add(label)
+        multiply_owned_names = {name: sorted(labels) for name, labels in labels_by_name.items() if len(labels) > 1}
+        if multiply_owned_names:
+            raise mismatch(f"tensor names cannot belong to multiple nonempty block load labels: {multiply_owned_names}")
+
+        loaded_names = set(labels_by_name)
+        view_names = set(self.view_tensors_names)
+        if view_names != loaded_names:
+            raise mismatch(
+                "view_tensors_names must match names owned by block load_strategy: "
+                f"missing={sorted(loaded_names - view_names)}, unexpected={sorted(view_names - loaded_names)}"
+            )
+
+        load_labels = set(load_stats)
+        allocated_labels = [label for labels in self.allocation_ordered.values() for label in labels]
+        allocation_counts = Counter(allocated_labels)
+        missing_labels = sorted(load_labels - allocation_counts.keys())
+        duplicate_labels = sorted(label for label, count in allocation_counts.items() if count != 1)
+        unknown_labels = sorted(allocation_counts.keys() - load_labels)
+        empty_blocks = sorted(block_id for block_id, labels in self.allocation_ordered.items() if not labels)
+        if missing_labels or duplicate_labels or unknown_labels or empty_blocks:
+            raise mismatch(
+                "allocation_ordered must contain every nonempty load label exactly once: "
+                f"missing={missing_labels}, duplicate={duplicate_labels}, unknown={unknown_labels}, "
+                f"empty_blocks={empty_blocks}"
+            )
+
+        expected_label_to_block_id = {
+            label: block_id for block_id, labels in self.allocation_ordered.items() for label in labels
+        }
+        if self.label_to_block_id != expected_label_to_block_id:
+            raise mismatch("label_to_block_id disagrees with allocation_ordered")
+
+        logical_label_sizes = {label: sum(stat.size_bytes for stat in stats) for label, stats in load_stats.items()}
+        expected_label_sizes = (
+            logical_label_sizes if self.loader_type == "raw_block_transfer" or self.label_to_size_map else {}
+        )
+        if self.label_to_size_map != expected_label_sizes:
+            raise mismatch("label_to_size_map does not match logical load-strategy sizes")
+
+        logical_block_sizes = {
+            block_id: max(logical_label_sizes[label] for label in labels)
+            for block_id, labels in self.allocation_ordered.items()
+        }
+        if self.block_sizes != logical_block_sizes:
+            raise mismatch("block_sizes do not match logical allocation_ordered capacities")
+
+        stats_labels = {layer.label for layer in self.stats}
+        unknown_compute_labels = sorted(set(self.transfer_to_compute_map.values()) - stats_labels)
+        if set(self.transfer_to_compute_map) != load_labels or unknown_compute_labels:
+            raise mismatch("transfer_to_compute_map must cover the load labels and reference known stats labels")
 
     def to_dict(self) -> dict[str, Any]:
         """Convert the object to a dictionary, handling Pydantic models."""
@@ -175,7 +298,7 @@ class TensorManagerState:
         # Reconstruct stats: list[LayerStatistics]
         stats = [LayerStatistics(**ls) for ls in data["stats"]]
 
-        return cls(
+        state = cls(
             loader_type=data["loader_type"],
             tensor_id_to_name_map=tensor_id_to_name_map,
             allocation_ordered=allocation_ordered,
@@ -191,6 +314,8 @@ class TensorManagerState:
             gpu_tensors_names=data["gpu_tensors_names"],
             shm_block_name_map=data["shm_block_name_map"],
         )
+        state.validate_internal()
+        return state
 
     def to_loader_input_data(self) -> LoaderInputData:
         """Create LoaderInputData from this state for loader creation.
@@ -267,7 +392,10 @@ class TensorManagerStateHandler:
             TensorManagerState object containing all state information.
         """
         tm = self.tensor_manager
-        tensor_id_to_name_map = tm.tensor_id_to_name_map
+        tensor_id_to_name_map = tm.tensor_id_to_name_map.copy()
+        if isinstance(getattr(tm, "model", None), torch.nn.Module):
+            for name, buffer in tm.model.named_buffers():
+                tensor_id_to_name_map.setdefault(id(buffer), name)
 
         tensor_id_to_view_map = {}
         if tm.loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
@@ -363,19 +491,14 @@ class TensorManagerStateHandler:
             Set of all tensor names referenced in load_strategy, release_strategy, and stats.
         """
         names: set[str] = set()
-
-        for s_stats in state.load_strategy.values():
-            names.update(stat.name for stat in s_stats)
-
-        for s_stats in state.release_strategy.values():
-            names.update(stat.name for stat in s_stats)
-
-        for layer_stats in state.stats:
-            names.update(stat.name for stat in layer_stats.tensors)
-
-        # Also include view tensors
+        for statistics in state.load_strategy.values():
+            names.update(stat.name for stat in statistics)
+        for statistics in state.release_strategy.values():
+            names.update(stat.name for stat in statistics)
+        for layer in state.stats:
+            names.update(stat.name for stat in layer.tensors)
         names.update(state.view_tensors_names)
-
+        names.update(state.gpu_tensors_names)
         return names
 
     @staticmethod
@@ -390,7 +513,7 @@ class TensorManagerStateHandler:
             Set of all tensor names in the model.
         """
         if isinstance(model, torch.nn.Module):
-            return {name for name, _ in model.named_parameters()}
+            return {name for name, _ in model.named_parameters()} | {name for name, _ in model.named_buffers()}
         elif isinstance(model, dict):
             return set(model.keys())
         else:
@@ -508,6 +631,73 @@ class TensorManagerStateHandler:
             )
             raise ValueError(msg)
 
+        state.validate_internal()
+        load_labels = {label for label, stats in state.load_strategy.items() if stats}
+        if (
+            state.loader_type != "strategy"
+            and tm.use_shm
+            and state.shm_block_name_map is not None
+            and set(state.shm_block_name_map) != load_labels
+        ):
+            raise ValueError(
+                "Saved state mismatch: shm_block_name_map must cover exactly the nonempty load labels. "
+                "Re-profile the model."
+            )
+
+        validation_result = self.validate_state_compatibility(model, state)
+        self._check_validation_result(validation_result, strict=strict)
+        if isinstance(model, torch.nn.Module):
+            live_tensors: dict[str, torch.Tensor] = dict(model.named_parameters(remove_duplicate=False))
+            live_tensors.update(model.named_buffers(remove_duplicate=False))
+            buffer_names = {name for name, _ in model.named_buffers(remove_duplicate=False)}
+            current = capture_model_state(model)
+            tensors_by_storage: dict[object, dict[object, list[str]]] = {storage.id: {} for storage in current.storages}
+            for captured_tensor in current.tensors:
+                tensors_by_storage[captured_tensor.storage_id][captured_tensor.id] = list(captured_tensor.names)
+        else:
+            live_tensors = model
+            buffer_names = set()
+            tensors_by_storage = {}
+            for name, live_tensor in live_tensors.items():
+                if isinstance(live_tensor, torch.Tensor):
+                    tensors_by_storage.setdefault(live_tensor.untyped_storage()._cdata, {}).setdefault(  # noqa: SLF001
+                        id(live_tensor), []
+                    ).append(name)
+        managed_names = {stat.name for stats in state.load_strategy.values() for stat in stats}
+        managed_names.update(state.view_tensors_names)
+        managed_buffers = sorted(managed_names & buffer_names)
+        if managed_buffers:
+            raise ValueError(f"Registered buffer(s) must remain final-GPU, not managed: {managed_buffers}")
+        contradictory_storages = {
+            storage_id: sorted(name for names in tensors.values() for name in names)
+            for storage_id, tensors in tensors_by_storage.items()
+            if len({"cpu" if managed_names.intersection(names) else "gpu" for names in tensors.values()}) > 1
+        }
+        if contradictory_storages:
+            raise ValueError(f"Contradictory alias destinations for shared storage: {contradictory_storages}")
+        if state.loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
+            shared_storage_views = {
+                storage_id: sorted(name for names in tensors.values() for name in names)
+                for storage_id, tensors in tensors_by_storage.items()
+                if sum(bool(managed_names.intersection(names)) for names in tensors.values()) > 1
+            }
+            if shared_storage_views:
+                raise ValueError(
+                    f"Block loaders cannot preserve distinct tensor views sharing storage: {shared_storage_views}"
+                )
+        statistics = [stat for stats in state.load_strategy.values() for stat in stats]
+        statistics.extend(stat for stats in state.release_strategy.values() for stat in stats)
+        statistics.extend(stat for layer in state.stats for stat in layer.tensors)
+        for stat in statistics:
+            matching_tensor = live_tensors.get(stat.name)
+            if matching_tensor is not None:
+                logical_bytes = matching_tensor.numel() * matching_tensor.element_size()
+                if stat.size_bytes != logical_bytes:
+                    raise ValueError(
+                        f"TensorStatistics.size_bytes drift for {stat.name}: "
+                        f"saved={stat.size_bytes}, current_logical={logical_bytes}"
+                    )
+
         # Deep-copy the state so we don't mutate the caller's object (it may be reused).
         state = copy.deepcopy(state)
 
@@ -530,10 +720,6 @@ class TensorManagerStateHandler:
         elif isinstance(model, dict):
             for name, tensor in model.items():
                 tensor_name_to_id_map[name] = id(tensor)
-
-        # Validate state compatibility
-        validation_result = self.validate_state_compatibility(model, state)
-        self._check_validation_result(validation_result, strict=strict)
 
         # Set of valid tensor names (present in current model)
         valid_tensor_names = set(tensor_name_to_id_map.keys())

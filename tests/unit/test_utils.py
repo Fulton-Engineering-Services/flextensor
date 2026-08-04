@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
+from flextensor import utils
 from flextensor.utils import (
     PartitionedPatterns,
     _compile_segment_regex,
@@ -24,6 +25,11 @@ from flextensor.utils import (
     matches_any_pattern,
     partition_patterns,
 )
+
+
+def test_packed_tensor_layout_helper_is_not_public() -> None:
+    assert "compute_packed_tensor_layout" not in utils.__all__
+    assert not hasattr(utils, "compute_packed_tensor_layout")
 
 
 class TestConfigFieldWasSet:

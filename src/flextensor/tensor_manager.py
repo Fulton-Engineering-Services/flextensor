@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args
 
+import psutil
 import torch
 from typing_extensions import deprecated as _deprecated
 
@@ -21,7 +22,11 @@ from flextensor.collectors import (
     TensorStatistics,
 )
 from flextensor.config import ProfileMode
-from flextensor.gpu_budget import reserve_strategy_invisible_gpu_budget, resolve_gpu_budget
+from flextensor.gpu_budget import (
+    CUDAMemorySnapshot,
+    reserve_strategy_invisible_gpu_budget,
+    resolve_gpu_budget,
+)
 from flextensor.helpers import ProfilingSuspender, TrapNestingGuard, format_tensor_id_hint
 from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
 from flextensor.instrumentation import instrumentable
@@ -41,12 +46,11 @@ from flextensor.memory_transfer_benchmark import (
     extract_memory_transfers_from_layer_stats,
     format_memory_transfer_table,
 )
+from flextensor.model_state_capture import capture_model_state
 from flextensor.profile_block_controller import ProfileBlockController
-from flextensor.state_handler import (
-    LoaderInputData,
-    TensorManagerState,
-    TensorManagerStateHandler,
-)
+from flextensor.state_adoption import PinningMode, target_from_profile
+from flextensor.state_handler import LoaderInputData, TensorManagerState, TensorManagerStateHandler
+from flextensor.state_transition import MemoryCapacity, StateTransitionPlan, plan_state_transition
 from flextensor.strategy import (
     BlockStrategyData,
     GreedyStrategy,
@@ -97,6 +101,8 @@ if TYPE_CHECKING:
     from flextensor.offload_manager import TensorManagerProtocol as _TensorManagerProtocol
 
 logger = logging.getLogger(__name__)
+_STATE_ADOPTION_HOST_RESERVE_BYTES = 4 * 1024**3
+_STATE_ADOPTION_GPU_RESERVE_BYTES = 1024**3
 
 
 # =============================================================================
@@ -1737,6 +1743,67 @@ class TensorManager:
         """Delegate to TensorManagerStateHandler for state restoration."""
         state_handler = TensorManagerStateHandler(self)
         state_handler.restore_state(model, state)
+
+    def plan_state_adoption(
+        self,
+        model: torch.nn.Module,
+        state: TensorManagerState,
+        *,
+        host_reserve_bytes: int = _STATE_ADOPTION_HOST_RESERVE_BYTES,
+        gpu_reserve_bytes: int = _STATE_ADOPTION_GPU_RESERVE_BYTES,
+    ) -> StateTransitionPlan:
+        """Plan a read-only transition from ``model`` to a saved placement.
+
+        Args:
+            model: Model whose current tensor placement is captured.
+            state: Saved profile describing the target placement and loader strategy.
+            host_reserve_bytes: Available host memory excluded from planning. The
+                4-GiB default leaves room for Python, framework, and loader setup;
+                tune it for the deployment rather than treating it as an invariant.
+            gpu_reserve_bytes: Available GPU memory excluded from planning. The
+                1-GiB default leaves room for CUDA/framework runtime growth; tune it
+                for the deployment rather than treating it as an invariant.
+
+        Returns:
+            A transition plan. This method does not move or pin tensors, allocate
+            loaders, patch ``model``, or activate the manager.
+
+        Raises:
+            ValueError: If the reserves are invalid, the saved profile is
+                incompatible with this manager or model, or its metadata is invalid.
+            RuntimeError: If the planned transition exceeds available capacity.
+        """
+        if state.loader_type != self.loader_type:
+            raise ValueError(
+                f"Saved state uses loader_type='{state.loader_type}' but TensorManager is configured "
+                f"with loader_type='{self.loader_type}'. Re-profile or use a matching transfer mode."
+            )
+        if type(host_reserve_bytes) is not int or host_reserve_bytes < 0:
+            raise ValueError("host_reserve_bytes must be a non-negative integer")
+        if type(gpu_reserve_bytes) is not int or gpu_reserve_bytes < 0:
+            raise ValueError("gpu_reserve_bytes must be a non-negative integer")
+        host_available_bytes = psutil.virtual_memory().available
+        gpu_memory = CUDAMemorySnapshot.capture(self.device_gpu)
+        current = capture_model_state(model)
+        pinning: PinningMode = (
+            "none" if not self.pinned_memory else "in_place" if self.host_pinner.registry is not None else "copy"
+        )
+        target, transition = target_from_profile(
+            current,
+            state,
+            target_device=str(self.device_gpu),
+            pinning=pinning,
+            use_shm=self.use_shm,
+        )
+        return plan_state_transition(
+            current,
+            target,
+            transition=transition,
+            capacity=MemoryCapacity(
+                host_bytes=max(0, host_available_bytes - host_reserve_bytes),
+                gpu_bytes=max(0, gpu_memory.available_bytes - gpu_reserve_bytes),
+            ),
+        )
 
     def _save_state_to_file(self, file_path):
         """Internal: Save state to a specific file path."""

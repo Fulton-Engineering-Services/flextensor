@@ -6,7 +6,7 @@ import logging
 import pathlib
 import re
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Any
@@ -14,6 +14,12 @@ from typing import Any
 import torch
 
 logger = logging.getLogger(__name__)
+
+# AllocationBlock's historical slot-packing policy. A 128-byte boundary keeps
+# projected GPU suballocations conservatively aligned for CUDA memory access;
+# it is not a CUDA correctness requirement. Changing it also changes planned
+# block sizes, so the planner and allocator must share this value.
+_DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES = 128
 
 __all__ = [
     "any_path_matches_pattern",
@@ -44,6 +50,22 @@ CLASS_PATTERN_PREFIX = "class:"
 # symmetry with ``class:`` and to disambiguate a literal module path that starts
 # with ``class:`` (unlikely, but possible in principle).
 NAME_PATTERN_PREFIX = "name:"
+
+
+def _compute_packed_byte_layout(
+    sizes: Iterable[int],
+    memory_alignment: int = _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES,
+) -> tuple[list[int], int]:
+    """Return tensor offsets and total bytes for aligned allocation-block packing."""
+    if type(memory_alignment) is not int or memory_alignment <= 0:
+        raise ValueError(f"memory_alignment must be a positive integer, got {memory_alignment!r}")
+    offsets: list[int] = []
+    cursor = 0
+    for size in sizes:
+        offsets.append(cursor)
+        cursor += size
+        cursor = (cursor + memory_alignment - 1) // memory_alignment * memory_alignment
+    return offsets, cursor
 
 
 def config_field_was_set(config: Any, field_name: str) -> bool:

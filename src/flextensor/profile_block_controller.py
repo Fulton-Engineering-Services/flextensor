@@ -21,11 +21,10 @@ import torch
 
 from flextensor.collectors import IterativeLayerStatistics  # noqa: TC001 (beartype needs runtime symbol)
 from flextensor.host_pinning import HostPinner, PinnedMemoryMode, make_host_pinner
+from flextensor.utils import _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES as _DEFAULT_SLOT_ALIGNMENT_BYTES
 from flextensor.utils import is_dense_layout
 
 LOGGER = logging.getLogger(__name__)
-
-_DEFAULT_SLOT_ALIGNMENT_BYTES = 128
 
 
 @dataclass(frozen=True)

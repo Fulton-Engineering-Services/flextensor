@@ -307,7 +307,7 @@ class TestTensorManagerLoadProfile:
             "label_to_block_id": {},
             "stats": [],
             "transfer_to_compute_map": {},
-            "view_tensors_ids": [],
+            "view_tensors_ids": [123],
             "view_tensors_names": ["layer.weight"],
             "gpu_tensors_names": [],
             "shm_block_name_map": None,

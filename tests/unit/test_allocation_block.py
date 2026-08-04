@@ -24,6 +24,15 @@ class TestAllocationBlock:
         ]
         self.block = AllocationBlock(device="cpu", host_pinner=HostPinner())
 
+    @pytest.mark.parametrize("memory_alignment", [0, -1, 1.5, True, "128"])
+    def test_rejects_invalid_memory_alignment(self, memory_alignment: object):
+        with pytest.raises(ValueError, match="memory_alignment must be a positive integer"):
+            AllocationBlock(
+                device="cpu",
+                host_pinner=HostPinner(),
+                memory_alignment=memory_alignment,
+            )
+
     def test_allocate_and_allocate(self):
         # Allocate all tensors
         for tensor in self.tensors:

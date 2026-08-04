@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `TensorManager.plan_state_adoption()` for read-only, capacity-safe saved-state adoption planning.
+
 ## [0.3.0] — 2026-07-29
 
 ### Added
@@ -57,6 +61,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cap. Set a numeric fraction to opt into memory mode. The vLLM worker
   preserves its existing `0.9` fallback when the setting is omitted; set
   `FT_MAX_GPU_MEM_FRACTION=none` to select latency mode explicitly under vLLM.
+- **Breaking:** saved-profile schema v3 includes registered buffers in the tensor inventory;
+  v2 profiles must be regenerated before loading.
 - **Breaking (memory):** the default `profile_mode` changed to `"view"`, which
   uses more GPU memory during the profile phase than the previous default. If you
   set `max_gpu_mem_fraction`, FlexTensor now checks this up front and raises a

@@ -41,41 +41,83 @@ class SimpleModel(torch.nn.Module):
         return self.layer2(x)
 
 
-def create_tensor_statistics(names: list[str]) -> list[TensorStatistics]:
+def create_tensor_statistics(names: list[str], size_by_name: dict[str, int] | None = None) -> list[TensorStatistics]:
     """Create a list of TensorStatistics with given names."""
-    return [TensorStatistics(tensor_id=i, name=name, size_bytes=1000, load_time_ms=0.1) for i, name in enumerate(names)]
+    size_by_name = size_by_name or {}
+    return [
+        TensorStatistics(tensor_id=i, name=name, size_bytes=size_by_name.get(name, 1000), load_time_ms=0.1)
+        for i, name in enumerate(names)
+    ]
 
 
-def create_layer_statistics(names: list[str]) -> list[LayerStatistics]:
+def create_layer_statistics(names: list[str], size_by_name: dict[str, int] | None = None) -> list[LayerStatistics]:
     """Create a LayerStatistics with given tensor names."""
-    tensors = create_tensor_statistics(names)
+    tensors = create_tensor_statistics(names, size_by_name)
     return [LayerStatistics(label="layer_0", tensors=tensors, duration=1.0)]
 
 
 def create_mock_state(
     tensor_names: list[str],
     view_tensor_names: list[str] | None = None,
+    model: torch.nn.Module | dict | None = None,
 ) -> TensorManagerState:
     """Create a mock TensorManagerState with the given tensor names."""
     if view_tensor_names is None:
         view_tensor_names = []
+    tensor_names = list(tensor_names)
+    inventory_names = [*tensor_names, *(name for name in view_tensor_names if name not in tensor_names)]
+    tensor_id_by_name = {name: tensor_id for tensor_id, name in enumerate(inventory_names)}
+    if isinstance(model, torch.nn.Module):
+        live_tensors = dict(model.named_parameters(remove_duplicate=False))
+        live_tensors.update(model.named_buffers(remove_duplicate=False))
+    else:
+        live_tensors = model or {}
+    size_by_name = {
+        name: tensor.numel() * tensor.element_size()
+        for name, tensor in live_tensors.items()
+        if isinstance(tensor, torch.Tensor)
+    }
 
     return TensorManagerState(
         loader_type="strategy",
-        tensor_id_to_name_map=dict(enumerate(tensor_names)),
+        tensor_id_to_name_map=dict(enumerate(inventory_names)),
         allocation_ordered={},
         label_to_size_map={},
         block_sizes={},
-        load_strategy={"layer_0": create_tensor_statistics(tensor_names)},
-        release_strategy={"layer_0": create_tensor_statistics(tensor_names)},
+        load_strategy={"layer_0": create_tensor_statistics(tensor_names, size_by_name)},
+        release_strategy={"layer_0": create_tensor_statistics(tensor_names, size_by_name)},
         label_to_block_id={},
-        stats=create_layer_statistics(tensor_names),
+        stats=create_layer_statistics(tensor_names, size_by_name),
         transfer_to_compute_map={},
-        view_tensors_ids=[],
+        view_tensors_ids=[tensor_id_by_name[name] for name in view_tensor_names],
         view_tensors_names=view_tensor_names,
         gpu_tensors_names=[],
         shm_block_name_map=None,
     )
+
+
+def test_from_dict_rejects_duplicate_inventory_names() -> None:
+    data = create_mock_state(["first", "second"]).to_dict()
+    data["tensor_id_to_name_map"]["1"] = "first"
+
+    with pytest.raises(ValueError, match=r"inventory names.*unique"):
+        TensorManagerState.from_dict(data)
+
+
+def test_from_dict_rejects_unknown_loader_type() -> None:
+    data = create_mock_state(["weight"]).to_dict()
+    data["loader_type"] = "unknown"
+
+    with pytest.raises(ValueError, match="Unknown loader type"):
+        TensorManagerState.from_dict(data)
+
+
+def test_from_dict_rejects_statistic_identity_mismatch() -> None:
+    data = create_mock_state(["weight"]).to_dict()
+    data["load_strategy"]["layer_0"][0]["tensor_id"] = -1
+
+    with pytest.raises(ValueError, match=r"TensorStatistics.*tensor_id.*name"):
+        TensorManagerState.from_dict(data)
 
 
 class TestStateValidationResult:
@@ -280,7 +322,7 @@ class TestLoaderTypeMismatch:
         handler = TensorManagerStateHandler(mock_tm)
 
         # Create state with different loader_type (allocation_block_transfer)
-        state = create_mock_state(self.model_tensor_names)
+        state = create_mock_state([])
         state.loader_type = "allocation_block_transfer"
 
         with pytest.raises(ValueError) as exc_info:
@@ -300,7 +342,7 @@ class TestLoaderTypeMismatch:
 
         handler = TensorManagerStateHandler(mock_tm)
 
-        state = create_mock_state(self.model_tensor_names)
+        state = create_mock_state([])
         state.loader_type = "allocation_block_transfer"
 
         # Should not raise
@@ -319,7 +361,7 @@ class TestLoaderTypeMismatch:
 
                 handler = TensorManagerStateHandler(mock_tm)
 
-                state = create_mock_state(self.model_tensor_names)
+                state = create_mock_state([])
                 state.loader_type = state_loader_type
 
                 if manager_loader_type == state_loader_type:
@@ -348,7 +390,7 @@ class TestRestoreStateWithValidation:
 
     def test_restore_state_strict_raises_on_missing(self):
         """restore_state with strict=True raises on missing tensors."""
-        state = create_mock_state([*self.model_tensor_names, "missing.weight"])
+        state = create_mock_state([*self.model_tensor_names, "missing.weight"], model=self.model)
 
         with pytest.raises(ValueError, match=r"missing\.weight"):
             self.handler.restore_state(self.model, state, strict=True)
@@ -356,7 +398,7 @@ class TestRestoreStateWithValidation:
     def test_restore_state_non_strict_skips_missing(self, caplog):
         """restore_state with strict=False skips missing tensors."""
         extra_tensor = "missing.weight"
-        state = create_mock_state([*self.model_tensor_names, extra_tensor])
+        state = create_mock_state([*self.model_tensor_names, extra_tensor], model=self.model)
 
         with caplog.at_level(logging.WARNING):
             result = self.handler.restore_state(self.model, state, strict=False)
@@ -377,7 +419,7 @@ class TestRestoreStateWithValidation:
         """restore_state returns StateValidationResult for inspection."""
         # Use exact match - should have no missing but maybe unexpected
         partial_names = ["layer1.weight", "layer1.bias"]
-        state = create_mock_state(partial_names)
+        state = create_mock_state(partial_names, model=self.model)
 
         result = self.handler.restore_state(self.model, state, strict=True)
 
@@ -387,17 +429,93 @@ class TestRestoreStateWithValidation:
 
     def test_restore_state_default_is_strict(self):
         """restore_state defaults to strict=True."""
-        state = create_mock_state([*self.model_tensor_names, "missing.weight"])
+        state = create_mock_state([*self.model_tensor_names, "missing.weight"], model=self.model)
 
         # Should raise without explicit strict parameter
         with pytest.raises(ValueError):
             self.handler.restore_state(self.model, state)
+
+    def test_restore_state_rejects_renamed_persisted_buffer(self):
+        self.model.register_buffer("renamed_constant", torch.ones(1))
+        state = create_mock_state(self.model_tensor_names, model=self.model)
+        state.tensor_id_to_name_map[-1] = "constant"
+        state.gpu_tensors_names = ["constant"]
+        persisted_state = TensorManagerState.from_dict(state.to_dict())
+
+        with pytest.raises(ValueError, match="constant"):
+            self.handler.restore_state(self.model, persisted_state, strict=True)
+
+    def test_restore_state_rejects_managed_buffer(self):
+        self.model.register_buffer("constant", torch.ones(1))
+        names = [*self.model_tensor_names, "constant"]
+        state = create_mock_state(names, model=self.model)
+
+        with pytest.raises(ValueError, match="buffer"):
+            self.handler.restore_state(self.model, state, strict=True)
+
+    def test_restore_state_rejects_empty_shm_map_when_shm_is_enabled(self):
+        state = create_mock_state(self.model_tensor_names, model=self.model)
+        state.loader_type = "allocation_block_transfer"
+        state.release_strategy = {}
+        state.allocation_ordered = {0: ["layer_0"]}
+        state.block_sizes = {0: sum(stat.size_bytes for stat in state.load_strategy["layer_0"])}
+        state.label_to_block_id = {"layer_0": 0}
+        state.transfer_to_compute_map = {"layer_0": "layer_0"}
+        state.view_tensors_ids = list(state.tensor_id_to_name_map)
+        state.view_tensors_names = self.model_tensor_names
+        state.shm_block_name_map = {}
+        self.mock_tm.loader_type = "allocation_block_transfer"
+        self.mock_tm.use_shm = True
+
+        with pytest.raises(ValueError, match="shm_block_name_map"):
+            self.handler.restore_state(self.model, state, strict=True)
+
+    def test_restore_state_rejects_shared_storage_for_block_loader(self):
+        storage = torch.arange(8, dtype=torch.float32)
+        model = torch.nn.Module()
+        model.register_parameter("first", torch.nn.Parameter(storage[:4], requires_grad=False))
+        model.register_parameter("second", torch.nn.Parameter(storage[2:6], requires_grad=False))
+        state = create_mock_state(["first", "second"], model=model)
+        state.loader_type = "allocation_block_transfer"
+        state.allocation_ordered = {0: ["layer_0"]}
+        state.block_sizes = {0: sum(stat.size_bytes for stat in state.load_strategy["layer_0"])}
+        state.label_to_block_id = {"layer_0": 0}
+        state.transfer_to_compute_map = {"layer_0": "layer_0"}
+        state.view_tensors_ids = [0, 1]
+        state.view_tensors_names = ["first", "second"]
+        self.mock_tm.loader_type = "allocation_block_transfer"
+
+        with pytest.raises(ValueError, match="sharing storage"):
+            self.handler.restore_state(model, state, strict=True)
+
+    def test_restore_state_rejects_shared_storage_split_between_destinations(self):
+        storage = torch.arange(8, dtype=torch.float32)
+        model = torch.nn.Module()
+        model.register_parameter("managed", torch.nn.Parameter(storage[:4], requires_grad=False))
+        model.register_parameter("gpu", torch.nn.Parameter(storage[2:6], requires_grad=False))
+        state = create_mock_state(["managed", "gpu"], model=model)
+        state.load_strategy["layer_0"] = [state.load_strategy["layer_0"][0]]
+        state.release_strategy["layer_0"] = [state.release_strategy["layer_0"][0]]
+        state.stats[0] = state.stats[0].model_copy(update={"tensors": [state.stats[0].tensors[0]]})
+        state.gpu_tensors_names = ["gpu"]
+
+        with pytest.raises(ValueError, match="Contradictory alias destinations"):
+            self.handler.restore_state(model, state, strict=True)
+
+    def test_restore_state_rejects_meta_tensor_before_mutation(self):
+        model = torch.nn.Module()
+        model.register_parameter("weight", torch.nn.Parameter(torch.empty(1, device="meta"), requires_grad=False))
+        state = create_mock_state(["weight"], model=model)
+
+        with pytest.raises(ValueError, match="meta tensor"):
+            self.handler.restore_state(model, state, strict=True)
 
     def test_restore_state_filters_view_tensors(self):
         """restore_state filters out missing view tensor names."""
         state = create_mock_state(
             self.model_tensor_names,
             view_tensor_names=["valid.view", "missing.view"],
+            model=self.model,
         )
         # Add valid.view to model for partial match
         # (In this case, both will be filtered since SimpleModel doesn't have them)
@@ -449,7 +567,7 @@ class TestRestoreStateForwardsHostPinner:
 
     def test_restore_state_forwards_manager_host_pinner(self, monkeypatch):
         captured = self._patch_preprocess_model(monkeypatch)
-        state = create_mock_state(self.model_tensor_names)
+        state = create_mock_state(self.model_tensor_names, model=self.model)
 
         self.handler.restore_state(self.model, state, strict=True)
 
@@ -458,6 +576,27 @@ class TestRestoreStateForwardsHostPinner:
             "restore_state must forward the same HostPinner instance owned by the manager, "
             "not a freshly constructed default."
         )
+
+    def test_restore_state_validates_before_preprocessing(self, monkeypatch):
+        captured = self._patch_preprocess_model(monkeypatch)
+        state = create_mock_state(self.model_tensor_names, model=self.model)
+        state.tensor_id_to_name_map[-1] = self.model_tensor_names[0]
+
+        with pytest.raises(ValueError, match=r"inventory names.*unique"):
+            self.handler.restore_state(self.model, state, strict=True)
+
+        assert captured == {}
+
+    def test_restore_state_rejects_size_drift_before_preprocessing(self, monkeypatch):
+        captured = self._patch_preprocess_model(monkeypatch)
+        state = create_mock_state(self.model_tensor_names, model=self.model)
+        stat = state.load_strategy["layer_0"][0]
+        state.load_strategy["layer_0"][0] = stat.model_copy(update={"size_bytes": stat.size_bytes + 1})
+
+        with pytest.raises(ValueError, match="size_bytes drift"):
+            self.handler.restore_state(self.model, state, strict=True)
+
+        assert captured == {}
 
     def test_restore_state_consults_should_pin_in_preprocess(self, monkeypatch):
         """The pin_memory value forwarded to ``preprocess_model`` must come
@@ -472,7 +611,7 @@ class TestRestoreStateForwardsHostPinner:
         sentinel = object()
         self.mock_tm.should_pin_in_preprocess.return_value = sentinel
         captured = self._patch_preprocess_model(monkeypatch)
-        state = create_mock_state(self.model_tensor_names)
+        state = create_mock_state(self.model_tensor_names, model=self.model)
 
         self.handler.restore_state(self.model, state, strict=True)
 

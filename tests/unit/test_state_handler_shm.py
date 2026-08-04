@@ -21,9 +21,9 @@ def _make_minimal_state() -> TensorManagerState:
         TensorStatistics(tensor_id=2, name="layer2.weight", size_bytes=512, load_time_ms=0.05),
     ]
     return TensorManagerState(
-        loader_type="PreallocatedBatchTransferTensorLoader",
+        loader_type="allocation_block_transfer",
         tensor_id_to_name_map={0: "layer0.weight", 1: "layer1.weight", 2: "layer2.weight"},
-        allocation_ordered={0: ["layer0.weight", "layer1.weight"], 1: ["layer2.weight"]},
+        allocation_ordered={0: ["trap_0"], 1: ["trap_1"]},
         label_to_size_map={"trap_0": 3072, "trap_1": 512},
         block_sizes={0: 3072, 1: 512},
         load_strategy={"trap_0": tensor_stats[:2], "trap_1": tensor_stats[2:]},
@@ -34,8 +34,8 @@ def _make_minimal_state() -> TensorManagerState:
             LayerStatistics(label="trap_1", tensors=tensor_stats[2:], duration=0.5),
         ],
         transfer_to_compute_map={"trap_0": "trap_0", "trap_1": "trap_1"},
-        view_tensors_ids=[],
-        view_tensors_names=[],
+        view_tensors_ids=[0, 1, 2],
+        view_tensors_names=["layer0.weight", "layer1.weight", "layer2.weight"],
         gpu_tensors_names=[],
         shm_block_name_map=None,
     )
@@ -43,6 +43,19 @@ def _make_minimal_state() -> TensorManagerState:
 
 class TestStateHandlerShm:
     """Tests for SHM serialization of TensorManagerState."""
+
+    def test_schema_v2_is_rejected_as_outdated(self):
+        saved_state = _make_minimal_state().to_dict()
+        saved_state["version"] = 2
+
+        with pytest.raises(ValueError, match=r"schema version 2 is outdated \(current: 3\)"):
+            TensorManagerState.from_dict(saved_state)
+
+    def test_current_schema_v3_roundtrips(self):
+        saved_state = _make_minimal_state().to_dict()
+
+        assert saved_state["version"] == 3
+        assert TensorManagerState.from_dict(saved_state).to_dict() == saved_state
 
     def test_roundtrip_to_bytes(self):
         """State survives serialization to bytes and back."""

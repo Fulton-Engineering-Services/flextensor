@@ -382,6 +382,17 @@ class TestReachableTensorMapProcessor:
 class TestMoveBuffersToGPUTensorProcessor:
     """Test cases for MoveBuffersToGPUTensorProcessor to ensure buffers are moved to GPU."""
 
+    def test_rebinds_every_name_for_an_aliased_buffer(self):
+        module = nn.Module()
+        shared = torch.ones(1)
+        module.register_buffer("first", shared)
+        module.register_buffer("second", shared)
+
+        MoveBuffersToGPUTensorProcessor(torch.device("meta")).apply(module)
+
+        assert module.first is module.second
+        assert module.first.device.type == "meta"
+
     def test_simple_module_with_buffer(self):
         """Test moving buffers in a simple module with one buffer."""
         if not torch.cuda.is_available():

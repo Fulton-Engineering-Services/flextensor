@@ -35,6 +35,34 @@ class StrategyInvisibleGPUBudgetReservation:
     reserved_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class CUDAMemorySnapshot:
+    """Raw CUDA/PyTorch memory counters and derived availability."""
+
+    free_bytes: int
+    total_bytes: int
+    reserved_bytes: int
+    allocated_bytes: int
+
+    @classmethod
+    def capture(cls, device_gpu: torch.device | str | int) -> "CUDAMemorySnapshot":
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_gpu)
+        return cls(
+            free_bytes=free_bytes,
+            total_bytes=total_bytes,
+            reserved_bytes=torch.cuda.memory_reserved(device_gpu),
+            allocated_bytes=torch.cuda.memory_allocated(device_gpu),
+        )
+
+    @property
+    def reusable_cache_bytes(self) -> int:
+        return max(0, self.reserved_bytes - self.allocated_bytes)
+
+    @property
+    def available_bytes(self) -> int:
+        return self.free_bytes + self.reusable_cache_bytes
+
+
 def resolve_gpu_budget(
     max_gpu_mem_fraction: float | None,
     device_gpu: torch.device | str | int,
@@ -55,18 +83,15 @@ def resolve_gpu_budget(
     if max_gpu_mem_fraction is None:
         return None
 
-    free_cuda, total = torch.cuda.mem_get_info(device_gpu)
-    budget = int(total * max_gpu_mem_fraction)
-
-    reserved = torch.cuda.memory_reserved(device_gpu)
-    allocated = torch.cuda.memory_allocated(device_gpu)
-    available = free_cuda + (reserved - allocated)
+    memory = CUDAMemorySnapshot.capture(device_gpu)
+    budget = int(memory.total_bytes * max_gpu_mem_fraction)
+    available = memory.available_bytes
 
     if available < min_gpu_budget_bytes:
         raise RuntimeError(
             f"Insufficient free GPU memory: {available / _GIB:.2f} GiB available "
-            f"(free={free_cuda / _GIB:.2f}, reserved={reserved / _GIB:.2f}, "
-            f"allocated={allocated / _GIB:.2f}), "
+            f"(free={memory.free_bytes / _GIB:.2f}, reserved={memory.reserved_bytes / _GIB:.2f}, "
+            f"allocated={memory.allocated_bytes / _GIB:.2f}), "
             f"minimum required: {min_gpu_budget_bytes / _GIB:.2f} GiB"
         )
 
@@ -77,8 +102,8 @@ def resolve_gpu_budget(
             "(available: %.2f GiB free_cuda + %.2f GiB allocator cache)",
             budget / _GIB,
             available / _GIB,
-            free_cuda / _GIB,
-            (reserved - allocated) / _GIB,
+            memory.free_bytes / _GIB,
+            memory.reusable_cache_bytes / _GIB,
         )
         budget = available
 

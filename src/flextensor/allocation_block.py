@@ -8,7 +8,11 @@ from typing_extensions import Self
 from flextensor.host_pinning import HostPinner
 from flextensor.shm import FlexibleSharedMemory, ProcessFileLock
 from flextensor.shm.flexible_shm import LOCK_ACQUIRE_TIMEOUT
-from flextensor.utils import is_dense_layout
+from flextensor.utils import (
+    _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES,
+    _compute_packed_byte_layout,
+    is_dense_layout,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +46,9 @@ class AllocationBlock:
         self.shm_block = None
         self.pinned_memory = config.get("pinned_memory", False)
         self.host_pinner: HostPinner = host_pinner
-        self.memory_alignment = config.get("memory_alignment", 128)
+        self.memory_alignment = config.get("memory_alignment", _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES)
         self.release_tensor_memory = config.get("release_tensor_memory", False)
-        if self.memory_alignment <= 0:
+        if type(self.memory_alignment) is not int or self.memory_alignment <= 0:
             raise ValueError(f"memory_alignment must be a positive integer, got {self.memory_alignment!r}")
         self.load_from_shm = config.get("load_from_shm", False)
         self.shm_ptr = None
@@ -113,12 +117,10 @@ class AllocationBlock:
         self.tensor_offsets = []
 
     def _prepare_block(self):
-        self.tensor_offsets = []
-        tensor_offset = 0
-        for tensor in self.tensors:
-            self.tensor_offsets.append(tensor_offset)
-            tensor_offset += tensor.element_size() * tensor.numel()
-            tensor_offset = (tensor_offset + self.memory_alignment - 1) // self.memory_alignment * self.memory_alignment
+        self.tensor_offsets, tensor_offset = _compute_packed_byte_layout(
+            (tensor.element_size() * tensor.numel() for tensor in self.tensors),
+            self.memory_alignment,
+        )
 
         self.block = self._make_base_block(tensor_offset, device=self.device, pin_memory=self.pinned_memory)
         self._prepare_views()
@@ -200,7 +202,7 @@ class AllocationManager:
         pinned_memory: bool = False,
         *,
         host_pinner: HostPinner,
-        memory_alignment: int = 128,
+        memory_alignment: int = _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES,
         lock_class=None,
         release_tensor_memory: bool = False,
     ):

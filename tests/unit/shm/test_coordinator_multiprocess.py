@@ -15,6 +15,7 @@ import pytest
 # spawn-launched worker processes (which inherit sys.path).
 from conftest import EVENT_TIMEOUT, assert_clean_exit, drain_results, format_failed_results, wait_for_event
 
+from flextensor.collectors import LayerStatistics, TensorStatistics
 from flextensor.shm.coordinator import ShmCoordinator
 from flextensor.state_handler import TensorManagerState
 
@@ -23,21 +24,25 @@ if TYPE_CHECKING:
 
 
 def _make_minimal_state(loader_type: str = "allocation_block_transfer") -> TensorManagerState:
+    tensor_stats = [
+        TensorStatistics(tensor_id=1, name="layer.weight", size_bytes=1024, load_time_ms=0.1),
+        TensorStatistics(tensor_id=2, name="layer.bias", size_bytes=1024, load_time_ms=0.1),
+    ]
     return TensorManagerState(
         loader_type=loader_type,
         tensor_id_to_name_map={1: "layer.weight", 2: "layer.bias"},
-        allocation_ordered={0: ["layer.weight", "layer.bias"]},
-        label_to_size_map={"layer": 1024},
+        allocation_ordered={0: ["layer"]},
+        label_to_size_map={"layer": 2048},
         block_sizes={0: 2048},
-        load_strategy={},
+        load_strategy={"layer": tensor_stats},
         release_strategy={},
-        label_to_block_id={"layer.weight": 0, "layer.bias": 0},
-        stats=[],
-        transfer_to_compute_map={},
-        view_tensors_ids=[],
-        view_tensors_names=[],
+        label_to_block_id={"layer": 0},
+        stats=[LayerStatistics(label="layer", tensors=tensor_stats, duration=1.0)],
+        transfer_to_compute_map={"layer": "layer"},
+        view_tensors_ids=[1, 2],
+        view_tensors_names=["layer.weight", "layer.bias"],
         gpu_tensors_names=[],
-        shm_block_name_map={"layer.weight": "ft_test_w0", "layer.bias": "ft_test_w0"},
+        shm_block_name_map={"layer": "ft_test_w0"},
     )
 
 
