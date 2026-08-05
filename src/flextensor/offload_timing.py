@@ -445,37 +445,56 @@ class OffloadTimingCollector:
     # Recording helpers (called from loader hot path — very cheap)
     # ------------------------------------------------------------------
 
+    def _mark_captured_if_recording_under_capture(self) -> None:
+        """Latch ``_pass_was_captured`` if recording under CUDA-graph capture.
+
+        Covers capture that starts after ``on_pass_start``. Without the latch,
+        a later eager ``on_pass_start`` would treat the pass as non-captured and
+        call ``_finalize_pass()``, which is unsafe for internal events and
+        clears ``_has_*`` needed for external replay measure.
+        """
+        if self._pass_was_captured:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            self._pass_was_captured = True
+
     def record_transfer_start(self, label: str, stream: Any) -> None:
         if label in self._label_set:
             self._transfer_start[label].record(stream)
             # Incomplete until record_transfer_end — avoid elapsed_time on a
             # missing/stale end if finalize runs after a partial abort.
             self._has_transfer[label] = False
+            self._mark_captured_if_recording_under_capture()
 
     def record_transfer_end(self, label: str, stream: Any) -> None:
         if label in self._label_set:
             self._transfer_end[label].record(stream)
             self._has_transfer[label] = True
+            self._mark_captured_if_recording_under_capture()
 
     def record_compute_start(self, label: str) -> None:
         if label in self._label_set:
             self._compute_start[label].record()
             self._has_compute[label] = False
+            self._mark_captured_if_recording_under_capture()
 
     def record_compute_end(self, label: str) -> None:
         if label in self._label_set:
             self._compute_end[label].record()
             self._has_compute[label] = True
+            self._mark_captured_if_recording_under_capture()
 
     def record_wait_start(self, label: str) -> None:
         if label in self._label_set:
             self._wait_start[label].record()
             self._has_wait[label] = False
+            self._mark_captured_if_recording_under_capture()
 
     def record_wait_end(self, label: str) -> None:
         if label in self._label_set:
             self._wait_end[label].record()
             self._has_wait[label] = True
+            self._mark_captured_if_recording_under_capture()
 
     def on_pass_start(self) -> None:
         """Called by the loader when the first trap is entered.
@@ -484,7 +503,7 @@ class OffloadTimingCollector:
         overwritten.  The previous pass is guaranteed to be complete at
         this point because the join event synced both streams.
 
-        Three branches cover the capture-mode permutations:
+        Branches cover the capture-mode permutations:
 
         1. **No pending pass** — first call after construction or after a
            finalize / reset. Nothing to finalize; just mark the new pass active.
@@ -495,15 +514,16 @@ class OffloadTimingCollector:
            target them; ``_pass_was_captured`` propagates the dirty-state
            flag through to the next eager boundary or
            :meth:`finalize_replay_pass`.
-        3. **Pending pass + not capturing** — normal case unless the
-           *previous* pass was captured. ``cudaEventElapsedTime`` on those
-           events returns ``cudaErrorInvalidValue`` because PyTorch's
-           CUDA-graph support leaves the host-side query path on
-           captured-and-replayed events unreliable. We detect that via
-           the ``_pass_was_captured`` flag and drop the dirty state
-           without reading events; the new pass starts fresh and records
-           cleanly. The captured pass's data is lost but the alternative
-           is a hard CUDA error mid-warmup.
+        3. **Pending captured pass + not capturing + internal events** —
+           ``cudaEventElapsedTime`` on those events is unreliable. Drop the
+           dirty state without reading; the new pass starts fresh.
+        4. **Pending captured pass + not capturing + external events** —
+           publish via :meth:`finalize_replay_pass` so ``_has_*`` stay set
+           for post-capture CUDA-graph measure replan. ``_finalize_pass``
+           would clear those maps and leave ``arm_replay_measure`` with an
+           empty trap set.
+        5. **Pending non-captured pass + not capturing** — normal
+           :meth:`_finalize_pass`.
         """
         if not self.enabled:
             return
@@ -519,6 +539,12 @@ class OffloadTimingCollector:
                     )
                     self._warned_drop_captured = True
                 self._reset_pass_state()
+            elif self._pass_was_captured and self._external_events:
+                # Keep _has_* / _pass_was_captured for graph-replay measure.
+                # If finalize refuses (e.g. empty trap maps), drop pending state
+                # so the new pass does not stick in a captured+active loop.
+                if not self.finalize_replay_pass():
+                    self._reset_pass_state()
             else:
                 self._finalize_pass()
         self._pass_active = True
@@ -731,11 +757,20 @@ class OffloadTimingCollector:
     def arm_replay_measure(self) -> None:
         """Ensure :meth:`finalize_replay_pass` records after CUDA-graph capture.
 
-        Capture should leave ``_pass_active`` set; call this if a prior eager
-        finalize cleared it so replay measure would otherwise no-op.
+        Capture should leave ``_pass_active`` / ``_has_*`` set; call this if a
+        prior finalize cleared ``_pass_active`` so replay measure would
+        otherwise no-op. Warns when trap maps are empty — measure cannot
+        succeed until graphs are recaptured with timing events recorded.
         """
-        if self.enabled:
-            self._pass_active = True
+        if not self.enabled:
+            return
+        self._pass_active = True
+        if not (self._has_transfer or self._has_wait or self._has_compute):
+            LOGGER.warning(
+                "OffloadTimingCollector: arm_replay_measure with no recorded trap "
+                "events — finalize_replay_pass will refuse until graphs are "
+                "recaptured (on_pass_start must not clear _has_* after capture)."
+            )
 
     def disarm_replay_measure(self) -> None:
         """Clear only ``_pass_active`` after a measure window finishes.

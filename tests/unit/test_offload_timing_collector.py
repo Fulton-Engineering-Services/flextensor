@@ -220,20 +220,71 @@ class TestOnPassStartCaptureBranch:
     def test_finalizes_when_prior_pass_was_captured_with_external_events(
         self, collector: OffloadTimingCollector
     ) -> None:
-        """External timing events are host-queryable after capture/replay."""
+        """External+captured uses finalize_replay_pass so _has_* survive replan."""
         collector._pass_active = True
         collector._pass_was_captured = True
         collector._external_events = True
         with (
             patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False),
+            patch.object(collector, "finalize_replay_pass", return_value=True) as finalize_replay,
             patch.object(collector, "_finalize_pass") as finalize,
             patch.object(collector, "_reset_pass_state") as reset,
         ):
             collector.on_pass_start()
 
-        finalize.assert_called_once_with()
+        finalize_replay.assert_called_once_with()
+        finalize.assert_not_called()
         reset.assert_not_called()
         assert collector._pass_active is True
+
+    def test_resets_when_external_captured_finalize_replay_refuses(self, collector: OffloadTimingCollector) -> None:
+        """Refused replay finalize must not leave sticky captured+active state."""
+        collector._pass_active = True
+        collector._pass_was_captured = True
+        collector._external_events = True
+        with (
+            patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False),
+            patch.object(collector, "finalize_replay_pass", return_value=False) as finalize_replay,
+            patch.object(collector, "_finalize_pass") as finalize,
+            patch.object(collector, "_reset_pass_state", wraps=collector._reset_pass_state) as reset,
+        ):
+            collector.on_pass_start()
+
+        finalize_replay.assert_called_once_with()
+        finalize.assert_not_called()
+        reset.assert_called_once_with()
+        assert collector._pass_active is True
+        assert collector._pass_was_captured is False
+
+    def test_external_captured_on_pass_start_preserves_maps_through_reset(
+        self, collector: OffloadTimingCollector
+    ) -> None:
+        """vLLM may enter traps after capture; maps must survive into replan."""
+        collector._pass_active = True
+        collector._pass_was_captured = True
+        collector._external_events = True
+        collector._has_compute["layer.0"] = True
+        collector._has_transfer["layer.0"] = True
+        with (
+            patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False),
+            patch.object(collector, "_read_pass_snapshot") as read_snapshot,
+        ):
+            read_snapshot.return_value = OffloadTimingSnapshot(
+                per_trap=(TrapTimingRecord(label="layer.0", compute_ms=1.0, transfer_ms=0.5),),
+            )
+            collector.on_pass_start()
+
+        assert collector._has_compute == {"layer.0": True}
+        assert collector._has_transfer == {"layer.0": True}
+        assert collector._pass_was_captured is True
+        collector.reset()
+        assert collector._has_compute == {"layer.0": True}
+        collector.arm_replay_measure()
+        with patch.object(collector, "_read_pass_snapshot") as read_snapshot:
+            read_snapshot.return_value = OffloadTimingSnapshot(
+                per_trap=(TrapTimingRecord(label="layer.0", compute_ms=1.0),),
+            )
+            assert collector.finalize_replay_pass(replay_generation=1) is True
 
 
 class TestResetForGraphReplan:
@@ -591,6 +642,53 @@ class TestFlushPendingEagerPass:
         collector.reset()
         assert collector._pass_active is True
         assert collector._has_compute == {"layer.0": True}
+
+    def test_record_under_capture_latches_pass_was_captured(self) -> None:
+        """Capture may begin after on_pass_start; record_* must still latch."""
+        with patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False):
+            collector = OffloadTimingCollector(trap_labels=["layer.0"], enabled=True, external_events=True)
+        collector._external_events = True
+        collector._pass_active = True
+        collector._pass_was_captured = False
+        with (
+            patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=True),
+            patch.object(collector._compute_end["layer.0"], "record"),
+        ):
+            collector.record_compute_end("layer.0")
+        assert collector._pass_was_captured is True
+        assert collector._has_compute["layer.0"] is True
+
+        collector.reset()
+        assert collector._pass_active is True
+        assert collector._has_compute == {"layer.0": True}
+        with patch.object(collector, "_read_pass_snapshot") as read_snapshot:
+            read_snapshot.return_value = OffloadTimingSnapshot(
+                per_trap=(TrapTimingRecord(label="layer.0", compute_ms=1.0),),
+            )
+            assert collector.finalize_replay_pass(replay_generation=1) is True
+
+    def test_record_under_capture_latches_even_without_external_events(self) -> None:
+        """Internal events must latch too so on_pass_start drops instead of finalize."""
+        with patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False):
+            collector = OffloadTimingCollector(trap_labels=["layer.0"], enabled=True, external_events=False)
+        collector._external_events = False
+        collector._pass_active = True
+        collector._pass_was_captured = False
+        with (
+            patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=True),
+            patch.object(collector._compute_end["layer.0"], "record"),
+        ):
+            collector.record_compute_end("layer.0")
+        assert collector._pass_was_captured is True
+
+        with (
+            patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False),
+            patch.object(collector, "_finalize_pass") as finalize,
+            patch.object(collector, "_reset_pass_state", wraps=collector._reset_pass_state) as reset,
+        ):
+            collector.on_pass_start()
+        finalize.assert_not_called()
+        reset.assert_called_once_with()
 
 
 class TestPublicCollectFlushBoundary:
