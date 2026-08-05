@@ -5,6 +5,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import torch
 
@@ -187,6 +188,17 @@ class Loader(ABC):
         Release resources and clean up allocations.
         """
         return None
+
+
+class TransferStreamSynchronizationError(RuntimeError):
+    """Transfer stream could not be quiesced safely during shutdown."""
+
+
+def _synchronize_transfer_stream(stream: Any) -> None:
+    try:
+        stream.synchronize()
+    except Exception as error:
+        raise TransferStreamSynchronizationError(str(error)) from error
 
 
 class _RawTensorDataBinder:
@@ -832,6 +844,19 @@ class TensorStrategyLoader(Loader):
         """
         return _compute_peak_memory_from_strategy(self.strategy_map, self.release_strategy_map, self.layer_stats)
 
+    def shutdown(self) -> None:
+        """Release constructor preloads and interrupted transfer state."""
+        _synchronize_transfer_stream(self.transfer_stream)
+        for tensor_id, gpu_tensor in self.cpu_to_gpu_map.items():
+            if tensor_id not in self._passthrough_preload_ids:
+                self.del_tensor(gpu_tensor)
+        self.cpu_to_gpu_map.clear()
+        self._passthrough_preload_ids.clear()
+        self.transfer_ongoing.clear()
+        self.scheduled_releases.clear()
+        self.transfer_events.clear()
+        self.scheduled_transfers.clear()
+
 
 @instrumentable
 class RawBlockController:
@@ -997,8 +1022,14 @@ class RawBlockController:
 
     def shutdown(self) -> None:
         """Release any resources associated with this controller."""
-        # Currently nothing explicit to free; method present for API compatibility.
-        return None
+        self.block_map_cpu.clear()
+        self.block_map_cpu_sizes.clear()
+        self.block_map_gpu.clear()
+        self.block_meta_map.clear()
+        self.label_to_cpu_tensor_id_map.clear()
+        self.gpu_block_view_map.clear()
+        self.label_to_tensor_views_map.clear()
+        self.tensor_id_to_view_map.clear()
 
     def release_gpu_blocks(self) -> None:
         """Drop every reference to this controller's GPU block allocations.
@@ -1174,9 +1205,16 @@ class AllocationBlockController:
         gpu_block_view = self.gpu_block_view_map[label]
         cpu_block.copy_to(gpu_block_view, non_blocking=non_blocking)
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         for block in self.block_map_cpu.values():
             block.release()
+        self.block_map_cpu.clear()
+        self.block_map_gpu.clear()
+        self.label_to_gpu_block.clear()
+        self.gpu_block_view_map.clear()
+        self.label_to_tensor_views_map.clear()
+        self.label_to_cpu_tensor_id_map.clear()
+        self.tensor_id_to_view_map.clear()
 
     def release_gpu_blocks(self) -> None:
         """Drop every reference to this controller's GPU block allocations.
@@ -1485,6 +1523,10 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
     def release_memory(self):
         pass
 
+    def shutdown(self) -> None:
+        _synchronize_transfer_stream(self.transfer_stream)
+        super().shutdown()
+
 
 @instrumentable
 class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
@@ -1710,3 +1752,7 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
     def release_memory(self):
         pass
+
+    def shutdown(self) -> None:
+        _synchronize_transfer_stream(self.transfer_stream)
+        super().shutdown()

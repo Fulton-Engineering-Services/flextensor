@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   :func:`~flextensor.update_state`; see
   [torch.compile](docs/how-to/torch-compile.md)).
 - `TensorManager.plan_state_adoption()` for read-only, capacity-safe saved-state adoption planning.
+- `offload_from_state()` for adopting a matching in-memory state and entering inference
+  without discovery or profiling.
 
 ## [0.3.0] — 2026-07-29
 

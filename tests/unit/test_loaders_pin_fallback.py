@@ -21,7 +21,12 @@ from flextensor import host_pinning
 from flextensor.allocation_block import AllocationBlock
 from flextensor.collectors import TensorStatistics
 from flextensor.host_pinning import HostPinner, HostPinRegistry
-from flextensor.loaders import AllocationBlockController, RawBlockController
+from flextensor.loaders import (
+    AllocationBlockController,
+    PreallocatedBatchTransferTensorLoader,
+    RawBlockController,
+    TensorStrategyLoader,
+)
 
 
 def _failing_pinner() -> HostPinner:
@@ -209,3 +214,71 @@ def test_allocation_block_controller_shutdown_does_not_unregister_pins(monkeypat
     pinner.release_all()
     assert len(pinner.registry) == 0
     assert len(cudart.unregister_calls) == 3
+
+
+@pytest.mark.parametrize("controller_type", [RawBlockController, AllocationBlockController])
+def test_block_controller_shutdown_drops_owned_storage_maps(controller_type):
+    controller = controller_type.__new__(controller_type)
+    controller.block_map_cpu = {}
+    controller.block_map_gpu = {0: torch.ones(1)}
+    controller.gpu_block_view_map = {"layer": torch.ones(1)}
+    controller.label_to_tensor_views_map = {"layer": [torch.ones(1)]}
+    controller.label_to_cpu_tensor_id_map = {"layer": [1]}
+    controller.tensor_id_to_view_map = {1: torch.ones(1)}
+    if controller_type is RawBlockController:
+        controller.block_map_cpu_sizes = {"layer": 4}
+        controller.block_meta_map = {"layer": []}
+    else:
+        controller.label_to_gpu_block = {"layer": 0}
+
+    controller.shutdown()
+
+    assert controller.block_map_gpu == {}
+    assert controller.gpu_block_view_map == {}
+    assert controller.label_to_tensor_views_map == {}
+    assert controller.label_to_cpu_tensor_id_map == {}
+    assert controller.tensor_id_to_view_map == {}
+    if controller_type is RawBlockController:
+        assert controller.block_map_cpu_sizes == {}
+        assert controller.block_meta_map == {}
+    else:
+        assert controller.label_to_gpu_block == {}
+
+
+def test_strategy_loader_shutdown_drops_preloads_and_transfer_state():
+    events = []
+    released = []
+    owned = torch.ones(1)
+    passthrough = torch.ones(1)
+    loader = TensorStrategyLoader.__new__(TensorStrategyLoader)
+    loader.transfer_stream = type("Stream", (), {"synchronize": lambda _self: events.append("synchronize")})()
+    loader.cpu_to_gpu_map = {1: owned, 2: passthrough}
+    loader._passthrough_preload_ids = {2}
+    loader.del_tensor = released.append
+    loader.transfer_ongoing = {1}
+    loader.scheduled_releases = {"layer": object()}
+    loader.transfer_events = {1: object()}
+    loader.scheduled_transfers = {"layer": object()}
+
+    loader.shutdown()
+
+    assert events == ["synchronize"]
+    assert len(released) == 1
+    assert released[0] is owned
+    assert loader.cpu_to_gpu_map == {}
+    assert loader._passthrough_preload_ids == set()
+    assert loader.transfer_ongoing == set()
+    assert loader.scheduled_releases == {}
+    assert loader.transfer_events == {}
+    assert loader.scheduled_transfers == {}
+
+
+def test_preallocated_loader_shutdown_synchronizes_before_releasing_blocks():
+    events = []
+    loader = PreallocatedBatchTransferTensorLoader.__new__(PreallocatedBatchTransferTensorLoader)
+    loader.transfer_stream = type("Stream", (), {"synchronize": lambda _self: events.append("synchronize")})()
+    loader.allocation_controller = type("Controller", (), {"shutdown": lambda _self: events.append("shutdown")})()
+
+    loader.shutdown()
+
+    assert events == ["synchronize", "shutdown"]

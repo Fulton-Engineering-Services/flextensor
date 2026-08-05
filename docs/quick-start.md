@@ -128,6 +128,16 @@ model = flextensor.offload_from_profile(
 `offload_from_profile` combines `init`, `load_profile`, and `offload` into a single call —
 the model is ready for inference immediately with no discovery or profiling overhead.
 
+Integrations that already hold a matching in-memory `TensorManagerState` can avoid
+filesystem profile loading:
+
+```python
+model = flextensor.offload_from_state(model, state, config=config)
+```
+
+State adoption may move and pin the model's existing storage, but preserves model,
+module, and parameter identity. It returns the standard offload proxy ready for inference.
+
 ## Verify It's Working
 
 ```python

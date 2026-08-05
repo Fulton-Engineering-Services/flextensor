@@ -14,6 +14,7 @@ rather than constructing one directly.
         - init
         - set_config
         - offload
+        - offload_from_state
         - offload_block
         - get_gpu_memory_usage
         - save_profile

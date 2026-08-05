@@ -16,8 +16,6 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar, runtime_chec
 
 if TYPE_CHECKING:
     from flextensor.collectors import LayerStatistics
-    from flextensor.state_handler import TensorManagerState
-
 import psutil
 import torch
 from proxytypes3 import ObjectWrapper
@@ -40,6 +38,7 @@ from flextensor.offload_timing import (
     OffloadTimingReport,
     format_offload_timing_table,
 )
+from flextensor.state_handler import TensorManagerState  # noqa: TC001 — beartype resolves annotations at runtime
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.tensor_discovery import (
     has_offload_modules,
@@ -51,10 +50,15 @@ from flextensor.types import GPUMemoryUsage  # noqa: TC001
 from flextensor.utils import (
     get_class_matched_module_paths,
     get_module_paths,
+    get_tensor_data,
     matches_any_class_pattern,
     matches_any_pattern,
     partition_patterns,
+    set_tensor_data,
 )
+
+if TYPE_CHECKING:
+    from flextensor.state_transition import StateTransitionPlan
 
 LOGGER = logging.getLogger(__name__)
 _GiB = 1 << 30
@@ -252,6 +256,11 @@ class TensorManagerProtocol(Protocol):
     def initialize_profile(self) -> nn.Module: ...
     def initialize_inference(self) -> nn.Module: ...
     def restore_state(self, model: nn.Module, state: TensorManagerState) -> None: ...
+    def plan_state_adoption(self, model: nn.Module, state: TensorManagerState) -> StateTransitionPlan: ...
+    def execute_state_adoption(self, model: nn.Module, plan: StateTransitionPlan) -> None: ...
+    def restore_adopted_state(self, model: nn.Module, state: TensorManagerState) -> None: ...
+    def prepare_infer_load_mode(self) -> None: ...
+    def prepare_final_model(self, model: nn.Module, *, in_place: bool = False) -> nn.Module: ...
     def save_profile(self, profile_directory: str) -> None: ...
     def load_profile(self, profile_directory: str, model: nn.Module) -> None: ...
     def get_gpu_memory_usage(self) -> GPUMemoryUsage: ...
@@ -491,6 +500,10 @@ class OffloadManager:
         # When True, the caller drives :meth:`update_state` after each CUDA-graph
         # replay (forward hooks do not run under ``graph.replay()``).
         self._manual_update_state = False
+        self._state_takeover_active = False
+        self._cleanup_blocked = False
+        # Keep post-migration data alive when failed takeover cleanup cannot rebind its parameters.
+        self._failed_state_takeover_parameter_data: list[tuple[nn.Parameter, torch.Tensor]] = []
 
     @property
     def compiled_offload_manager_id(self) -> int:
@@ -1594,11 +1607,144 @@ class OffloadManager:
         profile_component = self.eager_profiling_iters
         return discovery_component + profile_component + self._compiled.extra_iters_before_inference()
 
-    def init(self, config: OffloadConfig | None = None):
+    def init(self, config: OffloadConfig | None = None) -> None:
+        if self._cleanup_blocked:
+            raise RuntimeError("Manager cleanup is incomplete; retained resources cannot be reused safely.")
         if config is not None:
             self.set_config(config)
         if self._tensor_manager is None:
             self._initialize_tensor_manager()
+
+    @_error_boundary
+    def offload_from_state(
+        self,
+        model: nn.Module,
+        state: TensorManagerState,
+        config: OffloadConfig | None = None,
+    ) -> nn.Module:
+        """Adopt a saved state and return the offloaded model proxy.
+
+        If this method raises, cleanup preserves storage ownership and removes
+        FlexTensor modifications where possible, but does not roll back storage
+        placement. The input model is not guaranteed usable and must be discarded.
+        """
+        if self._cleanup_blocked:
+            raise RuntimeError("Manager cleanup is incomplete; retained resources cannot be reused safely.")
+        if self._state_takeover_active or self._current_phase != OffloadPhase.NOT_INITIALIZED:
+            raise RuntimeError("OffloadManager is already active; call release() before adopting another state.")
+        if is_torch_compiled_module(model):
+            raise RuntimeError("Cannot adopt state into a compiled model; use the eager model first.")
+
+        self._manual_update_state = False
+        effective_config = config if config is not None else self.config
+        self._compiled.resolve_activation(effective_config, None)
+        self.init(config)
+        if self._tensor_manager is None:
+            raise RuntimeError("Tensor manager initialization failed")
+        self._compiled.arm_non_destructive_first_loader()
+
+        try:
+            plan = self._tensor_manager.plan_state_adoption(model, state)
+        except Exception:
+            self._cleanup_failed_state_takeover(model, [])
+            raise
+
+        # Loaders may replace or empty Parameter.data while taking ownership.
+        # Retain the bounded post-migration homes until setup commits.
+        migrated_parameter_data: list[tuple[nn.Parameter, torch.Tensor]] = []
+        try:
+            self._tensor_manager.execute_state_adoption(model, plan)
+            self._state_takeover_active = True
+            for parameter in model.parameters():
+                migrated_parameter_data.append((parameter, get_tensor_data(parameter)))
+            self._tensor_manager.restore_adopted_state(model, state)
+            self._tensor_manager.prepare_infer_load_mode()
+
+            self._model = model
+            self._offload_modules(model, self.config.include_patterns)
+            self._exclude_modules(model, self.config.exclude_patterns)
+            self._check_no_modules_patched()
+
+            final_model = self._tensor_manager.prepare_final_model(model, in_place=True)
+            self._tensor_manager.set_model(final_model)
+            final_model = self._tensor_manager.initialize_inference()
+            self._swap_to_new_model(final_model, OffloadPhase.INFERENCE)
+            self._install_compiled_forwards()
+            self._compiled.on_enter_inference()
+            if self._model_proxy is None:
+                self._model_proxy = OffloadModelProxy(self._model, self)
+            return self._model_proxy
+        except Exception:
+            self._cleanup_failed_state_takeover(model, migrated_parameter_data)
+            raise
+
+    def _cleanup_failed_state_takeover(  # noqa: C901
+        self,
+        model: nn.Module,
+        migrated_parameter_data: list[tuple[nn.Parameter, torch.Tensor]],
+    ) -> None:
+        """Drop setup resources without rolling back completed migrations."""
+        self._compiled.teardown()
+        if self._state_hook_handle is not None:
+            _safe_remove_hook_handle(self._state_hook_handle, context="failed state takeover")
+            self._state_hook_handle = None
+        for module in model.modules():
+            hooks = getattr(module, "_forward_hooks", None)
+            if hooks is None:
+                continue
+            for hook_id, hook in list(hooks.items()):
+                if getattr(hook, "_ft_state_update_hook", False):
+                    hooks.pop(hook_id, None)
+
+        unrestored_modules = []
+        for module in reversed(self._patched_modules):
+            try:
+                self._restore_module_forward(module)
+            except Exception:
+                unrestored_modules.append(module)
+                LOGGER.exception("Failed-state-takeover cleanup could not restore a module forward")
+        self._patched_modules[:] = reversed(unrestored_modules)
+
+        ownership_restored = True
+        for parameter, migrated_data in migrated_parameter_data:
+            try:
+                set_tensor_data(parameter, migrated_data)
+            except Exception:
+                ownership_restored = False
+                LOGGER.exception("Failed-state-takeover cleanup could not restore post-migration parameter data")
+
+        tensor_manager = self._tensor_manager
+        cleanup_complete = ownership_restored and not self._patched_modules
+        if cleanup_complete and tensor_manager is not None:
+            try:
+                tensor_manager.release_memory()
+            except Exception:
+                cleanup_complete = False
+                LOGGER.exception("Failed-state-takeover release_memory cleanup failed; preserving the original error")
+            if cleanup_complete:
+                try:
+                    tensor_manager.shutdown()
+                except Exception:
+                    cleanup_complete = False
+                    LOGGER.exception("Failed-state-takeover shutdown cleanup failed; preserving the original error")
+        if not cleanup_complete:
+            LOGGER.error(
+                "Failed-state-takeover cleanup retained TensorManager resources because parameter ownership "
+                "or resource teardown could not be completed; restart the process after reporting this error."
+            )
+
+        self._tensor_manager = None if cleanup_complete else tensor_manager
+        self._cleanup_blocked = not cleanup_complete
+        self._failed_state_takeover_parameter_data = [] if cleanup_complete else migrated_parameter_data
+        self._initialized = False
+        self._current_phase = OffloadPhase.NOT_INITIALIZED
+        self._iteration_count = 0
+        if cleanup_complete:
+            self._model_proxy = None
+            self._model = None
+        else:
+            self._model = model
+        self._state_takeover_active = False
 
     def offload(
         self,
@@ -1994,20 +2140,42 @@ class OffloadManager:
         with self._tensor_manager.pause_profiling():
             yield
 
-    def release(self):
+    def release(self) -> None:  # noqa: C901
+        if self._cleanup_blocked:
+            raise RuntimeError(
+                "Manager cleanup is incomplete; TensorManager resources remain retained and cannot be released safely."
+            )
         # Undo any compile_fn substitutions and tear down the compiled-offload
         # tail before restoring forwards, so the model is left as it was handed in.
         self._manual_update_state = False
         self._compiled.teardown()
 
-        # Restore original forward methods for all patched modules
-        for module in self._patched_modules:
-            self._restore_module_forward(module)
+        if self._tensor_manager is not None:
+            teardown_error: Exception | None = None
+            try:
+                self._tensor_manager.release_memory()
+            except Exception as error:
+                teardown_error = error
+            try:
+                self._tensor_manager.shutdown()
+            except Exception as error:
+                if teardown_error is None:
+                    teardown_error = error
+            if teardown_error is not None:
+                self._cleanup_blocked = True
+                raise teardown_error
+
+        # Do not remove transfer traps until their manager has released every
+        # storage owner successfully.
+        try:
+            for module in self._patched_modules:
+                self._restore_module_forward(module)
+        except Exception:
+            self._cleanup_blocked = True
+            raise
         self._patched_modules.clear()
 
         if self._tensor_manager is not None:
-            self._tensor_manager.release_memory()
-            self._tensor_manager.shutdown()
             self._tensor_manager = None
         # Nothing has captured a value any more; the next offload() re-snapshots.
         self._tensor_manager_oneshot_snapshot = {}
@@ -2019,6 +2187,8 @@ class OffloadManager:
         self._current_phase = OffloadPhase.NOT_INITIALIZED
         self._model_proxy = None
         self._model = None
+        self._state_takeover_active = False
+        self._failed_state_takeover_parameter_data.clear()
         if self._state_hook_handle is not None:
             _safe_remove_hook_handle(self._state_hook_handle, context="release()")
             self._state_hook_handle = None
@@ -2241,6 +2411,34 @@ def load_profile(
     """
     om = get_offload_manager(name)
     om.load_profile(profile_directory, model)
+
+
+def offload_from_state(
+    model: nn.Module,
+    state: TensorManagerState,
+    config: OffloadConfig | None = None,
+    name: str = DEFAULT_MANAGER_NAME,
+) -> nn.Module:
+    """Adopt an in-memory tensor-manager state and enter inference.
+
+    The state must describe ``model`` and use the transfer mode selected by
+    ``config``. Storage placement is adopted before loader metadata is restored;
+    the model and its modules keep their identity.
+
+    If this function raises, cleanup preserves storage ownership and removes
+    FlexTensor modifications where possible, but does not roll back storage
+    placement. The input model is not guaranteed usable and must be discarded.
+
+    Args:
+        model: Eager model matching the saved state.
+        state: Validated state to adopt.
+        config: Offload configuration. Uses the manager's current configuration when omitted.
+        name: Offload manager name.
+
+    Returns:
+        An inference-ready proxy for ``model``.
+    """
+    return get_offload_manager(name).offload_from_state(model, state, config=config)
 
 
 def offload_from_profile(

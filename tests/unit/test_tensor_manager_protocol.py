@@ -4,6 +4,7 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from flextensor.collectors import LayerStatistics, TensorStatistics
@@ -13,7 +14,7 @@ from flextensor.state_handler import TensorManagerState
 from flextensor.tensor_manager import TensorManager
 
 
-def _make_tensor_manager() -> TensorManager:
+def _make_tensor_manager(*, loader_type: str = "allocation_block_transfer") -> TensorManager:
     """Create a fresh TensorManager without requiring CUDA hardware."""
     with (
         patch("torch.cuda.is_available", return_value=False),
@@ -23,6 +24,7 @@ def _make_tensor_manager() -> TensorManager:
             device_gpu="cpu",
             tensor_manager_load_strategy=MagicMock(),
             pinned_memory=False,
+            loader_type=loader_type,
         )
 
 
@@ -116,3 +118,102 @@ def test_noop_tensor_manager_profile_restore_paths_associate_model() -> None:
     assert manager.initialize_warmup() is loaded_model
     assert manager.initialize_profile() is loaded_model
     assert manager.initialize_inference() is loaded_model
+
+
+class _SharedModuleModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        shared = torch.nn.Linear(2, 2)
+        self.left = shared
+        self.right = shared
+        self.register_buffer("constant", torch.ones(2))
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.right(self.left(inputs))
+
+
+class _RejectClassRestoreModel(_SharedModuleModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.reject_class_restore = False
+
+    def __setattr__(self, name, value):
+        if name == "__class__" and self.__dict__.get("reject_class_restore", False):
+            raise RuntimeError("class restoration failed")
+        super().__setattr__(name, value)
+
+
+def test_prepare_final_model_in_place_preserves_identity_and_shutdown_restores_classes() -> None:
+    manager = _make_tensor_manager(loader_type="strategy")
+    model = _SharedModuleModel()
+    modules_before = {name: id(module) for name, module in model.named_modules()}
+    classes_before = {id(module): type(module) for module in model.modules()}
+    parameters_before = {name: id(parameter) for name, parameter in model.named_parameters()}
+
+    final_model = manager.prepare_final_model(model, in_place=True)
+
+    assert final_model is model
+    assert {name: id(module) for name, module in model.named_modules()} == modules_before
+    assert {name: id(parameter) for name, parameter in model.named_parameters()} == parameters_before
+    assert model.left is model.right
+    assert type(model.left) is not classes_before[id(model.left)]
+    assert isinstance(model.left, classes_before[id(model.left)])
+
+    manager.shutdown()
+    assert all(type(module) is classes_before[id(module)] for module in model.modules())
+
+
+def test_shutdown_restores_in_place_classes_even_when_loader_shutdown_fails() -> None:
+    manager = _make_tensor_manager(loader_type="strategy")
+    model = _SharedModuleModel()
+    classes_before = {id(module): type(module) for module in model.modules()}
+    manager.prepare_final_model(model, in_place=True)
+    manager.tensor_layer_loader = MagicMock()
+    manager.tensor_layer_loader.shutdown.side_effect = RuntimeError("loader teardown failed")
+
+    with pytest.raises(RuntimeError, match="loader teardown failed"):
+        manager.shutdown()
+
+    assert all(type(module) is classes_before[id(module)] for module in model.modules())
+
+
+def test_shutdown_restores_classes_before_loader_teardown() -> None:
+    manager = _make_tensor_manager(loader_type="strategy")
+    model = _SharedModuleModel()
+    classes_before = {id(module): type(module) for module in model.modules()}
+    manager.prepare_final_model(model, in_place=True)
+    manager.tensor_layer_loader = MagicMock()
+
+    def assert_classes_restored():
+        assert all(type(module) is classes_before[id(module)] for module in model.modules())
+
+    manager.tensor_layer_loader.shutdown.side_effect = assert_classes_restored
+
+    manager.shutdown()
+
+    manager.tensor_layer_loader.shutdown.assert_called_once()
+
+
+def test_failed_class_restoration_remains_tracked_and_aborts_loader_teardown() -> None:
+    manager = _make_tensor_manager(loader_type="strategy")
+    model = _RejectClassRestoreModel()
+    original_class = type(model)
+    manager.prepare_final_model(model, in_place=True)
+    manager.tensor_layer_loader = MagicMock()
+    model.reject_class_restore = True
+
+    with pytest.raises(RuntimeError, match="class restoration failed"):
+        manager.shutdown()
+
+    manager.tensor_layer_loader.shutdown.assert_not_called()
+    assert manager._in_place_original_classes == {model: original_class}
+
+    model.reject_class_restore = False
+    manager.shutdown()
+    assert manager._in_place_original_classes == {}
+    manager.tensor_layer_loader.shutdown.assert_called_once()
+
+
+def test_noop_prepare_final_model_accepts_in_place() -> None:
+    model = _SharedModuleModel()
+    assert NoOpTensorManager(device_gpu="cpu").prepare_final_model(model, in_place=True) is model

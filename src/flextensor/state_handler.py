@@ -9,7 +9,7 @@ import pathlib
 import struct
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar
 
 import torch
 
@@ -22,7 +22,7 @@ from flextensor.tensor_processors import (
     compute_reachable_tensor_map,
     preprocess_model,
 )
-from flextensor.utils import atomic_write_json
+from flextensor.utils import atomic_write_json, get_tensor_data, set_tensor_data
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +30,6 @@ logger = logging.getLogger(__name__)
 def _get_live_storage_key(name: str, tensor: torch.Tensor) -> tuple[str, int, int]:
     storage_key, nbytes, _pinned = _inspect_storage(name, tensor)
     return storage_key[0], storage_key[1], nbytes
-
-
-def _set_tensor_data(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
-    """Replace a tensor's data while bypassing subclass property overrides."""
-    cast("Any", torch.Tensor.data).__set__(tensor, replacement)
 
 
 def _copy_storage_to_device(source_bytes: torch.Tensor, destination_device: str) -> torch.Tensor:
@@ -46,7 +41,7 @@ def _rebind_storage_group(tensors: list[torch.Tensor], destination_bytes: torch.
     destination_storage = destination_bytes.untyped_storage()
     staged_views: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     for tensor in tensors:
-        original_view = cast("Any", torch.Tensor.data).__get__(tensor, torch.Tensor)
+        original_view = get_tensor_data(tensor)
         replacement_view = torch.empty(0, dtype=tensor.dtype, device=destination_bytes.device)
         torch.Tensor.set_(
             replacement_view,
@@ -65,7 +60,7 @@ def _rebind_storage_group(tensors: list[torch.Tensor], destination_bytes: torch.
     try:
         with torch.no_grad():
             for tensor, original_view, replacement_view in staged_views:
-                _set_tensor_data(tensor, replacement_view)
+                set_tensor_data(tensor, replacement_view)
                 rebound.append((tensor, original_view))
                 names = getattr(original_view, "names", None)
                 rename = getattr(tensor, "rename_", None)
@@ -76,7 +71,7 @@ def _rebind_storage_group(tensors: list[torch.Tensor], destination_bytes: torch.
         with torch.no_grad():
             for tensor, original_view in reversed(rebound):
                 try:
-                    _set_tensor_data(tensor, original_view)
+                    set_tensor_data(tensor, original_view)
                 except Exception as rollback_error:
                     rollback_errors.append(rollback_error)
         if rollback_errors:

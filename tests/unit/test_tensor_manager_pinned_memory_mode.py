@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -15,6 +16,12 @@ from flextensor import host_pinning
 from flextensor import tensor_manager as tm_module
 from flextensor.collectors import TensorStatistics
 from flextensor.host_pinning import HostPinRegistry
+from flextensor.loaders import (
+    PreallocatedBatchTransferTensorLoader,
+    PreallocatedBatchTransferTensorLoaderReordered,
+    PreallocatedLoader,
+    TensorStrategyLoader,
+)
 from flextensor.state_handler import LoaderInputData
 from flextensor.strategy import GreedyStrategy
 from flextensor.tensor_manager import TensorManager
@@ -317,6 +324,60 @@ def test_shutdown_releases_pins_when_loader_shutdown_raises(_fake_cudart_availab
 
     failing_loader.shutdown.assert_called_once()
     assert len(registry) == 0
+
+
+def test_shutdown_propagates_release_all_failure_when_loader_succeeds(_fake_cudart_available) -> None:
+    tm = _make_manager(pinned_memory_mode="host_register")
+    tm.tensor_layer_loader = MagicMock()
+    tm.host_pinner = MagicMock()
+    tm.host_pinner.release_all.side_effect = RuntimeError("pin release failed")
+
+    with pytest.raises(RuntimeError, match="pin release failed"):
+        tm.shutdown()
+
+
+def test_preallocated_base_shutdown_does_not_require_transfer_stream() -> None:
+    events = []
+    loader = SimpleNamespace(allocation_controller=SimpleNamespace(shutdown=lambda: events.append("shutdown")))
+
+    PreallocatedLoader.shutdown(loader)
+
+    assert events == ["shutdown"]
+
+
+@pytest.mark.parametrize(
+    "loader_type",
+    [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+)
+def test_shutdown_synchronizes_preallocated_loader_once(loader_type) -> None:
+    events = []
+    tm = _make_manager(pinned_memory=False)
+    loader = loader_type.__new__(loader_type)
+    loader.transfer_stream = SimpleNamespace(synchronize=lambda: events.append("synchronize"))
+    loader.allocation_controller = SimpleNamespace(shutdown=lambda: events.append("shutdown"))
+    tm.tensor_layer_loader = loader
+
+    tm.shutdown()
+
+    assert events == ["synchronize", "shutdown"]
+
+
+@pytest.mark.parametrize("loader_type", [TensorStrategyLoader, PreallocatedBatchTransferTensorLoader])
+def test_shutdown_transfer_sync_failure_retains_pins(_fake_cudart_available, loader_type) -> None:
+    tm = _make_manager(pinned_memory_mode="host_register")
+    registry = tm.host_pin_registry
+    assert registry is not None
+    registry.pin_in_place(torch.zeros(16, dtype=torch.uint8))
+
+    loader = loader_type.__new__(loader_type)
+    loader.transfer_stream = MagicMock()
+    loader.transfer_stream.synchronize.side_effect = RuntimeError("transfer sync failed")
+    tm.tensor_layer_loader = loader
+
+    with pytest.raises(RuntimeError, match="transfer sync failed"):
+        tm.shutdown()
+
+    assert len(registry) == 1
 
 
 def test_shutdown_loader_exception_not_masked_when_release_all_also_raises(_fake_cudart_available, caplog) -> None:

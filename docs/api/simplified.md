@@ -47,6 +47,10 @@ These wrap the [`OffloadManager`](offload-manager.md) singleton for common use c
     options:
       show_root_full_path: false
 
+::: flextensor.offload_manager.offload_from_state
+    options:
+      show_root_full_path: false
+
 ::: flextensor.offload_manager.release
     options:
       show_root_full_path: false

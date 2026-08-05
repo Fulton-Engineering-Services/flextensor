@@ -1686,7 +1686,7 @@ def test_execute_stages_cross_device_replacements_on_destination(monkeypatch) ->
     )
     monkeypatch.setattr(
         state_handler_module,
-        "_set_tensor_data",
+        "set_tensor_data",
         lambda _tensor, replacement: replacements.append(replacement),
     )
     monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
@@ -1973,7 +1973,7 @@ def test_execute_rolls_back_current_alias_group_when_rebind_fails(monkeypatch) -
         gpu_available_bytes=1024,
         gpu_reserve_bytes=0,
     )
-    original_set_data = state_handler_module._set_tensor_data  # noqa: SLF001
+    original_set_data = state_handler_module.set_tensor_data
     set_data_calls = 0
     source_key = _storage_impl_key(model.first)
     values_before = {name: tensor.detach().clone() for name, tensor in model.named_parameters()}
@@ -1985,7 +1985,7 @@ def test_execute_rolls_back_current_alias_group_when_rebind_fails(monkeypatch) -
             raise RuntimeError("injected alias rebind failure")
         original_set_data(tensor, replacement)
 
-    monkeypatch.setattr(state_handler_module, "_set_tensor_data", fail_second_rebind)
+    monkeypatch.setattr(state_handler_module, "set_tensor_data", fail_second_rebind)
 
     with pytest.raises(RuntimeError, match="injected alias rebind failure"):
         handler.execute_state_adoption(model, plan)

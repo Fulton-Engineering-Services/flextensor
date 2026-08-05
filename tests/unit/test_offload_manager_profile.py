@@ -18,7 +18,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from flextensor.offload_manager import OffloadConfig, OffloadManager
+import flextensor
+from flextensor import custom_ops
+from flextensor.collectors import LayerStatistics, TensorStatistics
+from flextensor.loaders import PreallocatedLoader
+from flextensor.offload_manager import OffloadConfig, OffloadManager, OffloadModelProxy, OffloadPhase
+from flextensor.state_handler import TensorManagerState
+from flextensor.state_transition import StateTransitionPlan
+from flextensor.tensor_manager import TensorManager
 
 
 class SimpleModel(torch.nn.Module):
@@ -32,6 +39,19 @@ class SimpleModel(torch.nn.Module):
     def forward(self, x):
         x = self.linear1(x)
         return self.linear2(x)
+
+
+class _RejectDataAssignmentParameter(torch.nn.Parameter):
+    def __new__(cls, data: torch.Tensor) -> "_RejectDataAssignmentParameter":
+        return super().__new__(cls, data, requires_grad=False)
+
+    @property
+    def data(self) -> torch.Tensor:
+        return torch.Tensor.data.__get__(self, type(self))
+
+    @data.setter
+    def data(self, _value: torch.Tensor) -> None:
+        raise RuntimeError("custom parameter rejects .data assignment")
 
 
 class MockTensorManagerState:
@@ -59,6 +79,62 @@ class MockTensorManagerState:
             "gpu_tensors_names": [],
             "shm_block_name_map": None,
         }
+
+
+def _state_for_model(model: torch.nn.Module) -> TensorManagerState:
+    tensors = list(model.named_parameters())
+    stats = [
+        TensorStatistics(
+            tensor_id=index,
+            name=name,
+            size_bytes=tensor.numel() * tensor.element_size(),
+            load_time_ms=0.0,
+        )
+        for index, (name, tensor) in enumerate(tensors)
+    ]
+    return TensorManagerState(
+        loader_type="strategy",
+        tensor_id_to_name_map={stat.tensor_id: stat.name for stat in stats},
+        allocation_ordered={},
+        label_to_size_map={},
+        block_sizes={},
+        load_strategy={"linear": stats},
+        release_strategy={"linear": stats},
+        label_to_block_id={},
+        stats=[LayerStatistics(label="linear", tensors=stats, duration=1.0)],
+        transfer_to_compute_map={},
+        view_tensors_ids=[],
+        view_tensors_names=[],
+        gpu_tensors_names=[],
+        shm_block_name_map=None,
+    )
+
+
+def _takeover_state_for_model(model: torch.nn.Module, loader_type: str) -> TensorManagerState:
+    state = _state_for_model(model)
+    state.loader_type = loader_type
+    if loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
+        stats = state.load_strategy["linear"]
+        state.release_strategy = {}
+        state.view_tensors_ids = [stat.tensor_id for stat in stats]
+        state.view_tensors_names = [stat.name for stat in stats]
+        state.allocation_ordered = {0: ["linear"]}
+        state.label_to_size_map = {"linear": sum(stat.size_bytes for stat in stats)}
+        state.block_sizes = {0: sum(stat.size_bytes for stat in stats)}
+        state.label_to_block_id = {"linear": 0}
+        state.transfer_to_compute_map = {"linear": "linear"}
+    return state
+
+
+def _takeover_tensor_manager(loader_type: str) -> TensorManager:
+    with patch("torch.cuda.Event", return_value=MagicMock()):
+        return TensorManager(
+            device_gpu=torch.device("cpu"),
+            tensor_manager_load_strategy=MagicMock(),
+            pinned_memory=False,
+            loader_type=loader_type,
+            include_patterns=["linear1"],
+        )
 
 
 class TestOffloadManagerSaveProfile:
@@ -615,6 +691,582 @@ class TestModuleLevelProfileFunctions:
         load_profile(profile_dir)
 
         mock_om.load_profile.assert_called_once_with(profile_dir, None)
+
+
+class TestOffloadFromState:
+    @patch("flextensor.offload_manager.get_offload_manager")
+    def test_module_level_api_delegates_to_named_manager(self, mock_get_om):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        config = OffloadConfig(include_patterns=["linear1"])
+        final_model = SimpleModel()
+        manager = MagicMock()
+        manager.offload_from_state.return_value = final_model
+        mock_get_om.return_value = manager
+
+        result = flextensor.offload_from_state(model, state, config=config, name="adopted")
+
+        mock_get_om.assert_called_once_with("adopted")
+        manager.offload_from_state.assert_called_once_with(model, state, config=config)
+        assert result is final_model
+
+    def test_manager_runs_takeover_in_order_and_rejects_a_second_active_call(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        config = OffloadConfig(include_patterns=["linear1"], exclude_patterns=["linear2"])
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        events: list[str] = []
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.side_effect = lambda *_: (events.append("plan"), plan)[1]
+        tensor_manager.execute_state_adoption.side_effect = lambda *_: events.append("execute")
+        tensor_manager.restore_adopted_state.side_effect = lambda *_: events.append("restore")
+        tensor_manager.prepare_infer_load_mode.side_effect = lambda: events.append("loader")
+        tensor_manager.prepare_final_model.side_effect = lambda candidate, **_: (
+            events.append("finalize"),
+            candidate,
+        )[1]
+        tensor_manager.set_model.side_effect = lambda *_: events.append("set_model")
+        final_model = SimpleModel()
+        tensor_manager.initialize_inference.side_effect = lambda: (events.append("publish"), final_model)[1]
+        manager = OffloadManager("adopted")
+        manager._tensor_manager = tensor_manager
+        manager._offload_modules = MagicMock(side_effect=lambda *_: events.append("patch"))
+        manager._exclude_modules = MagicMock(side_effect=lambda *_: events.append("exclude"))
+        manager._check_no_modules_patched = MagicMock()
+
+        result = manager.offload_from_state(model, state, config=config)
+
+        assert isinstance(result, OffloadModelProxy)
+        assert result.__subject__ is final_model
+        assert result.offload_manager is manager
+        assert events == [
+            "plan",
+            "execute",
+            "restore",
+            "loader",
+            "patch",
+            "exclude",
+            "finalize",
+            "set_model",
+            "publish",
+        ]
+        tensor_manager.execute_state_adoption.assert_called_once_with(model, plan)
+        tensor_manager.prepare_final_model.assert_called_once_with(model, in_place=True)
+        assert manager.model is final_model
+        assert manager._current_phase is OffloadPhase.INFERENCE
+
+        with pytest.raises(RuntimeError, match="already active"):
+            manager.offload_from_state(model, state, config=config)
+        tensor_manager.plan_state_adoption.assert_called_once()
+
+    def test_external_compile_config_installs_the_adopted_loader(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        loader = MagicMock(spec=PreallocatedLoader)
+        tensor_manager = MagicMock()
+        tensor_manager.tensor_layer_loader = loader
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.prepare_final_model.return_value = model
+        tensor_manager.initialize_inference.return_value = model
+        manager = OffloadManager("adopted-compiled")
+        manager._tensor_manager = tensor_manager
+
+        try:
+            manager.offload_from_state(
+                model,
+                state,
+                config=OffloadConfig(
+                    external_compile=True,
+                    transfer_mode="allocation_block_transfer",
+                ),
+            )
+
+            assert manager._compiled.active
+            assert custom_ops.get_active_loader(manager.compiled_offload_manager_id) is loader
+        finally:
+            manager.release()
+
+    def test_failed_external_compile_takeover_clears_compiled_lifecycle(self):
+        model = SimpleModel()
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.side_effect = RuntimeError("plan failed")
+        manager = OffloadManager("adopted-compiled-failure")
+        manager._tensor_manager = tensor_manager
+
+        with pytest.raises(RuntimeError, match="plan failed"):
+            manager.offload_from_state(
+                model,
+                _state_for_model(model),
+                config=OffloadConfig(
+                    external_compile=True,
+                    transfer_mode="allocation_block_transfer",
+                ),
+            )
+
+        assert not manager._compiled.active
+        assert custom_ops.get_active_loader(manager.compiled_offload_manager_id) is None
+
+    def test_compiled_model_is_rejected_before_state_planning(self):
+        model = SimpleModel()
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = StateTransitionPlan(
+            migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0
+        )
+        tensor_manager.prepare_final_model.return_value = model
+        tensor_manager.initialize_inference.return_value = model
+        manager = OffloadManager("adopted-compiled-model")
+        manager._tensor_manager = tensor_manager
+
+        with (
+            patch("flextensor.offload_manager.is_torch_compiled_module", return_value=True),
+            pytest.raises(RuntimeError, match="eager model"),
+        ):
+            manager.offload_from_state(model, _state_for_model(model))
+
+        tensor_manager.plan_state_adoption.assert_not_called()
+
+    def test_postmigration_failure_restores_owned_parameter_data_and_closes_manager(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        migrated = {parameter: torch.full_like(parameter, 7) for parameter in model.parameters()}
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+
+        def migrate(*_):
+            for parameter, data in migrated.items():
+                parameter.data = data
+
+        def fail_restore(*_):
+            for parameter in model.parameters():
+                parameter.data = torch.empty(0, dtype=parameter.dtype)
+            raise RuntimeError("restore failed")
+
+        tensor_manager.execute_state_adoption.side_effect = migrate
+        tensor_manager.restore_adopted_state.side_effect = fail_restore
+        manager = OffloadManager("failed-adoption")
+        manager._tensor_manager = tensor_manager
+
+        with pytest.raises(RuntimeError, match="restore failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        for parameter, expected in migrated.items():
+            torch.testing.assert_close(parameter, expected)
+        tensor_manager.release_memory.assert_called_once()
+        tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is None
+        assert manager._current_phase is OffloadPhase.NOT_INITIALIZED
+        assert not manager._patched_modules
+
+    def test_cleanup_bypasses_parameter_subclass_data_setter(self):
+        model = torch.nn.Module()
+        parameter = _RejectDataAssignmentParameter(torch.arange(4.0))
+        model.register_parameter("weight", parameter)
+        state = _state_for_model(model)
+        retained = torch.full_like(parameter, 13)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.execute_state_adoption.side_effect = lambda *_: torch.Tensor.data.__set__(parameter, retained)
+
+        def fail_restore(*_):
+            torch.Tensor.data.__set__(parameter, torch.empty(0))
+            raise RuntimeError("restore failed")
+
+        tensor_manager.restore_adopted_state.side_effect = fail_restore
+        manager = OffloadManager("subclass-cleanup")
+        manager._tensor_manager = tensor_manager
+
+        with pytest.raises(RuntimeError, match="restore failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        torch.testing.assert_close(parameter, retained)
+        tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is None
+
+    def test_failed_parameter_restoration_retains_storage_owner(self, monkeypatch):
+        model = torch.nn.Module()
+        parameter = torch.nn.Parameter(torch.arange(4.0), requires_grad=False)
+        model.register_parameter("weight", parameter)
+        state = _state_for_model(model)
+        retained = parameter.detach().clone()
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.execute_state_adoption = MagicMock()
+
+        def fail_restore(*_):
+            torch.Tensor.data.__set__(parameter, torch.empty(0))
+            raise RuntimeError("restore failed")
+
+        tensor_manager.restore_adopted_state.side_effect = fail_restore
+        manager = OffloadManager("retained-owner")
+        manager._tensor_manager = tensor_manager
+        monkeypatch.setattr(
+            "flextensor.offload_manager.set_tensor_data",
+            MagicMock(side_effect=RuntimeError("rebind failed")),
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="restore failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        assert parameter.numel() == 0
+        assert retained.numel() == 4
+        tensor_manager.release_memory.assert_not_called()
+        tensor_manager.shutdown.assert_not_called()
+        assert manager._tensor_manager is tensor_manager
+        assert manager._cleanup_blocked
+        with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+    def test_postmigration_snapshot_failure_cleans_inactive_manager(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        manager = OffloadManager("snapshot-failure")
+        manager._tensor_manager = tensor_manager
+        model.parameters = MagicMock(side_effect=RuntimeError("snapshot failed"))
+
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        tensor_manager.execute_state_adoption.assert_called_once_with(model, plan)
+        tensor_manager.release_memory.assert_called_once()
+        tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is None
+        assert not manager._cleanup_blocked
+        assert manager._state_hook_handle is None
+        assert manager._patched_modules == []
+        manager._initialize_tensor_manager = MagicMock()
+        manager.init()
+        manager._initialize_tensor_manager.assert_called_once()
+
+    def test_snapshot_cleanup_shutdown_failure_retains_explicit_owner(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.shutdown.side_effect = RuntimeError("shutdown failed")
+        manager = OffloadManager("snapshot-cleanup-failure")
+        manager._tensor_manager = tensor_manager
+        model.parameters = MagicMock(side_effect=RuntimeError("snapshot failed"))
+
+        with pytest.raises(RuntimeError, match="snapshot failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        assert manager._tensor_manager is tensor_manager
+        assert manager._model is model
+        assert manager._cleanup_blocked
+        with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+            manager.offload_from_state(model, state)
+
+    @pytest.mark.parametrize("failure_stage", ["release", "shutdown"])
+    def test_takeover_cleanup_resource_failure_retains_manager(self, failure_stage):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        retained = {parameter: parameter.detach().clone() for parameter in model.parameters()}
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.restore_adopted_state.side_effect = RuntimeError("restore failed")
+        if failure_stage == "release":
+            tensor_manager.release_memory.side_effect = RuntimeError("release failed")
+        else:
+            tensor_manager.shutdown.side_effect = RuntimeError("shutdown failed")
+        manager = OffloadManager(f"cleanup-{failure_stage}-failure")
+        manager._tensor_manager = tensor_manager
+
+        with pytest.raises(RuntimeError, match="restore failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        for parameter, expected in retained.items():
+            torch.testing.assert_close(parameter, expected)
+        if failure_stage == "release":
+            tensor_manager.shutdown.assert_not_called()
+        else:
+            tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is tensor_manager
+        assert manager._model is model
+        assert manager._cleanup_blocked
+        assert manager._failed_state_takeover_parameter_data
+
+    def test_takeover_cleanup_forward_restore_failure_retains_manager(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        tensor_manager.prepare_final_model.side_effect = RuntimeError("finalize failed")
+        manager = OffloadManager("cleanup-unpatch-failure")
+        manager._tensor_manager = tensor_manager
+        manager._restore_module_forward = MagicMock(side_effect=RuntimeError("unpatch failed"))
+
+        with pytest.raises(RuntimeError, match="finalize failed"):
+            manager.offload_from_state(
+                model,
+                state,
+                config=OffloadConfig(include_patterns=["linear1"], pinned_memory=False),
+            )
+
+        tensor_manager.release_memory.assert_not_called()
+        tensor_manager.shutdown.assert_not_called()
+        assert manager._tensor_manager is tensor_manager
+        assert manager._patched_modules == [model.linear1]
+        assert manager._cleanup_blocked
+
+    @pytest.mark.parametrize("failure_stage", ["release", "shutdown"])
+    def test_release_failure_preserves_patches_and_manager_ownership(self, failure_stage):
+        model = SimpleModel()
+        tensor_manager = MagicMock()
+        if failure_stage == "release":
+            tensor_manager.release_memory.side_effect = RuntimeError("release failed")
+        else:
+            tensor_manager.shutdown.side_effect = RuntimeError("shutdown failed")
+        manager = OffloadManager(f"active-{failure_stage}-failure")
+        manager._tensor_manager = tensor_manager
+        manager._model = model
+        manager._current_phase = OffloadPhase.INFERENCE
+        manager._state_takeover_active = True
+        manager._patch_module_forward(model.linear1, "linear1")
+
+        with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+            manager.release()
+
+        assert manager._tensor_manager is tensor_manager
+        assert manager._model is model
+        assert manager._current_phase is OffloadPhase.INFERENCE
+        assert manager._state_takeover_active
+        assert manager._patched_modules == [model.linear1]
+        assert "_ft_original_forward_func" in model.linear1.__dict__
+        assert manager._cleanup_blocked
+        tensor_manager.shutdown.assert_called_once()
+
+    def test_release_preserves_first_error_when_shutdown_also_fails(self):
+        model = SimpleModel()
+        tensor_manager = MagicMock()
+        tensor_manager.release_memory.side_effect = RuntimeError("first release failure")
+        tensor_manager.shutdown.side_effect = RuntimeError("second shutdown failure")
+        manager = OffloadManager("double-release-failure")
+        manager._tensor_manager = tensor_manager
+        manager._model = model
+        manager._current_phase = OffloadPhase.INFERENCE
+        manager._patch_module_forward(model.linear1, "linear1")
+
+        with pytest.raises(RuntimeError, match="first release failure"):
+            manager.release()
+
+        tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is tensor_manager
+        assert manager._patched_modules == [model.linear1]
+        assert manager._cleanup_blocked
+
+    def test_release_tears_down_tensor_manager_before_unpatching(self):
+        model = SimpleModel()
+        events = []
+        tensor_manager = MagicMock()
+        tensor_manager.release_memory.side_effect = lambda: events.append("release")
+        tensor_manager.shutdown.side_effect = lambda: events.append("shutdown")
+        manager = OffloadManager("release-order")
+        manager._tensor_manager = tensor_manager
+        manager._patch_module_forward(model.linear1, "linear1")
+        restore_forward = manager._restore_module_forward
+
+        def record_restore(module):
+            events.append("unpatch")
+            restore_forward(module)
+
+        manager._restore_module_forward = record_restore
+
+        manager.release()
+
+        assert events == ["release", "shutdown", "unpatch"]
+
+    @pytest.mark.parametrize("loader_type", ["allocation_block_transfer", "raw_block_transfer"])
+    def test_release_restores_block_loader_parameter_data(self, loader_type):
+        model = SimpleModel().eval()
+        state = _takeover_state_for_model(model, loader_type)
+        values_before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+        tensor_manager = _takeover_tensor_manager(loader_type)
+        tensor_manager.plan_state_adoption = MagicMock(
+            return_value=StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        )
+        tensor_manager.execute_state_adoption = MagicMock()
+        manager = OffloadManager(f"release-restores-{loader_type}")
+        manager._tensor_manager = tensor_manager
+
+        stream_context = MagicMock(__enter__=MagicMock(), __exit__=MagicMock())
+        with (
+            patch("flextensor.state_handler.TensorManagerStateHandler._validate_adopted_placement"),
+            patch("torch.cuda.Stream", return_value=MagicMock()),
+            patch("torch.cuda.stream", return_value=stream_context),
+            patch("torch.cuda.current_stream", return_value=MagicMock()),
+            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.device_count", return_value=0),
+        ):
+            manager.offload_from_state(
+                model,
+                state,
+                config=OffloadConfig(
+                    include_patterns=["linear1"],
+                    transfer_mode=loader_type,
+                    pinned_memory=False,
+                ),
+            )
+            rolling_views = list(
+                tensor_manager.tensor_layer_loader.allocation_controller.tensor_id_to_view_map.values()
+            )
+            manager.release()
+
+        for view in rolling_views:
+            view.zero_()
+        for name, parameter in model.named_parameters():
+            torch.testing.assert_close(parameter, values_before[name])
+
+    @pytest.mark.parametrize("failure_stage", ["plan", "migration"])
+    def test_pre_setup_failure_closes_inactive_manager_without_rollback(self, failure_stage):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        original = next(model.parameters())
+        migrated = torch.full_like(original, 11)
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.return_value = plan
+        if failure_stage == "plan":
+            tensor_manager.plan_state_adoption.side_effect = RuntimeError("plan failed")
+        else:
+
+            def fail_migration(*_):
+                original.data = migrated
+                raise RuntimeError("migration failed")
+
+            tensor_manager.execute_state_adoption.side_effect = fail_migration
+        manager = OffloadManager(f"failed-{failure_stage}")
+        manager._tensor_manager = tensor_manager
+
+        with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+            manager.offload_from_state(model, state, config=OffloadConfig(pinned_memory=False))
+
+        if failure_stage == "plan":
+            tensor_manager.execute_state_adoption.assert_not_called()
+        else:
+            torch.testing.assert_close(original, migrated)
+        tensor_manager.shutdown.assert_called_once()
+        assert manager._tensor_manager is None
+        assert not manager._state_takeover_active
+
+    @pytest.mark.parametrize("loader_type", ["strategy", "allocation_block_transfer", "raw_block_transfer"])
+    @pytest.mark.parametrize("failure_stage", ["restore", "loader", "patch", "finalize", "inference", "swap"])
+    def test_setup_failure_unpatches_and_releases_owned_loader_state(self, loader_type, failure_stage):  # noqa: C901
+        model = SimpleModel().eval()
+        state = _takeover_state_for_model(model, loader_type)
+        values_before = {name: tensor.detach().clone() for name, tensor in model.named_parameters()}
+        data_ptrs_before = {name: tensor.data_ptr() for name, tensor in model.named_parameters()}
+        classes_before = {id(module): type(module) for module in model.modules()}
+        plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+        tensor_manager = _takeover_tensor_manager(loader_type)
+        tensor_manager.plan_state_adoption = MagicMock(return_value=plan)
+        tensor_manager.execute_state_adoption = MagicMock()
+        loader_holder = []
+
+        restore_adopted_state = tensor_manager.restore_adopted_state
+
+        def restore(*args):
+            result = restore_adopted_state(*args)
+            if failure_stage == "restore":
+                raise RuntimeError("restore failed")
+            return result
+
+        tensor_manager.restore_adopted_state = restore
+        prepare_infer_load_mode = tensor_manager.prepare_infer_load_mode
+
+        def prepare_loader():
+            result = prepare_infer_load_mode()
+            loader_holder.append(tensor_manager.tensor_layer_loader)
+            if failure_stage == "loader":
+                raise RuntimeError("loader failed")
+            return result
+
+        tensor_manager.prepare_infer_load_mode = prepare_loader
+        prepare_final_model = tensor_manager.prepare_final_model
+
+        def finalize(*args, **kwargs):
+            result = prepare_final_model(*args, **kwargs)
+            if failure_stage == "finalize":
+                raise RuntimeError("finalize failed")
+            return result
+
+        tensor_manager.prepare_final_model = finalize
+        initialize_inference = tensor_manager.initialize_inference
+
+        def inference():
+            result = initialize_inference()
+            if failure_stage == "inference":
+                raise RuntimeError("inference failed")
+            return result
+
+        tensor_manager.initialize_inference = inference
+        manager = OffloadManager(f"failed-{loader_type}-{failure_stage}")
+        manager._tensor_manager = tensor_manager
+        config = OffloadConfig(
+            include_patterns=["linear1"],
+            transfer_mode=loader_type,
+            pinned_memory=False,
+        )
+        if failure_stage == "patch":
+            offload_modules = manager._offload_modules
+
+            def fail_after_patch(*args):
+                offload_modules(*args)
+                raise RuntimeError("patch failed")
+
+            manager._offload_modules = fail_after_patch
+        if failure_stage == "swap":
+            swap_to_new_model = manager._swap_to_new_model
+
+            def fail_after_swap(*args):
+                swap_to_new_model(*args)
+                raise RuntimeError("swap failed")
+
+            manager._swap_to_new_model = fail_after_swap
+
+        stream_context = MagicMock(__enter__=MagicMock(), __exit__=MagicMock())
+        with (
+            patch("flextensor.state_handler.TensorManagerStateHandler._validate_adopted_placement"),
+            patch("torch.cuda.Stream", return_value=MagicMock()),
+            patch("torch.cuda.stream", return_value=stream_context),
+            patch("torch.cuda.current_stream", return_value=MagicMock()),
+            patch("torch.cuda.synchronize"),
+            patch("torch.cuda.device_count", return_value=0),
+            pytest.raises(RuntimeError, match=f"{failure_stage} failed"),
+        ):
+            manager.offload_from_state(model, state, config=config)
+
+        assert manager._tensor_manager is None
+        assert manager._model is None
+        assert manager._current_phase is OffloadPhase.NOT_INITIALIZED
+        assert manager._state_hook_handle is None
+        assert not manager._state_takeover_active
+        assert not any("_ft_original_forward_func" in module.__dict__ for module in model.modules())
+        assert all(type(module) is classes_before[id(module)] for module in model.modules())
+        assert not any(
+            getattr(hook, "_ft_state_update_hook", False)
+            for module in model.modules()
+            for hook in module._forward_hooks.values()
+        )
+        for loader in loader_holder:
+            if loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
+                assert loader.allocation_controller.block_map_cpu == {}
+                assert loader.allocation_controller.block_map_gpu == {}
+            else:
+                assert loader.cpu_to_gpu_map == {}
+        for name, tensor in model.named_parameters():
+            torch.testing.assert_close(tensor, values_before[name])
+            assert tensor.data_ptr() == data_ptrs_before[name]
 
 
 class TestOffloadFromProfile:

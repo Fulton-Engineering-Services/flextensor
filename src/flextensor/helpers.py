@@ -234,6 +234,9 @@ class NoOpTensorManager:
     def prepare_infer_mode(self):
         pass
 
+    def prepare_infer_load_mode(self) -> None:
+        pass
+
     def is_profiling_suspended(self) -> bool:
         return False
 
@@ -270,7 +273,7 @@ class NoOpTensorManager:
     def prepare_model(self, model):
         return model
 
-    def prepare_final_model(self, model):
+    def prepare_final_model(self, model: Any, *, in_place: bool = False) -> Any:
         return model
 
     def benchmark_context(self, _iterations: int = 10):
@@ -297,6 +300,17 @@ class NoOpTensorManager:
     def restore_state(self, model: Any, _state: Any) -> None:
         # Match TensorManager's profile-restore contract: later initialize_* calls
         # return the model associated with the restored state.
+        self.model = model
+
+    def plan_state_adoption(self, _model: Any, _state: Any) -> Any:
+        from flextensor.state_transition import StateTransitionPlan
+
+        return StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+
+    def execute_state_adoption(self, _model: Any, _plan: Any) -> None:
+        pass
+
+    def restore_adopted_state(self, model: Any, _state: Any) -> None:
         self.model = model
 
     def save_profile(self, _profile_directory: str) -> None:

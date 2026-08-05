@@ -9,7 +9,7 @@ import tempfile
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -30,9 +30,11 @@ __all__ = [
     "delete_tensor",
     "get_class_matched_module_paths",
     "get_module_paths",
+    "get_tensor_data",
     "is_dense_layout",
     "matches_any_class_pattern",
     "matches_any_pattern",
+    "set_tensor_data",
 ]
 
 # Prefix marker for class-based matching in include/exclude patterns.
@@ -50,6 +52,16 @@ CLASS_PATTERN_PREFIX = "class:"
 # symmetry with ``class:`` and to disambiguate a literal module path that starts
 # with ``class:`` (unlikely, but possible in principle).
 NAME_PATTERN_PREFIX = "name:"
+
+
+def get_tensor_data(tensor: torch.Tensor) -> torch.Tensor:
+    """Read tensor data while bypassing subclass property overrides."""
+    return cast("torch.Tensor", cast("Any", torch.Tensor.data).__get__(tensor, type(tensor)))
+
+
+def set_tensor_data(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
+    """Replace tensor data while bypassing subclass property overrides."""
+    cast("Any", torch.Tensor.data).__set__(tensor, replacement)
 
 
 def _compute_packed_byte_layout(

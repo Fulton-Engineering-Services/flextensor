@@ -39,6 +39,7 @@ from flextensor.loaders import (
     RawBlockController,
     TensorLayerLoader,
     TensorStrategyLoader,
+    TransferStreamSynchronizationError,
     UntimedTrapRescuer,
     WarmupDirectTensorLoader,
 )
@@ -58,7 +59,11 @@ from flextensor.offload_timing import (
 from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicy
 from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.state_adoption import PinningMode, target_from_profile
-from flextensor.state_handler import LoaderInputData, TensorManagerState, TensorManagerStateHandler
+from flextensor.state_handler import (
+    LoaderInputData,
+    TensorManagerState,
+    TensorManagerStateHandler,
+)
 from flextensor.state_transition import MemoryCapacity, StateTransitionPlan, plan_state_transition
 from flextensor.strategy import (
     BlockStrategyData,
@@ -103,6 +108,7 @@ from flextensor.trap_tensor_mode import (
     WarmupTrapDirect,
 )
 from flextensor.types import GPUMemoryUsage
+from flextensor.utils import get_tensor_data, set_tensor_data
 
 _PROFILE_MODES: tuple[str, ...] = get_args(ProfileMode)
 
@@ -255,14 +261,21 @@ def _make_tensor_getter(tensor_ref, tensor_manager, missing_fields):
     return getter
 
 
-def extend_nn_module(module, tensor_manager):
+def extend_nn_module(
+    module: torch.nn.Module,
+    tensor_manager: Any,
+    *,
+    in_place: bool = False,
+) -> torch.nn.Module:
     """
     Extend an nn.Module with property getters and setters for all parameters and tensors.
     Similar to extend_with_temperature_properties but for PyTorch modules.
     """
-    # Create a copy of the module to avoid modifying the original
-    module_copy = copy.copy(module)
-    _rebind_bound_methods(module_copy, module)
+    module_copy = module if in_place else copy.copy(module)
+    if in_place:
+        tensor_manager._in_place_original_classes.setdefault(module, type(module))  # noqa: SLF001
+    else:
+        _rebind_bound_methods(module_copy, module)
 
     # Create a new class dynamically for this module
     module_class = type(module_copy.__class__.__name__, (module_copy.__class__,), {})
@@ -288,20 +301,35 @@ def extend_nn_module(module, tensor_manager):
     return module_copy
 
 
-def prepare_model(model, tensor_manager):
+def prepare_model(
+    model: torch.nn.Module,
+    tensor_manager: Any,
+    *,
+    in_place: bool = False,
+) -> torch.nn.Module:
     """
     Recursively prepare a model by extending all its modules with tensor management capabilities.
     This function traverses the model hierarchy and applies extend_nn_module to each module.
     """
 
-    def _prepare_module(module):
+    visited: set[int] = set()
+
+    def _prepare_module(module: torch.nn.Module) -> torch.nn.Module:
+        if in_place:
+            module_id = id(module)
+            if module_id in visited:
+                return module
+            visited.add(module_id)
+
         # Extend the current module
-        extended_module = extend_nn_module(module, tensor_manager)
+        extended_module = extend_nn_module(module, tensor_manager, in_place=in_place)
         # Recursively process all child modules
         for name, child_module in extended_module.named_children():
             if isinstance(child_module, torch.nn.Module):
-                # Replace the child module with its extended version
-                setattr(extended_module, name, _prepare_module(child_module))
+                prepared_child = _prepare_module(child_module)
+                if not in_place:
+                    # Replace the child module with its extended version
+                    setattr(extended_module, name, prepared_child)
 
         return extended_module
 
@@ -545,6 +573,7 @@ class TensorManager:
         # Retained so teardown can restore dict-container entries patched with views.
         self._profile_view_model: Any = None
         self.memory_transfer_stats: dict[int, float] | None = None
+        self._in_place_original_classes: dict[torch.nn.Module, type[torch.nn.Module]] = {}
         self.trap_start_event = torch.cuda.Event(enable_timing=True)
         self.trap_end_event = torch.cuda.Event(enable_timing=True)
         self.trap_nesting_guard = TrapNestingGuard()
@@ -2121,23 +2150,64 @@ class TensorManager:
         if self.tensor_layer_loader is not None:
             self.tensor_layer_loader.release_memory()
 
-    def shutdown(self):
+    def _restore_block_loader_tensor_data(self) -> None:
+        controller = getattr(self.tensor_layer_loader, "allocation_controller", None)
+        if isinstance(controller, AllocationBlockController):
+            views_by_label = {label: block.views for label, block in controller.block_map_cpu.items()}
+        elif isinstance(controller, RawBlockController):
+            views_by_label = {
+                label: controller.reconstruct_original_shapes(block, controller.block_meta_map[label])
+                for label, block in controller.block_map_cpu.items()
+            }
+        else:
+            return
+
+        for label, views in views_by_label.items():
+            for tensor_id, source_view in zip(controller.label_to_cpu_tensor_id_map[label], views, strict=True):
+                tensor = self.tensors_map[tensor_id]
+                current_data = get_tensor_data(tensor)
+                current_storage = current_data.untyped_storage()._cdata  # noqa: SLF001
+                loader_storage = (
+                    controller.tensor_id_to_view_map[tensor_id].untyped_storage()._cdata  # noqa: SLF001
+                )
+                if current_storage == loader_storage:
+                    set_tensor_data(tensor, source_view.clone(memory_format=torch.preserve_format))
+
+    def shutdown(self) -> None:  # noqa: C901
+        class_restore_error: Exception | None = None
+        for module, original_class in reversed(list(self._in_place_original_classes.items())):
+            try:
+                module.__class__ = original_class
+            except Exception as error:
+                if class_restore_error is None:
+                    class_restore_error = error
+            else:
+                del self._in_place_original_classes[module]
+        if class_restore_error is not None:
+            raise class_restore_error
+
+        self._restore_block_loader_tensor_data()
+        teardown_error: Exception | None = None
         try:
             # If a view-mode profile is still in flight, restore ``.data`` first
             # so model parameters don't end up aliasing freed GPU storage.
             self._teardown_profile_block_controller()
             if self.tensor_layer_loader is not None:
                 self.tensor_layer_loader.shutdown()
-        finally:
-            # Pins must be released even if loader teardown raises, but a
-            # release_all() exception inside this finally block would mask
-            # the original loader exception — log and swallow instead.
-            try:
-                self.host_pinner.release_all()
-            except Exception:
-                logger.exception(
-                    "host_pinner.release_all() raised during shutdown; remaining pins will leak until process exit"
-                )
+        except TransferStreamSynchronizationError:
+            raise
+        except Exception as error:
+            teardown_error = error
+        try:
+            self.host_pinner.release_all()
+        except Exception:
+            if teardown_error is None:
+                raise
+            logger.exception(
+                "host_pinner.release_all() raised during shutdown; remaining pins will leak until process exit"
+            )
+        if teardown_error is not None:
+            raise teardown_error
 
     def get_gpu_memory_usage(self) -> GPUMemoryUsage:
         """Get GPU memory usage by FlexTensor in inference mode.
@@ -2287,20 +2357,20 @@ class TensorManager:
 
         return new_model
 
-    def prepare_final_model(self, model):
+    def prepare_final_model(self, model: Any, *, in_place: bool = False) -> Any:
         if self.loader_type in {"allocation_block_transfer", "raw_block_transfer"}:
             return self.prepare_view_model(model)
         if self.direct_enabled:
-            return self.prepare_model(model)
+            return self.prepare_model(model, in_place=in_place)
         return model
 
-    def prepare_model(self, model):
+    def prepare_model(self, model: Any, *, in_place: bool = False) -> Any:
         new_model = model
         if self.direct_enabled:
             if isinstance(model, dict):
                 new_model = ModelDict(self, model)
             elif isinstance(model, torch.nn.Module):
-                new_model = prepare_model(model, self)
+                new_model = prepare_model(model, self, in_place=in_place)
         return new_model
 
     @_deprecated(

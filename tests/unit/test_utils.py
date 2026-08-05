@@ -32,6 +32,33 @@ def test_packed_tensor_layout_helper_is_not_public() -> None:
     assert not hasattr(utils, "compute_packed_tensor_layout")
 
 
+def test_tensor_data_helpers_bypass_subclass_overrides() -> None:
+    class RejectDataPropertyParameter(torch.nn.Parameter):
+        def __new__(cls, data: torch.Tensor) -> "RejectDataPropertyParameter":
+            return super().__new__(cls, data, requires_grad=False)
+
+        @property
+        def data(self) -> torch.Tensor:
+            raise RuntimeError("custom parameter rejects .data access")
+
+        @data.setter
+        def data(self, _value: torch.Tensor) -> None:
+            raise RuntimeError("custom parameter rejects .data assignment")
+
+    get_tensor_data = getattr(utils, "get_tensor_data", None)
+    set_tensor_data = getattr(utils, "set_tensor_data", None)
+    assert callable(get_tensor_data)
+    assert callable(set_tensor_data)
+
+    parameter = RejectDataPropertyParameter(torch.arange(4.0))
+    replacement = torch.full((4,), 13.0)
+    torch.testing.assert_close(get_tensor_data(parameter), torch.arange(4.0))
+
+    set_tensor_data(parameter, replacement)
+
+    torch.testing.assert_close(torch.Tensor.data.__get__(parameter, torch.Tensor), replacement)
+
+
 class TestConfigFieldWasSet:
     """Test cases for explicit config-field detection."""
 

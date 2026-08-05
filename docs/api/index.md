@@ -19,6 +19,7 @@ Module-level convenience functions — the recommended starting point for most u
 - [`get_gpu_memory_usage()`](simplified.md#flextensor.offload_manager.get_gpu_memory_usage) — Get GPU memory usage (inference mode only)
 - [`save_profile()` / `load_profile()`](simplified.md#flextensor.offload_manager.save_profile) — Profile persistence
 - [`offload_from_profile()`](simplified.md#flextensor.offload_manager.offload_from_profile) — Load a saved profile and offload in one step
+- [`offload_from_state()`](simplified.md#flextensor.offload_manager.offload_from_state) — Adopt an in-memory saved state
 - [`release()`](simplified.md#flextensor.offload_manager.release) — Release resources and restore model
 - [`collect_offload_timing()`](simplified.md#flextensor.offload_manager.collect_offload_timing) / [`reset_offload_timing()`](simplified.md#flextensor.offload_manager.reset_offload_timing) / [`update_offload_timing()`](simplified.md#flextensor.offload_manager.update_offload_timing) — Inference offload-timing measure window
 - [`request_strategy_replan()`](simplified.md#flextensor.offload_manager.request_strategy_replan) / [`update_state()`](simplified.md#flextensor.offload_manager.update_state) — Remeasure and rebuild strategy (compile / CUDA graphs)
