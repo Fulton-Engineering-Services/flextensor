@@ -9,16 +9,81 @@ import pathlib
 import struct
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import torch
 
 from flextensor.collectors import LayerStatistics, TensorStatistics
-from flextensor.model_state_capture import capture_model_state
-from flextensor.tensor_processors import preprocess_model
+from flextensor.compiler_utils import find_torch_compile_wrapper, is_compiling, is_torch_compiled_module
+from flextensor.model_state_capture import _inspect_storage, _storage_id_from_key, capture_model_state
+from flextensor.state_transition import ModelPlacementState, StateTransitionPlan, StorageMigration
+from flextensor.tensor_processors import (
+    DisableRequiresGradTensorProcessor,
+    compute_reachable_tensor_map,
+    preprocess_model,
+)
 from flextensor.utils import atomic_write_json
 
 logger = logging.getLogger(__name__)
+
+
+def _get_live_storage_key(name: str, tensor: torch.Tensor) -> tuple[str, int, int]:
+    storage_key, nbytes, _pinned = _inspect_storage(name, tensor)
+    return storage_key[0], storage_key[1], nbytes
+
+
+def _set_tensor_data(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
+    """Replace a tensor's data while bypassing subclass property overrides."""
+    cast("Any", torch.Tensor.data).__set__(tensor, replacement)
+
+
+def _copy_storage_to_device(source_bytes: torch.Tensor, destination_device: str) -> torch.Tensor:
+    return source_bytes.to(destination_device)
+
+
+def _rebind_storage_group(tensors: list[torch.Tensor], destination_bytes: torch.Tensor) -> None:
+    """Rebind aliases to one storage while preserving their view metadata."""
+    destination_storage = destination_bytes.untyped_storage()
+    staged_views: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for tensor in tensors:
+        original_view = cast("Any", torch.Tensor.data).__get__(tensor, torch.Tensor)
+        replacement_view = torch.empty(0, dtype=tensor.dtype, device=destination_bytes.device)
+        torch.Tensor.set_(
+            replacement_view,
+            destination_storage,
+            tensor.storage_offset(),
+            tensor.size(),
+            tensor.stride(),
+        )
+        # PyTorch's MetaConverter restores these flags after rebuilding storage views:
+        # https://github.com/pytorch/pytorch/blob/main/torch/_subclasses/meta_utils.py
+        torch._C._set_conj(replacement_view, original_view.is_conj())  # noqa: SLF001
+        torch._C._set_neg(replacement_view, original_view.is_neg())  # noqa: SLF001
+        staged_views.append((tensor, original_view, replacement_view))
+
+    rebound: list[tuple[torch.Tensor, torch.Tensor]] = []
+    try:
+        with torch.no_grad():
+            for tensor, original_view, replacement_view in staged_views:
+                _set_tensor_data(tensor, replacement_view)
+                rebound.append((tensor, original_view))
+                names = getattr(original_view, "names", None)
+                rename = getattr(tensor, "rename_", None)
+                if names is not None and callable(rename) and any(name is not None for name in names):
+                    rename(*names)
+    except Exception as error:
+        rollback_errors: list[Exception] = []
+        with torch.no_grad():
+            for tensor, original_view in reversed(rebound):
+                try:
+                    _set_tensor_data(tensor, original_view)
+                except Exception as rollback_error:
+                    rollback_errors.append(rollback_error)
+        if rollback_errors:
+            raise RuntimeError(
+                f"Storage-group rebind failed ({error}); best-effort source rollback also failed: {rollback_errors}"
+            ) from error
+        raise
 
 
 @dataclass
@@ -591,8 +656,339 @@ class TensorManagerStateHandler:
                 suffix,
             )
 
+    def _resolve_state_adoption_plan(  # noqa: C901
+        self,
+        model: torch.nn.Module,
+        plan: StateTransitionPlan,
+    ) -> tuple[
+        list[tuple[StorageMigration, list[torch.Tensor]]],
+        list[tuple[tuple[str, ...], list[torch.Tensor]]],
+    ]:
+        """Validate a plan against the live model and resolve its storage groups."""
+        named_items = [
+            *model.named_parameters(remove_duplicate=False),
+            *model.named_buffers(remove_duplicate=False),
+        ]
+        named_tensors = dict(named_items)
+
+        tensors_by_storage: dict[tuple[str, int, int], list[torch.Tensor]] = {}
+        storage_key_by_id: dict[str, tuple[str, int, int]] = {}
+        for tensor in compute_reachable_tensor_map(model).values():
+            key = _get_live_storage_key("<reachable tensor>", tensor)
+            tensors_by_storage.setdefault(key, []).append(tensor)
+            storage_key_by_id.setdefault(_storage_id_from_key((key[0], key[1])), key)
+
+        storage_names: dict[tuple[str, int, int], tuple[str, ...]] = {}
+        storage_key_by_name: dict[str, tuple[str, int, int]] = {}
+        for name, tensor in named_items:
+            key = _get_live_storage_key(name, tensor)
+            storage_key_by_name[name] = key
+            storage_names[key] = tuple(sorted((*storage_names.get(key, ()), name)))
+
+        migrations_by_names: dict[frozenset[str], StorageMigration] = {}
+        migration_name_owners: dict[str, tuple[str, ...]] = {}
+        migration_storage_owners: dict[tuple[str, int, int], tuple[str, ...]] = {}
+        resolved_migrations: list[tuple[StorageMigration, list[torch.Tensor]]] = []
+        for migration in plan.migrations:
+            if len(set(migration.names)) != len(migration.names):
+                raise ValueError(
+                    f"State adoption execution plan contains duplicate names in migration group {migration.names}"
+                )
+            missing_names = sorted(set(migration.names) - set(named_tensors))
+            if missing_names:
+                raise ValueError(f"State adoption execution plan references missing tensor(s): {missing_names}")
+            duplicate_name = next((name for name in migration.names if name in migration_name_owners), None)
+            if duplicate_name is not None:
+                raise ValueError(
+                    f"State adoption execution plan repeats {duplicate_name!r} across migration groups "
+                    f"{migration_name_owners[duplicate_name]} and {migration.names}"
+                )
+            for name in migration.names:
+                migration_name_owners[name] = migration.names
+
+            if migration.names:
+                keys = {storage_key_by_name[name] for name in migration.names}
+                if len(keys) != 1:
+                    raise ValueError(f"State adoption execution plan splits live storage aliases: {migration.names}")
+                key = next(iter(keys))
+            else:
+                unnamed_key = storage_key_by_id.get(migration.storage_id)
+                if unnamed_key is None:
+                    raise ValueError(
+                        f"State adoption execution plan references missing unnamed storage {migration.storage_id!r}"
+                    )
+                key = unnamed_key
+            actual_names = storage_names.get(key, ())
+            if set(actual_names) != set(migration.names):
+                raise ValueError(
+                    f"State adoption execution plan aliases changed for {migration.names}: current={actual_names}"
+                )
+            if key in migration_storage_owners:
+                raise ValueError(
+                    "State adoption execution plan repeats storage across migration groups "
+                    f"{migration_storage_owners[key]} and {migration.names}"
+                )
+            migration_storage_owners[key] = migration.names
+            if key[0] != migration.source_device:
+                raise ValueError(
+                    f"State adoption execution plan source changed for {migration.names}: "
+                    f"expected={migration.source_device}, current={key[0]}"
+                )
+            if key[2] != migration.nbytes:
+                raise ValueError(
+                    f"State adoption execution plan nbytes changed for {migration.names}: "
+                    f"expected={migration.nbytes}, current={key[2]}"
+                )
+            live_storage_id = _storage_id_from_key((key[0], key[1]))
+            if live_storage_id != migration.storage_id:
+                raise ValueError(
+                    f"State adoption execution plan storage changed for {migration.names}: "
+                    f"expected={migration.storage_id}, current={live_storage_id}"
+                )
+            destination_valid = migration.destination_device == "cpu" or (
+                isinstance(migration.destination_device, str)
+                and migration.destination_device.startswith("cuda:")
+                and migration.destination_device.removeprefix("cuda:").isdigit()
+            )
+            if not destination_valid:
+                raise ValueError(
+                    f"State adoption execution plan has unsupported devices for {migration.names}: "
+                    f"{migration.source_device} -> {migration.destination_device}"
+                )
+            if migration.source_device == migration.destination_device:
+                raise ValueError(f"State adoption execution plan has a no-op migration for {migration.names}")
+            if migration.source_device.partition(":")[0] == migration.destination_device.partition(":")[0]:
+                raise ValueError(
+                    f"State adoption execution plan has unsupported same-kind migration for {migration.names}: "
+                    f"{migration.source_device} -> {migration.destination_device}"
+                )
+            tensors = tensors_by_storage.get(key)
+            if not tensors:
+                raise ValueError(f"No reachable tensors remain for storage group {migration.names}")
+            if any(tensor.is_quantized for tensor in tensors):
+                raise ValueError(f"State adoption cannot rebind quantized tensor storage for {migration.names}")
+            resolved_migrations.append((migration, tensors))
+            if migration.names:
+                migrations_by_names[frozenset(migration.names)] = migration
+
+        pinning_names: set[str] = set()
+        resolved_pinning: list[tuple[tuple[str, ...], list[torch.Tensor]]] = []
+        for names in plan.pinning_groups:
+            if not names:
+                raise ValueError("State adoption execution plan contains an empty host-pinning group")
+            if len(set(names)) != len(names):
+                raise ValueError(
+                    f"State adoption execution plan contains duplicate names in host-pinning group {names}"
+                )
+            missing_names = sorted(set(names) - set(named_tensors))
+            if missing_names:
+                raise ValueError(f"State adoption execution plan host-pinning names no longer exist: {missing_names}")
+            repeated_names = sorted(set(names) & pinning_names)
+            if repeated_names:
+                raise ValueError(f"State adoption execution plan repeats host-pinning tensor(s): {repeated_names}")
+            pinning_names.update(names)
+            keys = {storage_key_by_name[name] for name in names}
+            if len(keys) != 1:
+                raise ValueError(f"State adoption execution plan host-pinning aliases changed for {names}")
+            key = next(iter(keys))
+            if set(storage_names.get(key, ())) != set(names):
+                raise ValueError(f"State adoption execution plan host-pinning aliases changed for {names}")
+            pinning_migration = migrations_by_names.get(frozenset(names))
+            if pinning_migration is not None:
+                if pinning_migration.destination_device != "cpu":
+                    raise ValueError(f"State adoption execution plan pins final-GPU tensor group: {names}")
+            elif key[0] != "cpu":
+                raise ValueError(f"State adoption execution plan pins stationary non-CPU tensor group: {names}")
+            tensors = tensors_by_storage.get(key)
+            if not tensors:
+                raise ValueError(f"No reachable tensors remain for host-pinning group {names}")
+            if any(tensor.is_quantized for tensor in tensors):
+                raise ValueError(f"State adoption cannot rebind quantized tensor storage for {names}")
+            resolved_pinning.append((names, tensors))
+        if plan.pinning_groups and not callable(
+            getattr(getattr(self.tensor_manager, "host_pinner", None), "pin", None)
+        ):
+            raise ValueError("State adoption execution plan requires host pinning but no host_pinner is configured")
+
+        return resolved_migrations, resolved_pinning
+
+    @staticmethod
+    def _execute_state_adoption_migrations(
+        resolved_migrations: list[tuple[StorageMigration, list[torch.Tensor]]],
+    ) -> list[StorageMigration]:
+        """Execute validated migrations and return the completed groups."""
+        completed_migrations: list[StorageMigration] = []
+        for migration, tensors in resolved_migrations:
+            try:
+                display_name = migration.names[0] if migration.names else f"<storage:{migration.storage_id}>"
+                source_key = _get_live_storage_key(display_name, tensors[0])
+                if source_key[0] != migration.source_device or source_key[2] != migration.nbytes:
+                    raise ValueError(
+                        f"Planned source changed for {migration.names}: expected="
+                        f"({migration.source_device}, {migration.nbytes}), current=({source_key[0]}, {source_key[2]})"
+                    )
+                source_bytes = torch.empty(0, dtype=torch.uint8, device=migration.source_device)
+                source_bytes.set_(tensors[0].untyped_storage(), 0, (migration.nbytes,), (1,))
+                destination_bytes = _copy_storage_to_device(source_bytes, migration.destination_device)
+                _rebind_storage_group(tensors, destination_bytes)
+                completed_migrations.append(migration)
+                if migration.source_device.startswith("cuda:") or migration.destination_device.startswith("cuda:"):
+                    cuda_device = (
+                        migration.source_device
+                        if migration.source_device.startswith("cuda:")
+                        else migration.destination_device
+                    )
+                    torch.cuda.synchronize(cuda_device)
+                del source_bytes, destination_bytes, tensors
+            except Exception as error:
+                diagnostic_error: Exception | None = None
+                if migration.source_device.startswith("cuda:") or migration.destination_device.startswith("cuda:"):
+                    cuda_device = (
+                        migration.source_device
+                        if migration.source_device.startswith("cuda:")
+                        else migration.destination_device
+                    )
+                    try:
+                        torch.cuda.synchronize(cuda_device)
+                    except Exception as sync_error:
+                        diagnostic_error = sync_error
+                completed_names = [item.names for item in completed_migrations]
+                if migration in completed_migrations:
+                    current = f"post-migration synchronization for completed current group={migration.names}: {error}"
+                else:
+                    current = f"current migration group={migration.names}: {error}"
+                diagnostic = f" Diagnostic synchronization also failed: {diagnostic_error}." if diagnostic_error else ""
+                raise RuntimeError(
+                    "State adoption execution is partial: "
+                    f"completed migration groups={completed_names}; {current}.{diagnostic} "
+                    "No rollback of previously completed groups was attempted."
+                ) from error
+        return completed_migrations
+
+    def _execute_state_adoption_pinning(
+        self,
+        resolved_pinning: list[tuple[tuple[str, ...], list[torch.Tensor]]],
+        completed_migrations: list[StorageMigration],
+    ) -> None:
+        """Execute validated host-pinning groups."""
+        completed_pinning: list[tuple[str, ...]] = []
+        for names, tensors in resolved_pinning:
+            try:
+                source_key = _get_live_storage_key(names[0], tensors[0])
+                if source_key[0] != "cpu":
+                    raise ValueError(f"Planned host-pinning group is no longer on CPU: {names}")
+                source_bytes = torch.empty(0, dtype=torch.uint8, device="cpu")
+                source_bytes.set_(tensors[0].untyped_storage(), 0, (source_key[2],), (1,))
+                pinned_bytes = self.tensor_manager.host_pinner.pin(source_bytes)
+                pinned_key = _get_live_storage_key("<pinned storage>", pinned_bytes)
+                if pinned_key != source_key:
+                    _rebind_storage_group(tensors, pinned_bytes)
+                completed_pinning.append(names)
+                del source_bytes, pinned_bytes, tensors
+            except Exception as error:
+                raise RuntimeError(
+                    "State adoption execution is partial: "
+                    f"completed migration groups={[item.names for item in completed_migrations]}; "
+                    f"completed host-pinning groups={completed_pinning}; current host-pinning group={names}: {error}. "
+                    "No rollback of previously completed groups was attempted."
+                ) from error
+
+    def _validate_state_adoption_lifecycle(self, model: torch.nn.Module) -> None:
+        """Reject lifecycle states in which storage rebinding is unsafe."""
+        if getattr(self.tensor_manager, "tensor_layer_loader", None) is not None:
+            raise RuntimeError("State adoption must run before loader construction")
+        if is_compiling():
+            raise RuntimeError("State adoption must run before torch.compile tracing")
+        if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("State adoption must run before CUDA-graph capture")
+
+        compiled_model_state = any(
+            is_torch_compiled_module(module)
+            # Module.compile() and torch.compile(module.forward) do not expose
+            # public inspection APIs, so use the markers installed by PyTorch.
+            or getattr(module, "_compiled_call_impl", None) is not None
+            or hasattr(module.forward, "_torchdynamo_orig_callable")
+            for module in model.modules()
+        )
+        if compiled_model_state or find_torch_compile_wrapper(model) is not None:
+            raise RuntimeError("State adoption must run before torch.compile")
+
+    def execute_state_adoption(
+        self,
+        model: torch.nn.Module,
+        plan: StateTransitionPlan,
+    ) -> None:
+        """Execute a prevalidated plan one backing-storage group at a time.
+
+        The operation is intentionally not transactional. Runtime failures
+        report completed and current groups. A partially rebound current alias
+        group is restored best-effort, but completed groups are not rolled back.
+        """
+        if not isinstance(model, torch.nn.Module):
+            raise TypeError(f"model must be nn.Module, got {type(model)}")
+        if not isinstance(plan, StateTransitionPlan):
+            raise TypeError(f"plan must be StateTransitionPlan, got {type(plan)}")
+        self._validate_state_adoption_lifecycle(model)
+        resolved_migrations, resolved_pinning = self._resolve_state_adoption_plan(model, plan)
+        completed_migrations = self._execute_state_adoption_migrations(resolved_migrations)
+        self._execute_state_adoption_pinning(resolved_pinning, completed_migrations)
+
+    def _validate_adopted_placement(
+        self,
+        current: ModelPlacementState,
+        state: TensorManagerState,
+        live_tensors: dict[str, torch.Tensor],
+    ) -> None:
+        """Require the saved profile's placement before restoring its metadata."""
+        from flextensor.state_adoption import PinningMode, target_from_profile
+
+        tm = self.tensor_manager
+        pinning: PinningMode = (
+            "none" if not tm.pinned_memory else "in_place" if tm.host_pinner.registry is not None else "copy"
+        )
+        target, _transition = target_from_profile(
+            current,
+            state,
+            target_device=str(tm.device_gpu),
+            pinning=pinning,
+            use_shm=tm.use_shm,
+        )
+        target_storages = {storage.id: storage for storage in target.storages}
+        misplaced_storage_ids = {
+            storage.id for storage in current.storages if storage.device != target_storages[storage.id].device
+        }
+        required_pinned_storage_ids = {
+            storage.id for storage in target.storages if storage.device == "cpu" and storage.pinned
+        }
+        misplaced_pinning_names = {
+            name
+            for tensor in current.tensors
+            if tensor.storage_id in required_pinned_storage_ids
+            for name in tensor.names
+            if not tm.host_pinner.is_pinned(live_tensors[name])
+        }
+        if misplaced_storage_ids or misplaced_pinning_names:
+            misplaced_names = sorted(
+                misplaced_pinning_names
+                | {
+                    name
+                    for tensor in current.tensors
+                    if tensor.storage_id in misplaced_storage_ids
+                    for name in tensor.names
+                }
+            )
+            raise ValueError(
+                "State adoption target placement is not established; call execute_state_adoption first. "
+                f"Storage groups on the wrong device or with wrong pinning: {misplaced_names}"
+            )
+
     def restore_state(  # noqa: C901
-        self, model: torch.nn.Module | dict, state: TensorManagerState, *, strict: bool = True
+        self,
+        model: torch.nn.Module | dict,
+        state: TensorManagerState,
+        *,
+        strict: bool = True,
+        preprocess_model_state: bool = True,
     ) -> StateValidationResult:
         """
         Restore a TensorManager state from a TensorManagerState object.
@@ -606,6 +1002,9 @@ class TensorManagerStateHandler:
             strict: If True (default), raises ValueError if any tensor names in the
                 saved state are not found in the current model. If False, missing
                 tensors are skipped with a warning.
+            preprocess_model_state: If True (default), establish ordinary
+                profile-load placement before rebinding. Disable only after an
+                adoption plan has already established final placement.
 
         Raises:
             ValueError: If strict=True and the saved state contains tensor names
@@ -671,7 +1070,7 @@ class TensorManagerStateHandler:
         contradictory_storages = {
             storage_id: sorted(name for names in tensors.values() for name in names)
             for storage_id, tensors in tensors_by_storage.items()
-            if len({"cpu" if managed_names.intersection(names) else "gpu" for names in tensors.values()}) > 1
+            if len({"cpu" if managed_names.intersection(names) else "gpu" for names in tensors.values() if names}) > 1
         }
         if contradictory_storages:
             raise ValueError(f"Contradictory alias destinations for shared storage: {contradictory_storages}")
@@ -698,20 +1097,26 @@ class TensorManagerStateHandler:
                         f"saved={stat.size_bytes}, current_logical={logical_bytes}"
                     )
 
+        if not preprocess_model_state and isinstance(model, torch.nn.Module):
+            self._validate_adopted_placement(current, state, live_tensors)
+
         # Deep-copy the state so we don't mutate the caller's object (it may be reused).
         state = copy.deepcopy(state)
 
         # Put model in the same state as the discovery path: disable grad, params/buffers on GPU,
         # pinned memory for strategy loader, and traced_tensors populated for inference traps.
-        if not tm.use_trace_tensor:  # TODO: add support for trace tensor
-            preprocess_model(
-                model,
-                tm,
-                tm.device_gpu,
-                pin_memory=tm.should_pin_in_preprocess(),
-                host_pinner=tm.host_pinner,
-                move_top_level_buffers_to_gpu=tm.move_top_level_buffers_to_gpu,
-            )
+        if preprocess_model_state:
+            if not tm.use_trace_tensor:  # TODO: add support for trace tensor
+                preprocess_model(
+                    model,
+                    tm,
+                    tm.device_gpu,
+                    pin_memory=tm.should_pin_in_preprocess(),
+                    host_pinner=tm.host_pinner,
+                    move_top_level_buffers_to_gpu=tm.move_top_level_buffers_to_gpu,
+                )
+        else:
+            DisableRequiresGradTensorProcessor().apply(model)
 
         tensor_name_to_id_map = {}
         if isinstance(model, torch.nn.Module):

@@ -291,6 +291,18 @@ class TensorTypeHandler:
         return ctx.process_and_preserve(value)
 
 
+class SequenceTypeHandler:
+    """Handler for plain ``list`` and ``tuple`` attributes."""
+
+    def can_handle(self, value: Any) -> bool:
+        return type(value) in {list, tuple}
+
+    def process_attribute(self, value: list | tuple, ctx: ProcessingContext) -> list | tuple:
+        for item in value:
+            ctx.dispatch(item)
+        return value
+
+
 class SetTypeHandler:
     """Built-in handler for non-empty ``set`` attributes."""
 
@@ -576,12 +588,12 @@ class MoveToPinMemoryTensorProcessor(TensorProcessor):
 
 @instrumentable
 class DisableRequiresGradTensorProcessor(TensorProcessor):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(update_attributes=False)
 
-    def process(self, src):
-        if isinstance(src, torch.Tensor):
-            src.requires_grad_(requires_grad=False)
+    def process(self, src: Any) -> Any:
+        if isinstance(src, torch.Tensor) and src.is_leaf:
+            src.requires_grad_(False)
         return src
 
 
@@ -789,15 +801,13 @@ class ReachableTensorMapProcessor(TensorProcessor):
     tensors — their ``id()`` doesn't correspond to a real allocation, so
     they aren't useful as a narrowing input.
 
-    Uses the full :class:`TensorProcessor` traversal, so it covers the same
-    surface area as the other read-only collectors (:class:`TensorMappingProcessor`,
-    :class:`BenchmarkTensorProcessor`). The convenience wrapper
-    :func:`compute_reachable_tensor_map` is the typical entry point for callers
-    that need the tensor objects.
+    Adds list and tuple traversal to the standard :class:`TensorProcessor`
+    walk. The convenience wrapper :func:`compute_reachable_tensor_map` is the
+    typical entry point for callers that need the tensor objects.
     """
 
     def __init__(self) -> None:
-        super().__init__(update_attributes=False)
+        super().__init__(update_attributes=False, type_handlers=[SequenceTypeHandler()])
         self.reachable_tensors: dict[int, torch.Tensor] = {}
 
     def apply(self, model: object) -> None:
@@ -817,14 +827,13 @@ class ReachableTensorMapProcessor(TensorProcessor):
             self.process(value)
 
     def map_inner_fields(self, src: torch.Tensor) -> None:
+        self.process(getattr(src, "_base", None))
         ref_tensor_fields = set(dir(src))
         new_tensor_fields = set(dir(torch.Tensor))
-        missing_fields = ref_tensor_fields - new_tensor_fields
-        missing_fields = [name for name in missing_fields if not name.startswith("_")]
-        for missing_field in missing_fields:
-            field = getattr(src, missing_field)
-            if isinstance(field, torch.Tensor):
-                self.process(field)
+        ctx = ProcessingContext(self)
+        for missing_field in ref_tensor_fields - new_tensor_fields:
+            if not missing_field.startswith("_"):
+                ctx.dispatch(getattr(src, missing_field))
 
     def process(self, src: Any) -> Any:
         if not isinstance(src, torch.Tensor) or src.is_meta:

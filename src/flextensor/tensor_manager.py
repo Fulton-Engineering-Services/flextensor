@@ -1899,6 +1899,35 @@ class TensorManager:
             ),
         )
 
+    def execute_state_adoption(self, model: torch.nn.Module, plan: StateTransitionPlan) -> None:
+        """Execute a plan returned by :meth:`plan_state_adoption`.
+
+        This operation is not transactional. If a migration or pinning step
+        fails, the exception reports completed and current groups, but completed
+        groups are not rolled back. Run it before loader construction,
+        ``torch.compile``, or CUDA-graph capture because it replaces live tensor
+        storages and invalidates earlier references or captures. After success, call
+        :meth:`restore_adopted_state` before constructing the saved-state loader.
+
+        Args:
+            model: Model captured when the plan was created.
+            plan: Validated storage migration and pinning plan.
+        """
+        TensorManagerStateHandler(self).execute_state_adoption(model, plan)
+
+    def restore_adopted_state(self, model: torch.nn.Module, state: TensorManagerState) -> None:
+        """Restore saved loader metadata after successful state adoption.
+
+        Rebinds saved tensor IDs, strategies, statistics, and model ownership
+        without repeating placement preprocessing established by
+        :meth:`execute_state_adoption`.
+
+        Args:
+            model: Model whose state-adoption plan was executed.
+            state: Saved profile used to create that plan.
+        """
+        TensorManagerStateHandler(self).restore_state(model, state, preprocess_model_state=False)
+
     def _save_state_to_file(self, file_path):
         """Internal: Save state to a specific file path."""
         if self.tensor_manager_state is None:

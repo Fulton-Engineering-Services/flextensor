@@ -133,8 +133,13 @@ def _target_storages(
     destinations: dict[str, set[str]] = {storage.id: set() for storage in current.storages}
     for tensor in current.tensors:
         profile_names = saved_names.intersection(tensor.names)
+        if not profile_names:
+            continue
         destination = "cpu" if profile_names & managed_names else target_device
         destinations[tensor.storage_id].add(destination)
+    for devices in destinations.values():
+        if not devices:
+            devices.add(target_device)
 
     contradictory = sorted(storage_id for storage_id, devices in destinations.items() if len(devices) != 1)
     if contradictory:

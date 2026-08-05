@@ -102,6 +102,18 @@ class TestCachingByIdentity:
         assert out_a is not out_b
 
 
+def test_apply_leaves_tensor_nested_in_list_attribute_untouched() -> None:
+    model = torch.nn.Module()
+    nested = torch.arange(4.0)
+    model.tensors = [nested]
+    pinner = _SpyPinner(in_place=False)
+
+    MoveToPinMemoryTensorProcessor(pinner).apply(model)
+
+    assert model.tensors[0] is nested
+    assert pinner.calls == []
+
+
 class TestModeDispatch:
     def test_torch_mode_returns_fresh_tensor(self):
         """Torch mode: pinner returns a new tensor → processor returns it (not src)."""

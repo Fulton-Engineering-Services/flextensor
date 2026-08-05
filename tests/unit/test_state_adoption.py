@@ -3,12 +3,16 @@
 
 """Tests for read-only planning of saved-state adoption."""
 
+import gc
+import weakref
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 
 import flextensor.state_transition as state_adoption_module
+from flextensor import state_handler as state_handler_module
 from flextensor.collectors import LayerStatistics, TensorStatistics
 from flextensor.model_state_capture import capture_model_state
 from flextensor.state_adoption import target_from_profile
@@ -127,6 +131,16 @@ def _snapshot(model: torch.nn.Module) -> dict[str, tuple[int, torch.device, tupl
     }
 
 
+def _single_storage_migration_plan(model: torch.nn.Module, names: tuple[str, ...]) -> StateTransitionPlan:
+    storage = capture_model_state(model).storages[0]
+    return StateTransitionPlan(
+        migrations=(StorageMigration(storage.id, names, storage.device, "cuda:0", storage.nbytes),),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=storage.nbytes,
+    )
+
+
 def test_plan_state_adoption_returns_read_only_cpu_plan() -> None:
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(torch.arange(4.0), requires_grad=False))
@@ -202,6 +216,32 @@ def test_plan_canonicalizes_same_parameter_reachable_by_two_names() -> None:
     )
 
     assert plan.migrations == ()
+
+
+def test_target_from_profile_ignores_unnamed_tensor_order() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.arange(4.0), requires_grad=False))
+    model.workspace = torch.arange(2.0)
+    state = _state_for(model, load_names=("weight",))
+    current = capture_model_state(model)
+    current = type(current)(
+        tensors=tuple(sorted(current.tensors, key=lambda tensor: bool(tensor.names))),
+        storages=current.storages,
+    )
+
+    target, _transition = target_from_profile(
+        current,
+        state,
+        target_device="cuda:0",
+        pinning="none",
+        use_shm=False,
+    )
+
+    storage_by_id = {storage.id: storage for storage in target.storages}
+    weight_storage_id = next(tensor.storage_id for tensor in current.tensors if tensor.names == ("weight",))
+    workspace_storage_id = next(tensor.storage_id for tensor in current.tensors if not tensor.names)
+    assert storage_by_id[weight_storage_id].device == "cpu"
+    assert storage_by_id[workspace_storage_id].device == "cuda:0"
 
 
 def test_plan_accepts_logical_statistics_for_view_with_larger_backing_storage() -> None:
@@ -963,6 +1003,28 @@ def test_plan_rejects_meta_tensor() -> None:
         )
 
 
+@pytest.mark.parametrize("operation", ["migration", "pinning"])
+def test_execute_rejects_quantized_storage_before_rebinding(monkeypatch, operation: str) -> None:
+    model = torch.nn.Module()
+    model.register_buffer("workspace", torch.quantize_per_tensor(torch.arange(4.0), 0.1, 2, torch.qint8))
+    migration_plan = _single_storage_migration_plan(model, ("workspace",))
+    plan = StateTransitionPlan(
+        migrations=migration_plan.migrations if operation == "migration" else (),
+        pinning_groups=(("workspace",),) if operation == "pinning" else (),
+        peak_host_bytes=0,
+        peak_gpu_bytes=migration_plan.peak_gpu_bytes,
+    )
+    expected = model.workspace.dequantize().clone()
+    manager = SimpleNamespace(host_pinner=SimpleNamespace(pin=lambda tensor: tensor.clone()))
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", lambda source, _device: source.clone())
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    with pytest.raises(ValueError, match="quantized tensor"):
+        TensorManagerStateHandler(manager).execute_state_adoption(model, plan)
+
+    torch.testing.assert_close(model.workspace.dequantize(), expected)
+
+
 def test_plan_rejects_unsupported_live_layout_before_storage_inspection() -> None:
     model = torch.nn.Module()
     sparse = torch.sparse_coo_tensor(torch.tensor([[0], [1]]), torch.tensor([1.0]), (2, 2))
@@ -1276,6 +1338,20 @@ class _CopyingHostPinner:
         return tensor.clone()
 
 
+class _NonRetainingCopyingHostPinner:
+    registry = None
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def pin(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.calls += 1
+        return tensor.clone()
+
+    def is_pinned(self, _tensor: torch.Tensor) -> bool:
+        return self.calls > 0
+
+
 def _pinning_manager(*, pinned_memory: bool, registry: object | None = None) -> SimpleNamespace:
     pinner = _CopyingHostPinner()
     pinner.registry = registry
@@ -1422,3 +1498,958 @@ def test_block_plan_rejects_zero_host_headroom_before_mutation() -> None:
         )
 
     assert _snapshot(model) == before
+
+
+def _storage_impl_key(tensor: torch.Tensor) -> tuple[str, int | None, int, int]:
+    storage = tensor.untyped_storage()
+    return tensor.device.type, tensor.device.index, storage._cdata, storage.nbytes()  # noqa: SLF001
+
+
+def test_execute_resolves_unnamed_storage_after_reachability_reorder(monkeypatch) -> None:
+    model = torch.nn.Module()
+    planned = torch.arange(4.0)
+    other = torch.arange(4.0) + 10
+    model.workspaces = [planned, other]
+    captured = capture_model_state(model)
+    plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=captured.storages[0].id,
+                names=(),
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=planned.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=planned.untyped_storage().nbytes(),
+    )
+    planned_storage = _storage_impl_key(planned)
+    other_storage = _storage_impl_key(other)
+    model.workspaces.reverse()
+
+    monkeypatch.setattr(
+        state_handler_module,
+        "_copy_storage_to_device",
+        lambda source, _destination: source.clone(),
+    )
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert _storage_impl_key(planned) != planned_storage
+    assert _storage_impl_key(other) == other_storage
+
+
+@pytest.mark.parametrize("view_kind", ["conjugate", "negative"])
+def test_execute_preserves_lazy_view_metadata(monkeypatch, view_kind: str) -> None:
+    model = torch.nn.Module()
+    model.base = torch.tensor([[1 + 2j, 3 + 4j], [5 + 6j, 7 + 8j]])
+    model.view = model.base.T.conj() if view_kind == "conjugate" else model.base.conj().imag
+    captured = capture_model_state(model)
+    plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=captured.storages[0].id,
+                names=(),
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=model.base.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=model.base.untyped_storage().nbytes(),
+    )
+    view_id = id(model.view)
+    expected = model.view.clone()
+    expected_shape = model.view.shape
+    expected_stride = model.view.stride()
+    expected_offset = model.view.storage_offset()
+
+    monkeypatch.setattr(
+        state_handler_module,
+        "_copy_storage_to_device",
+        lambda source, _destination: source.clone(),
+    )
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert id(model.view) == view_id
+    assert model.view.is_conj() if view_kind == "conjugate" else model.view.is_neg()
+    torch.testing.assert_close(model.view, expected)
+    assert model.view.shape == expected_shape
+    assert model.view.stride() == expected_stride
+    assert model.view.storage_offset() == expected_offset
+    assert _storage_impl_key(model.base) == _storage_impl_key(model.view)
+
+
+@pytest.mark.skipif(
+    not callable(getattr(torch.Tensor, "refine_names", None)), reason="PyTorch named tensors are unavailable"
+)
+def test_execute_preserves_named_tensor_dimensions(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.workspace = torch.arange(6.0).reshape(2, 3).refine_names("row", "column")
+    plan = _single_storage_migration_plan(model, ())
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", lambda source, _device: source.clone())
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert model.workspace.names == ("row", "column")
+
+
+def test_execute_rebinds_when_named_tensor_api_is_unavailable(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.workspace = torch.arange(6.0).reshape(2, 3)
+    plan = _single_storage_migration_plan(model, ())
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", lambda source, _device: source.clone())
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+    monkeypatch.setattr(torch.Tensor, "has_names", None, raising=False)
+    monkeypatch.setattr(torch.Tensor, "names", None, raising=False)
+    monkeypatch.setattr(torch.Tensor, "rename_", None, raising=False)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert model.workspace.tolist() == [[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]
+
+
+@pytest.mark.parametrize(
+    "invalid_state",
+    [
+        "loader",
+        "compiling",
+        "capturing",
+        "compiled_wrapper",
+        "live_wrapper",
+        "compiled_in_place",
+        "compiled_forward",
+    ],
+)
+def test_execute_rejects_invalid_lifecycle_state_before_mutation(monkeypatch, invalid_state: str) -> None:
+    manager = SimpleNamespace(tensor_layer_loader=None)
+    model = torch.nn.Linear(2, 2)
+    model_to_execute = model
+    if invalid_state == "loader":
+        manager.tensor_layer_loader = object()
+    elif invalid_state == "compiling":
+        monkeypatch.setattr(state_handler_module, "is_compiling", lambda: True, raising=False)
+    elif invalid_state == "capturing":
+        monkeypatch.setattr(state_handler_module.torch.cuda, "is_initialized", lambda: True)
+        monkeypatch.setattr(state_handler_module.torch.cuda, "is_current_stream_capturing", lambda: True)
+    elif invalid_state == "compiled_wrapper":
+        model_to_execute = torch.compile(model, backend="eager")
+    elif invalid_state == "live_wrapper":
+        _live_wrapper = torch.compile(model, backend="eager")
+    elif invalid_state == "compiled_in_place":
+        model.compile(backend="eager")
+    else:
+        model.forward = torch.compile(model.forward, backend="eager")
+
+    plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
+    handler = TensorManagerStateHandler(manager)
+
+    with (
+        patch.object(handler, "_resolve_state_adoption_plan") as resolve_plan,
+        pytest.raises(RuntimeError, match="State adoption must run before"),
+    ):
+        handler.execute_state_adoption(model_to_execute, plan)
+    resolve_plan.assert_not_called()
+
+
+def test_execute_stages_cross_device_replacements_on_destination(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.workspace = torch.arange(4.0)
+    captured = capture_model_state(model)
+    plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=captured.storages[0].id,
+                names=(),
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=model.workspace.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=model.workspace.untyped_storage().nbytes(),
+    )
+    replacements: list[torch.Tensor] = []
+
+    monkeypatch.setattr(
+        state_handler_module,
+        "_copy_storage_to_device",
+        lambda source, _destination: torch.empty(source.numel(), dtype=source.dtype, device="meta"),
+    )
+    monkeypatch.setattr(
+        state_handler_module,
+        "_set_tensor_data",
+        lambda _tensor, replacement: replacements.append(replacement),
+    )
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert [replacement.device.type for replacement in replacements] == ["meta"]
+
+
+def test_execute_migrates_unregistered_workspace_storage(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.workspace = torch.arange(8.0)
+    list_view = model.workspace[1:4]
+    tuple_view = model.workspace[4:7]
+    model.views = [list_view, (tuple_view,)]
+    state = _state_for(model, load_names=())
+    manager = SimpleNamespace(loader_type="strategy", pinned_memory=False)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=1024,
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    tensors = (model.workspace, list_view, tuple_view)
+    tensor_ids = tuple(map(id, tensors))
+    expected = tuple(tensor.clone() for tensor in tensors)
+    destinations: list[str] = []
+
+    def copy_to_requested_device(source: torch.Tensor, destination: str) -> torch.Tensor:
+        destinations.append(destination)
+        return source.clone()
+
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", copy_to_requested_device)
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert plan.migrations[0].names == ()
+    assert destinations == ["cuda:0"]
+    migrated = (model.workspace, model.views[0], model.views[1][0])
+    assert tuple(map(id, migrated)) == tensor_ids
+    assert len({_storage_impl_key(tensor) for tensor in migrated}) == 1
+    for tensor, value in zip(migrated, expected, strict=True):
+        torch.testing.assert_close(tensor, value)
+
+
+def test_execute_walks_reachable_tensors_once_during_preflight(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.register_parameter("first", torch.nn.Parameter(torch.arange(2.0), requires_grad=False))
+    model.register_parameter("second", torch.nn.Parameter(torch.arange(3.0), requires_grad=False))
+    state = _state_for(model, load_names=("first", "second"))
+    manager = _pinning_manager(pinned_memory=True)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=1024,
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    original_compute = state_handler_module.compute_reachable_tensor_map
+    walks = 0
+
+    def count_walks(current_model: torch.nn.Module) -> dict[int, torch.Tensor]:
+        nonlocal walks
+        walks += 1
+        return original_compute(current_model)
+
+    monkeypatch.setattr(state_handler_module, "compute_reachable_tensor_map", count_walks)
+
+    TensorManagerStateHandler(manager).execute_state_adoption(model, plan)
+
+    assert walks == 1
+
+
+def test_execute_pins_stationary_alias_group_without_replacing_tensor_objects() -> None:
+    model = _AliasModel()
+    state = _state_for(model, load_names=("first",), view_names=("second",))
+    manager = _pinning_manager(pinned_memory=True)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=2 * model.first.untyped_storage().nbytes(),
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    tensors_before = {
+        name: (
+            id(tensor),
+            tensor.detach().clone(),
+            tensor.shape,
+            tensor.stride(),
+            tensor.storage_offset(),
+        )
+        for name, tensor in model.named_parameters()
+    }
+    old_storage_key = _storage_impl_key(model.first)
+
+    handler.execute_state_adoption(model, plan)
+
+    assert len(manager.host_pinner.calls) == 1
+    assert _storage_impl_key(model.first) == _storage_impl_key(model.second)
+    assert _storage_impl_key(model.first) != old_storage_key
+    for name, tensor in model.named_parameters():
+        object_id, value, shape, stride, storage_offset = tensors_before[name]
+        assert id(tensor) == object_id
+        torch.testing.assert_close(tensor, value)
+        assert tensor.shape == shape
+        assert tensor.stride() == stride
+        assert tensor.storage_offset() == storage_offset
+
+
+def test_execute_keeps_distinct_empty_storage_groups_distinct_when_pinning() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("first", torch.nn.Parameter(torch.empty(0), requires_grad=False))
+    model.register_parameter("second", torch.nn.Parameter(torch.empty(0), requires_grad=False))
+    state = _state_for(model, load_names=("first", "second"))
+    manager = _pinning_manager(pinned_memory=True)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=1024,
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    ids_before = {name: id(tensor) for name, tensor in model.named_parameters()}
+
+    handler.execute_state_adoption(model, plan)
+
+    assert len(manager.host_pinner.calls) == 2
+    assert _storage_impl_key(model.first) != _storage_impl_key(model.second)
+    assert {name: id(tensor) for name, tensor in model.named_parameters()} == ids_before
+
+
+def test_execute_and_restore_preserve_unnamed_nested_view_alias() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.arange(8.0), requires_grad=False))
+    nested_view = model.weight[1:5]
+    model.weight.views = {"nested": {"slice": nested_view}}
+    state = _state_for(model, load_names=("weight",))
+    pinner = _NonRetainingCopyingHostPinner()
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=True,
+        host_pinner=pinner,
+        use_shm=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+    )
+    manager.set_model = lambda restored_model: setattr(manager, "model", restored_model)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=2 * model.weight.untyped_storage().nbytes(),
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    old_storage = weakref.ref(model.weight.untyped_storage())
+    nested_id = id(nested_view)
+    expected = nested_view.clone()
+
+    handler.execute_state_adoption(model, plan)
+    gc.collect()
+
+    assert pinner.calls == 1
+    assert old_storage() is None
+    assert id(model.weight.views["nested"]["slice"]) == nested_id
+    torch.testing.assert_close(model.weight.views["nested"]["slice"], expected)
+    assert _storage_impl_key(model.weight) == _storage_impl_key(model.weight.views["nested"]["slice"])
+
+    handler.restore_state(model, state, preprocess_model_state=False)
+
+    assert _storage_impl_key(model.weight) == _storage_impl_key(model.weight.views["nested"]["slice"])
+
+
+def test_execute_rebinds_hidden_view_base_and_releases_source_storage(monkeypatch) -> None:
+    model = torch.nn.Module()
+    backing = torch.arange(8.0)
+    model.view = backing[1:5]
+    captured = capture_model_state(model)
+    plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=captured.storages[0].id,
+                names=(),
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=backing.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=backing.untyped_storage().nbytes(),
+    )
+    old_storage = weakref.ref(backing.untyped_storage())
+    expected = model.view.clone()
+    del backing
+
+    monkeypatch.setattr(
+        state_handler_module,
+        "_copy_storage_to_device",
+        lambda source, _destination: source.clone(),
+    )
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+    gc.collect()
+
+    assert old_storage() is None
+    assert _storage_impl_key(model.view) == _storage_impl_key(model.view._base)
+    torch.testing.assert_close(model.view, expected)
+
+
+class _RejectDataAssignmentParameter(torch.nn.Parameter):
+    def __new__(cls, data: torch.Tensor) -> "_RejectDataAssignmentParameter":
+        return super().__new__(cls, data, requires_grad=False)
+
+    @property
+    def data(self) -> torch.Tensor:
+        return torch.Tensor.data.__get__(self, type(self))
+
+    @data.setter
+    def data(self, _value: torch.Tensor) -> None:
+        raise RuntimeError("custom parameter rejects .data assignment")
+
+
+def test_execute_rebinds_parameter_subclass_without_using_custom_data_setter() -> None:
+    model = torch.nn.Module()
+    backing = torch.arange(8.0)
+    model.register_parameter("first", torch.nn.Parameter(backing[:4], requires_grad=False))
+    model.register_parameter("second", _RejectDataAssignmentParameter(backing[2:6]))
+    state = _state_for(model, load_names=("first",), view_names=("second",))
+    pinner = _NonRetainingCopyingHostPinner()
+    manager = SimpleNamespace(loader_type="strategy", pinned_memory=True, host_pinner=pinner)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=2 * model.first.untyped_storage().nbytes(),
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    ids_before = {name: id(tensor) for name, tensor in model.named_parameters()}
+    values_before = {name: tensor.detach().clone() for name, tensor in model.named_parameters()}
+
+    handler.execute_state_adoption(model, plan)
+
+    assert isinstance(model.second, _RejectDataAssignmentParameter)
+    assert {name: id(tensor) for name, tensor in model.named_parameters()} == ids_before
+    assert _storage_impl_key(model.first) == _storage_impl_key(model.second)
+    for name, tensor in model.named_parameters():
+        torch.testing.assert_close(tensor, values_before[name])
+
+
+def test_execute_rolls_back_current_alias_group_when_rebind_fails(monkeypatch) -> None:
+    model = _AliasModel()
+    state = _state_for(model, load_names=("first",), view_names=("second",))
+    pinner = _NonRetainingCopyingHostPinner()
+    manager = SimpleNamespace(loader_type="strategy", pinned_memory=True, host_pinner=pinner)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=2 * model.first.untyped_storage().nbytes(),
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+    original_set_data = state_handler_module._set_tensor_data  # noqa: SLF001
+    set_data_calls = 0
+    source_key = _storage_impl_key(model.first)
+    values_before = {name: tensor.detach().clone() for name, tensor in model.named_parameters()}
+
+    def fail_second_rebind(tensor: torch.Tensor, replacement: torch.Tensor) -> None:
+        nonlocal set_data_calls
+        set_data_calls += 1
+        if set_data_calls == 2:
+            raise RuntimeError("injected alias rebind failure")
+        original_set_data(tensor, replacement)
+
+    monkeypatch.setattr(state_handler_module, "_set_tensor_data", fail_second_rebind)
+
+    with pytest.raises(RuntimeError, match="injected alias rebind failure"):
+        handler.execute_state_adoption(model, plan)
+
+    assert set_data_calls == 3
+    assert _storage_impl_key(model.first) == source_key
+    assert _storage_impl_key(model.second) == source_key
+    for name, tensor in model.named_parameters():
+        torch.testing.assert_close(tensor, values_before[name])
+
+
+@pytest.mark.skipif(
+    not callable(getattr(torch.Tensor, "refine_names", None)), reason="PyTorch named tensors are unavailable"
+)
+def test_execute_rolls_back_named_tensor_when_name_restore_fails(monkeypatch) -> None:
+    model = torch.nn.Module()
+    model.workspace = torch.arange(6.0).reshape(2, 3).refine_names("row", "column")
+    plan = _single_storage_migration_plan(model, ())
+    source_key = _storage_impl_key(model.workspace)
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", lambda source, _device: source.clone())
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    def fail_name_restore(_tensor: torch.Tensor, *_names: str | None) -> None:
+        raise RuntimeError("injected name restoration failure")
+
+    monkeypatch.setattr(torch.Tensor, "rename_", fail_name_restore)
+
+    with pytest.raises(RuntimeError, match="injected name restoration failure"):
+        TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert _storage_impl_key(model.workspace) == source_key
+    assert model.workspace.names == ("row", "column")
+
+
+def test_execute_rejects_stale_plan_before_any_pinning_or_migration() -> None:
+    model, _state = _cpu_model_and_state()
+    manager = _pinning_manager(pinned_memory=True)
+    before = _snapshot(model)
+    stale_plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id="storage:stale",
+                names=("weight",),
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=model.weight.untyped_storage().nbytes() + 1,
+            ),
+        ),
+        peak_host_bytes=0,
+        peak_gpu_bytes=0,
+        pinning_groups=(("weight",),),
+    )
+
+    with pytest.raises(ValueError, match=r"plan.*weight.*nbytes|nbytes.*weight"):
+        TensorManagerStateHandler(manager).execute_state_adoption(model, stale_plan)
+
+    assert manager.host_pinner.calls == []
+    assert _snapshot(model) == before
+
+
+def test_execute_rejects_same_sized_replaced_named_storage(monkeypatch) -> None:
+    model, _state = _cpu_model_and_state()
+    plan = _single_storage_migration_plan(model, ("weight",))
+    model.weight.data = model.weight.data.clone()
+    replacement_key = _storage_impl_key(model.weight)
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", lambda source, _device: source.clone())
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", lambda _device=None: None)
+
+    with pytest.raises(ValueError, match="storage"):
+        TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert _storage_impl_key(model.weight) == replacement_key
+
+
+@pytest.mark.parametrize(
+    ("names", "destination_device", "error"),
+    [
+        (("missing",), "cuda:0", "missing tensor"),
+        (("weight",), "meta", "unsupported devices"),
+    ],
+)
+def test_execute_rejects_invalid_migration_before_copy(
+    monkeypatch,
+    names: tuple[str, ...],
+    destination_device: str,
+    error: str,
+) -> None:
+    model, _state = _cpu_model_and_state()
+    captured = capture_model_state(model)
+    plan = StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=captured.storages[0].id,
+                names=names,
+                source_device="cpu",
+                destination_device=destination_device,
+                nbytes=model.weight.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=0,
+        peak_gpu_bytes=0,
+    )
+    monkeypatch.setattr(
+        state_handler_module,
+        "_copy_storage_to_device",
+        lambda *_args: pytest.fail("invalid plan reached storage copy"),
+    )
+
+    with pytest.raises(ValueError, match=error):
+        TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+
+@pytest.mark.parametrize("duplicate_group", ["migration", "pinning"])
+def test_execute_rejects_duplicate_names_inside_a_planned_group(duplicate_group: str) -> None:
+    model, _state = _cpu_model_and_state()
+    manager = _pinning_manager(pinned_memory=True)
+    names = ("weight", "weight")
+    migrations = (
+        (
+            StorageMigration(
+                storage_id="storage:duplicate",
+                names=names,
+                source_device="cpu",
+                destination_device="cuda:0",
+                nbytes=model.weight.untyped_storage().nbytes(),
+            ),
+        )
+        if duplicate_group == "migration"
+        else ()
+    )
+    plan = StateTransitionPlan(
+        migrations=migrations,
+        peak_host_bytes=0,
+        peak_gpu_bytes=0,
+        pinning_groups=(names,) if duplicate_group == "pinning" else (),
+    )
+    before = _snapshot(model)
+
+    with pytest.raises(ValueError, match=r"duplicate.*weight|weight.*duplicate"):
+        TensorManagerStateHandler(manager).execute_state_adoption(model, plan)
+
+    assert manager.host_pinner.calls == []
+    assert _snapshot(model) == before
+
+
+class _FailSecondHostPinner(_CopyingHostPinner):
+    def pin(self, tensor: torch.Tensor) -> torch.Tensor:
+        if len(self.calls) == 1:
+            raise RuntimeError("injected second pin failure")
+        return super().pin(tensor)
+
+
+def test_execute_reports_completed_and_current_groups_after_partial_pinning_failure() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("first", torch.nn.Parameter(torch.arange(2.0), requires_grad=False))
+    model.register_parameter("second", torch.nn.Parameter(torch.arange(3.0), requires_grad=False))
+    state = _state_for(model, load_names=("first", "second"))
+    pinner = _FailSecondHostPinner()
+    manager = SimpleNamespace(loader_type="strategy", pinned_memory=True, host_pinner=pinner)
+    handler = TensorManagerStateHandler(manager)
+    plan = _plan_profile_transition(
+        manager,
+        model,
+        state,
+        host_available_bytes=1024,
+        host_reserve_bytes=0,
+        gpu_available_bytes=1024,
+        gpu_reserve_bytes=0,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        handler.execute_state_adoption(model, plan)
+
+    message = str(exc_info.value)
+    assert "partial" in message.lower()
+    assert "completed" in message.lower()
+    assert "current" in message.lower()
+    assert "No rollback of previously completed groups was attempted" in message
+    assert "first" in message
+    assert "second" in message
+
+
+def test_restore_adopted_state_skips_preprocess_but_rebinds_manager_state() -> None:
+    model, state = _cpu_model_and_state()
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=False,
+        use_shm=False,
+        use_trace_tensor=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+        set_model=lambda restored_model: setattr(manager, "model", restored_model),
+    )
+
+    with patch("flextensor.state_handler.preprocess_model") as preprocess_model:
+        result = TensorManagerStateHandler(manager).restore_state(
+            model,
+            state,
+            preprocess_model_state=False,
+        )
+
+    preprocess_model.assert_not_called()
+    assert set(manager.tensors_map) == {id(model.weight)}
+    assert manager.traced_tensors == {id(model.weight)}
+    assert manager.tensor_manager_state is not state
+    assert manager.model is model
+    assert not result
+
+
+def test_restore_adopted_state_rejects_unexecuted_gpu_placement() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.arange(4.0), requires_grad=False))
+    state = _state_for(model, load_names=())
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=False,
+        use_shm=False,
+        use_trace_tensor=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+        set_model=lambda restored_model: setattr(manager, "model", restored_model),
+    )
+
+    with pytest.raises(ValueError, match="execute_state_adoption"):
+        TensorManagerStateHandler(manager).restore_state(model, state, preprocess_model_state=False)
+
+
+def test_restore_adopted_state_rejects_unexecuted_host_pinning() -> None:
+    model, state = _cpu_model_and_state()
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=True,
+        host_pinner=SimpleNamespace(registry=None, is_pinned=lambda _tensor: False),
+        use_shm=False,
+        use_trace_tensor=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+        set_model=lambda restored_model: setattr(manager, "model", restored_model),
+    )
+
+    with pytest.raises(ValueError, match="execute_state_adoption"):
+        TensorManagerStateHandler(manager).restore_state(model, state, preprocess_model_state=False)
+
+
+def test_restore_adopted_state_accepts_in_place_registered_storage() -> None:
+    model, state = _cpu_model_and_state()
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=True,
+        host_pinner=SimpleNamespace(registry=object(), is_pinned=lambda _tensor: True),
+        use_shm=False,
+        use_trace_tensor=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+        set_model=lambda restored_model: setattr(manager, "model", restored_model),
+    )
+
+    result = TensorManagerStateHandler(manager).restore_state(model, state, preprocess_model_state=False)
+
+    assert not result
+    assert manager.model is model
+
+
+def test_restore_adopted_state_still_disables_gradients() -> None:
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.arange(4.0)))
+    state = _state_for(model, load_names=("weight",))
+    manager = SimpleNamespace(
+        loader_type="strategy",
+        device_gpu=torch.device("cuda:0"),
+        pinned_memory=False,
+        use_shm=False,
+        use_trace_tensor=False,
+        tensors_map={},
+        traced_tensors=set(),
+        tensor_manager_state=None,
+        set_model=lambda restored_model: setattr(manager, "model", restored_model),
+    )
+
+    TensorManagerStateHandler(manager).restore_state(model, state, preprocess_model_state=False)
+
+    assert model.weight.requires_grad is False
+
+
+def _split_execution_plan(model: _SplitDeviceModel, device: torch.device) -> StateTransitionPlan:
+    captured = capture_model_state(model)
+    storage_ids = {name: tensor.storage_id for tensor in captured.tensors for name in tensor.names}
+    return StateTransitionPlan(
+        migrations=(
+            StorageMigration(
+                storage_id=storage_ids["promote.weight"],
+                names=("promote.weight",),
+                source_device="cpu",
+                destination_device=str(device),
+                nbytes=model.promote.weight.untyped_storage().nbytes(),
+            ),
+            StorageMigration(
+                storage_id=storage_ids["demote.weight"],
+                names=("demote.weight", "demote.weight_view"),
+                source_device=str(device),
+                destination_device="cpu",
+                nbytes=model.demote.weight.untyped_storage().nbytes(),
+            ),
+        ),
+        pinning_groups=(),
+        peak_host_bytes=model.promote.weight.untyped_storage().nbytes(),
+        peak_gpu_bytes=model.promote.weight.untyped_storage().nbytes(),
+    )
+
+
+@requires_cuda
+def test_execute_migrates_storage_groups_and_preserves_views_and_tensor_identity(monkeypatch) -> None:
+    model, _state, device = _split_model_and_state()
+    inner_view = torch.empty(0, dtype=model.demote.weight.dtype, device=device)
+    inner_view.set_(model.demote.weight.untyped_storage(), 1, (2, 2), (2, 1))
+    model.demote.weight.views = {"nested": {"slice": inner_view}}
+    base_plan = _split_execution_plan(model, device)
+    plan = StateTransitionPlan(
+        migrations=tuple(reversed(base_plan.migrations)),
+        pinning_groups=(),
+        peak_host_bytes=base_plan.peak_host_bytes,
+        peak_gpu_bytes=base_plan.peak_gpu_bytes,
+    )
+    tensors = dict(model.named_parameters(remove_duplicate=False))
+    expected = {
+        name: (
+            id(tensor),
+            tensor.detach().cpu().clone(),
+            tensor.shape,
+            tensor.stride(),
+            tensor.storage_offset(),
+        )
+        for name, tensor in tensors.items()
+    }
+    expected_inner = (
+        id(inner_view),
+        inner_view.cpu().clone(),
+        inner_view.shape,
+        inner_view.stride(),
+        inner_view.storage_offset(),
+    )
+    source_storages = [
+        weakref.ref(dict(model.named_parameters(remove_duplicate=False))[migration.names[0]].untyped_storage())
+        for migration in plan.migrations
+    ]
+    original_copy = state_handler_module._copy_storage_to_device
+    copy_calls = 0
+
+    def record_copy(source_bytes: torch.Tensor, destination_device: str) -> torch.Tensor:
+        nonlocal copy_calls
+        if copy_calls:
+            gc.collect()
+            assert source_storages[copy_calls - 1]() is None
+        copy_calls += 1
+        return original_copy(source_bytes, destination_device)
+
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", record_copy)
+
+    TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    assert copy_calls == len(plan.migrations)
+    tensors = dict(model.named_parameters(remove_duplicate=False))
+    destinations = {name: migration.destination_device for migration in plan.migrations for name in migration.names}
+    for name, (object_id, value, shape, stride, storage_offset) in expected.items():
+        tensor = tensors[name]
+        assert id(tensor) == object_id
+        assert torch.equal(tensor.detach().cpu(), value)
+        assert tensor.shape == shape
+        assert tensor.stride() == stride
+        assert tensor.storage_offset() == storage_offset
+        if name in destinations:
+            assert str(tensor.device) == destinations[name]
+    migrated_inner = model.demote.weight.views["nested"]["slice"]
+    assert id(migrated_inner) == expected_inner[0]
+    assert torch.equal(migrated_inner, expected_inner[1])
+    assert migrated_inner.shape == expected_inner[2]
+    assert migrated_inner.stride() == expected_inner[3]
+    assert migrated_inner.storage_offset() == expected_inner[4]
+    assert _storage_impl_key(model.demote.weight) == _storage_impl_key(model.demote.weight_view)
+    assert _storage_impl_key(model.demote.weight) == _storage_impl_key(migrated_inner)
+    assert isinstance(model.demote.weight, _TaggedParameter)
+    assert model.demote.weight.tag == "demote"
+    assert model.demote.weight.scale is model.demote.weight_view
+
+
+@requires_cuda
+def test_execute_reports_rebound_group_as_completed_when_synchronization_fails(monkeypatch) -> None:
+    model, _state, device = _split_model_and_state()
+    plan = _split_execution_plan(model, device)
+    first = plan.migrations[0]
+    synchronize_calls = 0
+
+    def fail_synchronization(_device=None) -> None:
+        nonlocal synchronize_calls
+        synchronize_calls += 1
+        raise RuntimeError(f"injected synchronize failure {synchronize_calls}")
+
+    monkeypatch.setattr(state_handler_module.torch.cuda, "synchronize", fail_synchronization)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    message = str(exc_info.value)
+    assert "partial" in message.lower()
+    assert "No rollback of previously completed groups was attempted" in message
+    assert str(first.names) in message
+    assert "completed" in message.lower()
+    assert "synchron" in message.lower()
+    assert synchronize_calls == 2
+    assert str(model.promote.weight.device) == first.destination_device
+
+
+@requires_cuda
+def test_execute_reports_completed_and_current_migrations_when_second_copy_fails(monkeypatch) -> None:
+    model, _state, device = _split_model_and_state()
+    plan = _split_execution_plan(model, device)
+    first, second = plan.migrations
+    original_copy = state_handler_module._copy_storage_to_device
+    copy_calls = 0
+
+    def fail_second_copy(source_bytes: torch.Tensor, destination_device: str) -> torch.Tensor:
+        nonlocal copy_calls
+        copy_calls += 1
+        if copy_calls == 2:
+            raise RuntimeError("injected second migration failure")
+        return original_copy(source_bytes, destination_device)
+
+    monkeypatch.setattr(state_handler_module, "_copy_storage_to_device", fail_second_copy)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        TensorManagerStateHandler(object()).execute_state_adoption(model, plan)
+
+    message = str(exc_info.value)
+    assert f"completed migration groups={[first.names]}" in message
+    assert f"current migration group={second.names}" in message
+    assert "No rollback of previously completed groups was attempted" in message
+    assert str(model.promote.weight.device) == first.destination_device
+    assert str(model.demote.weight.device) == second.source_device
+
+
+@requires_cuda
+def test_execute_pins_a_group_after_migrating_it_to_cpu() -> None:
+    model, _state, device = _split_model_and_state()
+    base_plan = _split_execution_plan(model, device)
+    demotion = base_plan.migrations[1]
+    plan = StateTransitionPlan(
+        migrations=base_plan.migrations,
+        peak_host_bytes=base_plan.peak_host_bytes,
+        peak_gpu_bytes=base_plan.peak_gpu_bytes,
+        pinning_groups=(demotion.names,),
+    )
+    manager = _pinning_manager(pinned_memory=True)
+
+    TensorManagerStateHandler(manager).execute_state_adoption(model, plan)
+
+    assert len(manager.host_pinner.calls) == 1
+    assert model.demote.weight.device.type == "cpu"
+    assert _storage_impl_key(model.demote.weight) == _storage_impl_key(model.demote.weight_view)

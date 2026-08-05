@@ -31,6 +31,8 @@ See [Internal Phases](../explanation/phases.md) for details on how these compone
         - load_state
         - restore_state
         - plan_state_adoption
+        - execute_state_adoption
+        - restore_adopted_state
 
 ## Benchmark Modes
 

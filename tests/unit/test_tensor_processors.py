@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from flextensor.tensor_manager import ModelDict
 from flextensor.tensor_processors import (
+    DisableRequiresGradTensorProcessor,
     LegacySetTypeHandler,
     MoveBuffersToGPUTensorProcessor,
     MoveUnmappedTensorsToGPUProcessor,
@@ -24,6 +25,17 @@ from flextensor.tensor_processors import (
     create_model_with_shared_tensors,
     preserve_parameter_type,
 )
+
+
+def test_disable_requires_grad_skips_non_leaf_views() -> None:
+    model = nn.Module()
+    model.base = torch.arange(4.0, requires_grad=True)
+    model.view = model.base[1:]
+
+    DisableRequiresGradTensorProcessor().apply(model)
+
+    assert model.base.requires_grad is False
+    assert model.view.requires_grad is True
 
 
 class TestTensorMappingProcessor:
@@ -246,6 +258,38 @@ class TestReachableTensorMapProcessor:
 
         assert tensors[id(m.w)] is m.w
         assert tensors[id(m.b)] is m.b
+
+    def test_returns_tensors_nested_in_custom_tensor_containers(self) -> None:
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.arange(8.0), requires_grad=False)
+
+        m = _M()
+        dict_view = m.w[1:4]
+        set_view = m.w[4:7]
+        m.w.views = {"nested": {"slice": dict_view}, "set": {set_view}}
+
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(dict_view) in ids
+        assert id(set_view) in ids
+
+    def test_returns_tensors_nested_in_list_and_tuple_attributes(self) -> None:
+        class _M(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.w = nn.Parameter(torch.arange(8.0), requires_grad=False)
+
+        m = _M()
+        list_view = m.w[1:4]
+        tuple_view = m.w[4:7]
+        m.views = [list_view, (tuple_view,)]
+
+        ids = compute_reachable_tensor_ids(m)
+
+        assert id(list_view) in ids
+        assert id(tuple_view) in ids
 
     def test_returns_dict_model_tensor_ids(self) -> None:
         t1 = torch.zeros(4)

@@ -28,6 +28,12 @@ def _inspect_storage(name: str, tensor: torch.Tensor) -> tuple[tuple[str, int], 
     return (str(tensor.device), storage._cdata), storage.nbytes(), tensor.device.type == "cpu" and tensor.is_pinned()  # noqa: SLF001
 
 
+def _storage_id_from_key(storage_key: tuple[str, int]) -> str:
+    """Return an opaque process-local ID for one inspected storage."""
+    device, storage_impl = storage_key
+    return f"storage:{device}:{storage_impl}"
+
+
 def capture_model_state(model: torch.nn.Module) -> ModelPlacementState:
     """Capture tensor identity, aliases, storage size, and placement without mutation."""
     if not isinstance(model, torch.nn.Module):
@@ -53,16 +59,15 @@ def capture_model_state(model: torch.nn.Module) -> ModelPlacementState:
     for tensor_id, tensor in compute_reachable_tensor_map(model).items():
         captured.setdefault(tensor_id, (tensor, [], "tensor"))
 
-    storage_ids: dict[tuple[str, int], str] = {}
+    storage_keys: set[tuple[str, int]] = set()
     storages: list[StorageState] = []
     tensors: list[TensorState] = []
     for index, (tensor, names, kind) in enumerate(captured.values()):
         display_name = names[0] if names else f"<reachable:{index}>"
         storage_key, nbytes, pinned = _inspect_storage(display_name, tensor)
-        storage_id = storage_ids.get(storage_key)
-        if storage_id is None:
-            storage_id = f"storage:{len(storages)}"
-            storage_ids[storage_key] = storage_id
+        storage_id = _storage_id_from_key(storage_key)
+        if storage_key not in storage_keys:
+            storage_keys.add(storage_key)
             storages.append(
                 StorageState(
                     id=storage_id,
