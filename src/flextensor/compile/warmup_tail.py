@@ -28,19 +28,30 @@ class WarmupTail:
         self.warm_seen = 0
         self.measure_seen = 0
         self.failure: BaseException | None = None
+        # Set when the tail reaches DONE: True if a new strategy was applied,
+        # False if finish returned a soft keep-current (empty budgets / rebuild
+        # refused). None while the tail has not finished.
+        self.replan_applied: bool | None = None
+        # When False, skip enable_compiled_profiling on MEASURING entry (e.g.
+        # CUDA-graph offload-timing replan supplies budgets elsewhere).
+        self.enable_profiling: bool = True
 
     def reset(self) -> None:
         self.state = CompiledOffloadTailState.IDLE
         self.warm_seen = 0
         self.measure_seen = 0
         self.failure = None
+        self.replan_applied = None
+        self.enable_profiling = True
 
-    def arm(self, *, credited_warm: int = 0) -> int:
+    def arm(self, *, credited_warm: int = 0, enable_profiling: bool = True) -> int:
         """Arm warm→measure; return remaining forwards until finish."""
         credited = min(max(credited_warm, 0), self.warmup_forwards)
         self.warm_seen = credited
         self.measure_seen = 0
         self.failure = None
+        self.replan_applied = None
+        self.enable_profiling = enable_profiling
         remaining_warm = self.warmup_forwards - credited
         if credited >= self.warmup_forwards:
             self.state = CompiledOffloadTailState.MEASURING
@@ -48,9 +59,12 @@ class WarmupTail:
             self.state = CompiledOffloadTailState.WARMING
         return remaining_warm + self.measure_forwards
 
-    def mark_done(self) -> None:
+    def mark_done(self, *, applied: bool = True) -> None:
+        """Mark the tail complete. ``applied=False`` means soft keep-current."""
         self.state = CompiledOffloadTailState.DONE
+        self.replan_applied = applied
 
     def mark_failed(self, exc: BaseException) -> None:
         self.state = CompiledOffloadTailState.FAILED
         self.failure = exc
+        self.replan_applied = False

@@ -895,6 +895,26 @@ class TestSetConfigWarnsOnOneShotFields:
             warnings.simplefilter("error")
             om.set_config(OffloadConfig(num_blocks=8))
 
+    def test_warns_when_offload_timing_changes_after_init(self) -> None:
+        """Construction-only timing mode must not flip silently under set_config."""
+        om = self._make_manager(OffloadConfig(offload_timing="off"))
+
+        with pytest.warns(UserWarning, match="offload_timing"):
+            om.set_config(OffloadConfig(offload_timing="eager"))
+
+    def test_warns_when_piecewise_prefetch_changes_after_init(self) -> None:
+        """Construction-only piecewise policy must not flip silently under set_config."""
+        om = self._make_manager(OffloadConfig(piecewise_prefetch="warn"))
+
+        with pytest.warns(UserWarning, match="piecewise_prefetch"):
+            om.set_config(OffloadConfig(piecewise_prefetch="error"))
+
+    def test_offload_timing_and_piecewise_are_oneshot_fields(self) -> None:
+        from flextensor.offload_manager import _TENSOR_MANAGER_ONESHOT_FIELDS
+
+        assert "offload_timing" in _TENSOR_MANAGER_ONESHOT_FIELDS
+        assert "piecewise_prefetch" in _TENSOR_MANAGER_ONESHOT_FIELDS
+
 
 class TestLayerStatsResetPerWarmupCycle:
     """A fresh discovery cycle must rebuild ``layer_stats``.

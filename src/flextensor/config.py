@@ -38,6 +38,8 @@ _ALL_WARMUP_ITERS_MSG = (
 _REGISTERED_ENV_VARS: set[str] = set()
 
 ProfileMode = Literal["torch_function", "getter", "view"]
+OffloadTimingMode = Literal["off", "eager", "cuda_graph"]
+PiecewisePrefetchMode = Literal["off", "warn", "error"]
 
 # Bidirectional deprecated ↔ canonical field pairs. Used by model_copy()
 # to mirror updates so that Pydantic v2's validator-bypass doesn't desync
@@ -277,6 +279,57 @@ class OffloadConfig(BaseModel):
     instrumentation_output_dir: str = Field(default=".flextensor/instrumentation")
     """Instrumentation output directory."""
 
+    offload_timing: OffloadTimingMode = Field(default="off")
+    """Inference offload-timing instrumentation mode.
+
+    * ``"off"`` — disabled (default).
+    * ``"eager"`` — record per-trap transfer / compute / wait with internal
+      CUDA timing events (module forwards / collect via
+      :meth:`OffloadManager.collect_offload_timing`).
+    * ``"cuda_graph"`` — same measurement using
+      ``torch.cuda.Event(..., external=True)`` so ``elapsed_time()`` is fresh
+      after CUDA-graph replay (PyTorch >= 2.8). Required for
+      :meth:`OffloadManager.request_strategy_replan` with
+      ``manual_update_state=True``.
+
+    Periodic log cadence and durable measure retention are internal defaults
+    (not independently tunable). Can also be set via ``FT_OFFLOAD_TIMING``.
+
+    Requires a block ``transfer_mode`` (``allocation_block_transfer`` or
+    ``raw_block_transfer``). ``transfer_mode='strategy'`` has no
+    ``PreallocatedLoader`` enter/exit timing hooks, so enabling timing with
+    strategy is rejected at config construction.
+
+    One-shot: consumed when the ``TensorManager`` is first constructed (first
+    ``offload()``). A later ``set_config`` with a different value warns; call
+    ``release()`` and re-``offload()`` to apply it.
+    """
+
+    piecewise_prefetch: PiecewisePrefetchMode = Field(default="warn")
+    """Policy when a PIECEWISE join forces outstanding H2D onto the critical path.
+
+    Under PIECEWISE capture, ``join_after_forward`` drains ``transfer_stream`` at
+    the piece boundary. If schedule and wait straddle pieces (rearrange
+    early-slot, or nested enter/exit such as parent ``1`` with graphs on
+    ``1.1`` / ``1.2``), the transfer still completes but async overlap is lost.
+
+    * ``"off"`` — disable the check.
+    * ``"warn"`` — log a warning (default; lost overlap is not silent).
+    * ``"error"`` — raise
+      :class:`~flextensor.piecewise_prefetch_policy.PiecewisePrefetchPolicyError`.
+
+    Integrations must call the block loader's ``join_after_forward()`` before
+    each piece's ``capture_end``. There is no in-tree automatic piece hook yet;
+    without that call only the last-trap join runs, so mid-piece boundaries are
+    neither joined nor checked.
+
+    Can also be set via ``FT_PIECEWISE_PREFETCH``.
+
+    One-shot: consumed when the ``TensorManager`` is first constructed (first
+    ``offload()``). A later ``set_config`` with a different value warns; call
+    ``release()`` and re-``offload()`` to apply it.
+    """
+
     include_patterns: list[str] = Field(default_factory=lambda: ["*"])
     """Module or parameter patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
@@ -501,6 +554,14 @@ class OffloadConfig(BaseModel):
                 f"transfer_mode={self.transfer_mode!r}. The compiled-offload "
                 f"path installs a PreallocatedLoader for pre_compute/post_compute "
                 f"custom ops, which transfer_mode='strategy' does not provide."
+            )
+        if self.offload_timing != "off" and self.transfer_mode not in block_loaders:
+            raise ValueError(
+                f"offload_timing={self.offload_timing!r} requires a block transfer_mode "
+                f"(allocation_block_transfer or raw_block_transfer); got "
+                f"transfer_mode={self.transfer_mode!r}. Inference timing is recorded "
+                f"by PreallocatedLoader enter/exit hooks, which "
+                f"transfer_mode='strategy' does not install."
             )
         return self
 

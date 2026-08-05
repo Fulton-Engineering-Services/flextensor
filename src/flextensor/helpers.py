@@ -217,6 +217,7 @@ class NoOpTensorManager:
         self.traced_tensors = set()
         self.loader_type = ""
         self.shm_namespace: str | None = None
+        self.stats: list[Any] = []
 
     def build_parameters_mapping(self, _model):
         pass
@@ -307,6 +308,9 @@ class NoOpTensorManager:
         self.model = model
 
     def get_memory_transfer_stats(self) -> dict[int, float] | None:
+        return None
+
+    def collect_offload_timing(self) -> Any:
         return None
 
     def get_gpu_memory_usage(self) -> GPUMemoryUsage:

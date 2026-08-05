@@ -508,11 +508,15 @@ Set `profile_read_only=True` to prevent accidental profile overwrites in product
 | `enable_instrumentation` | bool | `False` | Capture component initialization args |
 | `instrumentation_output_dir` | str | `".flextensor/instrumentation"` | Instrumentation output directory |
 | `enable_diagnostics` | bool | `False` | Log memory transfer statistics, per-trap duration statistics, and block assignment table after strategy computation |
+| `offload_timing` | `"off"` / `"eager"` / `"cuda_graph"` | `"off"` | Inference transfer / compute / wait timing; `"cuda_graph"` uses external CUDA events for replay readback (PyTorch ≥ 2.8). Requires a block `transfer_mode` (not `strategy`). |
+| `piecewise_prefetch` | `"off"` / `"warn"` / `"error"` | `"warn"` | Policy when a PIECEWISE join forces outstanding H2D onto the critical path. Integrations must call loader `join_after_forward()` before each piece's `capture_end`; otherwise only the last-trap join runs and mid-piece boundaries are neither joined nor checked. |
 
 These options help diagnose offloading behavior:
 
 - **`enable_instrumentation`**: Captures the arguments passed to FlexTensor components at initialization time and writes them to `instrumentation_output_dir`. Useful for reproducing configuration state.
 - **`enable_diagnostics`**: Logs three tables after strategy computation: a Memory Transfer Statistics table (tensor size → transfer time and bandwidth), a Trap Duration Statistics table (per-trap timing: min, max, median, avg, std, coefficient of variation), and the block assignment table (at NOTICE level 25). The Trap Duration Statistics table lists every offload trap created during profiling — it is the authoritative way to confirm which include patterns were applied as traps. Useful for diagnosing per-trap pipelining setup and inspecting why specific weights were assigned to specific pipeline blocks.
+- **`offload_timing`**: Measures H2D overlap during inference (not just profiling). See [Measure transfer overlap during inference](../how-to/configure-for-common-scenarios.md#measure-transfer-overlap-during-inference).
+- **`piecewise_prefetch`**: Warns (default) or errors when a PIECEWISE join breaks async H2D overlap. FlexTensor does not discover piece boundaries itself — the integration must call the block loader's `join_after_forward()` before each piece's `capture_end`. Without that, only the last-trap join runs, so mid-piece boundaries are neither joined nor checked by this policy.
 
 The distinction between `enable_diagnostics` and `enable_instrumentation` is scope: `enable_diagnostics` reports strategy decisions (which tensors landed in which block and why); `enable_instrumentation` captures component initialization arguments (how each component was configured).
 
@@ -522,10 +526,13 @@ config = OffloadConfig(enable_instrumentation=True)
 
 # Inspect strategy decisions
 config = OffloadConfig(enable_diagnostics=True)
+
+# Measure transfer/compute/wait overlap during inference
+config = OffloadConfig(offload_timing="eager")
 ```
 
 !!! warning "Performance Impact"
-    Instrumentation adds overhead. Use only for debugging, not production.
+    Instrumentation and offload timing add overhead. Use for measurement and debugging, not as a default production setting.
 
 ### Tensor Discovery
 
@@ -545,6 +552,6 @@ For ready-to-use starting configurations covering memory-constrained systems, pe
 | **Memory** | `pinned_memory`, `max_gpu_mem_fraction`, `shm_enabled` | Balance memory vs. performance |
 | **Profiling** | `discovery_iters` (only when `skip_discovery=False`), `profiling_iters` | More iters = more accurate |
 | **Transfer** | `transfer_mode`, `num_blocks`, `min_blocks` | Default works for most cases |
-| **Debug** | `enable_diagnostics`, `enable_instrumentation` | Only when troubleshooting |
+| **Debug** | `enable_diagnostics`, `enable_instrumentation`, `offload_timing` | Only when troubleshooting / measuring |
 
 Start with defaults, measure performance, and tune based on your specific workload characteristics. The profiling system will adapt to your model's actual behavior, so explicit strategy configuration is rarely needed.

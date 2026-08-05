@@ -1040,6 +1040,67 @@ class TestStateUpdateHookLifecycle:
         assert user_hook in new_hooks, "user hook must be transferred"
         assert _tagged_state_hooks(new_model) == [], "state-update hook must NOT be transferred"
 
+    def test_transfer_hooks_preserves_with_kwargs(self):
+        """Phase swaps must keep with_kwargs so hook signatures stay valid."""
+        om = OffloadManager("test_transfer_kwargs")
+
+        class KwargModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fc = nn.Linear(4, 4)
+
+            def forward(self, x, scale: float = 1.0):
+                return self.fc(x) * scale
+
+        old_model = KwargModel()
+        new_model = KwargModel()
+        seen: dict[str, object] = {}
+
+        def pre_hook(_m, _args, kwargs):
+            seen["pre"] = dict(kwargs)
+            return None
+
+        def post_hook(_m, _args, kwargs, _out):
+            seen["post"] = dict(kwargs)
+            return None
+
+        old_model.register_forward_pre_hook(pre_hook, with_kwargs=True)
+        old_model.register_forward_hook(post_hook, with_kwargs=True)
+
+        om._transfer_hooks(old_model, new_model)
+
+        # Behavioral: wrong arity if with_kwargs was dropped on re-register.
+        out = new_model(torch.randn(2, 4), scale=2.0)
+        assert out.shape == (2, 4)
+        assert seen["pre"] == {"scale": 2.0}
+        assert seen["post"] == {"scale": 2.0}
+
+    def test_transfer_hooks_preserves_always_call(self):
+        """Forward hooks registered with always_call=True must still run after transfer."""
+        om = OffloadManager("test_transfer_always_call")
+
+        class BoomModel(nn.Module):
+            def forward(self, x):
+                raise RuntimeError("boom")
+
+        old_model = BoomModel()
+        new_model = BoomModel()
+        called: list[str] = []
+
+        def post_hook(_m, _args, _out):
+            called.append("post")
+            return None
+
+        old_model.register_forward_hook(post_hook, always_call=True)
+        om._transfer_hooks(old_model, new_model)
+
+        post_id = next(iter(new_model._forward_hooks))
+        assert new_model._forward_hooks_always_called.get(post_id) is True
+
+        with pytest.raises(RuntimeError, match="boom"):
+            new_model(torch.randn(2, 4))
+        assert called == ["post"]
+
     @patch("flextensor.tensor_manager.TensorManager")
     @patch("flextensor.strategy.KnapsackStrategy")
     def test_transitions_keep_handle_on_current_model(self, _strategy_cls, mock_tensor_manager_cls):

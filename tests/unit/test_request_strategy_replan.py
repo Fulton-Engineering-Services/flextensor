@@ -22,6 +22,7 @@ def fake_custom_ops():
     mod.install_active_loader = MagicMock(name="install_active_loader")
     mod.clear_active_loader = MagicMock(name="clear_active_loader")
     mod.enable_compiled_profiling = MagicMock(name="enable_compiled_profiling")
+    mod.disable_compiled_profiling = MagicMock(name="disable_compiled_profiling")
     mod.finish_compiled_profiling = MagicMock(name="finish_compiled_profiling", return_value={})
 
     name = "flextensor.custom_ops"
@@ -125,6 +126,27 @@ def test_arm_replan_tail_finishes_immediately_when_warmup_credited_and_measure_z
     fake_custom_ops.finish_compiled_profiling.assert_called_once()
 
 
+def test_arm_replan_tail_enable_profiling_false_survives_warmup_transition(manager, fake_custom_ops):
+    """enable_profiling=False must also gate WARMING → MEASURING, not only immediate arm."""
+    finish = MagicMock(return_value=True)
+
+    remaining = manager.om._compiled.arm_replan_tail(
+        compiled_warm_forwards=0,
+        enable_profiling=False,
+        finish_replan=finish,
+    )
+    assert remaining == COMPILED_WARMUP_FORWARDS + 10
+    assert manager.om._compiled.tail_state == CompiledOffloadTailState.WARMING
+    fake_custom_ops.enable_compiled_profiling.assert_not_called()
+
+    for _ in range(remaining):
+        manager.om._compiled.advance_tail(finish_replan=finish)
+
+    assert manager.om._compiled.tail_state == CompiledOffloadTailState.DONE
+    fake_custom_ops.enable_compiled_profiling.assert_not_called()
+    finish.assert_called_once()
+
+
 def test_request_strategy_replan_works_with_compile_fn_when_replan_armed(manager, fake_custom_ops):
     """compile_fn + non-view (replan_active) may request a post-compile rebuild."""
     manager.om._compiled.compile_fn = lambda m: m
@@ -134,13 +156,15 @@ def test_request_strategy_replan_works_with_compile_fn_when_replan_armed(manager
     assert manager.om._compiled.tail_state == CompiledOffloadTailState.WARMING
 
 
-def test_request_strategy_replan_noop_when_compile_fn_without_replan_arm(manager, fake_custom_ops):
+def test_request_strategy_replan_noop_when_compile_fn_without_replan_arm(manager, fake_custom_ops, caplog):
     """Default compile_fn + view-profile leaves replan_active=False; do not arm a no-op tail."""
     manager.om._compiled.compile_fn = lambda m: m
     manager.om._compiled.replan_active = False
 
-    assert manager.om.request_strategy_replan() == 0
+    with caplog.at_level("WARNING"):
+        assert manager.om.request_strategy_replan() == 0
     assert manager.om._compiled.tail_state == CompiledOffloadTailState.IDLE
+    assert any("replan was not armed" in r.message for r in caplog.records)
 
 
 @pytest.mark.parametrize(
@@ -148,8 +172,10 @@ def test_request_strategy_replan_noop_when_compile_fn_without_replan_arm(manager
     [(False, True), (True, False), (False, False)],
     ids=["offload-off", "replan-off", "both-off"],
 )
-def test_request_strategy_replan_noop_when_flags_off(manager, monkeypatch, offload, replan):
+def test_request_strategy_replan_noop_when_flags_off(manager, monkeypatch, offload, replan, caplog):
     manager.om._compiled.active = offload
     manager.om._compiled.replan_active = replan
-    assert manager.om.request_strategy_replan() == 0
+    with caplog.at_level("WARNING"):
+        assert manager.om.request_strategy_replan() == 0
     assert manager.om._compiled.tail_state == CompiledOffloadTailState.IDLE
+    assert any("request_strategy_replan() ignored" in r.message for r in caplog.records)

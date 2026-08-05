@@ -3,6 +3,7 @@
 import copy
 import logging
 import types
+from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,7 +22,7 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
-from flextensor.config import ProfileMode
+from flextensor.config import OffloadTimingMode, PiecewisePrefetchMode, ProfileMode
 from flextensor.gpu_budget import (
     CUDAMemorySnapshot,
     reserve_strategy_invisible_gpu_budget,
@@ -47,6 +48,14 @@ from flextensor.memory_transfer_benchmark import (
     format_memory_transfer_table,
 )
 from flextensor.model_state_capture import capture_model_state
+from flextensor.offload_timing import (
+    OFFLOAD_TIMING_LOG_EVERY,
+    OFFLOAD_TIMING_MEASURE_MAX_PASSES,
+    OffloadTimingCollector,
+    OffloadTimingReport,
+    OffloadTimingSnapshot,
+)
+from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicy
 from flextensor.profile_block_controller import ProfileBlockController
 from flextensor.state_adoption import PinningMode, target_from_profile
 from flextensor.state_handler import LoaderInputData, TensorManagerState, TensorManagerStateHandler
@@ -365,6 +374,10 @@ class TensorManager:
         _rearrange_transfers: bool = False,
         _compute_transfer_gap: int = 1,
         _enable_untraced_tensor_discovery: bool = True,
+        _offload_timing: OffloadTimingMode = "off",
+        _piecewise_prefetch: PiecewisePrefetchMode = "warn",
+        _offload_timing_log_every: int = OFFLOAD_TIMING_LOG_EVERY,
+        _offload_timing_measure_max_passes: int = OFFLOAD_TIMING_MEASURE_MAX_PASSES,
     ) -> None:
         """
         Initialize TensorManager with configurable tensor loading strategy.
@@ -430,13 +443,24 @@ class TensorManager:
                 ``loader_type='strategy'``). ``profile_mode='torch_function'``
                 forces this ``False``. Not part of the public API.
             _use_trace_tensor: Internal debug flag — enables TraceTensor + BenchmarkReplace
-                for per-tensor transfer timing. Not part of the public API.
+                for per-tensor offload timing. Not part of the public API.
             _rearrange_transfers: Internal — whether to enable transfer rearrangement.
                 Auto-enabled when permanent gap layers are detected. (default: False)
             _compute_transfer_gap: Internal — minimum layer gap between a block's compute
                 and its next transfer during rearrangement. (default: 1)
             _enable_untraced_tensor_discovery: Internal — whether to discover untraced
                 tensors (e.g., FP8 weights passed to Triton kernels). (default: True)
+            _offload_timing: Offload-timing mode forwarded from
+                :attr:`~flextensor.config.OffloadConfig.offload_timing`
+                (``"off"`` / ``"eager"`` / ``"cuda_graph"``). (default: ``"off"``)
+            _piecewise_prefetch: Piecewise prefetch policy forwarded from
+                :attr:`~flextensor.config.OffloadConfig.piecewise_prefetch`
+                (``"off"`` / ``"warn"`` / ``"error"``). (default: ``"warn"``)
+            _offload_timing_log_every: Internal — log rolling timing table every N
+                passes; ``0`` disables. (default: :data:`~flextensor.offload_timing.OFFLOAD_TIMING_LOG_EVERY`)
+            _offload_timing_measure_max_passes: Internal — max finalized passes in
+                the durable measure store (ring buffer).
+                (default: :data:`~flextensor.offload_timing.OFFLOAD_TIMING_MEASURE_MAX_PASSES`)
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
@@ -465,6 +489,21 @@ class TensorManager:
         self.blocks = blocks
         self.move_top_level_buffers_to_gpu = move_top_level_buffers_to_gpu
         self.enable_untraced_tensor_discovery = _enable_untraced_tensor_discovery
+        self.offload_timing: OffloadTimingMode = _offload_timing
+        self.enable_offload_timing = _offload_timing != "off"
+        self.enable_offload_timing_external_events = _offload_timing == "cuda_graph"
+        self.offload_timing_log_every = _offload_timing_log_every
+        self.offload_timing_measure_max_passes = max(1, int(_offload_timing_measure_max_passes))
+        self.piecewise_prefetch: PiecewisePrefetchMode = _piecewise_prefetch
+        self.enable_piecewise_prefetch_check = _piecewise_prefetch != "off"
+        self.strict_piecewise_prefetch = _piecewise_prefetch == "error"
+        # Durable offload-timing measure store (replan / collect). Fed by the
+        # loader's OffloadTimingCollector via on_pass; independent of the
+        # collector's rolling log window. Capped ring buffer — see
+        # OFFLOAD_TIMING_MEASURE_MAX_PASSES.
+        self._offload_timing_measure: deque[OffloadTimingSnapshot] = deque(
+            maxlen=self.offload_timing_measure_max_passes
+        )
         validate_include_patterns(include_patterns)
         self.include_patterns = resolve_include_patterns(include_patterns)
         self.exclude_patterns = exclude_patterns or []
@@ -526,6 +565,8 @@ class TensorManager:
         self._layer_stats_seeded_statically: bool = False
         self.observed_cross_refs: set[int] = set()
         self._active_trap_tainted: bool = False
+        # Populated when the inference strategy / loader is built.
+        self.stats: list[LayerStatistics] = []
 
     def arm_non_destructive_first_loader(self) -> None:
         """Keep source weights intact on the first inference loader build.
@@ -1187,6 +1228,16 @@ class TensorManager:
             prepare_state: Whether to prepare and store state after setup
                 (False when loading from saved state).
         """
+        if self.enable_offload_timing:
+            msg = (
+                f"offload_timing={self.offload_timing!r} requires a block transfer_mode "
+                f"(allocation_block_transfer or raw_block_transfer); got "
+                f"loader_type={self.loader_type!r}. Inference timing is recorded by "
+                f"PreallocatedLoader enter/exit hooks, which the strategy loader "
+                f"does not install."
+            )
+            raise ValueError(msg)
+
         # Use release_strategy from data if available (from state), otherwise compute it
         release_strategy = data.release_strategy
         if not release_strategy:
@@ -1270,6 +1321,8 @@ class TensorManager:
             transfer_to_compute_map,
             stream_priority=self.transfer_stream_priority,
             allocation_controller=block_controller,
+            offload_timing_collector=self._make_offload_timing_collector(),
+            piecewise_prefetch_policy=self._make_piecewise_prefetch_policy(),
         )
 
         if prepare_state:
@@ -1285,6 +1338,39 @@ class TensorManager:
                 transfer_to_compute_map,
                 shm_block_name_map=None,
             )
+
+    def _make_offload_timing_collector(self) -> OffloadTimingCollector:
+        """Return an offload timing collector (disabled no-op when timing is off)."""
+        if not self.enable_offload_timing:
+            return OffloadTimingCollector(enabled=False)
+        labels = [stat.label for stat in self.stats]
+        return OffloadTimingCollector(
+            labels,
+            enabled=True,
+            external_events=self.enable_offload_timing_external_events,
+            log_every=self.offload_timing_log_every,
+            on_pass=self._record_offload_timing_pass,
+        )
+
+    def _record_offload_timing_pass(self, snapshot: OffloadTimingSnapshot) -> None:
+        """Sink for :class:`OffloadTimingCollector.on_pass` (durable measure)."""
+        self._offload_timing_measure.append(snapshot)
+
+    def _clear_offload_timing_measure(self) -> None:
+        self._offload_timing_measure.clear()
+
+    def _drain_offload_timing_measure(self) -> OffloadTimingReport | None:
+        if not self.enable_offload_timing or not self._offload_timing_measure:
+            return None
+        report = OffloadTimingCollector._build_report(self._offload_timing_measure)  # noqa: SLF001
+        self._offload_timing_measure.clear()
+        return report
+
+    def _make_piecewise_prefetch_policy(self) -> PiecewisePrefetchPolicy:
+        """Return a piecewise prefetch policy (disabled no-op when check is off)."""
+        if not self.enable_piecewise_prefetch_check:
+            return PiecewisePrefetchPolicy(enabled=False)
+        return PiecewisePrefetchPolicy(enabled=True, strict=self.strict_piecewise_prefetch)
 
     def _make_shm_block_name_fn(self) -> Callable[[int], str] | None:
         """Build a block-naming function from the SHM namespace, if available."""
@@ -1358,6 +1444,8 @@ class TensorManager:
             transfer_to_compute_map,
             stream_priority=self.transfer_stream_priority,
             allocation_controller=block_controller,
+            offload_timing_collector=self._make_offload_timing_collector(),
+            piecewise_prefetch_policy=self._make_piecewise_prefetch_policy(),
         )
 
         if prepare_state:
@@ -1610,13 +1698,19 @@ class TensorManager:
     ) -> bool:
         """Recompute offload strategy from compiled per-layer timings and rebuild the loader.
 
-        Rewrites durations, rebuilds a destructive loader from intact weights,
-        repoints ``param.data``, and releases loader-1. Safe without recompile:
-        the graph reads ``param.data`` each call and drives the loader via
-        ``pre_compute/post_compute`` custom ops.
+        Rewrites **compute** durations only, then rebuilds a destructive loader
+        from intact weights, repoints ``param.data``, and releases loader-1.
+        Reuses the existing :attr:`memory_transfer_stats` size→time curve for
+        H2D cost (tensor sizes / bandwidth are assumed unchanged under
+        CUDA-graph replay). Runtime offload-timing ``transfer_ms`` / ``wait_ms``
+        are not strategy inputs — see
+        :meth:`~flextensor.offload_timing.OffloadTimingReport.compute_budgets_by_profile_label`.
+
+        Safe without recompile: the graph reads ``param.data`` each call and
+        drives the loader via ``pre_compute/post_compute`` custom ops.
 
         Args:
-            durations_by_label: ``label -> compiled compute time (ms)``.
+            durations_by_label: ``label -> compiled compute / hiding budget (ms)``.
             model: Live model to repoint onto the rebuilt block views.
 
         Returns:
@@ -2048,6 +2142,43 @@ class TensorManager:
             unmapped_tensors_bytes=self._unmapped_tensors_bytes,
             total_bytes=blocks_bytes + self._unmapped_tensors_bytes,
         )
+
+    def collect_offload_timing(self) -> OffloadTimingReport | None:
+        """Collect aggregate offload timing from the durable measure store.
+
+        Flushes any pending **eager** pass into the durable store first
+        (:meth:`~flextensor.offload_timing.OffloadTimingCollector.flush_pending_eager_pass`):
+        :meth:`~flextensor.offload_timing.OffloadTimingCollector.on_pass_start`
+        only publishes the previous pass, so a one-forward window would
+        otherwise drain empty.
+
+        Does **not** call
+        :meth:`~flextensor.offload_timing.OffloadTimingCollector.finalize_replay_pass`:
+        per-replay :meth:`OffloadManager.update_offload_timing` already
+        publishes into this store, and a second finalize with the default
+        ``replay_generation=-1`` would duplicate the last pass (dedup only
+        applies for ``replay_generation >= 0``). Periodic log-window clears
+        on the collector do not affect this readout. Retention is capped by
+        :data:`~flextensor.offload_timing.OFFLOAD_TIMING_MEASURE_MAX_PASSES`
+        (oldest passes drop when the ring is full).
+        Prefer :meth:`OffloadManager.collect_offload_timing` at the public API.
+
+        Returns:
+            :class:`~flextensor.offload_timing.OffloadTimingReport`, or
+            ``None`` when offload timing is disabled or the durable measure
+            store is empty after flush.
+        """
+        if not self.enable_offload_timing:
+            return None
+        loader = self.tensor_layer_loader
+        collector = getattr(loader, "offload_timing_collector", None) if loader is not None else None
+        if (
+            collector is not None
+            and getattr(collector, "enabled", False)
+            and hasattr(collector, "flush_pending_eager_pass")
+        ):
+            collector.flush_pending_eager_pass()
+        return self._drain_offload_timing_measure()
 
     def is_traced_trace_tensor(self, tensor):
         return isinstance(tensor, TraceTensor)

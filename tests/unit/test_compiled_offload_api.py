@@ -314,6 +314,26 @@ def test_tail_failure_subsequent_calls_also_raise(manager: OffloadManager, monke
     assert co.tail_state == CompiledOffloadTailState.FAILED
 
 
+def test_tail_soft_false_marks_done_not_applied(
+    manager: OffloadManager, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """finish_replan() → False must not look like a successful rebuild."""
+    monkeypatch.setattr(manager._compiled, "finish_replan", lambda: False)
+    co = manager._compiled
+    co.tail_state = CompiledOffloadTailState.MEASURING
+    co.measure_seen = co.measure_forwards() - 1
+
+    with caplog.at_level("WARNING"):
+        co.on_forward()
+
+    assert co.tail_state == CompiledOffloadTailState.DONE
+    assert co._tail.replan_applied is False  # noqa: SLF001
+    assert any("without applying a new strategy" in r.message for r in caplog.records)
+    # Soft keep-current must not poison subsequent forwards.
+    co.on_forward()
+    assert co.tail_state == CompiledOffloadTailState.DONE
+
+
 # -- external compile (external_compile=True, no compile_fn) ---------------
 
 

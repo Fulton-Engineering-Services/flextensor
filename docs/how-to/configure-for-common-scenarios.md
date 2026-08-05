@@ -104,7 +104,49 @@ Key choices:
 
 ---
 
+## Measure transfer overlap during inference
+
+Use this when you want per-trap **transfer / compute / wait** timings while serving — without rebuilding the offload strategy.
+
+```python
+import flextensor as ft
+from flextensor import OffloadConfig, format_offload_timing_table, get_offload_manager, offload
+
+config = OffloadConfig(
+    offload_timing="eager",  # or "cuda_graph" under CUDA-graph replay
+    # Requires a block transfer_mode (default allocation_block_transfer).
+)
+model = offload(model, config=config)
+om = get_offload_manager()
+
+# Reach INFERENCE first — do not reset/collect during discovery/profiling.
+for _ in range(om.iters_before_inference):
+    model(x)
+
+# Clear so the report covers only the serving window you care about:
+ft.reset_offload_timing()
+
+for _ in range(20):
+    model(x)
+
+report = ft.collect_offload_timing()
+if report is not None:
+    print(format_offload_timing_table(report))
+```
+
+Key choices:
+
+- `offload_timing="eager"` (or env `FT_OFFLOAD_TIMING=eager`) arms the collector for module forwards.
+- Requires a block `transfer_mode` (`allocation_block_transfer` / `raw_block_transfer`); `transfer_mode="strategy"` is rejected — that loader has no enter/exit timing hooks.
+- Eager / normal module forwards publish each pass automatically; call `collect_offload_timing()` after the window ends (drains the durable store).
+- The durable store is an internal ring buffer (default cap 1024 passes).
+- `wait_ms ≈ 0` means H2D finished before compute needed the data (fully hidden).
+- CUDA-graph replay needs `offload_timing="cuda_graph"`, then `update_offload_timing()` after each `graph.replay()`, then `collect_offload_timing()`. See [torch.compile](torch-compile.md#cuda-graphs-request_strategy_replanmanual_update_statetrue).
+
+---
+
 ## Next Steps
 
 - [Configuration reference](../explanation/configuration.md) — full description of every `OffloadConfig` option
 - [Troubleshooting](troubleshooting.md) — diagnose performance and memory issues
+- [torch.compile](torch-compile.md) — compiled offload and CUDA-graph measure / replan

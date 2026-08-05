@@ -22,4 +22,9 @@ rather than constructing one directly.
         - suspend_profiling
         - resume_profiling
         - pause_profiling
+        - collect_offload_timing
+        - reset_offload_timing
+        - update_offload_timing
+        - request_strategy_replan
+        - update_state
         - release

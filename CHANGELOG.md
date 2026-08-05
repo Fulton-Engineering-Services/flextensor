@@ -13,6 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Collect per-trap transfer / compute / wait timings during inference via
+  ``OffloadConfig.offload_timing`` (``"off"`` / ``"eager"`` / ``"cuda_graph"``)
+  and :func:`~flextensor.collect_offload_timing` (see
+  [configure-for-common-scenarios](docs/how-to/configure-for-common-scenarios.md#measure-transfer-overlap-during-inference)).
+- Detect when PIECEWISE CUDA-graph joins break H2D overlap via
+  ``OffloadConfig.piecewise_prefetch`` (``"off"`` / ``"warn"`` / ``"error"``,
+  default **warn**).
+- Request a timing-based strategy rebuild after compile or CUDA-graph capture
+  with :func:`~flextensor.request_strategy_replan` (module forwards, or
+  ``manual_update_state=True`` with ``graph.replay()`` +
+  :func:`~flextensor.update_state`; see
+  [torch.compile](docs/how-to/torch-compile.md)).
 - `TensorManager.plan_state_adoption()` for read-only, capacity-safe saved-state adoption planning.
 
 ## [0.3.0] — 2026-07-29

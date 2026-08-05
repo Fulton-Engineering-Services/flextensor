@@ -87,6 +87,72 @@ Runnable example: `examples/diffusers/compiled-offload/wan_t2v_external_compile.
 
 Prefer `compile_fn` unless your pipeline already owns the compile step.
 
+## CUDA graphs: ``request_strategy_replan(manual_update_state=True)``
+
+After CUDA-graph capture, arm the same replan helper used for external
+compile. Replay does not run module forward hooks, so pass
+``manual_update_state=True`` and call ``update_state()`` after each replay.
+**Recapture** CUDA graphs after rebuild (loader views change).
+
+**Prerequisites** (otherwise ``request_strategy_replan(..., manual_update_state=True)``
+returns ``0`` and performs no replan):
+
+1. ``OffloadConfig(external_compile=True, offload_timing="cuda_graph", ...)``
+   so compiled replan is armed and the collector uses ``external=True`` CUDA
+   timing events (PyTorch >= 2.8).
+2. A block ``transfer_mode`` compatible with compiled offload
+   (``allocation_block_transfer`` / ``raw_block_transfer``).
+3. Lifecycle already at INFERENCE (discovery + profiling done), with the
+   rolling loader installed.
+
+```python
+import flextensor as ft
+
+config = ft.OffloadConfig(
+    include_patterns=["layers.*"],
+    transfer_mode="allocation_block_transfer",
+    external_compile=True,       # arms compiled replan; source weights survive first loader
+    offload_timing="cuda_graph", # external timing events for post-replay readback
+)
+model = ft.offload(model, config)
+om = ft.get_offload_manager()
+for _ in range(om.iters_before_inference):
+    model(x)  # discovery + profiling → INFERENCE
+
+# Optional: compile per offloaded unit, then capture.
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    out = model(static_x)
+
+iters = ft.request_strategy_replan(manual_update_state=True)
+for _ in range(iters):  # iters == 0 if any prerequisite above was missing
+    graph.replay()
+    ft.update_state()  # last call applies compute budgets + rebuilds
+
+# Loader changed — rebuild CUDA graphs before serving.
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    out = model(static_x)
+```
+
+``offload_timing="cuda_graph"`` clears prior durable measure when the manual
+replan arms and enables post-capture timing readback.
+
+**What replan consumes:** only the **compute** column (per-trap hiding
+budget). The strategy rebuild still uses the original profiling
+``memory_transfer_stats`` size→time curve for H2D cost — tensor sizes and
+host↔device bandwidth are assumed unchanged under CUDA-graph replay.
+Measured ``transfer_ms`` / ``wait_ms`` are diagnostic (``wait > 0`` means the
+current schedule lost overlap); they are not planner inputs.
+
+For a shutdown dump of serving timings (no replan), set
+``offload_timing="cuda_graph"``, call ``reset_offload_timing`` before the
+window you care about, after each ``graph.replay()`` call
+``update_offload_timing`` (CUDA graphs freeze event readback until then), and
+``collect_offload_timing`` at exit. ``update_state`` already invokes
+``update_offload_timing`` when a graph replan was armed with
+``manual_update_state=True``.
+
 ## Backends and modes
 
 FlexTensor does not constrain which `backend=` / `mode=` you pass to

@@ -31,6 +31,7 @@ from flextensor.offload_manager import (
     DEFAULT_MANAGER_NAME,
     OffloadManager,
     clear_profiling_durations,
+    collect_offload_timing,
     get_gpu_memory_usage,
     get_offload_manager,
     init,
@@ -40,10 +41,19 @@ from flextensor.offload_manager import (
     offload_from_profile,
     pause_profiling,
     release,
+    request_strategy_replan,
+    reset_offload_timing,
     resume_profiling,
     save_profile,
     set_config,
     suspend_profiling,
+    update_offload_timing,
+    update_state,
+)
+from flextensor.offload_timing import (
+    OffloadTimingReport,
+    OffloadTimingSnapshot,
+    format_offload_timing_table,
 )
 from flextensor.strategy import (
     AdaptiveKnapsackStrategy,
@@ -67,6 +77,8 @@ __all__ = [  # noqa: RUF022
     "OffloadManager",
     "PinnedMemoryMode",
     "clear_profiling_durations",
+    "collect_offload_timing",
+    "format_offload_timing_table",
     "get_gpu_memory_usage",
     "get_offload_manager",
     "init",
@@ -76,6 +88,8 @@ __all__ = [  # noqa: RUF022
     "offload",
     "offload_block",
     "offload_from_profile",
+    "request_strategy_replan",
+    "reset_offload_timing",
     "set_config",
     "save_profile",
     "load_profile",
@@ -83,6 +97,8 @@ __all__ = [  # noqa: RUF022
     "release",
     "resume_profiling",
     "suspend_profiling",
+    "update_state",
+    "update_offload_timing",
     # Internal/Advanced API (for backward compatibility)
     "AdaptiveKnapsackStrategy",
     "AdaptiveStrategy",
@@ -98,4 +114,6 @@ __all__ = [  # noqa: RUF022
     "Strategy",
     "TensorBenchmarkMode",
     "TensorManager",
+    "OffloadTimingReport",
+    "OffloadTimingSnapshot",
 ]

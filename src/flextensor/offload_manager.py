@@ -15,6 +15,7 @@ from enum import Enum, EnumMeta
 from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
+    from flextensor.collectors import LayerStatistics
     from flextensor.state_handler import TensorManagerState
 
 import psutil
@@ -24,7 +25,7 @@ from torch import nn
 from torch.utils.hooks import RemovableHandle  # noqa: TC002 — beartype on @decorated __init__ evaluates this at runtime
 
 from flextensor.benchmark_tensor_mode import PreloadToDevice
-from flextensor.compile import CompiledOffload
+from flextensor.compile import COMPILED_WARMUP_FORWARDS, CompiledOffload
 from flextensor.compiled_offload import build_compiled_offload_forward
 from flextensor.compiler_utils import disable as _compiler_disable
 from flextensor.compiler_utils import (
@@ -34,6 +35,11 @@ from flextensor.compiler_utils import (
 from flextensor.config import OffloadConfig
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
+from flextensor.offload_timing import (
+    OffloadTimingCollector,
+    OffloadTimingReport,
+    format_offload_timing_table,
+)
 from flextensor.strategy import AdaptiveStrategy
 from flextensor.tensor_discovery import (
     has_offload_modules,
@@ -238,6 +244,7 @@ class TensorManagerProtocol(Protocol):
     """Structural interface for tensor managers used by ``OffloadManager``."""
 
     shm_namespace: str | None
+    stats: list[LayerStatistics]
 
     def set_model(self, model: nn.Module) -> None: ...
     def build_parameters_mapping(self, model: nn.Module | dict[str, torch.Tensor]) -> None: ...
@@ -249,6 +256,7 @@ class TensorManagerProtocol(Protocol):
     def load_profile(self, profile_directory: str, model: nn.Module) -> None: ...
     def get_gpu_memory_usage(self) -> GPUMemoryUsage: ...
     def get_memory_transfer_stats(self) -> dict[int, float] | None: ...
+    def collect_offload_timing(self) -> OffloadTimingReport | None: ...
     def trap(self, name: str) -> Any: ...
     def is_profiling_suspended(self) -> bool: ...
     def clear_profiling_durations(self) -> None: ...
@@ -334,12 +342,14 @@ _TENSOR_MANAGER_ONESHOT_FIELDS: tuple[str, ...] = (
     "max_gpu_mem_fraction",
     "min_blocks",
     "num_blocks",
+    "piecewise_prefetch",
     "pinned_memory",
     "pinned_memory_mode",
     "profile_mode",
     "shm_enabled",
     "transfer_budget_scale",
     "transfer_mode",
+    "offload_timing",
 )
 
 
@@ -478,6 +488,9 @@ class OffloadManager:
         # One-shot config values as captured by the live TensorManager; see
         # ``_warn_on_one_shot_field_changes``. Empty until one is constructed.
         self._tensor_manager_oneshot_snapshot: dict[str, Any] = {}
+        # When True, the caller drives :meth:`update_state` after each CUDA-graph
+        # replay (forward hooks do not run under ``graph.replay()``).
+        self._manual_update_state = False
 
     @property
     def compiled_offload_manager_id(self) -> int:
@@ -583,7 +596,7 @@ class OffloadManager:
 
     @property
     def compiled_replan_active(self) -> bool:
-        """Whether to re-plan strategy from compiled per-layer timings."""
+        """Whether to re-plan strategy from compiled per-trap timings."""
         return self._compiled.replan_active
 
     @property
@@ -741,6 +754,89 @@ class OffloadManager:
 
         return self._tensor_manager.get_gpu_memory_usage()
 
+    def reset_offload_timing(self) -> None:
+        """Start a fresh durable offload-timing measure window.
+
+        Clears accumulated measure passes and the collector's rolling log
+        window. Drops any pending **eager** pass on the collector so it cannot
+        be published into this new window by a later ``on_pass_start``. Call
+        before a measure segment you care about (serving → shutdown
+        :meth:`collect_offload_timing`).
+        """
+        if self._tensor_manager is None:
+            return
+        if getattr(self.config, "offload_timing", "off") == "off":
+            return
+        tm = self._tensor_manager
+        if hasattr(tm, "_clear_offload_timing_measure"):
+            tm._clear_offload_timing_measure()  # noqa: SLF001
+        loader = getattr(tm, "tensor_layer_loader", None)
+        collector = getattr(loader, "offload_timing_collector", None) if loader is not None else None
+        if collector is None or not getattr(collector, "enabled", False):
+            return
+        if hasattr(collector, "reset"):
+            collector.reset()
+
+    def _arm_offload_timing_after_capture(self) -> None:
+        """Arm the timing collector to publish after captured/replayed execution."""
+        collector = self._offload_timing_collector()
+        if collector is None or not getattr(collector, "enabled", False):
+            return
+        if hasattr(collector, "arm_replay_measure"):
+            collector.arm_replay_measure()
+
+    def _offload_timing_collector(self) -> OffloadTimingCollector | None:
+        """Return the active loader's offload-timing collector, if any."""
+        if self._tensor_manager is None:
+            return None
+        loader = getattr(self._tensor_manager, "tensor_layer_loader", None)
+        return getattr(loader, "offload_timing_collector", None) if loader is not None else None
+
+    def _has_offload_timing_measure(self) -> bool:
+        """True when the durable measure store has at least one pass (integrations)."""
+        if self._tensor_manager is None:
+            return False
+        if getattr(self.config, "offload_timing", "off") == "off":
+            return False
+        # Best-effort: publish a pending replay or eager pass before inspecting.
+        self.update_offload_timing()
+        collector = self._offload_timing_collector()
+        if collector is not None and hasattr(collector, "flush_pending_eager_pass"):
+            collector.flush_pending_eager_pass()
+        measure = getattr(self._tensor_manager, "_offload_timing_measure", None)
+        return bool(measure)
+
+    def collect_offload_timing(self) -> OffloadTimingReport | None:
+        """Collect aggregate offload timing from the durable measure store.
+
+        Flushes any pending eager pass before draining (see
+        :meth:`TensorManager.collect_offload_timing`). Under CUDA-graph replay,
+        call :meth:`update_offload_timing` (or :meth:`update_state` during a
+        manual replan) after each replay so passes are published before
+        collect — this method does not re-finalize the last replay (that would
+        duplicate it).
+
+        Must be called **after** all forward passes have completed (e.g. after
+        ``pipe()`` returns or at shutdown). Calling this drains the durable
+        measure store, so the next call returns data only for passes since
+        :meth:`reset_offload_timing` / this collect. Retention before drain is
+        capped by
+        :data:`~flextensor.offload_timing.OFFLOAD_TIMING_MEASURE_MAX_PASSES`.
+
+        Returns:
+            :class:`~flextensor.offload_timing.OffloadTimingReport` with
+            per-trap min/max/avg/std for transfer, compute, and wait, or
+            ``None`` when:
+
+            * :attr:`OffloadConfig.offload_timing` is ``"off"``,
+            * the :class:`TensorManager` is not initialized yet, or
+            * the durable measure store is empty after flush (no passes in
+              the current window).
+        """
+        if self._tensor_manager is None:
+            return None
+        return self._tensor_manager.collect_offload_timing()
+
     @property
     def model(self) -> nn.Module | None:
         """Get the current active model.
@@ -786,6 +882,8 @@ class OffloadManager:
                 enable_diagnostics=self.config.enable_diagnostics,
                 max_gpu_mem_fraction=self.config.max_gpu_mem_fraction,
                 profile_mode=self.config.profile_mode,
+                _offload_timing=self.config.offload_timing,
+                _piecewise_prefetch=self.config.piecewise_prefetch,
             )
             self._tensor_manager.set_skip_discovery(self.config.skip_discovery)
 
@@ -822,16 +920,27 @@ class OffloadManager:
             # Skip our internal state-update hook: the manager re-installs it explicitly
             # on each phase transition so ``self._state_hook_handle`` tracks the live
             # hook and ``release()`` can remove it correctly.
+            # Preserve ``with_kwargs`` / ``always_called`` flags — re-registering without
+            # them changes the hook signature (e.g. drops kwargs) and breaks callers.
+            forward_hooks_with_kwargs = getattr(old_module, "_forward_hooks_with_kwargs", {})
+            forward_hooks_always_called = getattr(old_module, "_forward_hooks_always_called", {})
             if forward_hooks := getattr(old_module, "_forward_hooks", None):
-                for _, hook_fn in list(forward_hooks.items()):
+                for hook_id, hook_fn in list(forward_hooks.items()):
                     if getattr(hook_fn, "_ft_state_update_hook", False):
                         continue
-                    new_module.register_forward_hook(hook_fn)
+                    new_module.register_forward_hook(
+                        hook_fn,
+                        with_kwargs=bool(forward_hooks_with_kwargs.get(hook_id, False)),
+                        always_call=bool(forward_hooks_always_called.get(hook_id, False)),
+                    )
 
-            # Transfer forward pre-hooks (create list copy to avoid mutation during iteration)
+            forward_pre_hooks_with_kwargs = getattr(old_module, "_forward_pre_hooks_with_kwargs", {})
             if forward_pre_hooks := getattr(old_module, "_forward_pre_hooks", None):
-                for _, hook_fn in list(forward_pre_hooks.items()):
-                    new_module.register_forward_pre_hook(hook_fn)
+                for hook_id, hook_fn in list(forward_pre_hooks.items()):
+                    new_module.register_forward_pre_hook(
+                        hook_fn,
+                        with_kwargs=bool(forward_pre_hooks_with_kwargs.get(hook_id, False)),
+                    )
 
             # Transfer backward hooks (create list copy to avoid mutation during iteration)
             if backward_hooks := getattr(old_module, "_backward_hooks", None):
@@ -973,28 +1082,201 @@ class OffloadManager:
             len(self._patched_modules),
         )
 
-    def request_strategy_replan(self) -> int:
-        """Request a strategy replan after compute characteristics changed.
+    def request_strategy_replan(self, *, manual_update_state: bool = False) -> int:
+        """Remeasure under the current runtime and rebuild the offload strategy.
 
-        Needed when profile timings were **not** collected under compile — e.g.
-        after external ``torch.compile`` with ``external_compile=True``, or after
-        ``compile_fn`` with ``profile_mode='getter'``. Not required for the
-        default ``compile_fn`` + ``profile_mode='view'`` path (compiled
-        view-profile already built the strategy from compiled timings).
+        * ``manual_update_state=True`` — CUDA graphs: run ``graph.replay()`` then
+          :meth:`update_state` for the returned count (recapture graphs after).
+        * ``manual_update_state=False`` — external compile: run that many model
+          forwards; the forward hook calls :meth:`update_state` for you.
 
-        Arms a passive warm→measure→replan tail; each subsequent model forward
-        advances it via :meth:`update_state` until
-        :meth:`TensorManager.replan_from_compiled_durations` rebuilds the loader
-        and strategy from compiled per-layer timings.
+        Needed after external ``torch.compile`` (``external_compile=True``),
+        after ``compile_fn`` with ``profile_mode='getter'``, or after CUDA-graph
+        capture. Not required for default ``compile_fn`` + ``profile_mode='view'``.
+
+        Args:
+            manual_update_state: When True, caller drives each measure step
+                (e.g. ``graph.replay()`` + :meth:`update_state`).
 
         Returns:
-            ``replan_iters``: model forwards to run before the replanned strategy
-            is active (``COMPILED_WARMUP_FORWARDS`` warmup +
-            ``profiling_iters`` measure). ``0`` when compiled-offload is off or
-            replan was not armed at activation (e.g. default ``compile_fn`` +
-            view-profile).
+            Measure (and warmup) forwards / replays to drive, or ``0`` when
+            nothing was armed.
         """
+        if manual_update_state:
+            return self._begin_manual_update_replan()
         return self._compiled.request_strategy_replan()
+
+    def _begin_manual_update_replan(self) -> int:
+        """Start caller-driven measure→replan; return iters for the caller's loop.
+
+        Used when forward hooks do not run (today: CUDA-graph replay). Caller
+        drives each step then :meth:`update_state`.
+        """
+        if getattr(self.config, "offload_timing", "off") != "cuda_graph":
+            LOGGER.warning(
+                "FlexTensor: request_strategy_replan(manual_update_state=True) needs "
+                "offload_timing='cuda_graph'; not arming (compiled measure tail "
+                "cannot run under graph.replay() without external CUDA timing events)."
+            )
+            return 0
+        if not (self._compiled.active and self._compiled.replan_active):
+            LOGGER.warning(
+                "FlexTensor: request_strategy_replan(manual_update_state=True) ignored — "
+                "compiled replan was not armed (use external_compile=True so source "
+                "weights survive the first loader build)."
+            )
+            return 0
+
+        # Gate on resolved collector capability *before* reset/arm so a soft
+        # fallback refuse does not wipe the durable measure store.
+        collector = self._offload_timing_collector()
+        if collector is None or not getattr(collector, "enabled", False):
+            LOGGER.warning(
+                "FlexTensor: request_strategy_replan(manual_update_state=True) ignored — "
+                "no enabled offload-timing collector on the inference loader."
+            )
+            return 0
+        if not getattr(collector, "_external_events", False):
+            LOGGER.warning(
+                "FlexTensor: request_strategy_replan(manual_update_state=True) needs "
+                "external CUDA timing events on the collector; this build fell back "
+                "to internal events (or offload_timing was not 'cuda_graph'). Not arming."
+            )
+            return 0
+
+        # Fresh durable window + enable replay timing readback for captured events.
+        self.reset_offload_timing()
+        self._arm_offload_timing_after_capture()
+
+        self._manual_update_state = True
+        # Graph is already captured — skip compile warmup; measure only.
+        # Do not enable custom-op profiling; budgets come from offload timing.
+        remaining = self._compiled.arm_replan_tail(
+            compiled_warm_forwards=COMPILED_WARMUP_FORWARDS,
+            enable_profiling=False,
+            finish_replan=self._finish_manual_update_replan,
+        )
+        if remaining == 0:
+            # profiling_iters=0 finished inside arm; flag already cleared by finish.
+            return 0
+        LOGGER.info(
+            "FlexTensor: armed CUDA-graph measure replan "
+            "(%d replay + update_state() call(s); recapture graphs after rebuild).",
+            remaining,
+        )
+        return remaining
+
+    def update_offload_timing(self, *, replay_generation: int = -1) -> bool:
+        """Store the current offload-timing pass into the collector.
+
+        Measurement only — does not advance phase or rebuild strategy.
+        Needed under CUDA graphs: each ``graph.replay()`` overwrites the same
+        captured event handles, so call this after every replay you want to
+        keep (or :meth:`update_state` does it when replan used
+        ``manual_update_state=True``).
+
+        Returns:
+            ``True`` when a pass was published or same-generation deduped.
+            ``False`` when finalize raised or unexpectedly no-op'd (inactive
+            pass / capturing) — callers must not advance a measure replan
+            counter after ``False``.
+        """
+        if self._tensor_manager is None:
+            return False
+        if getattr(self.config, "offload_timing", "off") == "off":
+            return True  # timing off: treat as no-op success
+        collector = self._offload_timing_collector()
+        if collector is None or not getattr(collector, "enabled", False):
+            return False
+        if not hasattr(collector, "finalize_replay_pass"):
+            return False
+        try:
+            published = collector.finalize_replay_pass(replay_generation=replay_generation)
+        except Exception:
+            LOGGER.warning(
+                "FlexTensor: update_offload_timing failed",
+                exc_info=True,
+            )
+            return False
+        # ``None`` from older mocks/stubs: treat as success for compatibility.
+        if published is False:
+            LOGGER.warning(
+                "FlexTensor: update_offload_timing did not publish a pass "
+                "(collector inactive or stream capturing); not advancing measure."
+            )
+            return False
+        return True
+
+    def _fail_manual_update_replan(self, exc: BaseException) -> None:
+        """Abort an in-flight CUDA-graph measure replan (strategy unchanged)."""
+        self._manual_update_state = False
+        self._disarm_offload_timing_after_measure()
+        self._compiled._tail.mark_failed(exc)  # noqa: SLF001
+        raise exc
+
+    def _disarm_offload_timing_after_measure(self) -> None:
+        """Drop pending-pass flags so the next eager enter does not re-sink."""
+        collector = self._offload_timing_collector()
+        if collector is None or not getattr(collector, "enabled", False):
+            return
+        if hasattr(collector, "disarm_replay_measure"):
+            collector.disarm_replay_measure()
+
+    def _finish_manual_update_replan(self) -> bool:
+        """Drain measure and rebuild from offload-timing budgets.
+
+        Returns:
+            ``True`` when a new strategy was applied, ``False`` when keeping
+            the current loader (empty measure / rebuild refused).
+        """
+        self._manual_update_state = False
+        # Always disarm before drain/rebuild so a following eager on_pass_start
+        # cannot re-publish the last replay into the next durable window.
+        self._disarm_offload_timing_after_measure()
+        report = None
+        tm = self._tensor_manager
+        if tm is not None and hasattr(tm, "_drain_offload_timing_measure"):
+            report = tm._drain_offload_timing_measure()  # noqa: SLF001
+        if report is None or getattr(report, "num_passes", 0) <= 0 or not getattr(report, "per_trap", None):
+            LOGGER.warning(
+                "FlexTensor: CUDA-graph measure replan finished with no offload-timing "
+                "passes; keeping the current strategy. Ensure "
+                "offload_timing='cuda_graph' and call update_state() after "
+                "each graph.replay()."
+            )
+            return False
+        if not self._finish_replan_from_offload_timing(report):
+            LOGGER.warning(
+                "FlexTensor: CUDA-graph measure replan did not apply a new strategy; keeping the current loader."
+            )
+            return False
+        return True
+
+    def _finish_replan_from_offload_timing(self, report: OffloadTimingReport) -> bool:
+        """Map one offload-timing report → **compute** budgets and finish replan.
+
+        Only the compute/hiding-window column is applied. Runtime ``transfer_ms``
+        / ``wait_ms`` are diagnostic; transfer costs stay on the profiled
+        size→time curve. See
+        :meth:`~flextensor.offload_timing.OffloadTimingReport.compute_budgets_by_profile_label`.
+        """
+        if self._tensor_manager is None:
+            return False
+        profile_labels = [stat.label for stat in self._tensor_manager.stats]
+        durations_by_label = report.compute_budgets_by_profile_label(
+            profile_labels,
+            conservative=True,
+        )
+        if not durations_by_label:
+            LOGGER.warning("FlexTensor: no compute budgets in offload-timing report; keeping the current strategy.")
+            return False
+        LOGGER.info(
+            "FlexTensor: applying %d per-trap compute budget(s) from offload timing "
+            "(initial profile used median eager compute only).\n%s",
+            len(durations_by_label),
+            format_offload_timing_table(report),
+        )
+        return self._compiled.finish_replan(durations_by_label)
 
     def _warn_if_compile_wrapped(self, target_phase: str) -> None:
         """Warn the user when a phase transition fires while ``OffloadModelProxy``
@@ -1193,12 +1475,24 @@ class OffloadManager:
                     extra={"memory_transfer_stats": self._tensor_manager.get_memory_transfer_stats()},
                 )
 
-    def update_state(self):
+    def update_state(self, *, replay_generation: int = -1) -> None:
         """Advance the phase state machine by one iteration.
 
-        In ``INFERENCE``, phase transitions are finished, but when compiled-offload
-        re-plan is armed this method still advances the passive tail (warm ->
-        measure -> re-plan) via :meth:`CompiledOffload.on_forward`.
+        In ``INFERENCE``, phase transitions are finished, but when a replan
+        tail is armed this method still advances it:
+
+        * **CUDA-graph** (``request_strategy_replan(manual_update_state=True)``)
+          — :meth:`update_offload_timing` then advance the measure counter;
+          the last call rebuilds from graph budgets.
+        * **Compiled / external-compile** — advance the passive warm→measure
+          tail via :meth:`CompiledOffload.on_forward` (usually from the
+          forward hook; no explicit call needed).
+
+        Args:
+            replay_generation: Forwarded to :meth:`update_offload_timing` on
+                the CUDA-graph measure path. Pass the same generation used by
+                a gen-aware serving hook so ``-1`` is not required and
+                double-publish is avoided.
 
         No-op in ``NOT_INITIALIZED``.
 
@@ -1215,11 +1509,20 @@ class OffloadManager:
         are collected in full after warmup.
         """
         if self._current_phase == OffloadPhase.INFERENCE:
-            # In INFERENCE the phase state machine is done, but the passive
-            # compiled-offload tail (warm -> measure -> re-plan) rides the
-            # caller's forwards from here when armed (``compile_fn`` path at
-            # INFERENCE transition, or external compile via
-            # :meth:`request_strategy_replan`).
+            if self._manual_update_state:
+                # CUDA-graph replan: caller invokes this after each graph.replay().
+                # Do not advance the measure counter if finalize failed — that
+                # would finish replan from partial/skewed budgets.
+                if not self.update_offload_timing(replay_generation=replay_generation):
+                    self._fail_manual_update_replan(
+                        RuntimeError(
+                            "FlexTensor: update_offload_timing failed during "
+                            "CUDA-graph measure replan; aborting (strategy unchanged)."
+                        )
+                    )
+                self._compiled.advance_tail(finish_replan=self._finish_manual_update_replan)
+                return
+            # Compiled path: forward hook usually calls us; advance warm/measure.
             self._compiled.on_forward()
             return
 
@@ -1403,6 +1706,8 @@ class OffloadManager:
 
         # Resolve compiled-offload flags *before* init/patching so
         # ``_patch_module_forward`` pre-builds compile-transparent forwards when active.
+        # Drop any in-flight CUDA-graph measure arm from a prior session on this manager.
+        self._manual_update_state = False
         effective_config = config if config is not None else self.config
         self._compiled.resolve_activation(effective_config, compile_fn)
 
@@ -1692,6 +1997,7 @@ class OffloadManager:
     def release(self):
         # Undo any compile_fn substitutions and tear down the compiled-offload
         # tail before restoring forwards, so the model is left as it was handed in.
+        self._manual_update_state = False
         self._compiled.teardown()
 
         # Restore original forward methods for all patched modules
@@ -2004,6 +2310,84 @@ def get_gpu_memory_usage(name: str = DEFAULT_MANAGER_NAME) -> GPUMemoryUsage:
     """
     om = get_offload_manager(name)
     return om.get_gpu_memory_usage()
+
+
+def reset_offload_timing(name: str = DEFAULT_MANAGER_NAME) -> None:
+    """Start a fresh durable offload-timing measure window.
+
+    Convenience wrapper around :meth:`OffloadManager.reset_offload_timing`.
+    """
+    om = get_offload_manager(name)
+    om.reset_offload_timing()
+
+
+def collect_offload_timing(name: str = DEFAULT_MANAGER_NAME) -> OffloadTimingReport | None:
+    """Collect aggregate offload timing from the durable measure store.
+
+    Convenience wrapper around
+    :meth:`OffloadManager.collect_offload_timing`.
+    After CUDA-graph replay, call :func:`update_offload_timing` first so
+    passes are published; this drains the store and does not re-finalize.
+
+    Args:
+        name: Name for the offload manager. Defaults to DEFAULT_MANAGER_NAME.
+
+    Returns:
+        :class:`~flextensor.offload_timing.OffloadTimingReport`, or ``None``
+        when timing is ``"off"``, the manager has no ``TensorManager`` yet, or
+        the durable measure store is empty after flush.
+    """
+    om = get_offload_manager(name)
+    return om.collect_offload_timing()
+
+
+def update_offload_timing(name: str = DEFAULT_MANAGER_NAME, *, replay_generation: int = -1) -> bool:
+    """Store the current offload-timing pass into the collector.
+
+    Convenience wrapper around :meth:`OffloadManager.update_offload_timing`.
+    Measurement only. Call after each ``graph.replay()`` you want to keep
+    (or :func:`update_state` does it when replan used ``manual_update_state=True``).
+
+    Returns:
+        ``True`` on success / timing inactive; ``False`` if finalize failed.
+    """
+    om = get_offload_manager(name)
+    return om.update_offload_timing(replay_generation=replay_generation)
+
+
+def request_strategy_replan(name: str = DEFAULT_MANAGER_NAME, *, manual_update_state: bool = False) -> int:
+    """Remeasure under the current runtime and rebuild the offload strategy.
+
+    Convenience wrapper around :meth:`OffloadManager.request_strategy_replan`.
+
+    Args:
+        name: Offload manager name. Defaults to DEFAULT_MANAGER_NAME.
+        manual_update_state: Caller-driven measure path — arm post-capture
+            timing and require :func:`update_state` after each opaque step
+            (today: ``graph.replay()``). After rebuild, recapture CUDA graphs
+            before serving.
+
+    Returns:
+        Forwards / replays to drive, or ``0`` when no replan was armed.
+    """
+    om = get_offload_manager(name)
+    return om.request_strategy_replan(manual_update_state=manual_update_state)
+
+
+def update_state(name: str = DEFAULT_MANAGER_NAME, *, replay_generation: int = -1) -> None:
+    """Advance offload phase / armed replan by one step.
+
+    Convenience wrapper around :meth:`OffloadManager.update_state`. Needed
+    explicitly after ``graph.replay()`` when replan was armed with
+    ``manual_update_state=True`` (replay does not run module forward hooks).
+
+    Args:
+        name: Offload manager name.
+        replay_generation: Optional CUDA-graph replay generation for the
+            manual measure path (dedupes with a gen-aware serving hook).
+    """
+    om = get_offload_manager(name)
+    om.update_state(replay_generation=replay_generation)
 
 
 # ---------------------------------------------------------------------------

@@ -7,9 +7,14 @@ Forward builders remain in :mod:`flextensor.compiled_offload`; residency custom 
 :mod:`flextensor.custom_ops`.
 """
 
-from flextensor.compile.lifecycle import COMPILED_EAGER_PROFILE_FORWARDS, CompiledOffload
+from flextensor.compile.lifecycle import (
+    COMPILED_EAGER_PROFILE_FORWARDS,
+    COMPILED_WARMUP_FORWARDS,
+    CompiledOffload,
+)
 
 __all__ = [
     "COMPILED_EAGER_PROFILE_FORWARDS",
+    "COMPILED_WARMUP_FORWARDS",
     "CompiledOffload",
 ]

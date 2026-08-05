@@ -20,6 +20,9 @@ Module-level convenience functions — the recommended starting point for most u
 - [`save_profile()` / `load_profile()`](simplified.md#flextensor.offload_manager.save_profile) — Profile persistence
 - [`offload_from_profile()`](simplified.md#flextensor.offload_manager.offload_from_profile) — Load a saved profile and offload in one step
 - [`release()`](simplified.md#flextensor.offload_manager.release) — Release resources and restore model
+- [`collect_offload_timing()`](simplified.md#flextensor.offload_manager.collect_offload_timing) / [`reset_offload_timing()`](simplified.md#flextensor.offload_manager.reset_offload_timing) / [`update_offload_timing()`](simplified.md#flextensor.offload_manager.update_offload_timing) — Inference offload-timing measure window
+- [`request_strategy_replan()`](simplified.md#flextensor.offload_manager.request_strategy_replan) / [`update_state()`](simplified.md#flextensor.offload_manager.update_state) — Remeasure and rebuild strategy (compile / CUDA graphs)
+- [`OffloadTimingReport`](simplified.md#flextensor.offload_timing.OffloadTimingReport) / [`OffloadTimingSnapshot`](simplified.md#flextensor.offload_timing.OffloadTimingSnapshot) — Timing aggregates and per-pass data
 - [`load_model_from_profile()`](simplified.md#flextensor.lazy_model_init.load_model_from_profile) — Load a model from a saved profile with optimized weight loading
 
 ## [OffloadManager](offload-manager.md)

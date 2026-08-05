@@ -14,6 +14,8 @@ from flextensor.compiler_utils import is_compiling as _is_compiling
 from flextensor.helpers import format_tensor_id_hint
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
+from flextensor.offload_timing import OffloadTimingCollector
+from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicy
 from flextensor.strategy_operations import find_transfers_for_preload
 
 from .collectors import IterativeLayerStatistics, LayerStatistics, TensorStatistics
@@ -1211,8 +1213,15 @@ class AllocationBlockController:
 
 
 class PreallocatedLoader(Loader):
-    def __init__(self, allocation_controller: AllocationBlockController | RawBlockController):
+    def __init__(
+        self,
+        allocation_controller: AllocationBlockController | RawBlockController,
+        offload_timing_collector: "OffloadTimingCollector | None" = None,
+        piecewise_prefetch_policy: "PiecewisePrefetchPolicy | None" = None,
+    ):
         self.allocation_controller = allocation_controller
+        self.offload_timing_collector = offload_timing_collector or OffloadTimingCollector(enabled=False)
+        self.piecewise_prefetch_policy = piecewise_prefetch_policy or PiecewisePrefetchPolicy()
 
     @abstractmethod
     def preload(self) -> None:
@@ -1259,8 +1268,14 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         transfer_to_compute_map: dict[str, str],
         stream_priority: int,
         allocation_controller: AllocationBlockController | RawBlockController,
+        offload_timing_collector: "OffloadTimingCollector | None" = None,
+        piecewise_prefetch_policy: "PiecewisePrefetchPolicy | None" = None,
     ) -> None:
-        super().__init__(allocation_controller)
+        super().__init__(
+            allocation_controller,
+            offload_timing_collector=offload_timing_collector,
+            piecewise_prefetch_policy=piecewise_prefetch_policy,
+        )
         self.device_gpu = device_gpu
         self.cpu_to_gpu_map = {}
 
@@ -1280,6 +1295,10 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         self.last_iteration_event: torch.cuda.Event | None = None
         self.first_layer_label: str | None = None
         self.last_layer_label: str | None = None
+
+        # True while transfer_stream has unjoined H2D; cleared by
+        # ``join_after_forward`` / last-layer ``exit`` join.
+        self._has_pending_transfer_work: bool = False
 
         if layer_stats:
             self.first_layer_label = layer_stats[0].label
@@ -1306,14 +1325,30 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
 
     @_compiler_disable
     def enter(self, label):
+        tc = self.offload_timing_collector
+        pp = self.piecewise_prefetch_policy
+
         if label == self.first_layer_label:
-            # Safety net: a previous iteration that aborted before reaching
-            # last_layer's exit() leaves stale entries in these maps; the
-            # next iteration's lookups would then wait on events recorded
-            # in the aborted iteration and produce cross-capture violations
-            # under torch.compile / CUDA graph capture. Clear-on-entry costs
-            # one dict.clear() per forward and unblocks recovery.
-            if self.compute_events_map or self.last_block_id_to_label_map:
+            # Abort: join then clear all maps. Preload-only: clear occupancy maps,
+            # keep scheduled_transfers for the first wait.
+            recovering = bool(self.compute_events_map) or self._has_pending_transfer_work
+            if recovering:
+                if self._has_pending_transfer_work or self.scheduled_transfers:
+                    join_event = self.transfer_stream.record_event()
+                    torch.cuda.current_stream().wait_event(join_event)
+                    self._has_pending_transfer_work = False
+                LOGGER.debug(
+                    "PreallocatedBatchTransferTensorLoader: abort recovery — joined "
+                    "transfer stream and clearing %d scheduled / %d compute / %d "
+                    "block-map entries",
+                    len(self.scheduled_transfers),
+                    len(self.compute_events_map),
+                    len(self.last_block_id_to_label_map),
+                )
+                self.scheduled_transfers.clear()
+                self.compute_events_map.clear()
+                self.last_block_id_to_label_map.clear()
+            elif self.compute_events_map or self.last_block_id_to_label_map:
                 LOGGER.debug(
                     "PreallocatedBatchTransferTensorLoader: clearing %d stale event-map "
                     "entries from aborted previous iteration",
@@ -1322,12 +1357,20 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
                 self.compute_events_map.clear()
                 self.last_block_id_to_label_map.clear()
 
-            # Fork: bring transfer stream into CUDA graph capture scope.
-            # Once forked, the transfer stream stays captured for the entire graph.
+            self._has_pending_transfer_work = False
+            tc.on_pass_start()
+            pp.reset()
+
+        # Fork transfer_stream into this capture/eager session once. FULL /
+        # eager keep a single fork for the whole forward; PIECEWISE re-forks
+        # only after ``join_after_forward`` clears ``_has_pending_transfer_work``.
+        if not self._has_pending_transfer_work:
             fork_event = torch.cuda.current_stream().record_event()
             self.transfer_stream.wait_event(fork_event)
+            self._has_pending_transfer_work = True
 
         if label not in self.label_to_block_id:
+            tc.record_compute_start(label)
             return
 
         block_id = self.label_to_block_id[label]
@@ -1340,17 +1383,36 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
 
         self.last_block_id_to_label_map[block_id] = label
 
+        tc.record_transfer_start(label, self.transfer_stream)
+
         with torch.cuda.stream(self.transfer_stream):
             self.allocation_controller.schedule_transfer(label)
 
         event = self.transfer_stream.record_event()
         self.scheduled_transfers[label] = event
+        # Non-reordered waits by schedule label in exit (same-layer).
+        pp.on_schedule(schedule_label=label, compute_label=label)
+
+        tc.record_transfer_end(label, self.transfer_stream)
+        tc.record_compute_start(label)
 
     @_compiler_disable
     def exit(self, label):
+        tc = self.offload_timing_collector
+        pp = self.piecewise_prefetch_policy
+
+        # Record compute_end BEFORE the wait so compute_ms reflects
+        # pure forward work, not forward + stall.
+        tc.record_compute_end(label)
+
         if label in self.scheduled_transfers:
+            tc.record_wait_start(label)
+
             event = self.scheduled_transfers[label]
             torch.cuda.current_stream().wait_event(event)
+            pp.on_wait(label)
+
+            tc.record_wait_end(label)
 
         event_compute = torch.cuda.current_stream().record_event()
         self.compute_events_map[label] = event_compute
@@ -1359,17 +1421,66 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         # Also serves as the final join to bring the transfer stream back to the
         # compute stream, required for CUDA graph capture completeness.
         if label == self.last_layer_label:
+            from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
+
             self.last_iteration_event = self.transfer_stream.record_event()
             torch.cuda.current_stream().wait_event(self.last_iteration_event)
+            self._has_pending_transfer_work = False
 
-            # Clear stale cross-iteration events so the next iteration starts
-            # fresh.  Required for CUDA graph capture: without it, the next
-            # iteration's enter() would wait on events recorded *before*
-            # capture, violating stream-capture isolation rules
-            # (cudaErrorStreamCaptureIsolation). Paired with the safety-net
-            # clear at first-layer enter() for aborted-mid-iteration recovery.
+            # Clear maps even if strict policy raises (same contract as
+            # join_after_forward) so capture-session handles never leak.
+            policy_error: BaseException | None = None
+            try:
+                pp.on_piece_join(at_last_layer=True)
+            except PiecewisePrefetchPolicyError as exc:
+                policy_error = exc
+
+            # After join: drop completion maps (incl. scheduled_transfers).
+            self.scheduled_transfers.clear()
             self.compute_events_map.clear()
             self.last_block_id_to_label_map.clear()
+
+            if policy_error is not None:
+                raise policy_error
+
+    @_compiler_disable
+    def join_after_forward(self) -> None:
+        """Join transfer_stream back to compute_stream at end of forward / piece.
+
+        Call before CUDA-graph ``capture_end`` (FULL once, PIECEWISE every piece)
+        so forked H2D is not left unjoined. Under PIECEWISE, last-layer ``exit()``
+        alone is not enough — earlier pieces never reach it.
+
+        Always clears transfer/event maps (even when the join itself is skipped):
+        capture-session event handles are invalid across piece/iteration
+        boundaries. Safe at end of forward / piece — not mid-forward.
+
+        The piecewise-prefetch policy check runs first for diagnostics, but the
+        stream join and map clears always run afterward — even if the policy
+        raises in strict mode — otherwise ``capture_end`` fails with
+        ``cudaErrorStreamCaptureUnjoined``.
+        """
+        from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
+
+        pp = self.piecewise_prefetch_policy
+        policy_error: BaseException | None = None
+        try:
+            pp.on_piece_join(at_last_layer=False)
+        except PiecewisePrefetchPolicyError as exc:
+            policy_error = exc
+
+        if self._has_pending_transfer_work:
+            join_event = self.transfer_stream.record_event()
+            torch.cuda.current_stream().wait_event(join_event)
+            self._has_pending_transfer_work = False
+
+        # Always clear: stale capture-session handles must not span boundaries.
+        self.scheduled_transfers.clear()
+        self.compute_events_map.clear()
+        self.last_block_id_to_label_map.clear()
+
+        if policy_error is not None:
+            raise policy_error
 
     def release_memory(self):
         pass
@@ -1385,8 +1496,14 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         transfer_to_compute_map: dict[str, str],
         stream_priority: int,
         allocation_controller: AllocationBlockController | RawBlockController,
+        offload_timing_collector: "OffloadTimingCollector | None" = None,
+        piecewise_prefetch_policy: "PiecewisePrefetchPolicy | None" = None,
     ) -> None:
-        super().__init__(allocation_controller)
+        super().__init__(
+            allocation_controller,
+            offload_timing_collector=offload_timing_collector,
+            piecewise_prefetch_policy=piecewise_prefetch_policy,
+        )
         self.device_gpu = device_gpu
         self.cpu_to_gpu_map = {}
 
@@ -1405,6 +1522,9 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         # Track iteration boundary for CUDA graph capture
         self.first_layer_label: str | None = None
         self.last_layer_label: str | None = None
+
+        # See PreallocatedBatchTransferTensorLoader for PIECEWISE rationale.
+        self._has_pending_transfer_work: bool = False
 
         if layer_stats:
             self.first_layer_label = layer_stats[0].label
@@ -1431,10 +1551,30 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
     @_compiler_disable
     def enter(self, label):
+        tc = self.offload_timing_collector
+        pp = self.piecewise_prefetch_policy
+
         if label == self.first_layer_label:
-            # Safety net: see PreallocatedBatchTransferTensorLoader.enter for
-            # the aborted-iteration rationale.
-            if self.compute_events_map or self.last_block_id_to_label_map:
+            # Abort: join then clear all maps. Preload-only: clear occupancy maps,
+            # keep scheduled_transfers for the first wait.
+            recovering = bool(self.compute_events_map) or self._has_pending_transfer_work
+            if recovering:
+                if self._has_pending_transfer_work or self.scheduled_transfers:
+                    join_event = self.transfer_stream.record_event()
+                    torch.cuda.current_stream().wait_event(join_event)
+                    self._has_pending_transfer_work = False
+                LOGGER.debug(
+                    "PreallocatedBatchTransferTensorLoaderReordered: abort recovery — "
+                    "joined transfer stream and clearing %d scheduled / %d compute / "
+                    "%d block-map entries",
+                    len(self.scheduled_transfers),
+                    len(self.compute_events_map),
+                    len(self.last_block_id_to_label_map),
+                )
+                self.scheduled_transfers.clear()
+                self.compute_events_map.clear()
+                self.last_block_id_to_label_map.clear()
+            elif self.compute_events_map or self.last_block_id_to_label_map:
                 LOGGER.debug(
                     "PreallocatedBatchTransferTensorLoaderReordered: clearing %d stale "
                     "event-map entries from aborted previous iteration",
@@ -1443,23 +1583,38 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
                 self.compute_events_map.clear()
                 self.last_block_id_to_label_map.clear()
 
-            # Fork: bring transfer stream into CUDA graph capture scope.
-            # Once forked, the transfer stream stays captured for the entire graph.
+            self._has_pending_transfer_work = False
+            tc.on_pass_start()
+            pp.reset()
+
+        # Fork once per forward / PIECEWISE piece; re-fork after join_after_forward.
+        if not self._has_pending_transfer_work:
             fork_event = torch.cuda.current_stream().record_event()
             self.transfer_stream.wait_event(fork_event)
+            self._has_pending_transfer_work = True
 
         # Wait for the transfer that provides this layer's data before compute reads it.
         if label in self.scheduled_transfers:
+            tc.record_wait_start(label)
+
             event = self.scheduled_transfers[label]
             torch.cuda.current_stream().wait_event(event)
+            pp.on_wait(label)
+
+            tc.record_wait_end(label)
 
         if label not in self.label_to_block_id:
+            tc.record_compute_start(label)
             return
 
         self._schedule_block_transfer(label)
 
+        tc.record_compute_start(label)
+
     def _schedule_block_transfer(self, label) -> None:
         """Issue the rolling-block H2D transfer for ``label`` on the transfer stream."""
+        tc = self.offload_timing_collector
+        pp = self.piecewise_prefetch_policy
         block_id = self.label_to_block_id[label]
         if block_id in self.last_block_id_to_label_map:
             last_label = self.last_block_id_to_label_map[block_id]
@@ -1470,28 +1625,88 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
         self.last_block_id_to_label_map[block_id] = label
 
+        tc.record_transfer_start(label, self.transfer_stream)
+
         compute_label = self.transfer_to_compute_map[label]
         with torch.cuda.stream(self.transfer_stream):
             self.allocation_controller.schedule_transfer(label)
             event = self.transfer_stream.record_event()
 
+        tc.record_transfer_end(label, self.transfer_stream)
+
         self.scheduled_transfers[compute_label] = event
+        pp.on_schedule(schedule_label=label, compute_label=compute_label)
 
     @_compiler_disable
     def exit(self, label):
+        tc = self.offload_timing_collector
+        pp = self.piecewise_prefetch_policy
+
+        # Record compute_end BEFORE the join so compute_ms reflects
+        # pure forward work, not forward + stall.
+        tc.record_compute_end(label)
+
         event_compute = torch.cuda.current_stream().record_event()
         self.compute_events_map[label] = event_compute
 
         # Join: bring transfer stream back to compute stream after last layer.
         # Required for CUDA graph capture completeness.
         if label == self.last_layer_label:
+            from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
+
             last_event = self.transfer_stream.record_event()
             torch.cuda.current_stream().wait_event(last_event)
+            self._has_pending_transfer_work = False
 
-            # Clear stale cross-iteration events (see comment in
-            # PreallocatedBatchTransferTensorLoader.exit for rationale).
+            # Clear maps even if strict policy raises (same contract as
+            # join_after_forward) so capture-session handles never leak.
+            policy_error: BaseException | None = None
+            try:
+                pp.on_piece_join(at_last_layer=True)
+            except PiecewisePrefetchPolicyError as exc:
+                policy_error = exc
+
+            # After join: drop completion maps (incl. scheduled_transfers).
+            self.scheduled_transfers.clear()
             self.compute_events_map.clear()
             self.last_block_id_to_label_map.clear()
+
+            if policy_error is not None:
+                raise policy_error
+
+    @_compiler_disable
+    def join_after_forward(self) -> None:
+        """Join transfer_stream back to compute_stream at end of forward / piece.
+
+        Call before CUDA-graph ``capture_end`` (FULL once, PIECEWISE every piece)
+        so forked H2D is not left unjoined. Always clears transfer/event maps.
+        Outstanding remapped (schedule≠compute) prefetches here mean rearrange
+        overlap was broken by the boundary; see
+        :class:`~flextensor.piecewise_prefetch_policy.PiecewisePrefetchPolicy`.
+
+        Stream join / map clears always run even if the policy raises (strict
+        mode); otherwise capture ends with ``cudaErrorStreamCaptureUnjoined``.
+        """
+        from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
+
+        pp = self.piecewise_prefetch_policy
+        policy_error: BaseException | None = None
+        try:
+            pp.on_piece_join(at_last_layer=False)
+        except PiecewisePrefetchPolicyError as exc:
+            policy_error = exc
+
+        if self._has_pending_transfer_work:
+            join_event = self.transfer_stream.record_event()
+            torch.cuda.current_stream().wait_event(join_event)
+            self._has_pending_transfer_work = False
+
+        self.scheduled_transfers.clear()
+        self.compute_events_map.clear()
+        self.last_block_id_to_label_map.clear()
+
+        if policy_error is not None:
+            raise policy_error
 
     def release_memory(self):
         pass

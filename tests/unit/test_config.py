@@ -231,6 +231,18 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError, match="external_compile=True requires a block transfer_mode"):
             OffloadConfig(external_compile=True, transfer_mode="strategy")
 
+    def test_offload_timing_rejects_strategy_transfer_mode(self):
+        """offload_timing needs PreallocatedLoader enter/exit hooks."""
+        for mode in ("eager", "cuda_graph"):
+            with pytest.raises(ValidationError, match=r"offload_timing=.*requires a block transfer_mode"):
+                OffloadConfig(offload_timing=mode, transfer_mode="strategy")
+
+    def test_offload_timing_accepts_block_transfer_modes(self):
+        for transfer_mode in ("allocation_block_transfer", "raw_block_transfer"):
+            config = OffloadConfig(offload_timing="eager", transfer_mode=transfer_mode)
+            assert config.offload_timing == "eager"
+            assert config.transfer_mode == transfer_mode
+
     def test_external_compile_accepts_block_transfer_modes(self):
         """external_compile is valid with either block transfer_mode."""
         for transfer_mode in ("allocation_block_transfer", "raw_block_transfer"):

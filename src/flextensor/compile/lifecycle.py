@@ -301,6 +301,7 @@ class CompiledOffload:
         self.active = False
         self.replan_active = False
         self.profile_active = False
+        self.profile_compile_warm_remaining = 0
 
     # -- inference wiring ---------------------------------------------------
 
@@ -361,9 +362,14 @@ class CompiledOffload:
     def request_strategy_replan(self) -> int:
         """Arm the passive warm→measure→replan tail; returns forwards to drive.
 
-        For external ``external_compile`` after ``torch.compile``, or for
-        ``compile_fn`` when profile was not under compile (e.g. ``getter``).
-        Not needed for default ``compile_fn`` + view-profile.
+        For ``external_compile`` after ``torch.compile``, or for ``compile_fn``
+        when profile was not under compile (e.g. ``getter``). Not needed for
+        default ``compile_fn`` + view-profile.
+
+        CUDA-graph replay (no forward hooks) must use
+        :meth:`~flextensor.OffloadManager.request_strategy_replan` with
+        ``manual_update_state=True`` instead — that path measures via transfer
+        timing, not this custom-op measure tail.
 
         Returns ``0`` unless :attr:`replan_active` was set at activation (source
         weights retained before the first loader build). Calling this on the
@@ -371,19 +377,40 @@ class CompiledOffload:
         originals, so a rebuild would be refused.
         """
         if not (self.active and self.replan_active):
+            if self.active and not self.replan_active:
+                LOGGER.warning(
+                    "FlexTensor compiled-offload: request_strategy_replan() ignored — "
+                    "replan was not armed (default view-profile keeps source weights "
+                    "off; use external_compile=True or profile_mode='getter' when a "
+                    "post-compile rebuild is required)."
+                )
+            elif not self.active:
+                LOGGER.warning(
+                    "FlexTensor compiled-offload: request_strategy_replan() ignored — compiled offload is not active."
+                )
             return 0
         return self.arm_replan_tail(compiled_warm_forwards=0)
 
-    def arm_replan_tail(self, *, compiled_warm_forwards: int = 0) -> int:
+    def arm_replan_tail(
+        self,
+        *,
+        compiled_warm_forwards: int = 0,
+        enable_profiling: bool = True,
+        finish_replan: Callable[[], bool | None] | None = None,
+    ) -> int:
         self._tail.measure_forwards = self.measure_forwards()
-        remaining = self._tail.arm(credited_warm=compiled_warm_forwards)
+        remaining = self._tail.arm(
+            credited_warm=compiled_warm_forwards,
+            enable_profiling=enable_profiling,
+        )
         if self._tail.state == CompiledOffloadTailState.MEASURING:
-            from flextensor.custom_ops import enable_compiled_profiling
+            if self._tail.enable_profiling:
+                from flextensor.custom_ops import enable_compiled_profiling
 
-            enable_compiled_profiling(self.manager_id)
+                enable_compiled_profiling(self.manager_id)
             if self._tail.measure_forwards == 0:
                 # No measure budget (profiling_iters=0): finish without waiting for a forward.
-                self._complete_replan_tail()
+                self._complete_replan_tail(finish_replan)
                 return 0
         remaining_warm = COMPILED_WARMUP_FORWARDS - self._tail.warm_seen
         LOGGER.info(
@@ -497,7 +524,7 @@ class CompiledOffload:
 
     # -- replan tail --------------------------------------------------------
 
-    def advance_tail(self, finish_replan: Callable[[], None] | None = None) -> None:
+    def advance_tail(self, finish_replan: Callable[[], bool | None] | None = None) -> None:
         finish = finish_replan or self.finish_replan
         state = self._tail.state
         match state:
@@ -510,9 +537,10 @@ class CompiledOffload:
             case CompiledOffloadTailState.WARMING:
                 self._tail.warm_seen += 1
                 if self._tail.warm_seen >= COMPILED_WARMUP_FORWARDS:
-                    from flextensor.custom_ops import enable_compiled_profiling
+                    if self._tail.enable_profiling:
+                        from flextensor.custom_ops import enable_compiled_profiling
 
-                    enable_compiled_profiling(self.manager_id)
+                        enable_compiled_profiling(self.manager_id)
                     self._tail.state = CompiledOffloadTailState.MEASURING
                     if self.measure_forwards() == 0:
                         self._complete_replan_tail(finish)
@@ -530,36 +558,58 @@ class CompiledOffload:
                     "This is an internal error — please report it."
                 )
 
-    def _complete_replan_tail(self, finish_replan: Callable[[], None] | None = None) -> None:
+    def _complete_replan_tail(self, finish_replan: Callable[[], bool | None] | None = None) -> None:
         finish = finish_replan or self.finish_replan
         try:
-            finish()
+            applied = finish()
         except Exception as exc:
             from flextensor.custom_ops import clear_active_loader
 
             clear_active_loader(self.manager_id)
             self._tail.mark_failed(exc)
             raise
-        self._tail.mark_done()
-
-    def finish_replan(self) -> None:
-        from flextensor.custom_ops import finish_compiled_profiling
-
-        durations_by_label = self._durations_by_label_from_samples(finish_compiled_profiling(self.manager_id))
-        if not durations_by_label:
+        # ``False`` = soft keep-current (empty budgets / rebuild refused).
+        # ``None`` / ``True`` = treated as applied (void callbacks return None).
+        # Still DONE so inference continues; ``replan_applied`` distinguishes.
+        if applied is False:
             LOGGER.warning(
-                "FlexTensor compiled-offload: no compiled per-layer timings captured; "
-                "keeping the eager-profile strategy."
+                "FlexTensor compiled-offload: re-plan finished without applying a "
+                "new strategy; keeping the current loader "
+                "(tail DONE, replan_applied=False)."
             )
-            return
+            self._tail.mark_done(applied=False)
+        else:
+            self._tail.mark_done(applied=True)
+
+    def finish_replan(self, durations_by_label: dict[str, float] | None = None) -> bool:
+        """Rebuild strategy from per-layer compute durations (ms) and reinstall loader.
+
+        When ``durations_by_label`` is omitted, drain compiled custom-op samples
+        from the measure tail. Offload-timing / CUDA-graph budgets are applied
+        via :meth:`~flextensor.OffloadManager.request_strategy_replan`, which
+        drains the collector and passes ``label → ms`` here.
+        """
+        if durations_by_label is None:
+            from flextensor.custom_ops import finish_compiled_profiling
+
+            durations_by_label = self._durations_by_label_from_samples(finish_compiled_profiling(self.manager_id))
+            if not durations_by_label:
+                LOGGER.warning(
+                    "FlexTensor compiled-offload: no compiled per-layer timings captured; "
+                    "keeping the eager-profile strategy."
+                )
+                return False
+        elif not durations_by_label:
+            return False
 
         tm = self._host._tensor_manager  # noqa: SLF001
         model = self._host._model  # noqa: SLF001
         if tm is None or model is None:
-            return
+            return False
         if not tm.replan_from_compiled_durations(durations_by_label, model):
-            return
+            return False
         self.reinstall_compiled_loader()
+        return True
 
     def _durations_by_label_from_samples(
         self,
