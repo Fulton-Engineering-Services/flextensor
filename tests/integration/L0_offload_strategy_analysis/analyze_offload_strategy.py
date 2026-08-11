@@ -14,6 +14,7 @@ Strategies:
     - global-strict: GlobalOffloadStrategy with StrictRoundRobinAssignment
     - knapsack: KnapsackStrategy (original per-layer strategy)
     - knapsack-block: KnapsackBlockStrategy (live GPU benchmarking, requires CUDA)
+    - budget-fill: BudgetFillStrategy (memory-first residency under GPU budget)
     - tensor-select: GlobalTensorSelectionStrategy with OptimizedRoundRobinAssignment (default)
     - tensor-select-strict: GlobalTensorSelectionStrategy with StrictRoundRobinAssignment
     - adaptive: AdaptiveStrategy (fast candidates only)
@@ -46,6 +47,7 @@ from data_generator import TENSOR_MANAGER_STATE_FILE, load_data, scale_memory_st
 from flextensor.memory_transfer_interpolator import MemoryTransferInterpolator  # noqa: E402
 from flextensor.strategy import (  # noqa: E402
     AdaptiveStrategy,
+    BudgetFillStrategy,
     GlobalOffloadStrategy,
     GlobalTensorSelectionStrategy,
     KnapsackBlockStrategy,
@@ -407,6 +409,51 @@ def run_knapsack_block_strategy(
 
     return AnalysisResult(
         strategy_name="KnapsackBlock",
+        layer_stats=layer_stats,
+        block_sizes=block_info.block_sizes,
+        blocks_used=block_info.blocks_used,
+        pipeline_violations=block_info.violations,
+        scale=scale,
+        peak_memory_bytes=peak_memory,
+        strategy_map=strategy_map,
+        layer_to_block=block_info.layer_to_block,
+        optimization_time_s=optimization_time,
+    )
+
+
+def run_budget_fill_strategy(
+    layer_stats_list: list[LayerStatistics],
+    interpolator: MemoryTransferInterpolator,
+    memory_stats: dict[int, float],
+    *,
+    scale: float = 1.0,
+    n_blocks: int = 4,
+    max_gpu_mem_bytes: int | None = None,
+) -> AnalysisResult:
+    """Run BudgetFillStrategy (memory-first residency under a hard GPU budget)."""
+    if max_gpu_mem_bytes is None:
+        msg = "budget-fill requires --gpu-mem / max_gpu_mem_bytes"
+        raise ValueError(msg)
+    strategy = BudgetFillStrategy(
+        n_blocks=n_blocks,
+        min_blocks=2,
+        threshold_mb=1.0,
+        scale=scale,
+    )
+    t0 = time.perf_counter()
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
+    optimization_time = time.perf_counter() - t0
+    strategy_map = compute_result.strategy_map
+    block_data = compute_result.block_data
+
+    layer_to_block = block_data.label_to_block_id if block_data else None
+    layer_stats = compute_layer_stats(layer_stats_list, strategy_map, layer_to_block, interpolator)
+    block_info = extract_block_info(block_data, layer_stats, n_blocks)
+
+    peak_memory = compute_peak_memory(layer_stats, block_info.block_sizes)
+
+    return AnalysisResult(
+        strategy_name="BudgetFill",
         layer_stats=layer_stats,
         block_sizes=block_info.block_sizes,
         blocks_used=block_info.blocks_used,
@@ -907,6 +954,7 @@ def main() -> None:  # noqa: C901
         "global-strict",
         "knapsack",
         "knapsack-block",
+        "budget-fill",
         "tensor-select",
         "tensor-select-strict",
         "adaptive",
@@ -1014,13 +1062,22 @@ def main() -> None:  # noqa: C901
 
     # Define which strategies to run
     if args.strategy == "recommended":
-        strategies_to_run = ["global", "knapsack", "knapsack-block", "tensor-select", "adaptive", "adaptive-extra"]
+        strategies_to_run = [
+            "global",
+            "knapsack",
+            "knapsack-block",
+            "budget-fill",
+            "tensor-select",
+            "adaptive",
+            "adaptive-extra",
+        ]
     elif args.strategy == "all":
         strategies_to_run = [
             "global",
             "global-strict",
             "knapsack",
             "knapsack-block",
+            "budget-fill",
             "tensor-select",
             "tensor-select-strict",
             "adaptive",
@@ -1070,6 +1127,14 @@ def main() -> None:  # noqa: C901
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
             ),
             "knapsack-block": lambda _i=profile_interpolator, _m=scaled_stats: run_knapsack_block_strategy(
+                layer_stats_list,
+                _i,
+                _m,
+                scale=args.transfer_budget_scale,
+                n_blocks=args.n_blocks,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
+            ),
+            "budget-fill": lambda _i=profile_interpolator, _m=scaled_stats: run_budget_fill_strategy(
                 layer_stats_list,
                 _i,
                 _m,

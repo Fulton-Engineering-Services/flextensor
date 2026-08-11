@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- ``BudgetFillStrategy`` — memory-first offload planner that fills a hard GPU
+  budget by spreading per-layer offload (also a candidate in
+  ``AdaptiveStrategy`` when ``max_gpu_mem_bytes`` is set).
 - Collect per-trap transfer / compute / wait timings during inference via
   ``OffloadConfig.offload_timing`` (``"off"`` / ``"eager"`` / ``"cuda_graph"``)
   and :func:`~flextensor.collect_offload_timing` (see

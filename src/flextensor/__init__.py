@@ -59,6 +59,7 @@ from flextensor.offload_timing import (
 from flextensor.strategy import (
     AdaptiveKnapsackStrategy,
     AdaptiveStrategy,
+    BudgetFillStrategy,
     GlobalOffloadStrategy,
     GlobalTensorSelectionStrategy,
     GreedyStrategy,
@@ -107,6 +108,7 @@ __all__ = [  # noqa: RUF022
     "BenchmarkReplace",
     "GlobalOffloadStrategy",
     "GlobalTensorSelectionStrategy",
+    "BudgetFillStrategy",
     "GreedyStrategy",
     "KnapsackBlockStrategy",
     "KnapsackStrategy",

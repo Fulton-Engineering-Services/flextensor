@@ -423,6 +423,7 @@ FlexTensor includes several offloading strategies. The table below is a conceptu
 | `NthLayerStrategy` | Offload every Nth layer | Predictable patterns |
 | `AdaptiveKnapsackStrategy` | Knapsack with runtime adaptation | Variable workloads |
 | `AdaptiveStrategy` | Evaluates multiple candidates, selects best | Default automatic selection |
+| `BudgetFillStrategy` | Spread per-layer offload until peak fits a hard GPU budget | Memory-first residency / bootstrap without rich profiles |
 | `GlobalOffloadStrategy` | Global optimizer across all layers | Maximizing overall memory reduction |
 | `GlobalTensorSelectionStrategy` | Metaheuristic search (`"DE"` or `"SA"`) | Highest-quality solution when runtime allows |
 

@@ -377,7 +377,7 @@ class TestAdaptiveStrategy:
         assert strategy.selected_strategy_name != ""
 
     def test_all_scores_populated(self):
-        """all_scores should contain one entry per candidate (default: 3 fast)."""
+        """all_scores should contain one entry per candidate (default: BudgetFill + 3 fast)."""
         layers, mem_stats = _make_simple_model(n_layers=3)
         strategy = AdaptiveStrategy(
             scale=1.0,
@@ -385,11 +385,25 @@ class TestAdaptiveStrategy:
             n_blocks=4,
         )
         strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
-        assert len(strategy.all_scores) == 3
+        assert len(strategy.all_scores) == 4
         names = {s.strategy_name for s in strategy.all_scores}
+        assert "BudgetFill" in names
         assert "KnapsackBlock" in names
         assert "GlobalOffload(Optimized)" in names
         assert "GlobalOffload(Strict)" in names
+
+    def test_budget_fill_skipped_without_memory_budget(self):
+        """Latency mode (no max_gpu_mem_bytes) should not evaluate BudgetFill."""
+        layers, mem_stats = _make_simple_model(n_layers=3)
+        strategy = AdaptiveStrategy(
+            scale=1.0,
+            loader_type="allocation_block_transfer",
+            n_blocks=4,
+        )
+        strategy.compute(layers, mem_stats, max_gpu_mem_bytes=None)
+        names = {s.strategy_name for s in strategy.all_scores}
+        assert "BudgetFill" not in names
+        assert len(strategy.all_scores) == 3
 
     def test_all_scores_populated_extra_optimization(self):
         """extra_optimization=True should include TensorSelection candidates."""
@@ -401,8 +415,9 @@ class TestAdaptiveStrategy:
             extra_optimization=True,
         )
         strategy.compute(layers, mem_stats, max_gpu_mem_bytes=200 * 1024**2)
-        assert len(strategy.all_scores) == 5
+        assert len(strategy.all_scores) == 6
         names = {s.strategy_name for s in strategy.all_scores}
+        assert "BudgetFill" in names
         assert "KnapsackBlock" in names
         assert "GlobalOffload(Optimized)" in names
         assert "GlobalOffload(Strict)" in names

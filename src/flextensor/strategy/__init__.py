@@ -16,6 +16,9 @@ from .assignment import (
     StrictRoundRobinAssignment,
 )
 
+# Budget-first strategy
+from .budget_fill import BudgetFillStrategy
+
 # Evaluation utilities
 from .evaluation import StrategyScore, evaluate_strategy_result
 
@@ -75,6 +78,8 @@ __all__ = [  # noqa: RUF022
     "KnapsackStrategy",
     "KnapsackBlockStrategy",
     "AdaptiveKnapsackStrategy",
+    # Budget-first strategy
+    "BudgetFillStrategy",
     # Simple strategies
     "GreedyStrategy",
     "NthLayerStrategy",

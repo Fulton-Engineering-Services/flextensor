@@ -25,6 +25,10 @@ Pass a strategy instance to [`OffloadConfig(load_strategy=...)`](configuration.m
 
 ::: flextensor.strategy.knapsack.AdaptiveKnapsackStrategy
 
+## Budget-First Strategy
+
+::: flextensor.strategy.budget_fill.BudgetFillStrategy
+
 ## Simple Strategies
 
 ::: flextensor.strategy.simple.GreedyStrategy

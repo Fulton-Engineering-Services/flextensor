@@ -19,6 +19,7 @@ from flextensor.strategy.assignment import (
     OptimizedRoundRobinAssignment,
     StrictRoundRobinAssignment,
 )
+from flextensor.strategy.budget_fill import BudgetFillStrategy
 from flextensor.strategy.evaluation import StrategyScore, evaluate_strategy_result
 from flextensor.strategy.global_strategy import (
     GlobalOffloadStrategy,
@@ -40,6 +41,7 @@ class AdaptiveStrategy:
     For block-based loaders (the common path), the following candidates are
     evaluated:
 
+    * :class:`BudgetFillStrategy` (only when ``max_gpu_mem_bytes`` is set)
     * :class:`KnapsackBlockStrategy`
     * :class:`GlobalOffloadStrategy` (Optimized assignment)
     * :class:`GlobalOffloadStrategy` (Strict assignment)
@@ -130,7 +132,7 @@ class AdaptiveStrategy:
             :class:`StrategyResult` from the best-scoring candidate.
         """
         interpolator = MemoryTransferInterpolator(memory_stats) if memory_stats else None
-        candidates = self._build_candidates()
+        candidates = self._build_candidates(max_gpu_mem_bytes=max_gpu_mem_bytes)
 
         best_result: StrategyResult | None = None
         best_score: StrategyScore | None = None
@@ -207,20 +209,31 @@ class AdaptiveStrategy:
     # Candidate construction
     # ------------------------------------------------------------------
 
-    def _build_candidates(self) -> list[tuple[str, Strategy]]:
+    def _build_candidates(self, *, max_gpu_mem_bytes: int | None = None) -> list[tuple[str, Strategy]]:
         """Build the list of ``(name, strategy_instance)`` candidates."""
         if self.loader_type in self.BLOCK_LOADER_TYPES:
-            return self._block_candidates()
+            return self._block_candidates(max_gpu_mem_bytes=max_gpu_mem_bytes)
         return self._non_block_candidates()
 
-    def _block_candidates(self) -> list[tuple[str, Strategy]]:
+    def _block_candidates(self, *, max_gpu_mem_bytes: int | None = None) -> list[tuple[str, Strategy]]:
         """Candidates for block-based loaders."""
         scale = self.scale
         threshold_mb = self.threshold_mb
         n_blocks = self.n_blocks
         min_blocks = self.min_blocks
 
-        candidates: list[tuple[str, Strategy]] = [
+        candidates: list[tuple[str, Strategy]] = []
+        if max_gpu_mem_bytes is not None:
+            candidates.append((
+                "BudgetFill",
+                BudgetFillStrategy(
+                    n_blocks=n_blocks,
+                    min_blocks=min_blocks,
+                    threshold_mb=threshold_mb,
+                    scale=scale,
+                ),
+            ))
+        candidates.extend([
             (
                 "KnapsackBlock",
                 KnapsackBlockStrategy(
@@ -248,7 +261,7 @@ class AdaptiveStrategy:
                     assignment_strategy=StrictRoundRobinAssignment(),
                 ),
             ),
-        ]
+        ])
 
         if self.extra_optimization:
             candidates.extend([
