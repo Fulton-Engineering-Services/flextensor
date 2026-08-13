@@ -12,6 +12,7 @@ import signal
 import subprocess  # noqa: S404 - subprocess needed for test utilities
 import threading
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
@@ -545,6 +546,7 @@ def start_vllm_server(case: VllmOffloadSmokeCase) -> tuple[subprocess.Popen[byte
         stderr=subprocess.STDOUT,
         text=False,
         bufsize=1,
+        start_new_session=True,
     )
 
     log_lines: list[str] = []
@@ -589,17 +591,24 @@ def wait_for_server(
 
 
 def stop_vllm_server(process: subprocess.Popen[bytes], timeout: int = 30) -> None:
-    """Stop vLLM server process gracefully."""
+    """Stop the vLLM server and every worker process it spawned."""
     if process.poll() is None:
         print("\nStopping vLLM server...")
-        process.send_signal(signal.SIGTERM)
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
 
         try:
             process.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             print("Server did not stop gracefully, forcing...")
-            process.kill()
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
             process.wait()
+        else:
+            # The API server can exit before EngineCore. The dedicated process
+            # group makes it safe to remove any descendants left after shutdown.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
 
 
 def make_chat_request(

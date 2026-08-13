@@ -1477,16 +1477,24 @@ class OffloadManager:
             self._install_compiled_forwards()
             self._compiled.on_enter_inference()
         finally:
-            # Dump instrumentation data if enabled and output directory is configured
-            if (
-                self.config.enable_instrumentation
-                and self.config.instrumentation_output_dir
-                and self._tensor_manager is not None
-            ):
-                dump_to_directory(
-                    self.config.instrumentation_output_dir,
-                    extra={"memory_transfer_stats": self._tensor_manager.get_memory_transfer_stats()},
-                )
+            self._dump_instrumentation()
+
+    def _dump_instrumentation(self) -> None:
+        if self._current_phase is not OffloadPhase.INFERENCE:
+            return
+        if (
+            not self.config.enable_instrumentation
+            or not self.config.instrumentation_output_dir
+            or self._tensor_manager is None
+        ):
+            return
+        try:
+            dump_to_directory(
+                self.config.instrumentation_output_dir,
+                extra={"memory_transfer_stats": self._tensor_manager.get_memory_transfer_stats()},
+            )
+        except Exception:
+            LOGGER.warning("OffloadManager: instrumentation dump failed; continuing.", exc_info=True)
 
     def update_state(self, *, replay_generation: int = -1) -> None:
         """Advance the phase state machine by one iteration.
@@ -1671,6 +1679,7 @@ class OffloadManager:
             self._swap_to_new_model(final_model, OffloadPhase.INFERENCE)
             self._install_compiled_forwards()
             self._compiled.on_enter_inference()
+            self._dump_instrumentation()
             if self._model_proxy is None:
                 self._model_proxy = OffloadModelProxy(self._model, self)
             return self._model_proxy

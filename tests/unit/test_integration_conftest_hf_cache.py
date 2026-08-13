@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
+import json
 import os
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 pytest.importorskip("huggingface_hub")
 
@@ -31,11 +36,17 @@ def _restore_hf_env() -> None:
 
 
 def test_enables_offline_when_all_required_files_are_cached(capsys: pytest.CaptureFixture[str]) -> None:
-    with mock.patch("huggingface_hub.try_to_load_from_cache", return_value="/fake/path") as m:
+    def fake_load(_model: str, filename: str) -> str | None:
+        if filename in _REQUIRED_CACHE_FILES or filename == "model.safetensors":
+            return "/fake/path"
+        return None
+
+    with mock.patch("huggingface_hub.try_to_load_from_cache", side_effect=fake_load) as m:
         enable_offline_if_cached(_MODEL)
 
-    assert m.call_count == len(_REQUIRED_CACHE_FILES)
-    assert {c.args[1] for c in m.call_args_list} == set(_REQUIRED_CACHE_FILES)
+    requested_files = {c.args[1] for c in m.call_args_list}
+    assert set(_REQUIRED_CACHE_FILES) < requested_files
+    assert "model.safetensors" in requested_files
     assert os.environ["HF_HUB_OFFLINE"] == "1"
     assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
     assert "fully cached" in capsys.readouterr().out
@@ -57,9 +68,58 @@ def test_stays_online_when_any_required_file_is_missing(capsys: pytest.CaptureFi
     assert missing_file in out
 
 
-def test_noop_when_already_offline() -> None:
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    with mock.patch("huggingface_hub.try_to_load_from_cache") as m:
+def test_stays_online_when_a_weight_shard_is_missing(tmp_path: Path) -> None:
+    index_file = tmp_path / "model.safetensors.index.json"
+    index_file.write_text(json.dumps({"weight_map": {"a": "model-00001.safetensors", "b": "model-00002.safetensors"}}))
+
+    def fake_load(_model: str, filename: str) -> str | None:
+        if filename in _REQUIRED_CACHE_FILES:
+            return "/fake/path"
+        if filename == index_file.name:
+            return str(index_file)
+        if filename == "model-00001.safetensors":
+            return "/fake/shard"
+        return None
+
+    with mock.patch("huggingface_hub.try_to_load_from_cache", side_effect=fake_load):
         enable_offline_if_cached(_MODEL)
 
-    m.assert_not_called()
+    assert "HF_HUB_OFFLINE" not in os.environ
+    assert "TRANSFORMERS_OFFLINE" not in os.environ
+
+
+def test_enables_offline_when_single_weight_file_exists_and_index_is_incomplete(tmp_path: Path) -> None:
+    index_file = tmp_path / "pytorch_model.bin.index.json"
+    index_file.write_text(json.dumps({"weight_map": {"a": "pytorch_model-00001.bin"}}))
+
+    def fake_load(_model: str, filename: str) -> str | None:
+        if filename in _REQUIRED_CACHE_FILES:
+            return "/fake/path"
+        if filename == "model.safetensors":
+            return "/fake/model.safetensors"
+        if filename == index_file.name:
+            return str(index_file)
+        return None
+
+    with mock.patch("huggingface_hub.try_to_load_from_cache", side_effect=fake_load):
+        enable_offline_if_cached(_MODEL)
+
+    assert os.environ["HF_HUB_OFFLINE"] == "1"
+    assert os.environ["TRANSFORMERS_OFFLINE"] == "1"
+
+
+def test_reenables_online_for_a_different_uncached_model() -> None:
+    cached_model = "Qwen/Qwen3.6-35B-A3B"
+    uncached_model = "Qwen/Qwen3-30B-A3B-FP8"
+
+    def fake_load(model: str, _filename: str) -> str | None:
+        if model != cached_model or _filename in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            return None
+        return "/fake/path"
+
+    with mock.patch("huggingface_hub.try_to_load_from_cache", side_effect=fake_load):
+        enable_offline_if_cached(cached_model)
+        enable_offline_if_cached(uncached_model)
+
+    assert "HF_HUB_OFFLINE" not in os.environ
+    assert "TRANSFORMERS_OFFLINE" not in os.environ

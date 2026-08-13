@@ -498,6 +498,7 @@ def test_start_vllm_server_builds_command_and_environment(monkeypatch) -> None:
         observed["env"] = kwargs["env"]
         assert kwargs["stdout"] is _vllm_server.subprocess.PIPE
         assert kwargs["stderr"] is _vllm_server.subprocess.STDOUT
+        assert kwargs["start_new_session"] is True
         return _FakeProcess()
 
     class _FakeThread:
@@ -526,45 +527,82 @@ def test_start_vllm_server_builds_command_and_environment(monkeypatch) -> None:
     assert observed["thread_started"] is True
 
 
-def test_stop_vllm_server_terminates_running_process() -> None:
+def test_stop_vllm_server_terminates_running_process_group(monkeypatch) -> None:
     events: list[object] = []
 
     class _Process:
+        pid = 42
+
         def poll(self):
             return None
-
-        def send_signal(self, sig):
-            events.append(("signal", sig))
 
         def wait(self, *, timeout):
             events.append(("wait", timeout))
 
+    monkeypatch.setattr(
+        _vllm_server.os,
+        "killpg",
+        lambda pid, sig: events.append(("killpg", pid, sig)),
+    )
+
     _vllm_server.stop_vllm_server(_Process(), timeout=5)
 
-    assert events == [("signal", _vllm_server.signal.SIGTERM), ("wait", 5)]
+    assert events == [
+        ("killpg", 42, _vllm_server.signal.SIGTERM),
+        ("wait", 5),
+        ("killpg", 42, _vllm_server.signal.SIGKILL),
+    ]
 
 
-def test_stop_vllm_server_kills_when_graceful_shutdown_times_out() -> None:
-    events: list[str] = []
+def test_stop_vllm_server_kills_process_group_when_graceful_shutdown_times_out(monkeypatch) -> None:
+    events: list[object] = []
 
     class _Process:
+        pid = 43
+
         def poll(self):
             return None
 
-        def send_signal(self, _sig):
-            events.append("signal")
-
         def wait(self, timeout=None):
-            events.append(f"wait:{timeout}")
-            if "kill" not in events:
+            events.append(("wait", timeout))
+            if ("killpg", 43, _vllm_server.signal.SIGKILL) not in events:
                 raise _vllm_server.subprocess.TimeoutExpired(cmd="vllm", timeout=timeout)
 
-        def kill(self):
-            events.append("kill")
+    monkeypatch.setattr(
+        _vllm_server.os,
+        "killpg",
+        lambda pid, sig: events.append(("killpg", pid, sig)),
+    )
 
     _vllm_server.stop_vllm_server(_Process(), timeout=5)
 
-    assert events == ["signal", "wait:5", "kill", "wait:None"]
+    assert events == [
+        ("killpg", 43, _vllm_server.signal.SIGTERM),
+        ("wait", 5),
+        ("killpg", 43, _vllm_server.signal.SIGKILL),
+        ("wait", None),
+    ]
+
+
+@pytest.mark.parametrize("missing_signal", [_vllm_server.signal.SIGTERM, _vllm_server.signal.SIGKILL])
+def test_stop_vllm_server_ignores_missing_process_group(monkeypatch, missing_signal) -> None:
+    class _Process:
+        pid = 44
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if timeout is not None and missing_signal is _vllm_server.signal.SIGKILL:
+                raise _vllm_server.subprocess.TimeoutExpired(cmd="vllm", timeout=timeout)
+
+    def killpg(_pid, sig):
+        if sig is missing_signal:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(_vllm_server.os, "killpg", killpg)
+
+    _vllm_server.stop_vllm_server(_Process(), timeout=5)
 
 
 def test_make_chat_request_posts_openai_payload(monkeypatch) -> None:

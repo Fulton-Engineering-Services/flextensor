@@ -5,11 +5,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess  # noqa: S404 - subprocess needed for test diagnostics
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 # Files that must all be present in the local HF cache before we trust it enough
 # to enable offline mode. A partial cache left by an HTTP 429-interrupted
@@ -22,6 +28,8 @@ _REQUIRED_CACHE_FILES = (
     "tokenizer_config.json",
     "tokenizer.json",
 )
+_WEIGHT_INDEX_FILES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin")
 
 PCIE_QUERY_ARGS = (
     "nvidia-smi",
@@ -54,6 +62,28 @@ def _print_command_output(title: str, args: tuple[str, ...], *, timeout_s: int) 
     return result
 
 
+def _model_weights_are_cached(model_name: str, load_from_cache: Callable[[str, str], object]) -> bool:
+    for index_name in _WEIGHT_INDEX_FILES:
+        index_path = load_from_cache(model_name, index_name)
+        if not isinstance(index_path, str):
+            continue
+
+        try:
+            index = json.loads(Path(index_path).read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
+            continue
+
+        shards = list(index["weight_map"].values())
+        if not shards or not all(isinstance(shard, str) for shard in shards):
+            continue
+        if all(isinstance(load_from_cache(model_name, shard), str) for shard in set(shards)):
+            return True
+
+    return any(isinstance(load_from_cache(model_name, filename), str) for filename in _WEIGHT_FILES)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def require_integration_nvidia_gpu() -> None:
     """Require an NVIDIA GPU once per integration pytest session."""
@@ -77,20 +107,20 @@ def enable_offline_if_cached(model_name: str) -> None:
     """Set ``HF_HUB_OFFLINE=1`` when *model_name* is fully present in the local HF cache.
 
     Prevents 429 burst rate-limit crashes from HF API calls for files not
-    present in the repo (e.g. quantization configs).  Safe to call multiple
-    times -- skips the check once offline mode is already active.
+    present in the repo (e.g. quantization configs).  Safe to call for
+    different models in one process: each call re-evaluates the current model.
 
-    Each file in :data:`_REQUIRED_CACHE_FILES` must resolve to a cached path;
-    if any are missing, the cache is treated as partial and online mode stays
-    on so the incomplete download can finish.
+    Each metadata file and every indexed model-weight shard must resolve to a
+    cached path; otherwise online mode stays on so the download can finish.
     """
-    if os.environ.get("HF_HUB_OFFLINE") == "1":
-        return
-
     from huggingface_hub import try_to_load_from_cache
 
     missing = [name for name in _REQUIRED_CACHE_FILES if not isinstance(try_to_load_from_cache(model_name, name), str)]
+    if not missing and not _model_weights_are_cached(model_name, try_to_load_from_cache):
+        missing.append("model weights")
     if missing:
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
         print(f"[HF cache] {model_name} not fully cached (missing: {', '.join(missing)}) — HF API calls enabled")
         return
 

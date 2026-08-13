@@ -694,6 +694,30 @@ class TestModuleLevelProfileFunctions:
 
 
 class TestOffloadFromState:
+    @pytest.mark.parametrize("phase", [OffloadPhase.NOT_INITIALIZED, OffloadPhase.PROFILING])
+    def test_instrumentation_dump_is_skipped_before_inference(self, phase):
+        manager = OffloadManager("instrumentation")
+        manager.config = OffloadConfig(enable_instrumentation=True, instrumentation_output_dir="instrumentation")
+        manager._tensor_manager = MagicMock()
+        manager._current_phase = phase
+
+        with patch("flextensor.offload_manager.dump_to_directory", side_effect=AssertionError("unexpected dump")):
+            manager._dump_instrumentation()
+
+    def test_instrumentation_dump_failure_does_not_escape(self, caplog):
+        manager = OffloadManager("instrumentation")
+        manager.config = OffloadConfig(enable_instrumentation=True, instrumentation_output_dir="instrumentation")
+        manager._tensor_manager = MagicMock()
+        manager._current_phase = OffloadPhase.INFERENCE
+
+        with (
+            patch("flextensor.offload_manager.dump_to_directory", side_effect=OSError("disk full")),
+            caplog.at_level("WARNING", logger="flextensor.offload_manager"),
+        ):
+            manager._dump_instrumentation()
+
+        assert "instrumentation dump failed" in caplog.text
+
     @patch("flextensor.offload_manager.get_offload_manager")
     def test_module_level_api_delegates_to_named_manager(self, mock_get_om):
         model = SimpleModel()
@@ -713,7 +737,12 @@ class TestOffloadFromState:
     def test_manager_runs_takeover_in_order_and_rejects_a_second_active_call(self):
         model = SimpleModel()
         state = _state_for_model(model)
-        config = OffloadConfig(include_patterns=["linear1"], exclude_patterns=["linear2"])
+        config = OffloadConfig(
+            include_patterns=["linear1"],
+            exclude_patterns=["linear2"],
+            enable_instrumentation=True,
+            instrumentation_output_dir="instrumentation",
+        )
         plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
         events: list[str] = []
         tensor_manager = MagicMock()
@@ -728,13 +757,18 @@ class TestOffloadFromState:
         tensor_manager.set_model.side_effect = lambda *_: events.append("set_model")
         final_model = SimpleModel()
         tensor_manager.initialize_inference.side_effect = lambda: (events.append("publish"), final_model)[1]
+        tensor_manager.get_memory_transfer_stats.return_value = {1024: 0.5}
         manager = OffloadManager("adopted")
         manager._tensor_manager = tensor_manager
         manager._offload_modules = MagicMock(side_effect=lambda *_: events.append("patch"))
         manager._exclude_modules = MagicMock(side_effect=lambda *_: events.append("exclude"))
         manager._check_no_modules_patched = MagicMock()
 
-        result = manager.offload_from_state(model, state, config=config)
+        with patch(
+            "flextensor.offload_manager.dump_to_directory",
+            side_effect=lambda *_args, **_kwargs: events.append("dump"),
+        ) as dump:
+            result = manager.offload_from_state(model, state, config=config)
 
         assert isinstance(result, OffloadModelProxy)
         assert result.__subject__ is final_model
@@ -749,7 +783,9 @@ class TestOffloadFromState:
             "finalize",
             "set_model",
             "publish",
+            "dump",
         ]
+        dump.assert_called_once_with("instrumentation", extra={"memory_transfer_stats": {1024: 0.5}})
         tensor_manager.execute_state_adoption.assert_called_once_with(model, plan)
         tensor_manager.prepare_final_model.assert_called_once_with(model, in_place=True)
         assert manager.model is final_model
