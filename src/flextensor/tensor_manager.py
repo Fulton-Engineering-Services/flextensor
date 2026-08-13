@@ -2171,7 +2171,19 @@ class TensorManager:
                     controller.tensor_id_to_view_map[tensor_id].untyped_storage()._cdata  # noqa: SLF001
                 )
                 if current_storage == loader_storage:
-                    set_tensor_data(tensor, source_view.clone(memory_format=torch.preserve_format))
+                    # Regular CPU blocks are ordinary tensor storage. Rebinding
+                    # transfers ownership to the model, so controller teardown
+                    # can drop its references without a second full weight copy.
+                    # SHM blocks are explicitly unmapped by ``block.release()``
+                    # and therefore still need independent storage.
+                    cpu_block = controller.block_map_cpu[label]
+                    requires_copy = (
+                        isinstance(controller, AllocationBlockController) and cpu_block.shm_block is not None
+                    )
+                    restored_data = (
+                        source_view.clone(memory_format=torch.preserve_format) if requires_copy else source_view
+                    )
+                    set_tensor_data(tensor, restored_data)
 
     def shutdown(self) -> None:  # noqa: C901
         class_restore_error: Exception | None = None

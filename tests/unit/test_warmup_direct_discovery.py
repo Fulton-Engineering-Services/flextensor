@@ -295,6 +295,24 @@ def test_warmup_direct_loader_rejects_distinct_parameters_sharing_storage() -> N
     assert loader.cpu_to_gpu_map == {}
 
 
+def test_raw_tensor_binder_allows_disjoint_views_of_packed_storage() -> None:
+    packed = torch.arange(6, dtype=torch.float32)
+    weight_a = nn.Parameter(packed[:2], requires_grad=False)
+    weight_b = nn.Parameter(packed[2:], requires_grad=False)
+    original_a = weight_a.detach().clone()
+    original_b = weight_b.detach().clone()
+    active_a = torch.full_like(weight_a, 9)
+    binder = _RawTensorDataBinder({id(weight_a): weight_a, id(weight_b): weight_b})
+
+    binder.bind(id(weight_a), active_a)
+
+    torch.testing.assert_close(weight_a, active_a)
+    torch.testing.assert_close(weight_b, original_b)
+    binder.restore_all()
+    torch.testing.assert_close(weight_a, original_a)
+    torch.testing.assert_close(weight_b, original_b)
+
+
 def test_warmup_direct_loader_preserves_requires_grad_grad_and_stride() -> None:
     weight = nn.Parameter(torch.arange(6, dtype=torch.float32).reshape(2, 3).t(), requires_grad=True)
     weight.grad = torch.ones_like(weight)

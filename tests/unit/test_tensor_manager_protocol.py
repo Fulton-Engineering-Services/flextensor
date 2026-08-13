@@ -7,11 +7,14 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from flextensor.allocation_block import AllocationBlock
 from flextensor.collectors import LayerStatistics, TensorStatistics
 from flextensor.helpers import NoOpTensorManager
+from flextensor.loaders import AllocationBlockController
 from flextensor.offload_manager import TensorManagerProtocol
 from flextensor.state_handler import TensorManagerState
 from flextensor.tensor_manager import TensorManager
+from flextensor.utils import set_tensor_data
 
 
 def _make_tensor_manager(*, loader_type: str = "allocation_block_transfer") -> TensorManager:
@@ -212,6 +215,68 @@ def test_failed_class_restoration_remains_tracked_and_aborts_loader_teardown() -
     manager.shutdown()
     assert manager._in_place_original_classes == {}
     manager.tensor_layer_loader.shutdown.assert_called_once()
+
+
+def _block_restore_case() -> tuple[
+    TensorManager,
+    torch.nn.Parameter,
+    torch.Tensor,
+    AllocationBlock,
+    int,
+    AllocationBlockController,
+]:
+    manager = _make_tensor_manager()
+    parameter = torch.nn.Parameter(torch.arange(8, dtype=torch.float32), requires_grad=False)
+    expected = parameter.detach().clone()
+    block = AllocationBlock(
+        device="cpu",
+        host_pinner=manager.host_pinner,
+        release_tensor_memory=True,
+    )
+    block.add(parameter)
+    source_view = block.allocate()[0]
+    source_storage = source_view.untyped_storage()._cdata  # noqa: SLF001
+
+    runtime_view = expected.clone()
+    set_tensor_data(parameter, runtime_view)
+    controller = AllocationBlockController.__new__(AllocationBlockController)
+    controller.block_map_cpu = {"layer": block}
+    controller.block_map_gpu = {}
+    controller.label_to_gpu_block = {}
+    controller.gpu_block_view_map = {}
+    controller.label_to_tensor_views_map = {}
+    controller.label_to_cpu_tensor_id_map = {"layer": [id(parameter)]}
+    controller.tensor_id_to_view_map = {id(parameter): runtime_view}
+    manager.tensors_map = {id(parameter): parameter}
+    manager.tensor_layer_loader = MagicMock(
+        allocation_controller=controller,
+        shutdown=controller.shutdown,
+    )
+    return manager, parameter, expected, block, source_storage, controller
+
+
+def test_shutdown_transfers_regular_cpu_block_storage_back_to_model() -> None:
+    manager, parameter, expected, _block, source_storage, controller = _block_restore_case()
+
+    manager.shutdown()
+
+    torch.testing.assert_close(parameter, expected)
+    assert parameter.untyped_storage()._cdata == source_storage  # noqa: SLF001
+    assert controller.block_map_cpu == {}
+
+
+def test_shutdown_copies_shm_block_storage_before_unmapping() -> None:
+    manager, parameter, expected, block, source_storage, controller = _block_restore_case()
+    runtime_storage = parameter.untyped_storage()._cdata  # noqa: SLF001
+    block.shm_block = MagicMock()
+    block.shm_block_name = "test"
+    block.lock_class = MagicMock(return_value=MagicMock())
+
+    manager.shutdown()
+
+    torch.testing.assert_close(parameter, expected)
+    assert parameter.untyped_storage()._cdata not in {source_storage, runtime_storage}  # noqa: SLF001
+    assert controller.block_map_cpu == {}
 
 
 def test_noop_prepare_final_model_accepts_in_place() -> None:

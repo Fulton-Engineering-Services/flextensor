@@ -215,24 +215,49 @@ class _RawTensorDataBinder:
 
     @classmethod
     def _find_shared_storage_ids(cls, tensors_map: Mapping[int, torch.Tensor]) -> dict[int, set[int]]:
-        storage_to_ids: dict[tuple[str, int], set[int]] = {}
+        storage_to_tensors: dict[tuple[str, int], list[tuple[int, torch.Tensor]]] = {}
         for tensor_id, tensor in tensors_map.items():
-            storage_to_ids.setdefault(cls._storage_key(tensor), set()).add(tensor_id)
+            storage_to_tensors.setdefault(cls._storage_key(tensor), []).append((tensor_id, tensor))
 
         shared_storage_ids: dict[int, set[int]] = {}
-        for tensor_ids in storage_to_ids.values():
-            if len(tensor_ids) <= 1:
-                continue
-            for tensor_id in tensor_ids:
-                shared_storage_ids[tensor_id] = set(tensor_ids)
+        for tensors in storage_to_tensors.values():
+            for index, (tensor_id, tensor) in enumerate(tensors):
+                for other_id, other in tensors[index + 1 :]:
+                    if not cls._storage_regions_may_overlap(tensor, other):
+                        continue
+                    shared_storage_ids.setdefault(tensor_id, {tensor_id}).add(other_id)
+                    shared_storage_ids.setdefault(other_id, {other_id}).add(tensor_id)
         return shared_storage_ids
+
+    @staticmethod
+    def _storage_regions_may_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
+        """Conservatively detect overlap between two views of one storage."""
+
+        def byte_bounds(tensor: torch.Tensor) -> tuple[int, int] | None:
+            if tensor.numel() == 0:
+                return (0, 0)
+            if tensor.layout != torch.strided or any(stride < 0 for stride in tensor.stride()):
+                return None
+            first_element = tensor.storage_offset()
+            last_element = first_element + sum(
+                (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+            )
+            element_size = tensor.element_size()
+            return first_element * element_size, (last_element + 1) * element_size
+
+        left_bounds = byte_bounds(left)
+        right_bounds = byte_bounds(right)
+        if left_bounds is None or right_bounds is None:
+            return True
+        return max(left_bounds[0], right_bounds[0]) < min(left_bounds[1], right_bounds[1])
 
     def _validate_bind(self, tensor_id: int, tensor: torch.Tensor, active_tensor: torch.Tensor) -> None:
         shared_ids = self._shared_storage_ids.get(tensor_id)
         if shared_ids is not None:
             msg = (
-                f"Cannot bind tensor id {tensor_id}; managed tensor ids {sorted(shared_ids)} share storage. "
-                "Shared-storage parameters are not supported by raw materialization."
+                f"Cannot bind tensor id {tensor_id}; managed tensor ids {sorted(shared_ids)} share storage "
+                "with overlapping byte regions. Overlapping shared-storage parameters are not supported "
+                "by raw materialization."
             )
             raise RuntimeError(msg)
 
