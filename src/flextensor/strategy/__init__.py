@@ -17,7 +17,12 @@ from .assignment import (
 )
 
 # Budget-first strategy
-from .budget_fill import BudgetFillStrategy
+from .budget_fill import (
+    BudgetFillGreedyStrategy,
+    BudgetFillLayerDEStrategy,
+    BudgetFillStrategy,
+    BudgetFillTensorDEStrategy,
+)
 
 # Evaluation utilities
 from .evaluation import StrategyScore, evaluate_strategy_result
@@ -80,6 +85,9 @@ __all__ = [  # noqa: RUF022
     "AdaptiveKnapsackStrategy",
     # Budget-first strategy
     "BudgetFillStrategy",
+    "BudgetFillGreedyStrategy",
+    "BudgetFillTensorDEStrategy",
+    "BudgetFillLayerDEStrategy",
     # Simple strategies
     "GreedyStrategy",
     "NthLayerStrategy",

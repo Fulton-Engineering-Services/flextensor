@@ -423,18 +423,28 @@ FlexTensor includes several offloading strategies. The table below is a conceptu
 | `NthLayerStrategy` | Offload every Nth layer | Predictable patterns |
 | `AdaptiveKnapsackStrategy` | Knapsack with runtime adaptation | Variable workloads |
 | `AdaptiveStrategy` | Evaluates multiple candidates, selects best | Default automatic selection |
-| `BudgetFillStrategy` | Spread per-layer offload until peak fits a hard GPU budget | Memory-first residency / bootstrap without rich profiles |
+| `BudgetFillStrategy` | Facade: greedy + layer/tensor DE (keeps best min-offload plan) | Hard GPU budget with minimal offload |
+| `BudgetFillGreedyStrategy` | Ranked-prefix scan under a hard peak budget | Same budget goal; fastest deterministic solver |
+| `BudgetFillLayerDEStrategy` | DE over per-layer offload fractions (~n_layers vars) | Same budget goal; may find better layer mixes |
+| `BudgetFillTensorDEStrategy` | DE over per-tensor binary selection | Fallback when best set is not a layer prefix |
 | `GlobalOffloadStrategy` | Global optimizer across all layers | Maximizing overall memory reduction |
 | `GlobalTensorSelectionStrategy` | Metaheuristic search (`"DE"` or `"SA"`) | Highest-quality solution when runtime allows |
 
-When `load_strategy=None` (the default), FlexTensor runs `AdaptiveStrategy` internally. `AdaptiveStrategy` evaluates multiple candidate strategies and selects the one with the lowest estimated overhead that satisfies the memory constraint. To include slower but potentially higher-quality `GlobalTensorSelectionStrategy` candidates in that evaluation, create an `AdaptiveStrategy` with `extra_optimization=True` and assign it to `load_strategy`:
+When `load_strategy=None` (the default), FlexTensor runs `AdaptiveStrategy` internally. `AdaptiveStrategy` evaluates multiple candidate strategies and selects the one with the lowest estimated overhead that satisfies the memory constraint. When `max_gpu_mem_bytes` is set, `BudgetFillStrategy` is included with layer DE on and tensor DE off (Adaptive uses `GlobalTensorSelectionStrategy` under `extra_optimization` for expensive tensor search). Direct `BudgetFillStrategy()` defaults both DE solvers on and does not skip them solely because the peak already pinches the budget (a tight peak does not prove minimum offload):
 
 ```python
-from flextensor import OffloadConfig, AdaptiveStrategy
+from flextensor import OffloadConfig, AdaptiveStrategy, BudgetFillStrategy
 
+# Default Adaptive (includes BudgetFill when a GPU budget is set)
+config = OffloadConfig(load_strategy=AdaptiveStrategy())
+
+# Add GlobalTensorSelection
 config = OffloadConfig(
     load_strategy=AdaptiveStrategy(extra_optimization=True)
 )
+
+# BudgetFill alone (layer + tensor DE on by default)
+config = OffloadConfig(load_strategy=BudgetFillStrategy(n_blocks=4))
 ```
 
 Override `load_strategy` only when you have specific requirements:

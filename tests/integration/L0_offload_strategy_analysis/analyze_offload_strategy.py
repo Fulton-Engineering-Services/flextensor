@@ -14,7 +14,11 @@ Strategies:
     - global-strict: GlobalOffloadStrategy with StrictRoundRobinAssignment
     - knapsack: KnapsackStrategy (original per-layer strategy)
     - knapsack-block: KnapsackBlockStrategy (live GPU benchmarking, requires CUDA)
-    - budget-fill: BudgetFillStrategy (memory-first residency under GPU budget)
+    - budget-fill: BudgetFillStrategy facade (greedy + optional layer DE)
+    - budget-fill-greedy: BudgetFillGreedyStrategy alone
+    - budget-fill-tensor-de: BudgetFillTensorDEStrategy (per-tensor DE; slow)
+    - budget-fill-layer-de: BudgetFillLayerDEStrategy (per-layer DE)
+    - budget-fill-compare: facade vs greedy vs layer DE vs tensor DE
     - tensor-select: GlobalTensorSelectionStrategy with OptimizedRoundRobinAssignment (default)
     - tensor-select-strict: GlobalTensorSelectionStrategy with StrictRoundRobinAssignment
     - adaptive: AdaptiveStrategy (fast candidates only)
@@ -47,11 +51,15 @@ from data_generator import TENSOR_MANAGER_STATE_FILE, load_data, scale_memory_st
 from flextensor.memory_transfer_interpolator import MemoryTransferInterpolator  # noqa: E402
 from flextensor.strategy import (  # noqa: E402
     AdaptiveStrategy,
+    BudgetFillGreedyStrategy,
+    BudgetFillLayerDEStrategy,
     BudgetFillStrategy,
+    BudgetFillTensorDEStrategy,
     GlobalOffloadStrategy,
     GlobalTensorSelectionStrategy,
     KnapsackBlockStrategy,
     KnapsackStrategy,
+    OptimizedRoundRobinAssignment,
     StrictRoundRobinAssignment,
 )
 from flextensor.strategy.protocol import BlockStrategyData  # noqa: E402
@@ -429,16 +437,23 @@ def run_budget_fill_strategy(
     scale: float = 1.0,
     n_blocks: int = 4,
     max_gpu_mem_bytes: int | None = None,
+    assignment_strategy: object | None = None,
+    assignment_name: str = "Optimized",
 ) -> AnalysisResult:
-    """Run BudgetFillStrategy (memory-first residency under a hard GPU budget)."""
+    """Run BudgetFillStrategy facade (greedy + optional layer DE)."""
     if max_gpu_mem_bytes is None:
         msg = "budget-fill requires --gpu-mem / max_gpu_mem_bytes"
         raise ValueError(msg)
+    if assignment_strategy is None:
+        assignment_strategy = OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=n_blocks)
+        assignment_name = "Optimized"
     strategy = BudgetFillStrategy(
         n_blocks=n_blocks,
-        min_blocks=2,
         threshold_mb=1.0,
         scale=scale,
+        assignment_strategy=assignment_strategy,  # type: ignore[arg-type]
+        enable_layer_de=True,
+        # enable_tensor_de defaults True (non-prefix fallback; Adaptive sets False).
     )
     t0 = time.perf_counter()
     compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
@@ -463,6 +478,168 @@ def run_budget_fill_strategy(
         strategy_map=strategy_map,
         layer_to_block=block_info.layer_to_block,
         optimization_time_s=optimization_time,
+        assignment=assignment_name,
+    )
+
+
+def run_budget_fill_greedy_strategy(
+    layer_stats_list: list[LayerStatistics],
+    interpolator: MemoryTransferInterpolator,
+    memory_stats: dict[int, float],
+    *,
+    scale: float = 1.0,
+    n_blocks: int = 4,
+    max_gpu_mem_bytes: int | None = None,
+    assignment_strategy: object | None = None,
+    assignment_name: str = "Optimized",
+) -> AnalysisResult:
+    """Run BudgetFillGreedyStrategy alone (ranked-prefix scan)."""
+    if max_gpu_mem_bytes is None:
+        msg = "budget-fill-greedy requires --gpu-mem / max_gpu_mem_bytes"
+        raise ValueError(msg)
+    if assignment_strategy is None:
+        assignment_strategy = OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=n_blocks)
+        assignment_name = "Optimized"
+    strategy = BudgetFillGreedyStrategy(
+        n_blocks=n_blocks,
+        threshold_mb=1.0,
+        scale=scale,
+        assignment_strategy=assignment_strategy,  # type: ignore[arg-type]
+    )
+    t0 = time.perf_counter()
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
+    optimization_time = time.perf_counter() - t0
+    strategy_map = compute_result.strategy_map
+    block_data = compute_result.block_data
+
+    layer_to_block = block_data.label_to_block_id if block_data else None
+    layer_stats = compute_layer_stats(layer_stats_list, strategy_map, layer_to_block, interpolator)
+    block_info = extract_block_info(block_data, layer_stats, n_blocks)
+
+    peak_memory = compute_peak_memory(layer_stats, block_info.block_sizes)
+
+    return AnalysisResult(
+        strategy_name="BudgetFillGreedy",
+        layer_stats=layer_stats,
+        block_sizes=block_info.block_sizes,
+        blocks_used=block_info.blocks_used,
+        pipeline_violations=block_info.violations,
+        scale=scale,
+        peak_memory_bytes=peak_memory,
+        strategy_map=strategy_map,
+        layer_to_block=block_info.layer_to_block,
+        optimization_time_s=optimization_time,
+        assignment=assignment_name,
+    )
+
+
+def run_budget_fill_tensor_de_strategy(
+    layer_stats_list: list[LayerStatistics],
+    interpolator: MemoryTransferInterpolator,
+    memory_stats: dict[int, float],
+    *,
+    scale: float = 1.0,
+    n_blocks: int = 4,
+    max_gpu_mem_bytes: int | None = None,
+    assignment_strategy: object | None = None,
+    assignment_name: str = "Optimized",
+) -> AnalysisResult:
+    """Run BudgetFillTensorDEStrategy (DE binary selection under a hard GPU budget)."""
+    if max_gpu_mem_bytes is None:
+        msg = "budget-fill-tensor-de requires --gpu-mem / max_gpu_mem_bytes"
+        raise ValueError(msg)
+    if assignment_strategy is None:
+        assignment_strategy = OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=n_blocks)
+        assignment_name = "Optimized"
+    strategy = BudgetFillTensorDEStrategy(
+        n_blocks=n_blocks,
+        threshold_mb=1.0,
+        scale=scale,
+        assignment_strategy=assignment_strategy,  # type: ignore[arg-type]
+        pop_size=30,
+        epoch=80,
+        max_early_stop=25,
+        seed=42,
+    )
+    t0 = time.perf_counter()
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
+    optimization_time = time.perf_counter() - t0
+    strategy_map = compute_result.strategy_map
+    block_data = compute_result.block_data
+
+    layer_to_block = block_data.label_to_block_id if block_data else None
+    layer_stats = compute_layer_stats(layer_stats_list, strategy_map, layer_to_block, interpolator)
+    block_info = extract_block_info(block_data, layer_stats, n_blocks)
+
+    peak_memory = compute_peak_memory(layer_stats, block_info.block_sizes)
+
+    return AnalysisResult(
+        strategy_name="BudgetFillTensorDE",
+        layer_stats=layer_stats,
+        block_sizes=block_info.block_sizes,
+        blocks_used=block_info.blocks_used,
+        pipeline_violations=block_info.violations,
+        scale=scale,
+        peak_memory_bytes=peak_memory,
+        strategy_map=strategy_map,
+        layer_to_block=block_info.layer_to_block,
+        optimization_time_s=optimization_time,
+        assignment=assignment_name,
+    )
+
+
+def run_budget_fill_layer_de_strategy(
+    layer_stats_list: list[LayerStatistics],
+    interpolator: MemoryTransferInterpolator,
+    memory_stats: dict[int, float],
+    *,
+    scale: float = 1.0,
+    n_blocks: int = 4,
+    max_gpu_mem_bytes: int | None = None,
+    assignment_strategy: object | None = None,
+    assignment_name: str = "Optimized",
+) -> AnalysisResult:
+    """Run BudgetFillLayerDEStrategy (per-layer DE under a hard GPU budget)."""
+    if max_gpu_mem_bytes is None:
+        msg = "budget-fill-layer-de requires --gpu-mem / max_gpu_mem_bytes"
+        raise ValueError(msg)
+    if assignment_strategy is None:
+        assignment_strategy = OptimizedRoundRobinAssignment(min_blocks=2, max_blocks=n_blocks)
+        assignment_name = "Optimized"
+    strategy = BudgetFillLayerDEStrategy(
+        n_blocks=n_blocks,
+        threshold_mb=1.0,
+        scale=scale,
+        assignment_strategy=assignment_strategy,  # type: ignore[arg-type]
+        pop_size=20,
+        epoch=60,
+        max_early_stop=20,
+        seed=42,
+    )
+    t0 = time.perf_counter()
+    compute_result = strategy.compute(layer_stats_list, memory_stats, max_gpu_mem_bytes=max_gpu_mem_bytes)
+    optimization_time = time.perf_counter() - t0
+    strategy_map = compute_result.strategy_map
+    block_data = compute_result.block_data
+
+    layer_to_block = block_data.label_to_block_id if block_data else None
+    layer_stats = compute_layer_stats(layer_stats_list, strategy_map, layer_to_block, interpolator)
+    block_info = extract_block_info(block_data, layer_stats, n_blocks)
+
+    peak_memory = compute_peak_memory(layer_stats, block_info.block_sizes)
+
+    return AnalysisResult(
+        strategy_name="BudgetFillLayerDE",
+        layer_stats=layer_stats,
+        block_sizes=block_info.block_sizes,
+        blocks_used=block_info.blocks_used,
+        pipeline_violations=block_info.violations,
+        scale=scale,
+        peak_memory_bytes=peak_memory,
+        strategy_map=strategy_map,
+        layer_to_block=block_info.layer_to_block,
+        optimization_time_s=optimization_time,
+        assignment=assignment_name,
     )
 
 
@@ -881,10 +1058,6 @@ def print_summary_statistics(result: AnalysisResult, model_size_bytes: int) -> N
         print("\nOptimization:")
         print(f"  Optimization time:            {result.optimization_time_s:.2f}s")
 
-    if result.optimization_time_s > 0:
-        print("\nOptimization:")
-        print(f"  Optimization time:            {result.optimization_time_s:.2f}s")
-
 
 def compare_strategies(results: list[AnalysisResult], model_size_bytes: int, title: str | None = None) -> None:
     """Print comparison table of all strategies."""
@@ -955,6 +1128,10 @@ def main() -> None:  # noqa: C901
         "knapsack",
         "knapsack-block",
         "budget-fill",
+        "budget-fill-greedy",
+        "budget-fill-tensor-de",
+        "budget-fill-layer-de",
+        "budget-fill-compare",
         "tensor-select",
         "tensor-select-strict",
         "adaptive",
@@ -1067,9 +1244,18 @@ def main() -> None:  # noqa: C901
             "knapsack",
             "knapsack-block",
             "budget-fill",
+            "budget-fill-greedy",
+            "budget-fill-layer-de",
             "tensor-select",
             "adaptive",
             "adaptive-extra",
+        ]
+    elif args.strategy == "budget-fill-compare":
+        strategies_to_run = [
+            "budget-fill",
+            "budget-fill-greedy",
+            "budget-fill-layer-de",
+            "budget-fill-tensor-de",
         ]
     elif args.strategy == "all":
         strategies_to_run = [
@@ -1078,6 +1264,9 @@ def main() -> None:  # noqa: C901
             "knapsack",
             "knapsack-block",
             "budget-fill",
+            "budget-fill-greedy",
+            "budget-fill-tensor-de",
+            "budget-fill-layer-de",
             "tensor-select",
             "tensor-select-strict",
             "adaptive",
@@ -1141,6 +1330,35 @@ def main() -> None:  # noqa: C901
                 scale=args.transfer_budget_scale,
                 n_blocks=args.n_blocks,
                 max_gpu_mem_bytes=max_gpu_mem_bytes,
+            ),
+            "budget-fill-greedy": lambda _i=profile_interpolator, _m=scaled_stats: (
+                run_budget_fill_greedy_strategy(
+                    layer_stats_list,
+                    _i,
+                    _m,
+                    scale=args.transfer_budget_scale,
+                    n_blocks=args.n_blocks,
+                    max_gpu_mem_bytes=max_gpu_mem_bytes,
+                )
+            ),
+            "budget-fill-tensor-de": lambda _i=profile_interpolator,
+            _m=scaled_stats: run_budget_fill_tensor_de_strategy(
+                layer_stats_list,
+                _i,
+                _m,
+                scale=args.transfer_budget_scale,
+                n_blocks=args.n_blocks,
+                max_gpu_mem_bytes=max_gpu_mem_bytes,
+            ),
+            "budget-fill-layer-de": lambda _i=profile_interpolator, _m=scaled_stats: (
+                run_budget_fill_layer_de_strategy(
+                    layer_stats_list,
+                    _i,
+                    _m,
+                    scale=args.transfer_budget_scale,
+                    n_blocks=args.n_blocks,
+                    max_gpu_mem_bytes=max_gpu_mem_bytes,
+                )
             ),
             "tensor-select": lambda _i=profile_interpolator, _m=scaled_stats: run_tensor_selection(
                 layer_stats_list,

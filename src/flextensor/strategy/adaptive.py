@@ -41,10 +41,15 @@ class AdaptiveStrategy:
     For block-based loaders (the common path), the following candidates are
     evaluated:
 
-    * :class:`BudgetFillStrategy` (only when ``max_gpu_mem_bytes`` is set)
     * :class:`KnapsackBlockStrategy`
     * :class:`GlobalOffloadStrategy` (Optimized assignment)
     * :class:`GlobalOffloadStrategy` (Strict assignment)
+    * :class:`BudgetFillStrategy` (only when ``max_gpu_mem_bytes`` is set;
+      layer DE on, tensor DE off — use ``enable_tensor_de=True`` only when
+      calling BudgetFill directly as a non-prefix fallback)
+
+    With ``extra_optimization=True`` (slower):
+
     * :class:`GlobalTensorSelectionStrategy` (Optimized assignment)
     * :class:`GlobalTensorSelectionStrategy` (Strict assignment)
 
@@ -87,9 +92,10 @@ class AdaptiveStrategy:
             min_blocks: Minimum number of blocks for OptimizedRoundRobinAssignment
                 search range. Does not affect Strict or Knapsack candidates.
             n_blocks: Number of memory blocks.
-            extra_optimization: If True, include additional slower strategy candidates
-                (GlobalTensorSelectionStrategy) that may find better solutions at the
-                cost of significantly longer optimization time. Default is False.
+            extra_optimization: If True, include slower
+                :class:`GlobalTensorSelectionStrategy` candidates. BudgetFill
+                stays on the default path (tensor DE remains off; Adaptive uses
+                TensorSelection for expensive tensor-level search). Default False.
         """
         validate_memory_params(scale)
         if min_blocks < 2:
@@ -222,18 +228,7 @@ class AdaptiveStrategy:
         n_blocks = self.n_blocks
         min_blocks = self.min_blocks
 
-        candidates: list[tuple[str, Strategy]] = []
-        if max_gpu_mem_bytes is not None:
-            candidates.append((
-                "BudgetFill",
-                BudgetFillStrategy(
-                    n_blocks=n_blocks,
-                    min_blocks=min_blocks,
-                    threshold_mb=threshold_mb,
-                    scale=scale,
-                ),
-            ))
-        candidates.extend([
+        candidates: list[tuple[str, Strategy]] = [
             (
                 "KnapsackBlock",
                 KnapsackBlockStrategy(
@@ -261,7 +256,24 @@ class AdaptiveStrategy:
                     assignment_strategy=StrictRoundRobinAssignment(),
                 ),
             ),
-        ])
+        ]
+
+        if max_gpu_mem_bytes is not None:
+            opt_assign = OptimizedRoundRobinAssignment(
+                min_blocks=min_blocks,
+                max_blocks=n_blocks,
+            )
+            candidates.append((
+                "BudgetFill",
+                BudgetFillStrategy(
+                    n_blocks=n_blocks,
+                    threshold_mb=threshold_mb,
+                    scale=scale,
+                    assignment_strategy=opt_assign,
+                    enable_layer_de=True,
+                    enable_tensor_de=False,
+                ),
+            ))
 
         if self.extra_optimization:
             candidates.extend([

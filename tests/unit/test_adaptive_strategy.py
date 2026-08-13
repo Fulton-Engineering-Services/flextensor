@@ -377,7 +377,7 @@ class TestAdaptiveStrategy:
         assert strategy.selected_strategy_name != ""
 
     def test_all_scores_populated(self):
-        """all_scores should contain one entry per candidate (default: BudgetFill + 3 fast)."""
+        """Default Adaptive evaluates the three fast block candidates + BudgetFill."""
         layers, mem_stats = _make_simple_model(n_layers=3)
         strategy = AdaptiveStrategy(
             scale=1.0,
@@ -393,12 +393,13 @@ class TestAdaptiveStrategy:
         assert "GlobalOffload(Strict)" in names
 
     def test_budget_fill_skipped_without_memory_budget(self):
-        """Latency mode (no max_gpu_mem_bytes) should not evaluate BudgetFill."""
+        """BudgetFill needs a GPU budget; latency mode keeps the three fast candidates."""
         layers, mem_stats = _make_simple_model(n_layers=3)
         strategy = AdaptiveStrategy(
             scale=1.0,
             loader_type="allocation_block_transfer",
             n_blocks=4,
+            extra_optimization=False,
         )
         strategy.compute(layers, mem_stats, max_gpu_mem_bytes=None)
         names = {s.strategy_name for s in strategy.all_scores}
@@ -406,7 +407,7 @@ class TestAdaptiveStrategy:
         assert len(strategy.all_scores) == 3
 
     def test_all_scores_populated_extra_optimization(self):
-        """extra_optimization=True should include TensorSelection candidates."""
+        """extra_optimization=True adds TensorSelection; BudgetFill stays tensor-DE off."""
         layers, mem_stats = _make_simple_model(n_layers=3)
         strategy = AdaptiveStrategy(
             scale=1.0,
@@ -423,6 +424,27 @@ class TestAdaptiveStrategy:
         assert "GlobalOffload(Strict)" in names
         assert "TensorSelection(Optimized)" in names
         assert "TensorSelection(Strict)" in names
+
+        # BudgetFill candidate must keep enable_tensor_de=False even with extra.
+        budget_fill = next(
+            cand for name, cand in strategy._block_candidates(max_gpu_mem_bytes=200 * 1024**2) if name == "BudgetFill"
+        )
+        assert budget_fill.enable_tensor_de is False
+        assert budget_fill.enable_layer_de is True
+
+    def test_budget_fill_skipped_in_extra_without_memory_budget(self):
+        """Latency mode still skips BudgetFill even with extra_optimization."""
+        layers, mem_stats = _make_simple_model(n_layers=3)
+        strategy = AdaptiveStrategy(
+            scale=1.0,
+            loader_type="allocation_block_transfer",
+            n_blocks=4,
+            extra_optimization=True,
+        )
+        strategy.compute(layers, mem_stats, max_gpu_mem_bytes=None)
+        names = {s.strategy_name for s in strategy.all_scores}
+        assert "BudgetFill" not in names
+        assert len(strategy.all_scores) == 5
 
     def test_warns_on_invalid_best(self):
         """Should warn when the best result still violates constraints."""

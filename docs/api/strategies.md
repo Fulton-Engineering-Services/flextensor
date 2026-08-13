@@ -29,6 +29,12 @@ Pass a strategy instance to [`OffloadConfig(load_strategy=...)`](configuration.m
 
 ::: flextensor.strategy.budget_fill.BudgetFillStrategy
 
+::: flextensor.strategy.budget_fill.BudgetFillGreedyStrategy
+
+::: flextensor.strategy.budget_fill.BudgetFillLayerDEStrategy
+
+::: flextensor.strategy.budget_fill.BudgetFillTensorDEStrategy
+
 ## Simple Strategies
 
 ::: flextensor.strategy.simple.GreedyStrategy
