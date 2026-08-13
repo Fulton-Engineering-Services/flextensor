@@ -1280,28 +1280,6 @@ class TestSecondOffloadIsNotTreatedAsRestoredProfile:
         assert tm._state_restored_from_profile is False
 
 
-class TestPreInferenceItersRemainsAnUpperBound:
-    """``pre_inference_iters`` must never undercount ``iters_before_inference``.
-
-    Both phase counts accept ``0`` while the state machine always consumes at
-    least one forward per phase it drives, so the raw sum stopped being an
-    upper bound once the runtime counts were floored.
-    """
-
-    @pytest.mark.parametrize(
-        ("discovery_iters", "profiling_iters"),
-        [(0, 0), (0, 10), (2, 0), (2, 7)],
-    )
-    def test_never_below_the_runtime_count(self, discovery_iters: int, profiling_iters: int) -> None:
-        config = OffloadConfig(skip_discovery=False, discovery_iters=discovery_iters, profiling_iters=profiling_iters)
-        om = OffloadManager(f"test_upper_bound_{discovery_iters}_{profiling_iters}")
-        om.set_config(config)
-        om._compiled.active = False
-        om._compiled.replan_active = False
-
-        assert config.pre_inference_iters >= om.iters_before_inference
-
-
 def _live_cycle_state():
     """A ``TensorManagerState`` of the shape a completed live cycle leaves behind."""
     from flextensor.state_handler import TensorManagerState

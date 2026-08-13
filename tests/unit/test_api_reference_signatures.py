@@ -3,7 +3,6 @@
 
 """Tests for public types rendered in the API reference."""
 
-from collections.abc import Callable
 from typing import Any, get_type_hints
 
 import torch
@@ -30,8 +29,4 @@ def test_api_reference_types_live_in_function_signatures() -> None:
     assert get_type_hints(TensorManager.load_state)["return"] is TensorManagerState
     assert get_type_hints(TensorManager.load_profile)["model"] is torch.nn.Module
 
-    profile_suite_hints = get_type_hints(TensorManager.run_profile_suite)
-    assert profile_suite_hints["callback"] == Callable[[Any], Any]
-    assert profile_suite_hints["model"] == Any | None
-    assert profile_suite_hints["direct_mode"] is bool
-    assert profile_suite_hints["return"] is Any
+    assert not hasattr(TensorManager, "run_profile_suite")

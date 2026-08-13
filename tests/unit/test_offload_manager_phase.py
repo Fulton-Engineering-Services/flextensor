@@ -784,17 +784,6 @@ class TestOffloadManagerStateMachine:
 class TestOffloadManagerConfig:
     """Test cases for OffloadConfig and configuration management."""
 
-    def test_config_pre_inference_iters_property(self):
-        """Test that pre_inference_iters property returns sum of discovery and profiling iters."""
-        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
-        assert config.pre_inference_iters == 10  # 3 + 7
-
-        config = OffloadConfig(discovery_iters=1, profiling_iters=10)
-        assert config.pre_inference_iters == 11  # 1 + 10
-
-        config = OffloadConfig(discovery_iters=5, profiling_iters=5)
-        assert config.pre_inference_iters == 10  # 5 + 5
-
     def test_config_defaults(self):
         """Test default configuration values."""
         config = OffloadConfig()
@@ -819,7 +808,6 @@ class TestOffloadManagerConfig:
         assert config.gpu_device == 1
         assert config.discovery_iters == 5
         assert config.profiling_iters == 15
-        assert config.pre_inference_iters == 20  # 5 + 15
 
 
 class TestEagerProfilingBudget:
@@ -868,7 +856,6 @@ class TestEagerProfilingBudget:
         om._compiled.active = False
         om._compiled.replan_active = False
         assert om.iters_before_inference == 9
-        assert om.iters_before_inference == om.config.pre_inference_iters
 
     def test_manager_iters_before_inference_skip_discovery_honored(self):
         """``skip_discovery=True`` honored: only profiling_iters, no discovery forwards."""
@@ -882,9 +869,6 @@ class TestEagerProfilingBudget:
         om._skip_discovery_honored = True
         assert om.skip_discovery_honored is True
         assert om.iters_before_inference == 7
-        # And diverges from the static ``pre_inference_iters`` upper bound —
-        # this is exactly the divergence the reviewer of #50 flagged.
-        assert om.iters_before_inference != om.config.pre_inference_iters
 
     def test_manager_iters_before_inference_skip_discovery_fallback(self):
         """``skip_discovery=True`` but not honored: full discovery still runs."""
@@ -910,7 +894,6 @@ class TestEagerProfilingBudget:
         om._compiled.active = True
         om._compiled.replan_active = True
         assert om.iters_before_inference == 2 + COMPILED_EAGER_PROFILE_FORWARDS
-        assert om.iters_before_inference != om.config.pre_inference_iters
 
     def test_manager_iters_before_inference_compile_fn_view_no_replan_tail(self):
         """Default compile_fn + view: warmup + full profile budget, no post-INFERENCE replan count."""

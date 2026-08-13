@@ -906,33 +906,3 @@ class TestPrepareWarmupModeResetsLayerStats:
         tm._layer_stats_computed = True
         tm.prepare_warmup_mode()
         assert tm._layer_stats_computed is False
-
-
-class TestRunProfileSuiteLegacyDirectSemantics:
-    """The deprecated ``run_profile_suite`` historically meant "direct profile"
-    when ``direct_mode=True``, regardless of any other config. Now that
-    ``profile_mode="view"`` is the default, Phase 3 must still drive the
-    direct path so existing callers don't suddenly OOM on the rotating
-    block during their deprecation window. ``profile_mode`` must also be
-    restored after the call so the manager state isn't mutated.
-    """
-
-    def test_phase3_uses_direct_even_when_profile_mode_is_view(self) -> None:
-        tm = _make_tm(profile_mode="view")
-        observed_modes: list[str] = []
-
-        def _record(_model):
-            observed_modes.append(tm.profile_mode)
-
-        tm.prepare_warmup_mode = MagicMock()
-        tm.prepare_profile_mode = MagicMock()
-        tm.prepare_profile_direct_mode_model = MagicMock(side_effect=_record, return_value=MagicMock())
-        tm.prepare_profile_direct_mode = MagicMock(side_effect=lambda: observed_modes.append(tm.profile_mode))
-
-        with pytest.warns(DeprecationWarning, match="run_profile_suite"):
-            tm.run_profile_suite(callback=lambda _m: None, model=MagicMock(), direct_mode=True)
-
-        # Both phase-3 setup steps ran with profile_mode forced to "getter".
-        assert observed_modes == ["getter", "getter"]
-        # And the original mode is restored when the shim returns.
-        assert tm.profile_mode == "view"

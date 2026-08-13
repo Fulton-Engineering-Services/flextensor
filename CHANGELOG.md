@@ -11,32 +11,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-17
+
 ### Added
 
-- New vLLM worker v2, selected by default and requiring vLLM 0.17+, with
-  compiled/CUDA-graph weight offloading and profile refresh from serving traffic.
-  Set ``FT_VLLM_USE_V2_WORKER=0`` explicitly to use the legacy worker. See the
-  [vLLM example](examples/vllm/README.md).
-- ``BudgetFillStrategy`` facade (greedy + optional layer/tensor DE; both DE
-  solvers default on and are not skipped solely because the peak pinches the
-  budget). Included in ``AdaptiveStrategy`` when a GPU budget is set with
-  ``enable_tensor_de=False``; ``extra_optimization`` adds
-  ``GlobalTensorSelectionStrategy`` instead
-- Collect per-trap transfer / compute / wait timings during inference via
-  ``OffloadConfig.offload_timing`` (``"off"`` / ``"eager"`` / ``"cuda_graph"``)
-  and :func:`~flextensor.collect_offload_timing` (see
-  [configure-for-common-scenarios](docs/how-to/configure-for-common-scenarios.md#measure-transfer-overlap-during-inference)).
-- Detect when PIECEWISE CUDA-graph joins break H2D overlap via
-  ``OffloadConfig.piecewise_prefetch`` (``"off"`` / ``"warn"`` / ``"error"``,
-  default **warn**).
-- Request a timing-based strategy rebuild after compile or CUDA-graph capture
-  with :func:`~flextensor.request_strategy_replan` (module forwards, or
-  ``manual_update_state=True`` with ``graph.replay()`` +
-  :func:`~flextensor.update_state`; see
-  [torch.compile](docs/how-to/torch-compile.md)).
-- `TensorManager.plan_state_adoption()` for read-only, capacity-safe saved-state adoption planning.
-- `offload_from_state()` for adopting a matching in-memory state and entering inference
-  without discovery or profiling.
+- Add vLLM worker v2 with compiled and CUDA graph weight offloading and profile
+  refresh from serving traffic. See the [vLLM example](examples/vllm/README.md).
+- Add `BudgetFillStrategy`, which combines greedy placement with optional layer-
+  and tensor-level differential evolution (DE). Both DE solvers are enabled by
+  default and are not skipped solely because the peak is close to the budget.
+  `AdaptiveStrategy` uses it for a GPU budget with `enable_tensor_de=False`;
+  `extra_optimization` adds `GlobalTensorSelectionStrategy` instead.
+- Add per-trap transfer, compute, and wait timings during inference through
+  `OffloadConfig.offload_timing` (`"off"` / `"eager"` / `"cuda_graph"`) and
+  `collect_offload_timing()`; see
+  [configure-for-common-scenarios](docs/how-to/configure-for-common-scenarios.md#measure-transfer-overlap-during-inference).
+- Add `OffloadConfig.piecewise_prefetch` to detect when PIECEWISE CUDA graph
+  joins break host-to-device overlap (`"off"` / `"warn"` / `"error"`; default
+  `"warn"`).
+- Add `request_strategy_replan()` for timing-based strategy rebuilds after
+  compilation or CUDA graph capture. For manual replay, use
+  `manual_update_state=True` with `graph.replay()` and `update_state()`; see
+  [torch.compile](docs/how-to/torch-compile.md).
+- Add `TensorManager.plan_state_adoption()` for read-only, capacity-safe
+  saved-state adoption planning.
+- Add `offload_from_state()` to adopt a matching in-memory state and enter
+  inference without discovery or profiling.
+
+### Changed
+
+- **Breaking:** Select vLLM worker v2 by default and require vLLM 0.17.0 or
+  later. Set `FT_VLLM_USE_V2_WORKER=0` to use the legacy worker.
+
+### Removed
+
+- Remove the deprecated `OffloadState`, `OffloadPhase.WARMUP`, and
+  `OffloadPhase.PROFILE` aliases. Use `OffloadPhase`,
+  `OffloadPhase.DISCOVERY`, and `OffloadPhase.PROFILING`.
+- Remove the deprecated `warmup_iters` / `FT_WARMUP_ITERS` and
+  `profile_iters` / `FT_PROFILE_ITERS` configuration names. Use
+  `discovery_iters` / `FT_DISCOVERY_ITERS` and
+  `profiling_iters` / `FT_PROFILING_ITERS`.
+- Remove `OffloadConfig.all_warmup_iters` and
+  `OffloadConfig.pre_inference_iters`. Use the path-aware
+  `OffloadManager.iters_before_inference`.
+- Remove `TensorManager.run_profile_suite()`. Use `OffloadManager` or
+  `offload()` to drive the lifecycle.
 
 ## [0.3.0] — 2026-07-29
 
@@ -319,7 +339,8 @@ memory snapshot collection during worker lifecycle.
 **Known limitations** — inference only (no training or backward pass); no data parallelism;
 no MoE support; not thread-safe (one thread per manager instance).
 
-[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/ai-dynamo/flextensor/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/ai-dynamo/flextensor/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/ai-dynamo/flextensor/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/ai-dynamo/flextensor/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/ai-dynamo/flextensor/compare/v0.1.0...v0.2.0

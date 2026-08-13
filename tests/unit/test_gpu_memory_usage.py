@@ -147,8 +147,7 @@ class TestOffloadManagerGPUMemoryUsage:
         ``skip_discovery`` changes when INFERENCE is reached (the discovery
         component drops out), and ``get_gpu_memory_usage()`` raises outside
         INFERENCE — so this pins the two together on both paths. Uses the
-        path-aware ``om.iters_before_inference`` rather than the static
-        ``config.pre_inference_iters``.
+        path-aware ``om.iters_before_inference``.
         """
         mock_tensor_manager = MagicMock()
         mock_tensor_manager.is_profiling_suspended.return_value = False
@@ -215,7 +214,7 @@ class TestOffloadManagerGPUMemoryUsage:
         model = om.offload(self.model, config=config)
 
         # Run through discovery and profiling to reach inference
-        for _ in range(config.pre_inference_iters):
+        for _ in range(om.iters_before_inference):
             with torch.no_grad():
                 _ = model(self.x)
 
@@ -348,9 +347,10 @@ class TestModuleLevelGetGPUMemoryUsage:
             enabled=True, discovery_iters=1, profiling_iters=1, include_patterns=["linear"], skip_discovery=False
         )
         model = flextensor.offload(self.model, config=config)
+        om = flextensor.get_offload_manager()
 
         # Run through discovery and profiling to reach inference
-        for _ in range(config.pre_inference_iters):
+        for _ in range(om.iters_before_inference):
             with torch.no_grad():
                 _ = model(self.x)
 

@@ -86,7 +86,7 @@ def _run_full_pipeline(
     model: nn.Module,
     x: torch.Tensor,
     *,
-    profile_iters: int = 2,
+    profiling_iters: int = 2,
 ) -> torch.Tensor:
     """Run warmup → profile → inference and return the inference output."""
     tensor_manager.set_model(model)
@@ -96,7 +96,7 @@ def _run_full_pipeline(
         _ = live(x)
 
         live = tensor_manager.initialize_profile()
-        for _ in range(profile_iters):
+        for _ in range(profiling_iters):
             _ = live(x)
 
         live = tensor_manager.initialize_inference()
@@ -180,7 +180,7 @@ class TestProfileViewModeTeardown:
         model = _SmallModel(tm, num_layers=2, hidden=64).cpu().eval()
         x = torch.randn(2, 64, device=device_gpu)
 
-        out = _run_full_pipeline(tm, model, x, profile_iters=2)
+        out = _run_full_pipeline(tm, model, x, profiling_iters=2)
 
         assert out.is_cuda
         assert out.shape == (2, 64)
@@ -224,7 +224,7 @@ def _run_dict_pipeline(
     x: torch.Tensor,
     *,
     num_layers: int,
-    profile_iters: int = 2,
+    profiling_iters: int = 2,
 ) -> torch.Tensor:
     tensor_manager.set_model(model_dict)
 
@@ -233,7 +233,7 @@ def _run_dict_pipeline(
         _ = _forward_dict_model(live, x, tensor_manager, num_layers)
 
         live = tensor_manager.initialize_profile()
-        for _ in range(profile_iters):
+        for _ in range(profiling_iters):
             _ = _forward_dict_model(live, x, tensor_manager, num_layers)
 
         live = tensor_manager.initialize_inference()

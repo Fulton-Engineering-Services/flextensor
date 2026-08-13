@@ -51,8 +51,8 @@ pytestmark = [
 # ---------------------------------------------------------------------------
 
 MODULE_PATTERNS = ["input_projection", "layers.*", "output_projection"]
-WARMUP_ITERS = 1
-PROFILE_ITERS = 3
+DISCOVERY_ITERS = 1
+PROFILING_ITERS = 3
 FEEDBACK_ITERS = 2
 SEED = 42
 NUM_LAYERS = 3
@@ -73,8 +73,8 @@ ATOL = 1e-2
 
 def _make_offload_config(feedback_iters: int = FEEDBACK_ITERS) -> OffloadConfig:
     return make_offload_config(
-        warmup_iters=WARMUP_ITERS,
-        profile_iters=PROFILE_ITERS,
+        discovery_iters=DISCOVERY_ITERS,
+        profiling_iters=PROFILING_ITERS,
         feedback_iters=feedback_iters,
         module_patterns=MODULE_PATTERNS,
     )
@@ -106,8 +106,8 @@ def _run_offload_lifecycle(
     return run_offload_lifecycle(
         proxy,
         x,
-        warmup_iters=WARMUP_ITERS,
-        profile_iters=PROFILE_ITERS,
+        discovery_iters=DISCOVERY_ITERS,
+        profiling_iters=PROFILING_ITERS,
         feedback_iters=feedback_iters,
     )
 

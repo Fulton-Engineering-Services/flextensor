@@ -13,7 +13,6 @@ import json
 import logging
 import os
 import types
-import warnings
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
@@ -21,19 +20,12 @@ from typing import Annotated, Any, Literal, Union, get_args, get_origin
 import yaml
 from pydantic import BaseModel, Field, WithJsonSchema, field_validator, model_validator
 from typing_extensions import Self
-from typing_extensions import deprecated as _deprecated
 
 from flextensor.host_pinning import PinnedMemoryMode
 from flextensor.strategy import AdaptiveStrategy, Strategy
 from flextensor.utils import CLASS_PATTERN_PREFIX, NAME_PATTERN_PREFIX
 
 logger = logging.getLogger(__name__)
-
-_WARMUP_ITERS_MSG = "`warmup_iters` is deprecated. Use `discovery_iters` instead. Will be removed in v0.4.0."
-_PROFILE_ITERS_MSG = "`profile_iters` is deprecated. Use `profiling_iters` instead. Will be removed in v0.4.0."
-_ALL_WARMUP_ITERS_MSG = (
-    "`all_warmup_iters` is deprecated. Use `pre_inference_iters` instead. Will be removed in v0.4.0."
-)
 
 _REGISTERED_ENV_VARS: set[str] = set()
 
@@ -42,24 +34,6 @@ OffloadTimingMode = Literal["off", "eager", "cuda_graph"]
 PiecewisePrefetchMode = Literal["off", "warn", "error"]
 BLOCK_TRANSFER_MODES = frozenset({"allocation_block_transfer", "raw_block_transfer"})
 OFFLOAD_TRANSFER_MODES = frozenset({"strategy", *BLOCK_TRANSFER_MODES})
-
-# Bidirectional deprecated ↔ canonical field pairs. Used by model_copy()
-# to mirror updates so that Pydantic v2's validator-bypass doesn't desync
-# deprecated fields from their replacements.
-_DEPRECATED_FIELD_MIRRORS: dict[str, str] = {
-    "discovery_iters": "warmup_iters",
-    "warmup_iters": "discovery_iters",
-    "profiling_iters": "profile_iters",
-    "profile_iters": "profiling_iters",
-}
-
-# The deprecated side of ``_DEPRECATED_FIELD_MIRRORS`` (that dict is
-# bidirectional, so it also contains the canonical names — those must stay in
-# the dump). ``model_copy`` re-validation dumps the instance and would
-# otherwise present both sides of a mirror pair to the ``mode='before'``
-# synchronizers, which reject that as an ambiguous double-set. Excluding these
-# on dump makes the re-parse see a canonical-only dict.
-_DEPRECATED_FIELD_NAMES: frozenset[str] = frozenset({"warmup_iters", "profile_iters"})
 
 _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
     "release_tensors": ("v0.2.0", "GPU tensors are now always released after layer execution."),
@@ -73,6 +47,8 @@ _REMOVED_FIELDS: dict[str, tuple[str, str]] = {
         " Use TensorManager(_enable_untraced_tensor_discovery=False) to override.",
     ),
     "enable_module_tracker": ("v0.2.0", "ModuleTracker is now always enabled for manual traps."),
+    "warmup_iters": ("v0.4.0", "Use discovery_iters instead."),
+    "profile_iters": ("v0.4.0", "Use profiling_iters instead."),
 }
 
 
@@ -204,22 +180,6 @@ class OffloadConfig(BaseModel):
     timings (no post-INFERENCE replan). Use
     :meth:`~flextensor.OffloadManager.request_strategy_replan` after a non-view
     profile or after external compile with ``external_compile=True``.
-    """
-
-    warmup_iters: Annotated[int, _deprecated(_WARMUP_ITERS_MSG)] = Field(default=1, ge=0, deprecated=_WARMUP_ITERS_MSG)
-    """Number of warmup iterations before profiling begins.
-
-    .. deprecated:: v0.3
-        Use :attr:`discovery_iters` instead. Will be removed in v0.4.0.
-    """
-
-    profile_iters: Annotated[int, _deprecated(_PROFILE_ITERS_MSG)] = Field(
-        default=10, ge=0, deprecated=_PROFILE_ITERS_MSG
-    )
-    """Number of profiling iterations to collect statistics.
-
-    .. deprecated:: v0.3
-        Use :attr:`profiling_iters` instead. Will be removed in v0.4.0.
     """
 
     transfer_budget_scale: float = Field(default=1.0, gt=0.0)
@@ -435,38 +395,6 @@ class OffloadConfig(BaseModel):
 
     model_config = {"arbitrary_types_allowed": True, "use_attribute_docstrings": True}
 
-    @model_validator(mode="before")
-    @classmethod
-    def _sync_iter_fields(cls, data: Any) -> Any:
-        """Sync deprecated warmup_iters/profile_iters with discovery_iters/profiling_iters."""
-        if isinstance(data, dict):
-            has_warmup = "warmup_iters" in data
-            has_discovery = "discovery_iters" in data
-            if has_warmup and has_discovery:
-                if data["warmup_iters"] != data["discovery_iters"]:
-                    msg = "Cannot set both `warmup_iters` and `discovery_iters` to different values"
-                    raise ValueError(msg)
-                warnings.warn(_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
-            elif has_warmup:
-                warnings.warn(_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
-                data["discovery_iters"] = data["warmup_iters"]
-            elif has_discovery:
-                data["warmup_iters"] = data["discovery_iters"]
-
-            has_profile = "profile_iters" in data
-            has_profiling = "profiling_iters" in data
-            if has_profile and has_profiling:
-                if data["profile_iters"] != data["profiling_iters"]:
-                    msg = "Cannot set both `profile_iters` and `profiling_iters` to different values"
-                    raise ValueError(msg)
-                warnings.warn(_PROFILE_ITERS_MSG, DeprecationWarning, stacklevel=2)
-            elif has_profile:
-                warnings.warn(_PROFILE_ITERS_MSG, DeprecationWarning, stacklevel=2)
-                data["profiling_iters"] = data["profile_iters"]
-            elif has_profiling:
-                data["profile_iters"] = data["profiling_iters"]
-        return data
-
     @field_validator("include_patterns", "exclude_patterns", mode="before")
     @classmethod
     def _validate_pattern_entries(cls, v: Any) -> list[str] | Any:
@@ -568,102 +496,15 @@ class OffloadConfig(BaseModel):
         return self
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
-        """Return a copy, mirroring updates to deprecated field counterparts.
-
-        Pydantic v2's ``model_copy(update=...)`` bypasses ``mode='before'``
-        *and* ``mode='after'`` validators, so:
-
-        - Deprecated fields desync from their canonical replacements.
-          Fix: mirror each updated field to its counterpart before
-          delegating to the base implementation (see
-          ``_DEPRECATED_FIELD_MIRRORS``).
-        - Invariants enforced by ``@model_validator`` (e.g.
-          ``_validate_block_range``'s ``num_blocks`` vs ``min_blocks``) can be
-          violated by the update dict. Fix: re-parse the resulting instance
-          through the full validator chain so every ``OffloadConfig`` the
-          runtime consumes upholds them. vLLM's worker uses
-          ``model_copy(update=...)`` in production to apply per-worker
-          overrides — that path in particular must not smuggle in an illegal
-          combination.
-
-        The re-parse runs on a full ``model_dump()``, which would otherwise
-        mark *every* field as explicitly set. ``model_fields_set`` is therefore
-        restored from the copy afterwards so
-        :func:`flextensor.utils.config_field_was_set` keeps reporting genuine
-        user intent — the vLLM worker relies on it to decide whether to apply
-        its default include/exclude patterns.
-
-        Raises:
-            ValueError: If both sides of a deprecated-field pair appear in
-                *update* with differing values, or if the resulting config
-                fails any ``@model_validator``.
-        """
+        """Return a validated copy while preserving explicit-field tracking."""
         if not update:
             return super().model_copy(deep=deep)
 
-        synced_update = dict(update)
-        for key, mirror in _DEPRECATED_FIELD_MIRRORS.items():
-            if key in synced_update and mirror in synced_update:
-                if synced_update[key] != synced_update[mirror]:
-                    msg = f"Cannot set both `{key}` and `{mirror}` to different values"
-                    raise ValueError(msg)
-            elif key in synced_update:
-                synced_update[mirror] = synced_update[key]
-
-        copied = super().model_copy(update=synced_update, deep=deep)
-        # Re-parse to catch invariants that ``model_copy`` bypasses.
-        # Exclude deprecated field names so the ``mode='before'``
-        # synchronizers don't see both sides of a mirror pair (they'd
-        # reject that as a double-set).
-        revalidated = type(self).model_validate(copied.model_dump(exclude=set(_DEPRECATED_FIELD_NAMES)))
-        # ``model_validate`` on a full dump marks every field as explicitly
-        # set; restore the real set so ``config_field_was_set`` stays honest.
+        validated_update = self._reject_removed_fields(dict(update))
+        copied = super().model_copy(update=validated_update, deep=deep)
+        revalidated = type(self).model_validate(copied.model_dump())
         object.__setattr__(revalidated, "__pydantic_fields_set__", set(copied.model_fields_set))
         return revalidated
-
-    @property
-    def pre_inference_iters(self) -> int:
-        """Static config-level upper bound on iterations before inference.
-
-        Returns ``max(1, discovery_iters) + max(1, profiling_iters)``. Both
-        counts accept ``0``, but ``OffloadManager.update_state`` runs as a
-        post-forward hook, so every phase it drives consumes at least one
-        forward. Summing the raw values would return *less* than
-        :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
-        at ``profiling_iters=0`` or ``discovery_iters=0`` — which would stop
-        this property being an upper bound at all.
-
-        It still overcounts on three runtime paths the config cannot see:
-
-        - **``skip_discovery=True`` honored**: the manager short-circuits
-          DISCOVERY→PROFILING inside ``offload()``, so ``discovery_iters``
-          forwards are never consumed.
-        - **Compiled offload**: uses a fixed eager seed
-          (``COMPILED_EAGER_PROFILE_FORWARDS``) shorter than
-          ``profiling_iters``.
-        - **External compile + replan**: replan measure/warmup happens
-          *after* INFERENCE, not before.
-
-        Prefer :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
-        for the runtime-actual count. Use this value only when a static,
-        pre-``offload()`` upper bound is needed.
-
-        .. deprecated::
-            Prefer :attr:`~flextensor.offload_manager.OffloadManager.iters_before_inference`
-            for path-aware budgets.
-        """
-        return max(1, self.discovery_iters) + max(1, self.profiling_iters)
-
-    @property
-    @_deprecated(_ALL_WARMUP_ITERS_MSG, category=None)
-    def all_warmup_iters(self) -> int:
-        """Total warmup iterations including profile iterations.
-
-        .. deprecated:: v0.3
-            Use :attr:`pre_inference_iters` instead. Will be removed in v0.4.0.
-        """
-        warnings.warn(_ALL_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
-        return self.pre_inference_iters
 
 
 def resolve_load_strategy(config: OffloadConfig) -> Strategy:
@@ -951,42 +792,6 @@ def _parse_env_list(field_name: str, env_value: str) -> list:
     return [_convert_env_value(p, element_type) for p in parts]
 
 
-def _migrate_deprecated_env(
-    env_prefix: str,
-    old_suffix: str,
-    new_suffix: str,
-    deprecation_msg: str,
-    convert: Any = None,
-) -> tuple[str, Any] | None:
-    """Check for a deprecated env var and migrate its value to the new name.
-
-    Returns ``(new_field_name, converted_value)`` when the deprecated var is
-    set, or ``None`` when it is absent.  Raises ``ValueError`` when both the
-    old and new env vars are set simultaneously.
-
-    *convert* is an optional callable applied to the raw string value.
-    When ``None`` the raw string is returned as-is.
-    """
-    old_env = f"{env_prefix}{old_suffix}"
-    old_value = os.environ.get(old_env)
-    if old_value is None:
-        return None
-    new_env = f"{env_prefix}{new_suffix}"
-    if os.environ.get(new_env) is not None:
-        msg = f"Cannot set both {old_env} (deprecated) and {new_env}."
-        raise ValueError(msg)
-    warnings.warn(deprecation_msg, DeprecationWarning, stacklevel=3)
-    new_field = new_suffix.lower()
-    if convert is not None:
-        try:
-            converted = convert(old_value)
-        except (ValueError, TypeError) as e:
-            raise ValueError(f"Failed to convert {old_env}={old_value}: {e}") from e
-    else:
-        converted = old_value
-    return new_field, converted
-
-
 def _register_env_var(name: str) -> None:
     _REGISTERED_ENV_VARS.add(name)
 
@@ -1054,17 +859,8 @@ def _load_from_env(
                 msg,
             )
 
-    for migration in (
-        ("WARMUP_ITERS", "DISCOVERY_ITERS", _WARMUP_ITERS_MSG, int),
-        ("PROFILE_ITERS", "PROFILING_ITERS", _PROFILE_ITERS_MSG, int),
-    ):
-        result = _migrate_deprecated_env(env_prefix, *migration)
-        if result is not None:
-            config_dict[result[0]] = result[1]
-
     for field_name, field_type in field_types.items():
-        # Deprecated iteration fields have dedicated env-var handling above.
-        if field_type is object or field_name in ("warmup_iters", "profile_iters"):
+        if field_type is object:
             continue
 
         env_var_name = f"{env_prefix}{field_name.upper()}"

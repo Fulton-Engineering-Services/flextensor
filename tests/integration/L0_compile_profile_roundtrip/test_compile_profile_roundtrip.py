@@ -85,8 +85,8 @@ SEQ_LEN = 64
 MODULE_PATTERNS = ["input_projection", "layers.*", "output_projection"]
 
 # Lifecycle iteration counts (consistent with existing integration tests).
-WARMUP_ITERS = 1
-PROFILE_ITERS = 3
+DISCOVERY_ITERS = 1
+PROFILING_ITERS = 3
 FEEDBACK_ITERS = 2
 
 
@@ -97,8 +97,8 @@ FEEDBACK_ITERS = 2
 
 def _make_offload_config(feedback_iters: int = FEEDBACK_ITERS) -> OffloadConfig:
     return make_offload_config(
-        warmup_iters=WARMUP_ITERS,
-        profile_iters=PROFILE_ITERS,
+        discovery_iters=DISCOVERY_ITERS,
+        profiling_iters=PROFILING_ITERS,
         feedback_iters=feedback_iters,
         module_patterns=MODULE_PATTERNS,
     )
@@ -130,8 +130,8 @@ def _run_offload_lifecycle(
     _, _, res_inference = run_offload_lifecycle(
         proxy,
         x,
-        warmup_iters=WARMUP_ITERS,
-        profile_iters=PROFILE_ITERS,
+        discovery_iters=DISCOVERY_ITERS,
+        profiling_iters=PROFILING_ITERS,
         feedback_iters=feedback_iters,
     )
     return res_inference
@@ -864,7 +864,7 @@ class TestCompileWrappedProxy:
         profile_dir.mkdir()
         try:
             with torch.no_grad():
-                for _ in range(WARMUP_ITERS):
+                for _ in range(DISCOVERY_ITERS):
                     out = x
                     for _ in range(FEEDBACK_ITERS):
                         out = proxy1(out)
@@ -874,7 +874,7 @@ class TestCompileWrappedProxy:
 
             compiled1 = torch.compile(proxy1, backend="inductor")
             with torch.no_grad():
-                for _ in range(PROFILE_ITERS):
+                for _ in range(PROFILING_ITERS):
                     out = x
                     for _ in range(FEEDBACK_ITERS):
                         out = compiled1(out)

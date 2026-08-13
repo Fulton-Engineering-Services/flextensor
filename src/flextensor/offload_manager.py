@@ -11,8 +11,8 @@ import warnings
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum, EnumMeta
-from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeVar, runtime_checkable
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar, runtime_checkable
 
 if TYPE_CHECKING:
     from flextensor.collectors import LayerStatistics
@@ -277,58 +277,13 @@ class TensorManagerProtocol(Protocol):
     def shutdown(self) -> None: ...
 
 
-_WARMUP_DEPRECATION = (
-    "`OffloadPhase.WARMUP` (and `OffloadState.WARMUP`) are deprecated. "
-    "Use `OffloadPhase.DISCOVERY` instead. Will be removed in v0.4.0."
-)
-_PROFILE_DEPRECATION = (
-    "`OffloadPhase.PROFILE` (and `OffloadState.PROFILE`) are deprecated. "
-    "Use `OffloadPhase.PROFILING` instead. Will be removed in v0.4.0."
-)
-_OFFLOAD_STATE_DEPRECATION = "`OffloadState` is deprecated. Use `OffloadPhase` instead. Will be removed in v0.4.0."
-
-
-class _DeprecatedMemberMeta(EnumMeta):
-    """EnumMeta subclass that issues DeprecationWarning for deprecated member names."""
-
-    _DEPRECATED_MEMBERS: ClassVar[dict[str, tuple[str, object]]] = {}
-
-    def __getattr__(cls, name: str) -> object:
-        if name in cls._DEPRECATED_MEMBERS:
-            msg, target = cls._DEPRECATED_MEMBERS[name]
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            return target
-        raise AttributeError(name)
-
-    def __getitem__(cls, name: str) -> object:
-        if name in cls._DEPRECATED_MEMBERS:
-            msg, target = cls._DEPRECATED_MEMBERS[name]
-            warnings.warn(msg, DeprecationWarning, stacklevel=2)
-            return target
-        return super().__getitem__(name)
-
-
-class OffloadPhase(Enum, metaclass=_DeprecatedMemberMeta):
+class OffloadPhase(Enum):
     """Phase of the offload manager during tensor discovery, profiling, and inference."""
 
     NOT_INITIALIZED = "not_initialized"
     DISCOVERY = "discovery"
     PROFILING = "profiling"
     INFERENCE = "inference"
-
-
-OffloadPhase._DEPRECATED_MEMBERS = {  # noqa: SLF001
-    "WARMUP": (_WARMUP_DEPRECATION, OffloadPhase.DISCOVERY),
-    "PROFILE": (_PROFILE_DEPRECATION, OffloadPhase.PROFILING),
-}
-
-
-def __getattr__(name: str) -> object:
-    """Module-level __getattr__ for deprecated names (PEP 562)."""
-    if name == "OffloadState":
-        warnings.warn(_OFFLOAD_STATE_DEPRECATION, DeprecationWarning, stacklevel=2)
-        return OffloadPhase
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 DEFAULT_MANAGER_NAME: str = "default"
@@ -1612,8 +1567,7 @@ class OffloadManager:
     def iters_before_inference(self) -> int:
         """Forwards to run before the model is ready to serve.
 
-        Unlike :attr:`OffloadConfig.pre_inference_iters` (static
-        ``discovery_iters + profiling_iters``), this reflects the active path:
+        This reflects the active path:
 
         - ``discovery_iters`` is *excluded* when ``skip_discovery=True`` was
           honored (the manager short-circuits from DISCOVERY straight to

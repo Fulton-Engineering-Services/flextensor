@@ -58,8 +58,8 @@ MODULE_PATTERNS = ["input_projection", "layers.*", "output_projection"]
 
 def main() -> int:
     config = make_offload_config(
-        warmup_iters=1,
-        profile_iters=3,
+        discovery_iters=1,
+        profiling_iters=3,
         feedback_iters=2,
         module_patterns=MODULE_PATTERNS,
     )
@@ -77,7 +77,7 @@ def main() -> int:
     om = get_offload_manager("subprocess_fullgraph")
     proxy = om.offload(model, config)
     try:
-        run_offload_lifecycle(proxy, x, warmup_iters=1, profile_iters=3, feedback_iters=2)
+        run_offload_lifecycle(proxy, x, discovery_iters=1, profiling_iters=3, feedback_iters=2)
         torch._dynamo.reset()
         # Sentinel: the parent asserts this string in stderr to confirm the
         # subprocess made it through lifecycle setup before any failure.

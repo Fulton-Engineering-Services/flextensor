@@ -285,9 +285,6 @@ class NoOpTensorManager:
     def benchmark_context(self, _iterations: int = 10):
         return self.benchmark_cls(device_gpu=self.device_gpu)
 
-    def run_profile_suite(self, _callback, _model=None, _direct_mode=True):
-        pass
-
     def set_model(self, model):
         self.model = model
 

@@ -119,8 +119,8 @@ def make_simple_model(
 
 def make_offload_config(
     *,
-    warmup_iters: int,
-    profile_iters: int,
+    discovery_iters: int,
+    profiling_iters: int,
     feedback_iters: int,
     module_patterns: list[str] | None = None,
     transfer_mode: str = "allocation_block_transfer",
@@ -130,14 +130,14 @@ def make_offload_config(
     """Build the ``OffloadConfig`` shape every compile/CUDA-graph suite uses.
 
     ``skip_discovery=False`` is pinned explicitly because ``run_offload_lifecycle``
-    below drives ``warmup_iters`` eager forwards through DISCOVERY; with
+    below drives ``discovery_iters`` eager forwards through DISCOVERY; with
     ``skip_discovery=True`` those forwards would land in PROFILING
     instead and skew the phase accounting these suites assert.
     """
     return OffloadConfig(
         include_patterns=module_patterns if module_patterns is not None else DEFAULT_MODULE_PATTERNS,
-        discovery_iters=warmup_iters * feedback_iters,
-        profiling_iters=profile_iters * feedback_iters,
+        discovery_iters=discovery_iters * feedback_iters,
+        profiling_iters=profiling_iters * feedback_iters,
         transfer_mode=transfer_mode,
         num_blocks=num_blocks,
         pinned_memory=pinned_memory,
@@ -149,29 +149,19 @@ def run_offload_lifecycle(
     proxy: nn.Module,
     x: torch.Tensor,
     *,
-    warmup_iters: int,
-    profile_iters: int,
+    discovery_iters: int,
+    profiling_iters: int,
     feedback_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Drive warmup → profile → inference; return outputs from each phase.
-
-    Phase outputs:
-        ``res_warmup``: the last warmup-phase forward.
-        ``res_profile``: the *first* profile-phase forward (kept stable across
-            the rest of the profile loop so callers can checksum a known
-            iteration).
-        ``res_inference``: the inference-phase forward.
-
-    Suites that only care about the inference output can ignore the first two.
-    """
+    """Drive discovery → profiling → inference; return each phase's output."""
     with torch.no_grad():
         res_warmup = x
-        for _ in range(warmup_iters):
+        for _ in range(discovery_iters):
             for _ in range(feedback_iters):
                 res_warmup = proxy(res_warmup)
 
         res_profile: torch.Tensor | None = None
-        for i in range(profile_iters):
+        for i in range(profiling_iters):
             res = x
             for _ in range(feedback_iters):
                 res = proxy(res)
@@ -182,7 +172,7 @@ def run_offload_lifecycle(
         for _ in range(feedback_iters):
             res_inference = proxy(res_inference)
 
-    assert res_profile is not None, "profile_iters must be >= 1"
+    assert res_profile is not None, "profiling_iters must be >= 1"
     return res_warmup, res_profile, res_inference
 
 

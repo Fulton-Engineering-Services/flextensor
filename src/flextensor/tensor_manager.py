@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, get_args
 
 import psutil
 import torch
-from typing_extensions import deprecated as _deprecated
 
 from flextensor._logging import ensure_diagnostics_visible, get_diagnostics_logger
 from flextensor.benchmark_tensor_mode import BenchmarkReplace, NoOpBenchmark, TensorBenchmarkMode
@@ -2441,56 +2440,3 @@ class TensorManager:
             elif isinstance(model, torch.nn.Module):
                 new_model = prepare_model(model, self, in_place=in_place)
         return new_model
-
-    @_deprecated(
-        "TensorManager.run_profile_suite() is deprecated and will be removed "
-        "in v0.4.0. Use OffloadManager / offload() instead."
-    )
-    def run_profile_suite(
-        self,
-        callback: Callable[[Any], Any],
-        model: Any | None = None,
-        direct_mode: bool = True,
-    ) -> Any:
-        """Run all three phases (discovery, profiling, direct_mode) in sequence with a callback.
-
-        .. deprecated:: v0.3
-            Use ``initialize_warmup`` / ``initialize_profile`` /
-            ``initialize_inference`` directly. Removed in v0.4.0.
-
-        Args:
-            callback: Function to call for each phase. Should accept model as argument.
-            model: The model to prepare
-            direct_mode: Whether to enable direct mode profiling
-
-        Returns:
-            The inference results
-        """
-        # Phase 1: Discovery
-        self.prepare_warmup_mode()
-        results = callback(model)
-
-        # Phase 2: Profile
-        self.prepare_profile_mode()
-        results = callback(model)
-
-        # Phase 3: Direct mode (if enabled)
-        if direct_mode and model is not None:
-            # Preserve historical semantics: ``direct_mode=True`` always meant
-            # the property-getter profile (``profile_mode='getter'``) in the
-            # direct family, regardless of the (newer) ``profile_mode`` setting
-            # (now defaulting to "view"). Forcing both keeps the deprecation
-            # window backwards compatible.
-            saved_profile_mode = self.profile_mode
-            saved_direct_mode = self._direct_mode
-            self.profile_mode = "getter"
-            self._direct_mode = True
-            try:
-                prepared_model = self.prepare_profile_direct_mode_model(model)
-                self.prepare_profile_direct_mode()
-                results = callback(prepared_model)
-            finally:
-                self.profile_mode = saved_profile_mode
-                self._direct_mode = saved_direct_mode
-
-        return results

@@ -25,7 +25,6 @@ See [Internal Phases](../explanation/phases.md) for details on how these compone
         - get_gpu_memory_usage
         - get_memory_transfer_stats
         - benchmark_context
-        - run_profile_suite
         - save_profile
         - load_profile
         - load_state

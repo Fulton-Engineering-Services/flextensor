@@ -302,16 +302,6 @@ class TestOffloadConfig:
         with pytest.raises(ValidationError, match="profile_mode"):
             OffloadConfig(profile_mode="bogus")
 
-    def test_pre_inference_iters_property(self):
-        """Test pre_inference_iters property calculation."""
-        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
-        assert config.pre_inference_iters == 10
-
-    def test_pre_inference_iters_property_default(self):
-        """Test pre_inference_iters property with default values."""
-        config = OffloadConfig()
-        assert config.pre_inference_iters == 11  # 1 + 10
-
     def test_knapsack_strategy_assignment(self):
         """Test assigning KnapsackStrategy to load_strategy."""
         strategy = KnapsackStrategy(scale=1.5, cyclic=True, group_size=2)
@@ -739,7 +729,7 @@ class TestLoadConfigFromEnv:
     def test_load_with_custom_prefix(self):
         """Test loading config with custom prefix."""
         os.environ["CUSTOM_GPU_DEVICE"] = "3"
-        os.environ["CUSTOM_WARMUP_ITERS"] = "7"
+        os.environ["CUSTOM_DISCOVERY_ITERS"] = "7"
 
         config = load_config_from_env(prefix="CUSTOM_")
         assert config.gpu_device == 3
@@ -1656,198 +1646,21 @@ class TestRemovedFieldsRejection:
         assert config.pinned_memory is False
 
 
-class TestIterFieldRename:
-    """Tests for the warmup_iters → discovery_iters and profile_iters → profiling_iters rename."""
-
-    def test_discovery_iters_is_primary_field(self):
-        config = OffloadConfig(discovery_iters=3)
-        assert config.discovery_iters == 3
-
-    def test_profiling_iters_is_primary_field(self):
-        config = OffloadConfig(profiling_iters=5)
-        assert config.profiling_iters == 5
-
-    def test_warmup_iters_deprecated_alias_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = OffloadConfig(warmup_iters=3)
-        assert any("warmup_iters" in str(warning.message) for warning in w)
-        assert config.discovery_iters == 3
-
-    def test_profile_iters_deprecated_alias_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            config = OffloadConfig(profile_iters=5)
-        assert any("profile_iters" in str(warning.message) for warning in w)
-        assert config.profiling_iters == 5
-
-    def test_pre_inference_iters_property(self):
-        config = OffloadConfig(discovery_iters=2, profiling_iters=8)
-        assert config.pre_inference_iters == 10
-
-    def test_all_warmup_iters_deprecated_property_warns(self):
-        config = OffloadConfig(discovery_iters=2, profiling_iters=8)
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            val = config.all_warmup_iters
-        assert val == 10
-        assert any("all_warmup_iters" in str(warning.message) for warning in w)
-
-    def test_ft_discovery_iters_env_var(self, monkeypatch):
-        monkeypatch.setenv("FT_DISCOVERY_ITERS", "7")
-        config = load_config()
-        assert config.discovery_iters == 7
-
-    def test_ft_warmup_iters_env_var_deprecated(self, monkeypatch):
-        monkeypatch.setenv("FT_WARMUP_ITERS", "4")
-        with pytest.warns(DeprecationWarning, match="warmup_iters"):
-            config = load_config()
-        assert config.discovery_iters == 4
-
-    def test_warmup_and_discovery_iters_different_raises(self):
-        """Passing both warmup_iters and discovery_iters with different values raises ValueError."""
-        with pytest.raises(ValueError, match="Cannot set both"):
-            OffloadConfig(warmup_iters=5, discovery_iters=3)
-
-    def test_profile_and_profiling_iters_different_raises(self):
-        """Passing both profile_iters and profiling_iters with different values raises ValueError."""
-        with pytest.raises(ValueError, match="Cannot set both"):
-            OffloadConfig(profile_iters=5, profiling_iters=3)
-
-    def test_warmup_and_discovery_iters_same_value_warns(self):
-        """Passing both warmup_iters and discovery_iters with same value emits DeprecationWarning."""
-        with pytest.warns(DeprecationWarning, match="warmup_iters"):
-            config = OffloadConfig(warmup_iters=5, discovery_iters=5)
-        assert config.discovery_iters == 5
-
-    def test_profile_and_profiling_iters_same_value_warns(self):
-        """Passing both profile_iters and profiling_iters with same value emits DeprecationWarning."""
-        with pytest.warns(DeprecationWarning, match="profile_iters"):
-            config = OffloadConfig(profile_iters=5, profiling_iters=5)
-        assert config.profiling_iters == 5
-
-    def test_ft_profiling_iters_env_var(self, monkeypatch):
-        """FT_PROFILING_ITERS env var maps to profiling_iters."""
-        monkeypatch.setenv("FT_PROFILING_ITERS", "15")
-        config = load_config()
-        assert config.profiling_iters == 15
-
-    def test_ft_profile_iters_env_var_deprecated(self, monkeypatch):
-        """FT_PROFILE_ITERS env var maps to profiling_iters with deprecation warning."""
-        monkeypatch.setenv("FT_PROFILE_ITERS", "8")
-        with pytest.warns(DeprecationWarning, match="profile_iters"):
-            config = load_config()
-        assert config.profiling_iters == 8
-
-    def test_ft_warmup_and_discovery_iters_env_conflict_raises(self, monkeypatch):
-        """Setting both FT_WARMUP_ITERS and FT_DISCOVERY_ITERS raises ValueError."""
-        monkeypatch.setenv("FT_WARMUP_ITERS", "4")
-        monkeypatch.setenv("FT_DISCOVERY_ITERS", "7")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config()
-
-    def test_ft_profile_and_profiling_iters_env_conflict_raises(self, monkeypatch):
-        """Setting both FT_PROFILE_ITERS and FT_PROFILING_ITERS raises ValueError."""
-        monkeypatch.setenv("FT_PROFILE_ITERS", "4")
-        monkeypatch.setenv("FT_PROFILING_ITERS", "7")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config()
-
-    def test_warmup_and_discovery_iters_from_env_conflict_raises(self, monkeypatch):
-        """Setting both FT_WARMUP_ITERS and FT_DISCOVERY_ITERS via load_config_from_env raises ValueError."""
-        monkeypatch.setenv("FT_WARMUP_ITERS", "3")
-        monkeypatch.setenv("FT_DISCOVERY_ITERS", "5")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config_from_env()
-
-    def test_profile_and_profiling_iters_from_env_conflict_raises(self, monkeypatch):
-        """Setting both FT_PROFILE_ITERS and FT_PROFILING_ITERS via load_config_from_env raises ValueError."""
-        monkeypatch.setenv("FT_PROFILE_ITERS", "10")
-        monkeypatch.setenv("FT_PROFILING_ITERS", "20")
-        with pytest.raises(ValueError, match="Cannot set both"):
-            load_config_from_env()
+@pytest.mark.parametrize("field", ["warmup_iters", "profile_iters"])
+def test_v040_constructor_rejects_removed_iter_field(field):
+    with pytest.raises(ValidationError, match=rf"'{field}' was removed in v0\.4\.0"):
+        OffloadConfig(**{field: 1})
 
 
-class TestModelCopyDeprecatedFieldSync:
-    """Tests that model_copy(update=...) keeps deprecated fields in sync.
+@pytest.mark.parametrize("field", ["warmup_iters", "profile_iters"])
+def test_v040_model_copy_rejects_removed_iter_field(field):
+    with pytest.raises(ValueError, match=rf"'{field}' was removed in v0\.4\.0"):
+        OffloadConfig().model_copy(update={field: 1})
 
-    Pydantic v2's model_copy bypasses mode='before' validators.  The
-    OffloadConfig.model_copy override mirrors updates to deprecated
-    counterparts so fields never desync.
-    """
 
-    def test_model_copy_syncs_discovery_to_warmup(self):
-        config = OffloadConfig(discovery_iters=1)
-        copied = config.model_copy(update={"discovery_iters": 5})
-        assert copied.discovery_iters == 5
-        assert copied.warmup_iters == 5
-
-    def test_model_copy_syncs_warmup_to_discovery(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            config = OffloadConfig(warmup_iters=1)
-        copied = config.model_copy(update={"warmup_iters": 7})
-        assert copied.warmup_iters == 7
-        assert copied.discovery_iters == 7
-
-    def test_model_copy_syncs_profiling_to_profile(self):
-        config = OffloadConfig(profiling_iters=10)
-        copied = config.model_copy(update={"profiling_iters": 3})
-        assert copied.profiling_iters == 3
-        assert copied.profile_iters == 3
-
-    def test_model_copy_syncs_profile_to_profiling(self):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", DeprecationWarning)
-            config = OffloadConfig(profile_iters=10)
-        copied = config.model_copy(update={"profile_iters": 4})
-        assert copied.profile_iters == 4
-        assert copied.profiling_iters == 4
-
-    def test_model_copy_explicit_both_sides_no_mirror(self):
-        """When both sides of a pair are in the update with the same value, no mirroring happens."""
-        config = OffloadConfig(discovery_iters=1)
-        copied = config.model_copy(update={"discovery_iters": 5, "warmup_iters": 5})
-        assert copied.discovery_iters == 5
-        assert copied.warmup_iters == 5
-
-    def test_model_copy_conflicting_both_sides_raises(self):
-        """When both sides of a pair are in the update with different values, raise ValueError."""
-        config = OffloadConfig(discovery_iters=1)
-        with pytest.raises(ValueError, match="Cannot set both"):
-            config.model_copy(update={"discovery_iters": 5, "warmup_iters": 3})
-
-    def test_model_copy_without_update_unchanged(self):
-        config = OffloadConfig(discovery_iters=3, profiling_iters=7)
-        copied = config.model_copy()
-        assert copied.discovery_iters == 3
-        assert copied.warmup_iters == 3
-        assert copied.profiling_iters == 7
-        assert copied.profile_iters == 7
-
-    def test_model_copy_deep_preserves_sync(self):
-        config = OffloadConfig(discovery_iters=2)
-        copied = config.model_copy(update={"discovery_iters": 9}, deep=True)
-        assert copied.discovery_iters == 9
-        assert copied.warmup_iters == 9
-
-    def test_model_copy_multiple_pairs_updated(self):
-        config = OffloadConfig(discovery_iters=1, profiling_iters=10)
-        copied = config.model_copy(update={"discovery_iters": 3, "profiling_iters": 2})
-        assert copied.discovery_iters == 3
-        assert copied.warmup_iters == 3
-        assert copied.profiling_iters == 2
-        assert copied.profile_iters == 2
-
-    def test_model_copy_unrelated_field_no_side_effects(self):
-        """Updating include_patterns does not alter iter fields."""
-        config = OffloadConfig(discovery_iters=5, profiling_iters=10)
-        copied = config.model_copy(update={"include_patterns": ["layers.*"]})
-        assert copied.include_patterns == ["layers.*"]
-        assert copied.discovery_iters == 5
-        assert copied.warmup_iters == 5
-        assert copied.profiling_iters == 10
-        assert copied.profile_iters == 10
+@pytest.mark.parametrize("name", ["all_warmup_iters", "pre_inference_iters"])
+def test_v040_removed_iter_property_is_absent(name):
+    assert not hasattr(OffloadConfig(), name)
 
 
 class TestModelCopyPreservesFieldsSet:
