@@ -32,6 +32,46 @@ SERVER_PORT = 8000
 SERVER_TIMEOUT = 600  # seconds to wait for server startup
 
 
+def test_serve_sh_forwards_vllm_arguments(tmp_path: Path) -> None:
+    """Catch helpers that drop model-specific arguments or force eager mode."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    args_file = tmp_path / "vllm-args.txt"
+    fake_vllm = bin_dir / "vllm"
+    fake_vllm.write_text('#!/usr/bin/env bash\nprintf \'%s\\n\' "$@" > "$ARGS_FILE"\n')
+    fake_vllm.chmod(0o755)
+
+    env = os.environ.copy()
+    env.update({"ARGS_FILE": str(args_file), "PATH": f"{bin_dir}:{env['PATH']}"})
+    result = subprocess.run(  # noqa: S603 - inputs are controlled by test
+        [
+            "/bin/bash",
+            str(EXAMPLES_DIR / "serve.sh"),
+            MODEL_NAME,
+            "--tensor-parallel-size",
+            "2",
+            "--max-model-len",
+            "4096",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert args_file.read_text().splitlines() == [
+        "serve",
+        MODEL_NAME,
+        "--worker-cls",
+        "flextensor.contrib.vllm.worker.FlexTensorOffloadWorker",
+        "--tensor-parallel-size",
+        "2",
+        "--max-model-len",
+        "4096",
+    ]
+
+
 def _log_reader_thread(process: subprocess.Popen[bytes], log_lines: list[str]) -> None:
     """Collect and display server logs in real-time.
 
@@ -99,6 +139,7 @@ class TestExampleVLLM:
         output_dir: Path,
         extra_env: dict[str, str] | None = None,
         run_client: bool = True,
+        vllm_args: tuple[str, ...] = (),
     ) -> list[str]:
         """Start serve.sh, optionally run client.sh, and return collected log lines.
 
@@ -107,6 +148,7 @@ class TestExampleVLLM:
             extra_env: Additional environment variables passed to serve.sh.
                 These simulate ``docker run -e KEY=VALUE`` passthrough.
             run_client: Whether to run client.sh and validate API responses.
+            vllm_args: Model-specific arguments forwarded to ``vllm serve``.
 
         Returns:
             Collected server log lines for further assertion by the caller.
@@ -128,10 +170,11 @@ class TestExampleVLLM:
         })
         if extra_env:
             env.update(extra_env)
+        use_v2_worker = env.get("FT_VLLM_USE_V2_WORKER", "1") == "1"
 
         log_lines: list[str] = []
         process = subprocess.Popen(  # noqa: S603 - inputs are controlled by test
-            ["bash", serve_script, MODEL_NAME],  # noqa: S607
+            ["bash", serve_script, MODEL_NAME, *vllm_args],  # noqa: S607
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -189,8 +232,8 @@ class TestExampleVLLM:
                 assert MODEL_NAME in model_ids, f"{MODEL_NAME} not in {model_ids}"
                 print(f"Available models: {model_ids}")
 
-            # Verify FlexTensor offloading was active — offloading messages
-            # are emitted during model loading (well before /health), but the
+            # Verify FlexTensor offloading was active — the v2 takeover message
+            # is emitted during model loading (well before /health), but the
             # reader thread may still be catching up. Join with a timeout to
             # ensure all buffered output has been consumed before asserting.
             log_thread.join(timeout=10)
@@ -199,12 +242,17 @@ class TestExampleVLLM:
 
             log_text = "\n".join(log_lines)
             assert_vllm_cuda_platform_logged(log_lines)
-            assert "FlexTensor offloading enabled with config" in log_text, (
-                "FlexTensor offloading config not found in server logs"
-            )
-            assert "FlexTensor offloading applied" in log_text, (
-                "FlexTensor offloading applied message not found in server logs"
-            )
+            if use_v2_worker:
+                assert "FlexTensor vLLM integration v2 state takeover complete" in log_text, (
+                    "FlexTensor v2 state takeover message not found in server logs"
+                )
+            else:
+                assert "FlexTensor offloading enabled with config" in log_text, (
+                    "FlexTensor legacy offloading config not found in server logs"
+                )
+                assert "FlexTensor offloading applied" in log_text, (
+                    "FlexTensor legacy offloading applied message not found in server logs"
+                )
 
         finally:
             _stop_server(process)
@@ -215,20 +263,21 @@ class TestExampleVLLM:
                 for line in log_lines[-50:]:
                     print(f"  {line}")
 
-        transfer_validation = validate_latest_memory_transfer_stats_for_current_bus(instrumentation_dir)
-        print("\nexamples/vllm - Memory transfer validation:")
-        print(
-            "  Bus: "
-            f"PCIe Gen{transfer_validation['pcie_link_gen']} x{transfer_validation['pcie_link_width']} "
-            f"({transfer_validation['pci_bus_id']}), CPU affinity={transfer_validation['cpu_affinity']}, "
-            f"NUMA affinity={transfer_validation['numa_affinity']}"
-        )
-        print(
-            "  Observed bandwidth: "
-            f"{transfer_validation['observed_bandwidth_gbps']:.2f} GB/s "
-            f"(expected {transfer_validation['min_expected_bandwidth_gbps']:.2f}-"
-            f"{transfer_validation['max_expected_bandwidth_gbps']:.2f} GB/s)"
-        )
+        if not use_v2_worker:
+            transfer_validation = validate_latest_memory_transfer_stats_for_current_bus(instrumentation_dir)
+            print("\nexamples/vllm - Memory transfer validation:")
+            print(
+                "  Bus: "
+                f"PCIe Gen{transfer_validation['pcie_link_gen']} x{transfer_validation['pcie_link_width']} "
+                f"({transfer_validation['pci_bus_id']}), CPU affinity={transfer_validation['cpu_affinity']}, "
+                f"NUMA affinity={transfer_validation['numa_affinity']}"
+            )
+            print(
+                "  Observed bandwidth: "
+                f"{transfer_validation['observed_bandwidth_gbps']:.2f} GB/s "
+                f"(expected {transfer_validation['min_expected_bandwidth_gbps']:.2f}-"
+                f"{transfer_validation['max_expected_bandwidth_gbps']:.2f} GB/s)"
+            )
 
         return log_lines
 
@@ -242,7 +291,7 @@ class TestExampleVLLM:
         2. Wait for the server to become healthy
         3. Run client.sh and assert it exits successfully (smoke test)
         4. Make structured Python requests for detailed assertions
-        5. Assert FlexTensor offloading log messages are present
+        5. Assert the FlexTensor v2 state-takeover log message is present
         6. Stop the server
         """
         self._run_serve_and_validate(tmp_path)
@@ -251,16 +300,16 @@ class TestExampleVLLM:
     def test_env_var_passthrough(self, tmp_path: Path) -> None:
         """Test that FT_* environment variables pass through to FlexTensor.
 
-        Simulates ``docker run -e FT_ENABLE_DIAGNOSTICS=1`` by setting the
-        variable in the subprocess environment. Verifies that FlexTensor
-        receives the variable by checking for the BLOCK ASSIGNMENT table in
-        server logs, which is only emitted when diagnostics are on and does
-        not depend on profiling-data consistency.
+        Simulates ``docker run -e`` by selecting the legacy worker and enabling
+        diagnostics in the subprocess environment. The legacy-worker selection
+        is verified by ``_run_serve_and_validate``; the BLOCK ASSIGNMENT table
+        verifies that diagnostics also passed through.
         """
         log_lines = self._run_serve_and_validate(
             tmp_path,
-            extra_env={"FT_ENABLE_DIAGNOSTICS": "1"},
+            extra_env={"FT_VLLM_USE_V2_WORKER": "0", "FT_ENABLE_DIAGNOSTICS": "1"},
             run_client=False,
+            vllm_args=("--enforce-eager",),
         )
 
         log_text = "\n".join(log_lines)

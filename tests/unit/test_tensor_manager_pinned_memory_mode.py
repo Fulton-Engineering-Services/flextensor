@@ -438,7 +438,7 @@ def test_offload_manager_forwards_pinned_memory_mode_to_tensor_manager(requested
     om.set_config(config)
 
     with (
-        patch("flextensor.offload_manager.AdaptiveStrategy"),
+        patch("flextensor.offload_manager.resolve_load_strategy"),
         patch("flextensor.tensor_manager.TensorManager") as mock_tm,
     ):
         om._initialize_tensor_manager()

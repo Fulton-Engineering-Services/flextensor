@@ -4,14 +4,29 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 from flextensor.state_transition import ModelPlacementState, StorageState, TensorState
 from flextensor.tensor_processors import compute_reachable_tensor_map
 
 
-def _inspect_storage(name: str, tensor: torch.Tensor) -> tuple[tuple[str, int], int, bool]:
-    """Return ``((device, storage identity), allocation bytes, pinned)``."""
+@dataclass(frozen=True, slots=True)
+class LiveStorageKey:
+    device: torch.device
+    storage_impl_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class LiveStorageInfo:
+    key: LiveStorageKey
+    nbytes: int
+    pinned: bool
+
+
+def inspect_tensor_storage(name: str, tensor: torch.Tensor) -> LiveStorageInfo:
+    """Return the tensor's storage key, allocation bytes, and pinning state."""
     if tensor.is_meta:
         raise ValueError(f"Cannot capture meta tensor {name}")
     if tensor.device.type not in {"cpu", "cuda"}:
@@ -25,13 +40,16 @@ def _inspect_storage(name: str, tensor: torch.Tensor) -> tuple[tuple[str, int], 
     except (NotImplementedError, RuntimeError) as error:
         raise ValueError(f"Cannot inspect backing storage for tensor {name}") from error
     # Storage identity stays shared across views even when their data pointers start at different offsets.
-    return (str(tensor.device), storage._cdata), storage.nbytes(), tensor.device.type == "cpu" and tensor.is_pinned()  # noqa: SLF001
+    return LiveStorageInfo(
+        key=LiveStorageKey(device=tensor.device, storage_impl_id=storage._cdata),  # noqa: SLF001
+        nbytes=storage.nbytes(),
+        pinned=tensor.device.type == "cpu" and tensor.is_pinned(),
+    )
 
 
-def _storage_id_from_key(storage_key: tuple[str, int]) -> str:
+def _storage_id_from_key(storage_key: LiveStorageKey) -> str:
     """Return an opaque process-local ID for one inspected storage."""
-    device, storage_impl = storage_key
-    return f"storage:{device}:{storage_impl}"
+    return f"storage:{storage_key.device}:{storage_key.storage_impl_id}"
 
 
 def capture_model_state(model: torch.nn.Module) -> ModelPlacementState:
@@ -59,21 +77,21 @@ def capture_model_state(model: torch.nn.Module) -> ModelPlacementState:
     for tensor_id, tensor in compute_reachable_tensor_map(model).items():
         captured.setdefault(tensor_id, (tensor, [], "tensor"))
 
-    storage_keys: set[tuple[str, int]] = set()
+    storage_keys: set[LiveStorageKey] = set()
     storages: list[StorageState] = []
     tensors: list[TensorState] = []
     for index, (tensor, names, kind) in enumerate(captured.values()):
         display_name = names[0] if names else f"<reachable:{index}>"
-        storage_key, nbytes, pinned = _inspect_storage(display_name, tensor)
-        storage_id = _storage_id_from_key(storage_key)
-        if storage_key not in storage_keys:
-            storage_keys.add(storage_key)
+        inspection = inspect_tensor_storage(display_name, tensor)
+        storage_id = _storage_id_from_key(inspection.key)
+        if inspection.key not in storage_keys:
+            storage_keys.add(inspection.key)
             storages.append(
                 StorageState(
                     id=storage_id,
-                    device=storage_key[0],
-                    nbytes=nbytes,
-                    pinned=pinned,
+                    device=str(inspection.key.device),
+                    nbytes=inspection.nbytes,
+                    pinned=inspection.pinned,
                 )
             )
         tensors.append(

@@ -233,6 +233,30 @@ def _run_inference(loader, labels: list[str], recorder: SyncRecorder) -> None:
         loader.exit(label)
 
 
+@pytest.mark.parametrize(
+    "loader_cls",
+    [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+)
+def test_sync_prev_onload_waits_compute_stream_on_transfer_stream(loader_cls):
+    labels = ["embed", "L0"]
+    layer_stats = _make_layer_stats(labels)
+    transfer_to_compute_map, label_to_block_id = _build_pipeline_maps(labels, set())
+    recorder = SyncRecorder()
+
+    with _create_loader(
+        loader_cls,
+        layer_stats,
+        label_to_block_id,
+        transfer_to_compute_map,
+        recorder,
+    ) as loader:
+        loader.sync_prev_onload()
+
+    assert len(recorder.log) == 1
+    assert recorder.log[0].op == "wait_stream"
+    assert recorder.log[0].stream == "compute"
+
+
 # ---------------------------------------------------------------------------
 # Test classes
 # ---------------------------------------------------------------------------
@@ -1014,6 +1038,37 @@ class TestCUDAGraphForkJoin:
         assert forks_after_next_enter == 2, (
             f"{loader_cls.__name__}: expected a second fork after piece join; log:\n{recorder.dump()}"
         )
+
+    @pytest.mark.parametrize(
+        "loader_cls",
+        [PreallocatedBatchTransferTensorLoader, PreallocatedBatchTransferTensorLoaderReordered],
+    )
+    def test_post_only_last_layer_exit_skips_cross_piece_transfer_join(self, loader_cls):
+        labels = ["embed", "L0"]
+        layer_stats = _make_layer_stats(labels)
+        transfer_to_compute_map = {"embed": "L0"}
+        label_to_block_id = {"embed": 0}
+        recorder = SyncRecorder()
+
+        with _create_loader(loader_cls, layer_stats, label_to_block_id, transfer_to_compute_map, recorder) as loader:
+            loader.enter("L0")
+            loader.join_after_forward()
+            recorder.log.clear()
+
+            policy = loader.piecewise_prefetch_policy
+            policy.enabled = True
+            policy.strict = True
+            policy.on_wait("L0")
+            policy.on_schedule("L0", "L0")
+
+            loader.exit("L0")
+
+            assert recorder.find_entries("record_event", stream="transfer") == [], recorder.dump()
+            assert recorder.find_entries("wait_event", stream="compute") == [], recorder.dump()
+            assert policy.on_piece_join() == []
+            assert loader.scheduled_transfers == {}
+            assert loader.compute_events_map == {}
+            assert loader.last_block_id_to_label_map == {}
 
     def test_cross_iteration_fork_after_join(self):
         """Second iteration's fork must come after first iteration's join."""

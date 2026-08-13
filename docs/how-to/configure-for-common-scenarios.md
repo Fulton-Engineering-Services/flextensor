@@ -102,6 +102,45 @@ Key choices:
 !!! tip "Use profile persistence for faster startup"
     Save profiles after the initial discovery/profiling run using `save_profile()`, then load them on subsequent runs with `load_profile()` to skip the discovery and profiling phases entirely. Set `profile_storage_dir` in your config and ensure `profile_read_only=False` to enable saving.
 
+### Refresh a vLLM worker-v2 profile from serving traffic
+
+Worker v2 can bootstrap from the previous `profile.json`, then replace its compute timings after ten
+matching serving batches. This example measures CUDA-graph replay:
+
+```bash
+export FT_ENABLED=1
+export FT_VLLM_USE_V2_WORKER=1
+export FT_PROFILING_ITERS=10
+export FT_PROFILE_STORAGE_DIR=/persistent/flextensor/qwen3-decode
+
+vllm serve Qwen/Qwen3-30B-A3B-FP8 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 4096 \
+  --max-num-seqs 64 \
+  --max-num-batched-tokens 512 \
+  --no-enable-prefix-caching \
+  --worker-cls flextensor.contrib.vllm.worker.FlexTensorOffloadWorker
+```
+
+Worker v2 derives and overwrites `external_compile` from vLLM's compilation mode and
+`offload_timing` from the CUDA-graph mode requested at model load. It warns before overriding an
+explicitly configured conflicting value. vLLM may later downgrade CUDA-graph mode for attention
+backend compatibility; external timing events also support eager execution, and each sampled
+`execute_model()` call selects CUDA-graph or eager finalization from actual replay activity.
+`FT_VLLM_TIMING_BATCH` defaults to `decode` for pure decode iterations; set it to `prefill` for pure
+prefill iterations. Mixed prefill/decode iterations are ignored. Worker v2 uses the first
+`max(1, FT_PROFILING_ITERS)` matching samples; the target must not exceed the 1024-entry timing-store
+limit. `FT_PROFILE_STORAGE_DIR` defaults to `None`, which disables persistence; set
+`FT_PROFILE_READ_ONLY=1` for load-only operation.
+
+On restart, worker v2 adopts only compatible saved timing statistics from `profile.json` and ignores
+its stale strategy. A fresh model scan, the current model/config, and current GPU budget remain
+authoritative when it computes a new strategy conservatively. It warns and falls back to conservative
+statistics when the saved profile is missing, invalid, or incompatible; incomplete timing collection
+leaves an existing file unchanged. The active server never replans or recaptures; refreshed timings
+affect strategy computation only on the next bootstrap. Delete `profile.json` or use another storage
+directory when switching between decode and prefill measurements.
+
 ---
 
 ## Measure transfer overlap during inference

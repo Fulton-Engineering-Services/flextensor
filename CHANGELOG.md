@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- New vLLM worker v2, selected by default and requiring vLLM 0.17+, with
+  compiled/CUDA-graph weight offloading and profile refresh from serving traffic.
+  Set ``FT_VLLM_USE_V2_WORKER=0`` explicitly to use the legacy worker. See the
+  [vLLM example](examples/vllm/README.md).
 - ``BudgetFillStrategy`` facade (greedy + optional layer/tensor DE; both DE
   solvers default on and are not skipped solely because the peak pinches the
   budget). Included in ``AdaptiveStrategy`` when a GPU budget is set with

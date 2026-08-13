@@ -27,7 +27,7 @@ def _find_repo_root(path: Path) -> Path:
 
 @pytest.fixture()
 def worker_module():
-    """Load the real worker.py with lightweight module stubs."""
+    """Load the real _legacy_worker.py with lightweight module stubs."""
     stubs: dict[str, types.ModuleType] = {}
 
     def _stub(name: str, **attrs) -> types.ModuleType:
@@ -50,7 +50,8 @@ def worker_module():
     contrib = _stub("flextensor.contrib")
     contrib.__path__ = []
     vllm_pkg = _stub("flextensor.contrib.vllm")
-    vllm_pkg.__path__ = []
+    vllm_package_path = _find_repo_root(Path(__file__)) / "src" / "flextensor" / "contrib" / "vllm"
+    vllm_pkg.__path__ = [str(vllm_package_path)]
 
     _stub("flextensor.compile", COMPILED_EAGER_PROFILE_FORWARDS=3)
     _stub("flextensor.config", load_config=lambda **_: SimpleNamespace(external_compile=False))
@@ -71,12 +72,14 @@ def worker_module():
     _stub("vllm.v1.worker")
     _stub("vllm.v1.worker.gpu_worker", Worker=_Worker)
 
-    module_name = "flextensor.contrib.vllm.worker"
-    previous = {name: sys.modules.get(name) for name in [*stubs, module_name]}
+    module_name = "flextensor.contrib.vllm._legacy_worker"
+    patterns_module_name = "flextensor.contrib.vllm._patterns"
+    previous = {name: sys.modules.get(name) for name in [*stubs, module_name, patterns_module_name]}
     sys.modules.update(stubs)
     sys.modules.pop(module_name, None)
+    sys.modules.pop(patterns_module_name, None)
 
-    worker_path = _find_repo_root(Path(__file__)) / "src" / "flextensor" / "contrib" / "vllm" / "worker.py"
+    worker_path = vllm_package_path / "_legacy_worker.py"
     spec = importlib.util.spec_from_file_location(module_name, worker_path)
     assert spec is not None
     assert spec.loader is not None
@@ -164,6 +167,16 @@ class TestVllmDefaultPatternUpdates:
         ]
         assert "*" not in updates["include_patterns"]
         assert "class:*Block" not in updates["include_patterns"]
+
+    def test_pattern_resolver_returns_copies_of_defaults(self, worker_module) -> None:
+        config = SimpleNamespace(include_patterns=["*"], exclude_patterns=[])
+
+        includes, excludes = worker_module.resolve_vllm_patterns(config)
+        includes.append("mutated")
+        excludes.append("mutated")
+
+        assert "mutated" not in worker_module.VLLM_DEFAULT_INCLUDE_PATTERNS
+        assert "mutated" not in worker_module.VLLM_DEFAULT_EXCLUDE_PATTERNS
 
     def test_explicit_empty_exclude_patterns_are_preserved(self, worker_module) -> None:
         config = SimpleNamespace(

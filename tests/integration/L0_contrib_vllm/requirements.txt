@@ -2,5 +2,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # vLLM OpenAI-compatible server API used by the worker smoke tests:
 # https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html
-vllm>=0.11.1
+vllm>=0.17.0
 requests~=2.32

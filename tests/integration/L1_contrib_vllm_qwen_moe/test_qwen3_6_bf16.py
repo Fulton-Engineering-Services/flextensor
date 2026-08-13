@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen 3.6 BF16 MoE vLLM functional smoke tests."""
+"""Qwen MoE vLLM functional smoke tests."""
 
 import importlib.metadata
 import json
@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from tests.integration._vllm_server import (
+    MemoryProfilingMetrics,
     VllmCorrectnessCheck,
     VllmOffloadSmokeCase,
     run_vllm_server_test,
@@ -23,12 +24,36 @@ from tests.integration._vllm_utils import (
     assert_no_triton_cpu_pointer_failure,
     assert_rejected_moe_backend_reason,
     sanitize_test_name,
+    validate_latest_memory_transfer_stats_for_current_bus,
 )
 
 QWEN3_6_35B_A3B_BF16_MODEL = "Qwen/Qwen3.6-35B-A3B"
 QWEN3_6_35B_A3B_FP8_MODEL = "Qwen/Qwen3.6-35B-A3B-FP8"
 # HF model.safetensors.index.json metadata.total_size: ~67.0 GiB.
 QWEN3_6_35B_A3B_BF16_WEIGHT_BYTES = 71_903_645_408
+
+QWEN3_30B_A3B_FP8_CASE = (
+    VllmOffloadSmokeCase(
+        model_name="Qwen/Qwen3-30B-A3B-FP8",
+        output_dir_name="qwen3_30b_a3b_fp8_v2",
+        cli_args=(
+            "--gpu-memory-utilization",
+            "0.85",
+            "--max-model-len",
+            "4096",
+            "--max-num-seqs",
+            "64",
+            "--max-num-batched-tokens",
+            "512",
+            "--no-enable-prefix-caching",
+        ),
+    )
+    .with_flextensor_offload()
+    .with_env_vars(
+        ("FT_VLLM_USE_V2_WORKER", "1"),
+        ("VLLM_USE_DEEP_GEMM", "0"),
+    )
+)
 
 
 @dataclass(frozen=True)
@@ -60,7 +85,6 @@ QWEN3_6_35B_A3B_BF16_SMOKE_CASE = VllmOffloadSmokeCase(
     model_name=QWEN3_6_35B_A3B_BF16_MODEL,
     output_dir_name="qwen3_6_35b_a3b_bf16",
     cli_args=(
-        "--enforce-eager",
         "--language-model-only",
         "--reasoning-parser",
         "qwen3",
@@ -75,6 +99,7 @@ QWEN3_6_35B_A3B_BF16_SMOKE_CASE = VllmOffloadSmokeCase(
     ),
     extra_env_vars=(
         ("FT_MAX_GPU_MEM_FRACTION", "0.70"),
+        ("FT_PINNED_MEMORY_MODE", "host_register"),
         ("FT_PROFILING_ITERS", "2"),
     ),
 ).with_flextensor_offload()
@@ -83,6 +108,7 @@ QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK = VllmCorrectnessCheck(
     timeout=180,
     chat_template_kwargs={"enable_thinking": False},
 )
+QWEN3_6_SERVER_READY_TIMEOUT = 1800
 QWEN3_6_UNQUANTIZED_MOE_BACKENDS = ("FlashInfer TRTLLM", "FlashInfer CUTLASS", "TRITON")
 QWEN3_6_FP8_PER_BLOCK_SKIP_REASON = (
     "vLLM 0.20.2 Qwen 3.6 fp8_per_block selects TRITON Fp8 on SM120, then fails warmup in "
@@ -165,6 +191,20 @@ QWEN3_6_QUANTIZED_MOE_CASES = (
 )
 
 
+def run_qwen3_6_server_test(
+    case: VllmOffloadSmokeCase,
+    *,
+    output_dir: Path,
+) -> tuple[MemoryProfilingMetrics, dict, list[str]]:
+    """Run the large Qwen 3.6 checkpoint with its measured startup allowance."""
+    return run_vllm_server_test(
+        case,
+        output_dir=output_dir,
+        correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
+        server_ready_timeout=QWEN3_6_SERVER_READY_TIMEOUT,
+    )
+
+
 def qwen3_6_35b_a3b_bf16_case_with_moe_backend(
     moe_backend: str,
     *,
@@ -232,12 +272,9 @@ class TestQwen36Bf16Moe:
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
+        offload_memory, offload_metrics, offload_logs = run_qwen3_6_server_test(
             case,
             output_dir=output_dir,
-            # Qwen thinking mode can spend the one-token smoke budget on reasoning,
-            # leaving empty final content even when generation succeeds.
-            correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
         )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
@@ -290,10 +327,9 @@ class TestQwen36Bf16Moe:
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
+        offload_memory, offload_metrics, offload_logs = run_qwen3_6_server_test(
             case,
             output_dir=output_dir,
-            correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
         )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
@@ -338,10 +374,9 @@ class TestQwen36Bf16Moe:
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
+        offload_memory, offload_metrics, offload_logs = run_qwen3_6_server_test(
             case,
             output_dir=output_dir,
-            correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
         )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
@@ -385,10 +420,9 @@ class TestQwen36Bf16Moe:
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
+        offload_memory, offload_metrics, offload_logs = run_qwen3_6_server_test(
             case,
             output_dir=output_dir,
-            correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
         )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
@@ -430,10 +464,9 @@ class TestQwen36Bf16Moe:
         output_dir = test_output_dir / vllm_case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
+        offload_memory, offload_metrics, offload_logs = run_qwen3_6_server_test(
             vllm_case,
             output_dir=output_dir,
-            correctness_check=QWEN3_6_ONE_TOKEN_NON_THINKING_CHECK,
         )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
@@ -479,3 +512,44 @@ class TestQwen36Bf16Moe:
     )
     def test_qwen3_6_35b_a3b_bf16_moe_explicit_flashinfer_trtllm_unsupported_on_sm120(self) -> None:
         """Record the current explicit FlashInfer TRTLLM rejection on SM120."""
+
+
+class TestQwen3Fp8Moe:
+    """Qwen 3 FP8 MoE regressions for FlexTensor's v2 worker."""
+
+    @pytest.mark.gpu_vram_96g
+    @pytest.mark.gpu_sm_120
+    def test_qwen3_30b_a3b_fp8_v2_dumps_diagnostics_before_and_after_profile(
+        self,
+        test_output_dir: Path,
+    ) -> None:
+        """Require diagnostics tables for writable profiling and read-only profile reuse."""
+        profile_dir = test_output_dir / "profile"
+        profiling_case = QWEN3_30B_A3B_FP8_CASE.with_env_vars(
+            ("FT_PROFILE_STORAGE_DIR", str(profile_dir)),
+            ("FT_PROFILING_ITERS", "1"),
+        )
+
+        profiling_output_dir = test_output_dir / "profiling"
+        _, _, profiling_logs = run_vllm_server_test(
+            profiling_case,
+            output_dir=profiling_output_dir,
+        )
+        assert (profile_dir / "profile.json").is_file()
+
+        profiled_case = profiling_case.with_env_vars(("FT_PROFILE_READ_ONLY", "1"))
+        profiled_output_dir = test_output_dir / "profiled"
+        _, _, profiled_logs = run_vllm_server_test(
+            profiled_case,
+            output_dir=profiled_output_dir,
+        )
+
+        for run_name, log_lines, output_dir in (
+            ("profiling", profiling_logs, profiling_output_dir),
+            ("profiled", profiled_logs, profiled_output_dir),
+        ):
+            log_text = "\n".join(log_lines)
+            assert "Layer Duration Statistics (ms)" in log_text, f"{run_name} run did not emit compute statistics"
+            assert "BLOCK ASSIGNMENT:" in log_text, f"{run_name} run did not emit the block-assignment table"
+            assert "Memory Transfer Statistics" in log_text, f"{run_name} run did not emit transfer statistics"
+            validate_latest_memory_transfer_stats_for_current_bus(output_dir / "instrumentation")

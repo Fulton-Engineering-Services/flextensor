@@ -2,145 +2,166 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 -->
-# vLLM Model Weight Offloading with FlexTensor [Coming Soon]
+# Serve a vLLM model with FlexTensor
 
-This example demonstrates how to use FlexTensor's tensor offloading with vLLM to run larger models with limited GPU memory.
+This tutorial serves `Qwen/Qwen2.5-72B-Instruct` on one NVIDIA H100 with the
+FlexTensor vLLM worker. Worker v2 is selected by default. It takes over the
+model state after vLLM loads the model, places model weights according to a
+FlexTensor offloading strategy, and can refresh an offload profile from serving
+traffic.
 
-## Prerequisites and Hardware Requirements
+`serve.sh` forwards every argument after the model name to `vllm serve`. This
+tutorial leaves model-specific vLLM settings at their defaults.
 
-**GPU memory**: A CUDA-capable GPU is required. Peak VRAM depends on model size, sequence length, and KV cache; FlexTensor offloads weights to CPU, significantly reducing requirements compared to a full model load.
+## Requirements
 
-**Compatible vLLM versions**: This integration requires vLLM 0.11.x or later (uses the `vllm.v1` worker API). The `FlexTensorOffloadWorker` class extends vLLM's internal worker API, which may change between major vLLM releases.
+- An NVIDIA GPU supported by vLLM, with enough host RAM for offloaded weights.
+- Docker with NVIDIA Container Toolkit, or an equivalent environment with FlexTensor and vLLM installed.
+- vLLM 0.17.0 or later. This tutorial uses the `vllm/vllm-openai:v0.25.1` image.
+- Run the commands from the FlexTensor repository root.
 
-**Docker image**: This example uses the official [vllm/vllm-openai](https://hub.docker.com/r/vllm/vllm-openai) image (`v0.19.0`).
+## Tutorial: build and reuse a decode profile
 
-## Feature Support
+The first run uses conservative timing statistics because its profile directory
+is empty. It then measures pure decode batches and writes an offload profile.
+The second run loads those measured timings and computes a new strategy for the
+current model, configuration, transfer benchmark, and GPU memory budget.
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| Tensor Parallelism (TP) | Supported | |
-| Pipeline Parallelism (PP) | Supported | |
-| Data Parallelism (DP) | In progress | |
-| Expert Parallelism (EP) | In progress | |
-| CUDA Graphs | In progress | Currently requires `--enforce-eager` |
-| Multi-Token Prediction (MTP) | Not supported | MTP targets decode; FlexTensor offloading targets prefill |
+### 1. Create an empty profile directory
 
-## Quick Start
-
-Start the server inside the vLLM container:
-
-```bash
-docker run --gpus all -p 8000:8000 \
-    -v ./examples/vllm:/workspace \
-    vllm/vllm-openai:v0.19.0 \
-    bash -c "/workspace/install.sh && /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct"
-```
-
-Pass `FT_*` environment variables with `-e` to configure offloading:
+Use a different directory when changing the model, GPU topology, or the batch
+type being measured.
 
 ```bash
-docker run --gpus all -p 8000:8000 \
-    -e FT_MAX_GPU_MEM_FRACTION=0.7 \
-    -e FT_ENABLE_DIAGNOSTICS=1 \
-    -v ./examples/vllm:/workspace \
-    vllm/vllm-openai:v0.19.0 \
-    bash -c "/workspace/install.sh && /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct"
+mkdir -p "$PWD/.flextensor-profiles/qwen2.5-72b-h100-decode"
 ```
 
-Test it from the host:
+Make sure it does not already contain `profile.json` for this first run.
+
+### 2. Start with conservative statistics and collect timings
 
 ```bash
-bash examples/vllm/client.sh Qwen/Qwen2.5-72B-Instruct
+docker run --rm --gpus all --ipc=host -p 8000:8000 --entrypoint bash \
+  -e FT_MAX_GPU_MEM_FRACTION=0.7 \
+  -e FT_PROFILING_ITERS=10 \
+  -e FT_PROFILE_STORAGE_DIR=/profiles \
+  -v "$PWD/.flextensor-profiles/qwen2.5-72b-h100-decode:/profiles" \
+  -v "$PWD/examples/vllm:/workspace" \
+  vllm/vllm-openai:v0.25.1 \
+  -c '/workspace/install.sh && exec /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct'
 ```
 
-## Scripts
+`FT_MAX_GPU_MEM_FRACTION` is the FlexTensor budget for model weights. It is
+separate from vLLM's `--gpu-memory-utilization`, which also accounts for KV
+cache and runtime allocations.
 
-### install.sh
-
-Installs FlexTensor and its dependencies inside the container:
+In another terminal, send requests until the server has collected ten pure
+decode batches. The collector stops after the tenth matching iteration, so
+extra requests are not sampled:
 
 ```bash
-bash /workspace/install.sh
+for _ in {1..10}; do
+  bash examples/vllm/client.sh Qwen/Qwen2.5-72B-Instruct
+done
 ```
 
-### serve.sh
+Wait for this log message before stopping the server:
 
-Starts vLLM with the FlexTensor offload worker. Takes the model name as the first argument:
+```text
+refreshed profile saved path=/profiles/profile.json samples=10
+```
+
+The file on the host is
+`.flextensor-profiles/qwen2.5-72b-h100-decode/profile.json`.
+
+`FT_VLLM_TIMING_BATCH` defaults to `decode`, which accepts only pure decode
+scheduler iterations. Set it to `prefill` to measure only pure prefill
+iterations. Mixed prefill/decode iterations are ignored in both cases.
+
+### 3. Restart with the measured profile
+
+Stop the first server, then run:
 
 ```bash
-bash /workspace/serve.sh MODEL_NAME
+docker run --rm --gpus all --ipc=host -p 8000:8000 --entrypoint bash \
+  -e FT_MAX_GPU_MEM_FRACTION=0.7 \
+  -e FT_PROFILE_STORAGE_DIR=/profiles \
+  -e FT_PROFILE_READ_ONLY=1 \
+  -v "$PWD/.flextensor-profiles/qwen2.5-72b-h100-decode:/profiles" \
+  -v "$PWD/examples/vllm:/workspace" \
+  vllm/vllm-openai:v0.25.1 \
+  -c '/workspace/install.sh && exec /workspace/serve.sh Qwen/Qwen2.5-72B-Instruct'
 ```
 
-### client.sh
+Confirm both messages appear:
 
-Sends a chat completion request and lists available models. Takes the model name as the first argument and an optional port (default 8000):
+```text
+saved profile loaded path=/profiles/profile.json
+saved profile statistics accepted for bootstrap strategy recomputation
+```
+
+Worker v2 adopts compatible timing statistics from the saved offload profile,
+but does not reuse its old strategy. It scans the current model and recomputes
+the strategy from the current configuration, GPU budget, and transfer
+benchmark. An active server does not replan or recapture CUDA graphs when the
+profile is written; the restart is what applies the refreshed timings.
+
+## Choose vLLM compilation settings for the model
+
+The tutorial uses vLLM's compiled path and CUDA graphs. Worker v2 derives the
+matching FlexTensor configuration from the resolved vLLM configuration:
+
+- `OffloadConfig.external_compile=True` only for `VLLM_COMPILE`; it is false for eager vLLM
+  execution.
+- `OffloadConfig.offload_timing="cuda_graph"` when CUDA graphs are requested at model load;
+  otherwise it is `"eager"`.
+
+Worker v2 owns and overwrites those two settings. If you explicitly configure a
+conflicting value, it logs a warning before overriding it. vLLM may resolve
+attention-backend compatibility later and downgrade the requested CUDA-graph
+mode. External timing events selected for a requested graph mode also support
+eager execution, so each sampled `execute_model()` call uses actual replay
+activity to choose CUDA-graph or eager finalization.
+
+For `VLLM_COMPILE`, the default
+`allocation_block_transfer` mode is supported. The resolved vLLM compilation
+configuration must use attention-piecewise compilation, include every attention
+operator in its splitting operators, and keep
+`use_inductor_graph_partition=false`.
+
+`CompilationMode.STOCK_TORCH_COMPILE` and whole-graph Inductor partitioning are
+not supported. Worker v2 also rejects elastic expert parallelism, u-batching,
+vLLM native weight transfer, and model-backed speculative loading. Model-free
+speculative methods (`ngram`, `ngram_gpu`, `suffix`, and `custom_class`) are
+supported by the worker validation.
+
+## Use the helper with another model
 
 ```bash
-bash examples/vllm/client.sh MODEL_NAME [PORT]
+bash examples/vllm/serve.sh MODEL_NAME [VLLM_ARGS...]
 ```
 
-## Configuration
+For example, eager mode is a caller choice, not a helper default:
 
-FlexTensor loads configuration from environment variables (`FT_*`).
-
-Every `OffloadConfig` field can be set via an environment variable named `FT_` + the uppercase field name. For example, `discovery_iters` → `FT_DISCOVERY_ITERS`. Values follow standard Python literals (`true`/`false`, integers, floats, comma-separated lists).
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `FT_ENABLED` | Enable offloading | `false` |
-| `FT_MAX_GPU_MEM_FRACTION` | Fraction of GPU memory to use for model weights (e.g. `0.7` = 70%); `None` disables the memory constraint | `0.9` |
-| `FT_INCLUDE_PATTERNS` | Comma-separated include patterns to offload | see below |
-| `FT_EXCLUDE_PATTERNS` | Comma-separated patterns to keep GPU-resident | see below |
-| `FT_ENABLE_DIAGNOSTICS` | Log Layer Duration Statistics and block assignment table after profiling | `false` |
-
-Unlike standalone `OffloadConfig`, which defaults to latency mode, the vLLM
-worker keeps an integration-specific `0.9` default when
-`FT_MAX_GPU_MEM_FRACTION` is omitted. Set it to `none` to request latency mode
-explicitly. The worker does not derive the FlexTensor weight budget from vLLM's
-`gpu_memory_utilization`, because that budget must also leave room for KV cache
-and runtime allocations.
-
-The worker defaults to vLLM-oriented patterns when `FT_INCLUDE_PATTERNS` /
-`FT_EXCLUDE_PATTERNS` are not customized: decoder-layer class includes, common
-embedding/norm/head paths, and excludes for known MoE sidecars and tiny
-router/gating tensors that should stay GPU-resident. The exact defaults live in
-`VLLM_DEFAULT_INCLUDE_PATTERNS` and `VLLM_DEFAULT_EXCLUDE_PATTERNS` in
-`src/flextensor/contrib/vllm/worker.py`.
-
-For models with a different module layout, set `FT_INCLUDE_PATTERNS` explicitly:
-
-| Family | `FT_INCLUDE_PATTERNS` |
-|---|---|
-| GPT-2 / GPT-J / Falcon v1 / BLOOM / Qwen1 | `class:*Block,transformer.wte,transformer.ln_f,lm_head,logits_processor` |
-| GPT-NeoX / Pythia | `class:*Layer,gpt_neox.embed_in,gpt_neox.final_layer_norm,embed_out,logits_processor` |
-| MPT / DBRX | `class:*Block,transformer.wte,transformer.norm_f,lm_head,logits_processor` |
-| Mamba / Mamba2 | `class:*DecoderLayer,backbone.embeddings,backbone.norm_f,lm_head,logits_processor` |
-| Phi-1 / Phi-2 / Jamba / Bamba | `class:*DecoderLayer,model.embed_tokens,model.final_layernorm,lm_head,logits_processor` |
-| InternLM2 | `class:*DecoderLayer,model.tok_embeddings,model.norm,output,logits_processor` |
-| OPT | `class:*DecoderLayer,model.decoder.embed_tokens,model.decoder.final_layer_norm,lm_head,logits_processor` |
-| ChatGLM v1–3 | `class:*Layer,transformer.embedding,transformer.encoder.final_layernorm,lm_head,logits_processor` |
-
-For the full list of configuration options (config files, discovery/profiling tuning, transfer modes), see the [Configuration Reference](https://github.com/ai-dynamo/flextensor/blob/main/docs/api/configuration.md).
-
-## How It Works
-
-The `FlexTensorOffloadWorker` extends vLLM's GPU worker to:
-
-1. Load configuration from environment variables or config file
-2. Apply FlexTensor offloading to model layers after loading
-3. Automatically manage tensor movement between CPU and GPU
-
-When `FT_ENABLED=1` is set, the worker applies offloading using the default decoder-only transformer
-include patterns (or those set via `FT_INCLUDE_PATTERNS`). Otherwise it behaves like the
-standard vLLM worker. Look for these log messages to confirm offloading is active:
-
-```
-FlexTensor offloading enabled with config: ...
-FlexTensor offloading applied (GPU usage: X.XX GiB)
+```bash
+bash examples/vllm/serve.sh MODEL_NAME --enforce-eager
 ```
 
-## Troubleshooting
+The helper always enables FlexTensor and adds the stable worker class:
 
-For troubleshooting tips (out of memory, performance tuning, debugging), see the [Troubleshooting Guide](https://github.com/ai-dynamo/flextensor/blob/main/docs/how-to/troubleshooting.md).
+```text
+flextensor.contrib.vllm.worker.FlexTensorOffloadWorker
+```
+
+## Scripts and configuration
+
+- `install.sh` installs the versions in `requirements.txt`.
+- `serve.sh` enables FlexTensor, selects worker v2 by default, adds the worker
+  class, and forwards vLLM arguments.
+- `client.sh` sends a chat completion request and lists available models. Its
+  arguments are `MODEL_NAME [PORT]`, with port 8000 by default.
+
+FlexTensor configuration uses `FT_*` environment variables. See the
+[configuration reference](../../docs/explanation/configuration.md) and
+[troubleshooting guide](../../docs/how-to/troubleshooting.md) for the complete
+options and diagnostics.

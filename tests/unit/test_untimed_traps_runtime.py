@@ -1377,7 +1377,7 @@ class TestPrepareInferModeFiltersObservedCrossRefs:
     @patch.object(TensorManager, "_get_memory_transfer_stats", return_value={})
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics", return_value=[])
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_cross_ref_ids_dropped_before_strategy_compute(
         self, _report_quality, mock_compute_stats, _bench, _mem, _budget, _remove, _gaps, _loader
     ) -> None:
@@ -1411,7 +1411,7 @@ class TestPrepareInferModeFiltersObservedCrossRefs:
     @patch.object(TensorManager, "_get_memory_transfer_stats", return_value={})
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics", return_value=[])
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_no_cross_refs_leaves_layer_stats_unchanged(
         self, _report_quality, mock_compute_stats, _bench, _mem, _budget, _remove, _gaps, _loader
     ) -> None:

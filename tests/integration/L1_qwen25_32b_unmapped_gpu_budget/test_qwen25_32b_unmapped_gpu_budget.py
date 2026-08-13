@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen2.5-32B unmapped GPU tensor budget coverage for vLLM.
+"""Qwen2.5-32B resident GPU tensor budget coverage for vLLM v2.
 
-This high-residency run exercises unmapped tensor finalization on A100-40GB CI.
+This high-residency run exercises conservative state budgeting on A100-40GB CI.
 Fixed code must avoid raw CUDA OOM and may either reach vLLM's controlled
 KV-cache capacity error or fail earlier with a clear FlexTensor budget error.
 """
@@ -30,7 +30,6 @@ from tests.integration._vllm_utils import sanitize_test_name
 pytestmark = [pytest.mark.gpu_vram_40g, pytest.mark.gpu_sm_80]
 
 MODEL_NAME = "Qwen/Qwen2.5-32B-Instruct"
-INCLUDE_PATTERNS = "model.embed_tokens,model.layers.*,model.norm,lm_head,logits_processor"
 RAW_CUDA_OOM_MARKERS = (
     "torch.OutOfMemoryError",
     "CUDA out of memory",
@@ -39,10 +38,11 @@ EXPECTED_MEMORY_PRESSURE_FAILURE_MARKERS = (
     "No available memory for the cache blocks",
     "larger than the available KV cache memory",
 )
-STRATEGY_BUDGET_FAILURE_MARKER = "Insufficient strategy GPU budget after reserving"
-# Emitted by src/flextensor/contrib/vllm/worker.py after FlexTensor finishes
-# warmup/profile/offload setup and before vLLM proceeds into KV-cache sizing.
-OFFLOAD_APPLIED_MARKER = "FlexTensor offloading applied"
+OFFLOAD_APPLIED_MARKER = "FlexTensor vLLM integration v2 state takeover complete"
+STRATEGY_BUDGET_FAILURE_MARKERS = (
+    "bootstrap placement exceeds GPU budget",
+    "conservative state resident tensors exceed GPU budget",
+)
 
 
 @pytest.fixture
@@ -53,7 +53,7 @@ def test_output_dir(request: pytest.FixtureRequest) -> Path:
     return output_dir
 
 
-def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_output_dir: Path) -> None:
+def test_qwen25_32b_budgets_resident_gpu_tensors_without_raw_cuda_oom(test_output_dir: Path) -> None:
     process = None
     log_lines: list[str] = []
     summary: dict[str, object] = {
@@ -65,13 +65,12 @@ def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_outpu
         case = VllmOffloadSmokeCase(
             model_name=MODEL_NAME,
             output_dir_name="qwen25_32b_unmapped_gpu_budget",
-            cli_args=("--enforce-eager", "--max-num-seqs", "1", "--max-model-len", "128"),
+            cli_args=("--max-num-seqs", "1", "--max-model-len", "128"),
             extra_env_vars=(
                 ("VLLM_NO_USAGE_STATS", "1"),
                 ("VLLM_LOGGING_LEVEL", "DEBUG"),
                 ("FT_ENABLE_DIAGNOSTICS", "1"),
                 ("FT_MAX_GPU_MEM_FRACTION", "0.95"),
-                ("FT_INCLUDE_PATTERNS", INCLUDE_PATTERNS),
             ),
         ).with_flextensor_offload()
         process, log_lines = start_vllm_server(
@@ -86,7 +85,7 @@ def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_outpu
         memory_metrics = parse_memory_profiling_logs(log_lines)
 
         assert not any(marker in log_text for marker in RAW_CUDA_OOM_MARKERS), (
-            "Qwen2.5-32B hit raw CUDA OOM in unmapped tensor finalization"
+            "Qwen2.5-32B hit raw CUDA OOM during conservative state budgeting"
         )
 
         if ready:
@@ -103,7 +102,7 @@ def test_qwen25_32b_budgets_unmapped_gpu_tensors_without_raw_cuda_oom(test_outpu
             return
 
         assert process is not None
-        accepted_clear_budget_failure = STRATEGY_BUDGET_FAILURE_MARKER in log_text
+        accepted_clear_budget_failure = any(marker in log_text for marker in STRATEGY_BUDGET_FAILURE_MARKERS)
         accepted_kv_failure_after_transition = OFFLOAD_APPLIED_MARKER in log_text and any(
             marker in log_text for marker in EXPECTED_MEMORY_PRESSURE_FAILURE_MARKERS
         )

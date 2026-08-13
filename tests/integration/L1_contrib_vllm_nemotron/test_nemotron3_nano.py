@@ -4,6 +4,7 @@
 """Nemotron 3 Nano vLLM functional smoke tests."""
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,8 +13,10 @@ import pytest
 from tests.integration._vllm_server import (
     MemoryProfilingMetrics,
     VllmBenchmarkConfig,
+    VllmCorrectnessCheck,
     VllmOffloadSmokeCase,
     run_vllm_server_test,
+    with_hf_reasoning_parser,
 )
 from tests.integration._vllm_utils import (
     assert_moe_backend_selection,
@@ -26,7 +29,6 @@ NEMOTRON_3_NANO_FP8_SMOKE_CASE = VllmOffloadSmokeCase(
     model_name="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
     output_dir_name="nemotron3_nano_fp8",
     cli_args=(
-        "--enforce-eager",
         "--trust-remote-code",
         "--max-model-len",
         "2048",
@@ -49,7 +51,6 @@ NEMOTRON_3_NANO_NVFP4_SMOKE_CASE = VllmOffloadSmokeCase(
     model_name="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
     output_dir_name="nemotron3_nano_nvfp4",
     cli_args=(
-        "--enforce-eager",
         "--trust-remote-code",
         "--max-model-len",
         "2048",
@@ -60,6 +61,20 @@ NEMOTRON_3_NANO_NVFP4_SMOKE_CASE = VllmOffloadSmokeCase(
     ),
     extra_env_vars=(("FT_MAX_GPU_MEM_FRACTION", "0.75"),),
 ).with_flextensor_offload()
+NEMOTRON_3_NANO_NVFP4_CASES = (
+    pytest.param(NEMOTRON_3_NANO_NVFP4_SMOKE_CASE, id="compiled-v2"),
+    pytest.param(
+        replace(
+            NEMOTRON_3_NANO_NVFP4_SMOKE_CASE,
+            output_dir_name="nemotron3_nano_nvfp4_legacy_eager",
+            cli_args=("--enforce-eager", *NEMOTRON_3_NANO_NVFP4_SMOKE_CASE.cli_args),
+        ).with_env_vars(
+            ("FT_VLLM_USE_V2_WORKER", "0"),
+            ("FT_EXTERNAL_COMPILE", "0"),
+        ),
+        id="legacy-eager-canary",
+    ),
+)
 NEMOTRON_3_NANO_NVFP4_REQUIRED_MOE_BACKENDS = (
     "FLASHINFER_TRTLLM",
     "FLASHINFER_CUTLASS",
@@ -71,6 +86,21 @@ NEMOTRON_3_NANO_BENCHMARK_CONFIG = VllmBenchmarkConfig(
     max_concurrency=1,
     timeout=600,
 )
+NEMOTRON_3_NANO_NON_THINKING_CHECK = VllmCorrectnessCheck(
+    max_tokens=20,
+    timeout=180,
+    chat_template_kwargs={"enable_thinking": False},
+)
+NEMOTRON_3_NANO_REASONING_PARSER = "nano_v3"
+NEMOTRON_3_NANO_REASONING_PARSER_FILENAME = "nano_v3_reasoning_parser.py"
+
+
+def with_nemotron3_nano_reasoning_parser(case: VllmOffloadSmokeCase) -> VllmOffloadSmokeCase:
+    return with_hf_reasoning_parser(
+        case,
+        filename=NEMOTRON_3_NANO_REASONING_PARSER_FILENAME,
+        parser_name=NEMOTRON_3_NANO_REASONING_PARSER,
+    )
 
 
 @pytest.fixture
@@ -123,7 +153,7 @@ class TestNemotron3Nano:
         test_output_dir: Path,
     ) -> None:
         """Smoke-test FP8 MoE offloading on the 24GB L4 target."""
-        case = NEMOTRON_3_NANO_FP8_SMOKE_CASE
+        case = with_nemotron3_nano_reasoning_parser(NEMOTRON_3_NANO_FP8_SMOKE_CASE)
 
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -131,9 +161,7 @@ class TestNemotron3Nano:
         offload_memory, offload_metrics, offload_logs = run_vllm_server_test(
             case,
             output_dir=output_dir,
-            # One token is enough to validate the offload path on a small VRAM target.
-            chat_max_tokens=1,
-            chat_request_timeout=180,
+            correctness_check=NEMOTRON_3_NANO_NON_THINKING_CHECK,
             benchmark_config=NEMOTRON_3_NANO_BENCHMARK_CONFIG,
         )
 
@@ -161,8 +189,10 @@ class TestNemotron3Nano:
 
     @pytest.mark.gpu_vram_96g
     @pytest.mark.gpu_sm_min_120
+    @pytest.mark.parametrize("case", NEMOTRON_3_NANO_NVFP4_CASES)
     def test_nemotron3_nano_nvfp4_moe_serves_with_offloading(
         self,
+        case: VllmOffloadSmokeCase,
         test_output_dir: Path,
     ) -> None:
         """Smoke-test Nemotron 3 Nano NVFP4 MoE serving through the vLLM worker.
@@ -172,14 +202,14 @@ class TestNemotron3Nano:
         completes FT warmup/profiling, and serves a chat request. Baseline memory
         comparison remains covered by the smaller 40GB Qwen test.
         """
-        case = NEMOTRON_3_NANO_NVFP4_SMOKE_CASE
-
+        case = with_nemotron3_nano_reasoning_parser(case)
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
 
         offload_memory, offload_metrics, _ = run_vllm_server_test(
             case,
             output_dir=output_dir,
+            correctness_check=NEMOTRON_3_NANO_NON_THINKING_CHECK,
             benchmark_config=NEMOTRON_3_NANO_BENCHMARK_CONFIG,
         )
 

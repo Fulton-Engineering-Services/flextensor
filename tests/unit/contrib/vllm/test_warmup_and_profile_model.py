@@ -44,7 +44,7 @@ import pytest
 
 @pytest.fixture(scope="module")
 def worker_module():
-    """Import ``flextensor.contrib.vllm.worker`` with vllm stubbed out.
+    """Import ``flextensor.contrib.vllm._legacy_worker`` with vllm stubbed out.
 
     The worker module unconditionally imports a handful of ``vllm.*`` symbols
     at the top level, plus ``flextensor.contrib.vllm.loader`` (which itself
@@ -79,7 +79,7 @@ def worker_module():
 
     previous = {name: sys.modules.get(name) for name in stubs}
     # Also remove any cached real worker module so our stubs take effect.
-    previous["flextensor.contrib.vllm.worker"] = sys.modules.pop("flextensor.contrib.vllm.worker", None)
+    previous["flextensor.contrib.vllm._legacy_worker"] = sys.modules.pop("flextensor.contrib.vllm._legacy_worker", None)
 
     sys.modules.update(stubs)
 
@@ -97,7 +97,7 @@ def worker_module():
     )
 
     try:
-        import flextensor.contrib.vllm.worker as worker  # noqa: PLC0415
+        import flextensor.contrib.vllm._legacy_worker as worker  # noqa: PLC0415
 
         yield worker
     finally:

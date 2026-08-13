@@ -10,8 +10,10 @@ from pathlib import Path
 import pytest
 
 from tests.integration._vllm_server import (
+    VllmCorrectnessCheck,
     VllmOffloadSmokeCase,
     run_vllm_server_test,
+    with_hf_reasoning_parser,
 )
 from tests.integration._vllm_utils import (
     assert_moe_backend_selection,
@@ -26,7 +28,6 @@ NEMOTRON_3_SUPER_NVFP4_SMOKE_CASE = VllmOffloadSmokeCase(
     model_name=NEMOTRON_3_SUPER_NVFP4_MODEL,
     output_dir_name="nemotron3_super_nvfp4",
     cli_args=(
-        "--enforce-eager",
         "--trust-remote-code",
         "--max-model-len",
         "1024",
@@ -44,6 +45,14 @@ NEMOTRON_3_SUPER_NVFP4_REQUIRED_MOE_BACKENDS = (
     "FLASHINFER_TRTLLM",
     "FLASHINFER_CUTLASS",
 )
+NEMOTRON_3_SUPER_NON_THINKING_CHECK = VllmCorrectnessCheck(
+    max_tokens=20,
+    timeout=180,
+    temperature=1.0,
+    chat_template_kwargs={"enable_thinking": False},
+)
+NEMOTRON_3_SUPER_REASONING_PARSER = "super_v3"
+NEMOTRON_3_SUPER_REASONING_PARSER_FILENAME = "super_v3_reasoning_parser.py"
 
 
 @pytest.fixture
@@ -68,13 +77,21 @@ class TestNemotron3SuperNvfp4Instrumentation:
         test_output_dir: Path,
     ) -> None:
         """Smoke-test Super serving and verify FlexTensor emits instrumentation."""
-        case = NEMOTRON_3_SUPER_NVFP4_SMOKE_CASE
+        case = with_hf_reasoning_parser(
+            NEMOTRON_3_SUPER_NVFP4_SMOKE_CASE,
+            filename=NEMOTRON_3_SUPER_REASONING_PARSER_FILENAME,
+            parser_name=NEMOTRON_3_SUPER_REASONING_PARSER,
+        )
 
         output_dir = test_output_dir / case.output_dir_name
         output_dir.mkdir(parents=True, exist_ok=True)
         shutil.rmtree(output_dir / "instrumentation", ignore_errors=True)
 
-        offload_memory, offload_metrics, _ = run_vllm_server_test(case, output_dir=output_dir)
+        offload_memory, offload_metrics, _ = run_vllm_server_test(
+            case,
+            output_dir=output_dir,
+            correctness_check=NEMOTRON_3_SUPER_NON_THINKING_CHECK,
+        )
 
         assert offload_metrics["usage"].get("completion_tokens", 0) > 0, (
             f"{case.model_name} returned no generated tokens"

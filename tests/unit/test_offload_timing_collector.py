@@ -20,6 +20,12 @@ from flextensor.offload_manager import OffloadManager
 from flextensor.offload_timing import OffloadTimingCollector, OffloadTimingSnapshot, TrapTimingRecord
 
 
+@pytest.fixture(autouse=True)
+def _default_not_capturing():
+    with patch("flextensor.offload_timing.torch.cuda.is_current_stream_capturing", return_value=False):
+        yield
+
+
 @pytest.fixture()
 def collector() -> OffloadTimingCollector:
     """A collector with no GPU events — we only exercise the branch logic.
@@ -443,6 +449,55 @@ class TestPassSinkSurvivesLogClear:
         assert collector._snapshots == []  # log window cleared at _log_every
         report = OffloadTimingCollector._build_report(sunk)
         assert report.num_passes == 2
+
+
+class TestSelectedMeasureWindow:
+    def test_unselected_eager_pass_does_not_reach_durable_sink(self, collector: OffloadTimingCollector) -> None:
+        sunk: list[OffloadTimingSnapshot] = []
+        collector.set_pass_sink(sunk.append)
+        collector.set_measure_window(False)
+        snapshot = OffloadTimingSnapshot(per_trap=(TrapTimingRecord(label="L0", compute_ms=1.0),))
+
+        with patch.object(collector, "_read_pass_snapshot", return_value=snapshot):
+            collector._pass_active = True
+            collector._finalize_pass()
+
+        assert sunk == []
+        assert collector._snapshots == [snapshot]
+
+    def test_selected_eager_pass_publishes_once(self, collector: OffloadTimingCollector) -> None:
+        sunk: list[OffloadTimingSnapshot] = []
+        collector.set_pass_sink(sunk.append)
+        collector.set_measure_window(False)
+        collector._pass_active = True
+        collector.set_measure_window(True)
+        assert not collector._pass_active
+        snapshot = OffloadTimingSnapshot(per_trap=(TrapTimingRecord(label="L0", compute_ms=1.0),))
+
+        with patch.object(collector, "_read_pass_snapshot", return_value=snapshot):
+            collector._pass_active = True
+            assert collector.flush_pending_eager_pass()
+        collector.set_measure_window(False)
+
+        assert sunk == [snapshot]
+
+    def test_selected_eager_fallback_preserves_later_replay(self, collector: OffloadTimingCollector) -> None:
+        sunk: list[OffloadTimingSnapshot] = []
+        collector.set_pass_sink(sunk.append)
+        collector._pass_active = True
+        collector._pass_was_captured = True
+        collector._has_compute["L0"] = True
+        eager = OffloadTimingSnapshot(per_trap=(TrapTimingRecord(label="L0", compute_ms=2.0),))
+        replay = OffloadTimingSnapshot(per_trap=(TrapTimingRecord(label="L0", compute_ms=3.0),))
+
+        with patch.object(collector, "_read_pass_snapshot", side_effect=(eager, replay)):
+            assert collector.flush_pending_eager_pass(preserve_replay_state=True)
+            collector.set_measure_window(False)
+            collector.arm_replay_measure()
+            collector.set_measure_window(True)
+            assert collector.finalize_replay_pass(replay_generation=2)
+
+        assert sunk == [eager, replay]
 
 
 class TestExternalEventsConfig:

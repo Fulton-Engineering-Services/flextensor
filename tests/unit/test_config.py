@@ -19,7 +19,10 @@ from typing import ClassVar
 import pytest
 from pydantic import ValidationError
 
+import flextensor.config as config_module
 from flextensor.config import (
+    BLOCK_TRANSFER_MODES,
+    OFFLOAD_TRANSFER_MODES,
     OffloadConfig,
     _get_field_types,
     _parse_bool,
@@ -28,8 +31,52 @@ from flextensor.config import (
     load_config_from_env,
     load_config_from_file,
 )
-from flextensor.strategy import GreedyStrategy, KnapsackStrategy, NthLayerStrategy
+from flextensor.strategy import AdaptiveStrategy, GreedyStrategy, KnapsackStrategy, NthLayerStrategy
 from flextensor.utils import config_field_was_set
+
+
+def test_transfer_mode_sets_define_complete_and_block_contracts() -> None:
+    assert (
+        frozenset({
+            "allocation_block_transfer",
+            "raw_block_transfer",
+        })
+        == BLOCK_TRANSFER_MODES
+    )
+    assert (
+        frozenset({
+            "strategy",
+            "allocation_block_transfer",
+            "raw_block_transfer",
+        })
+        == OFFLOAD_TRANSFER_MODES
+    )
+    assert BLOCK_TRANSFER_MODES < OFFLOAD_TRANSFER_MODES
+
+
+def test_resolve_load_strategy_returns_explicit_strategy_by_identity() -> None:
+    strategy = NthLayerStrategy(nth_layer=2)
+
+    assert config_module.resolve_load_strategy(OffloadConfig(load_strategy=strategy)) is strategy
+
+
+def test_resolve_load_strategy_builds_fresh_configured_defaults() -> None:
+    config = OffloadConfig(
+        transfer_budget_scale=0.75,
+        transfer_mode="raw_block_transfer",
+        num_blocks=7,
+        min_blocks=3,
+    )
+
+    first = config_module.resolve_load_strategy(config)
+    second = config_module.resolve_load_strategy(config)
+
+    assert isinstance(first, AdaptiveStrategy)
+    assert first is not second
+    assert first.scale == 0.75
+    assert first.loader_type == "raw_block_transfer"
+    assert first.n_blocks == 7
+    assert first.min_blocks == 3
 
 
 @pytest.fixture(autouse=True)

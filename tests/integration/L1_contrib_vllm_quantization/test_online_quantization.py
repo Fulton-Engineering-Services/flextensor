@@ -24,7 +24,6 @@ from tests.integration._vllm_utils import (
 )
 
 BASE_CLI_ARGS = (
-    "--enforce-eager",
     "--tensor-parallel-size",
     "1",
     "--gpu-memory-utilization",
@@ -35,10 +34,7 @@ BASE_CLI_ARGS = (
     "1",
 )
 
-ONLINE_QUANTIZATION_ENV_VARS = (
-    ("FT_ENABLE_DIAGNOSTICS", "1"),
-    ("FT_MAX_GPU_MEM_FRACTION", "0.90"),
-)
+ONLINE_QUANTIZATION_ENV_VARS = (("FT_ENABLE_DIAGNOSTICS", "1"),)
 
 
 @dataclass(frozen=True)
@@ -49,13 +45,14 @@ class OnlineQuantizationSmokeCase:
     output_dir_name: str
     quantization: str
     residency_note: str
+    max_gpu_mem_fraction: str = "0.90"
 
     def to_vllm_case(self) -> VllmOffloadSmokeCase:
         return VllmOffloadSmokeCase(
             model_name=self.model_name,
             output_dir_name=self.output_dir_name,
             cli_args=(*BASE_CLI_ARGS, "--quantization", self.quantization),
-            extra_env_vars=ONLINE_QUANTIZATION_ENV_VARS,
+            extra_env_vars=(*ONLINE_QUANTIZATION_ENV_VARS, ("FT_MAX_GPU_MEM_FRACTION", self.max_gpu_mem_fraction)),
         ).with_flextensor_offload()
 
 
@@ -76,6 +73,7 @@ ONLINE_QUANTIZATION_CASES = (
             output_dir_name="qwen3_32b_fp8_per_tensor",
             quantization="fp8_per_tensor",
             residency_note="BF16 checkpoint is larger than the 24GB L4 CI target",
+            max_gpu_mem_fraction="0.80",
         ),
         marks=(pytest.mark.gpu_vram_24g, pytest.mark.gpu_sm_89),
         id="qwen3-32b-fp8-per-tensor-sm89-24g",
@@ -86,6 +84,7 @@ ONLINE_QUANTIZATION_CASES = (
             output_dir_name="qwen3_32b_fp8_per_block",
             quantization="fp8_per_block",
             residency_note="BF16 checkpoint is larger than the 24GB L4 CI target",
+            max_gpu_mem_fraction="0.80",
         ),
         marks=(pytest.mark.gpu_vram_24g, pytest.mark.gpu_sm_89),
         id="qwen3-32b-fp8-per-block-sm89-24g",
@@ -128,8 +127,15 @@ def run_online_quantization_smoke(case: OnlineQuantizationSmokeCase, test_output
     )
 
     assert offload_metrics["usage"].get("completion_tokens", 0) > 0, f"{case.model_name} returned no generated tokens"
-    assert any("FlexTensorModelLoader: Processed" in line for line in log_lines), (
-        "FlexTensor loader did not report layer-by-layer GPU processing"
+    assert any("FlexTensor vLLM integration v2 state takeover complete" in line for line in log_lines), (
+        "v2 worker did not complete online-quantized state takeover"
+    )
+    if case.quantization == "fp8_per_tensor":
+        assert any("online quantization placement complete" in line for line in log_lines), (
+            "v2 worker served without evidence that deferred online-FP8 placement completed"
+        )
+    assert not any("FlexTensorModelLoader: Processed" in line for line in log_lines), (
+        "v2 worker unexpectedly used the legacy CPU-first custom loader"
     )
     assert offload_memory.available_kv_cache_memory_gib is not None, (
         "KV cache memory metric unavailable after online quantization offload processing"

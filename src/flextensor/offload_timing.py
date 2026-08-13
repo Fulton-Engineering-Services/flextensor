@@ -405,6 +405,7 @@ class OffloadTimingCollector:
         # Durable measure accumulation lives on TensorManager via ``on_pass``.
         self._snapshots: list[OffloadTimingSnapshot] = []
         self._on_pass = on_pass
+        self._measure_window_enabled = True
         self._log_every = 0
         self._last_finalized_replay_generation: int = -1
         self._external_events = False
@@ -440,6 +441,12 @@ class OffloadTimingCollector:
     def set_pass_sink(self, on_pass: Callable[[OffloadTimingSnapshot], None] | None) -> None:
         """Wire/replace the durable measure sink (TensorManager)."""
         self._on_pass = on_pass
+
+    def set_measure_window(self, enabled: bool) -> None:
+        """Gate durable samples without changing periodic diagnostics."""
+        if enabled and not self._measure_window_enabled and self._pass_active and not self._pass_was_captured:
+            self._reset_pass_state()
+        self._measure_window_enabled = enabled
 
     # ------------------------------------------------------------------
     # Recording helpers (called from loader hot path — very cheap)
@@ -564,7 +571,7 @@ class OffloadTimingCollector:
     # Internal finalization
     # ------------------------------------------------------------------
 
-    def flush_pending_eager_pass(self) -> bool:
+    def flush_pending_eager_pass(self, *, preserve_replay_state: bool = False) -> bool:
         """Publish a pending **non-captured** pass into the log + durable sink.
 
         :meth:`on_pass_start` only finalizes the *previous* pass, so after the
@@ -584,9 +591,16 @@ class OffloadTimingCollector:
             return False
         if torch.cuda.is_current_stream_capturing():
             return False
-        if self._pass_was_captured:
+        if self._pass_was_captured and not preserve_replay_state:
             return False
+        replay_maps = None
+        if self._pass_was_captured:
+            replay_maps = (self._has_wait.copy(), self._has_transfer.copy(), self._has_compute.copy())
+            self._pass_was_captured = False
         self._finalize_pass(periodic_log=True)
+        if replay_maps is not None:
+            self._has_wait, self._has_transfer, self._has_compute = replay_maps
+            self._pass_was_captured = True
         return True
 
     def _finalize_pass(self, *, periodic_log: bool = True) -> None:
@@ -635,8 +649,6 @@ class OffloadTimingCollector:
             return False
         if not self._pass_active:
             return False
-        if torch.cuda.is_current_stream_capturing():
-            return False
         if replay_generation >= 0 and replay_generation == self._last_finalized_replay_generation:
             return True  # same-gen dedup: already published this replay
         if replay_generation < 0 and self._last_finalized_replay_generation >= 0:
@@ -649,6 +661,8 @@ class OffloadTimingCollector:
                 "timing events are unavailable; internal captured events are not "
                 "replay-safe. Upgrade PyTorch or use offload_timing='eager'."
             )
+            return False
+        if torch.cuda.is_current_stream_capturing():
             return False
         if not (self._has_transfer or self._has_wait or self._has_compute):
             # Arm without capture/record left no trap events — refuse zeros.
@@ -669,7 +683,7 @@ class OffloadTimingCollector:
     def _publish_pass(self, snapshot: OffloadTimingSnapshot, *, periodic_log: bool) -> None:
         """Append to the log window, sink to durable measure, optionally log."""
         self._snapshots.append(snapshot)
-        if self._on_pass is not None:
+        if self._measure_window_enabled and self._on_pass is not None:
             self._on_pass(snapshot)
         if periodic_log:
             self._maybe_log_periodic()

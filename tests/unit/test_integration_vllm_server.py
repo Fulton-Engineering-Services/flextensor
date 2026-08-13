@@ -11,6 +11,7 @@ import pytest
 from tests.integration import _vllm_server
 from tests.integration._vllm_server import (
     FLEXTENSOR_OFFLOAD_WORKER_CLS,
+    FLEXTENSOR_SNAPSHOT_WORKER_CLS,
     MemoryProfilingMetrics,
     VllmBenchmarkConfig,
     VllmCorrectnessCheck,
@@ -101,6 +102,24 @@ def test_case_port_reads_cli_args() -> None:
     assert _vllm_server.case_port(case) == 8123
 
 
+def test_empty_chat_content_error_includes_full_response() -> None:
+    response = {
+        "choices": [
+            {
+                "finish_reason": "length",
+                "message": {"content": None, "reasoning_content": "Paris"},
+                "token_ids": [1, 2, 3],
+            }
+        ],
+        "usage": {"completion_tokens": 3},
+    }
+
+    with pytest.raises(AssertionError) as error:
+        _vllm_server._validated_chat_response_content(response)
+
+    assert str(error.value) == f"No text content in chat response: {response!r}"
+
+
 def test_run_vllm_server_test_uses_case_cli_args_without_injecting_enforce_eager(monkeypatch, tmp_path) -> None:
     case = VllmOffloadSmokeCase(
         model_name="Qwen/Qwen2.5-7B-Instruct",
@@ -120,30 +139,59 @@ def test_run_vllm_server_test_uses_case_cli_args_without_injecting_enforce_eager
     assert metrics["offload_enabled"] is False
 
 
-def test_run_vllm_server_test_adds_output_env_for_offload_case(monkeypatch, tmp_path) -> None:
-    case = _smoke_case(cli_args=("--port", "8123")).with_flextensor_offload()
+@pytest.mark.parametrize(
+    ("worker_cls", "worker_env", "worker_logs"),
+    [
+        (
+            FLEXTENSOR_OFFLOAD_WORKER_CLS,
+            (("FT_VLLM_USE_V2_WORKER", "1"),),
+            ["FlexTensor vLLM integration v2 state takeover complete"],
+        ),
+        (
+            FLEXTENSOR_OFFLOAD_WORKER_CLS,
+            (("FT_VLLM_USE_V2_WORKER", "0"),),
+            ["FlexTensor offloading enabled with config", "FlexTensor offloading applied"],
+        ),
+        (
+            FLEXTENSOR_SNAPSHOT_WORKER_CLS,
+            (),
+            ["FlexTensor offloading enabled with config", "FlexTensor offloading applied"],
+        ),
+    ],
+)
+def test_run_vllm_server_test_accepts_worker_specific_offload_logs(
+    monkeypatch,
+    tmp_path,
+    worker_cls,
+    worker_env,
+    worker_logs,
+) -> None:
+    case = _smoke_case(cli_args=("--port", "8123")).with_flextensor_offload(worker_cls).with_env_vars(*worker_env)
+    validated_instrumentation_dirs = []
+    transfer_validation = {
+        "pcie_link_gen": 4,
+        "pcie_link_width": 16,
+        "pci_bus_id": "00000000:01:00.0",
+        "cpu_affinity": "0-31",
+        "numa_affinity": "0",
+        "observed_bandwidth_gbps": 20.0,
+        "min_expected_bandwidth_gbps": 4.0,
+        "max_expected_bandwidth_gbps": 40.0,
+    }
     started_cases = _patch_successful_vllm_server(
         monkeypatch,
         case,
-        log_lines=[
-            "Automatically detected platform cuda.",
-            "FlexTensor offloading enabled with config",
-            "FlexTensor offloading applied",
-        ],
+        log_lines=["Automatically detected platform cuda.", *worker_logs],
     )
+
+    def validate_transfer(instrumentation_dir):
+        validated_instrumentation_dirs.append(instrumentation_dir)
+        return transfer_validation
+
     monkeypatch.setattr(
         _vllm_server,
         "validate_latest_memory_transfer_stats_for_current_bus",
-        lambda _instrumentation_dir: {
-            "pcie_link_gen": 4,
-            "pcie_link_width": 16,
-            "pci_bus_id": "00000000:01:00.0",
-            "cpu_affinity": "0-31",
-            "numa_affinity": "0",
-            "observed_bandwidth_gbps": 20.0,
-            "min_expected_bandwidth_gbps": 4.0,
-            "max_expected_bandwidth_gbps": 40.0,
-        },
+        validate_transfer,
     )
 
     _memory, metrics, _logs = run_vllm_server_test(case, output_dir=tmp_path)
@@ -154,6 +202,35 @@ def test_run_vllm_server_test_adds_output_env_for_offload_case(monkeypatch, tmp_
     assert env_vars["FT_ENABLE_DIAGNOSTICS"] == "1"
     assert env_vars["FT_ENABLE_INSTRUMENTATION"] == "1"
     assert metrics["offload_enabled"] is True
+    if worker_cls == FLEXTENSOR_SNAPSHOT_WORKER_CLS:
+        assert validated_instrumentation_dirs == [tmp_path / "instrumentation"]
+        assert metrics["memory_transfer_validation"] == transfer_validation
+    else:
+        assert validated_instrumentation_dirs == []
+        assert "memory_transfer_validation" not in metrics
+
+
+def test_run_vllm_server_test_rejects_zero_completion_tokens(monkeypatch, tmp_path) -> None:
+    case = _smoke_case(cli_args=("--port", "8123"))
+    _patch_successful_vllm_server(monkeypatch, case, usage={"completion_tokens": 0})
+
+    with pytest.raises(AssertionError, match="completion_tokens"):
+        run_vllm_server_test(case, output_dir=tmp_path)
+
+
+def test_run_vllm_server_test_rejects_v2_takeover_log_for_baseline(monkeypatch, tmp_path) -> None:
+    case = _smoke_case(cli_args=("--port", "8123"))
+    _patch_successful_vllm_server(
+        monkeypatch,
+        case,
+        log_lines=[
+            "Automatically detected platform cuda.",
+            "FlexTensor vLLM integration v2 state takeover complete",
+        ],
+    )
+
+    with pytest.raises(AssertionError, match="Unexpected v2 state takeover in baseline"):
+        run_vllm_server_test(case, output_dir=tmp_path)
 
 
 def test_run_vllm_server_test_records_backend_evidence_env_vars(monkeypatch, tmp_path) -> None:
@@ -417,6 +494,8 @@ def test_memory_profiling_metrics_to_dict_includes_all_fields() -> None:
         non_torch_forward_increase_memory_gib=4.0,
         weights_memory_gib=3.0,
         available_kv_cache_memory_gib=2.0,
+        whole_model_budget_bytes=123456,
+        managed_gpu_resident_bytes=120000,
     )
 
     assert metrics.to_dict() == {
@@ -430,6 +509,8 @@ def test_memory_profiling_metrics_to_dict_includes_all_fields() -> None:
         "non_torch_forward_increase_memory_gib": 4.0,
         "weights_memory_gib": 3.0,
         "available_kv_cache_memory_gib": 2.0,
+        "whole_model_budget_bytes": 123456,
+        "managed_gpu_resident_bytes": 120000,
     }
 
 
@@ -442,6 +523,7 @@ def test_parse_memory_profiling_logs_extracts_all_known_metrics() -> None:
             "non-torch forward increase memory: 0.75 GiB; weights memory: 9.00 GiB"
         ),
         "Available KV cache memory: 42.75 GiB",
+        "FlexTensor v2 GPU budget resolved: whole_model_budget_bytes=123456 managed_gpu_resident_bytes=120000",
     ])
 
     assert metrics == MemoryProfilingMetrics(
@@ -455,6 +537,8 @@ def test_parse_memory_profiling_logs_extracts_all_known_metrics() -> None:
         non_torch_forward_increase_memory_gib=0.75,
         weights_memory_gib=9.00,
         available_kv_cache_memory_gib=42.75,
+        whole_model_budget_bytes=123456,
+        managed_gpu_resident_bytes=120000,
     )
 
 
@@ -637,6 +721,7 @@ def test_make_chat_request_posts_openai_payload(monkeypatch) -> None:
             "messages": [{"role": "user", "content": "Say OK"}],
             "max_tokens": 3,
             "temperature": 0.2,
+            "return_token_ids": True,
             "seed": 123,
         },
         "timeout": 9,

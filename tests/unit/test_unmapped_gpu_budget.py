@@ -82,7 +82,7 @@ def test_block_loader_reserves_reachable_tensors_missing_from_layer_stats() -> N
     invisible_bytes = _tensor_bytes(model.invisible)
 
     with (
-        patch("flextensor.tensor_manager.report_profiling_quality"),
+        patch("flextensor.tensor_manager.report_profiling_quality", return_value=None),
         patch.object(TensorManager, "_benchmark_tensor_statistics") as mock_benchmark,
         patch.object(TensorManager, "_get_memory_transfer_stats", return_value={}),
         patch("flextensor.tensor_manager.resolve_gpu_budget", return_value=original_budget),
@@ -109,7 +109,7 @@ def test_strategy_loader_reserves_reachable_traced_tensors_missing_from_layer_st
     invisible_bytes = _tensor_bytes(model.invisible)
 
     with (
-        patch("flextensor.tensor_manager.report_profiling_quality"),
+        patch("flextensor.tensor_manager.report_profiling_quality", return_value=None),
         patch.object(TensorManager, "_benchmark_tensor_statistics") as mock_benchmark,
         patch.object(TensorManager, "_get_memory_transfer_stats", return_value={}),
         patch("flextensor.tensor_manager.resolve_gpu_budget", return_value=original_budget),
@@ -135,7 +135,7 @@ def test_strategy_loader_does_not_reserve_reachable_tensors_outside_rescue_set()
     original_budget = MIN_GPU_BUDGET_BYTES + 4096
 
     with (
-        patch("flextensor.tensor_manager.report_profiling_quality"),
+        patch("flextensor.tensor_manager.report_profiling_quality", return_value=None),
         patch.object(TensorManager, "_benchmark_tensor_statistics") as mock_benchmark,
         patch.object(TensorManager, "_get_memory_transfer_stats", return_value={}),
         patch("flextensor.tensor_manager.resolve_gpu_budget", return_value=original_budget),
@@ -207,7 +207,7 @@ def test_prepare_infer_mode_raises_when_invisible_tensors_exhaust_budget() -> No
     original_budget = MIN_GPU_BUDGET_BYTES + _tensor_bytes(model.invisible) - 1
 
     with (
-        patch("flextensor.tensor_manager.report_profiling_quality"),
+        patch("flextensor.tensor_manager.report_profiling_quality", return_value=None),
         patch.object(TensorManager, "_benchmark_tensor_statistics") as mock_benchmark,
         patch.object(TensorManager, "_get_memory_transfer_stats", return_value={}),
         patch("flextensor.tensor_manager.resolve_gpu_budget", return_value=original_budget),
@@ -237,7 +237,7 @@ def test_cuda_tiny_fraction_reproduction_fails_before_strategy_compute() -> None
     tm._max_gpu_mem_fraction = (MIN_GPU_BUDGET_BYTES + _tensor_bytes(model.invisible) - 1) / total_bytes
 
     with (
-        patch("flextensor.tensor_manager.report_profiling_quality"),
+        patch("flextensor.tensor_manager.report_profiling_quality", return_value=None),
         patch.object(TensorManager, "_benchmark_tensor_statistics") as mock_benchmark,
         patch.object(TensorManager, "_get_memory_transfer_stats", return_value={}),
         patch.object(TensorManager, "_create_loader"),

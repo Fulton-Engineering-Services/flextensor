@@ -468,7 +468,7 @@ class TestSetSkipDiscoveryPropagation:
     """``OffloadManager`` must forward ``config.skip_discovery`` to the
     ``TensorManager`` after constructing it."""
 
-    @patch("flextensor.offload_manager.AdaptiveStrategy")
+    @patch("flextensor.offload_manager.resolve_load_strategy")
     @patch("flextensor.tensor_manager.TensorManager")
     def test_set_skip_discovery_called_with_config_value(
         self,
@@ -484,7 +484,7 @@ class TestSetSkipDiscoveryPropagation:
 
         mock_tm.set_skip_discovery.assert_called_once_with(True)
 
-    @patch("flextensor.offload_manager.AdaptiveStrategy")
+    @patch("flextensor.offload_manager.resolve_load_strategy")
     @patch("flextensor.tensor_manager.TensorManager")
     def test_set_skip_discovery_called_with_explicit_false(
         self,
@@ -500,7 +500,7 @@ class TestSetSkipDiscoveryPropagation:
 
         mock_tm.set_skip_discovery.assert_called_once_with(False)
 
-    @patch("flextensor.offload_manager.AdaptiveStrategy")
+    @patch("flextensor.offload_manager.resolve_load_strategy")
     @patch("flextensor.tensor_manager.TensorManager")
     def test_set_skip_discovery_called_before_initialize_warmup(
         self,
@@ -595,7 +595,7 @@ class TestEndToEndNoWarmupTrapFires:
     """
 
     @patch("flextensor.trap_tensor_mode.WarmupTrap.__enter__")
-    @patch("flextensor.offload_manager.AdaptiveStrategy")
+    @patch("flextensor.offload_manager.resolve_load_strategy")
     @patch("flextensor.tensor_manager.TensorManager")
     def test_warmup_trap_not_entered_when_skip_discovery_honored(
         self,

@@ -237,6 +237,12 @@ class NoOpTensorManager:
     def prepare_infer_load_mode(self) -> None:
         pass
 
+    def sync_prev_onload(self) -> None:
+        pass
+
+    def join_after_forward(self) -> None:
+        pass
+
     def is_profiling_suspended(self) -> bool:
         return False
 

@@ -13,6 +13,7 @@ automatically cleaned up after each test.
 """
 
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -39,6 +40,29 @@ class SimpleModel(torch.nn.Module):
     def forward(self, x):
         x = self.linear1(x)
         return self.linear2(x)
+
+
+class _RecordingPreallocatedLoader(PreallocatedLoader):
+    def __init__(self) -> None:
+        self.boundary_calls: list[str] = []
+
+    def enter(self, label: str) -> None:
+        pass
+
+    def exit(self, label: str) -> None:
+        pass
+
+    def preload(self) -> None:
+        pass
+
+    def prepare(self) -> None:
+        pass
+
+    def sync_prev_onload(self) -> None:
+        self.boundary_calls.append("sync_prev_onload")
+
+    def join_after_forward(self) -> None:
+        self.boundary_calls.append("join_after_forward")
 
 
 class _RejectDataAssignmentParameter(torch.nn.Parameter):
@@ -135,6 +159,47 @@ def _takeover_tensor_manager(loader_type: str) -> TensorManager:
             loader_type=loader_type,
             include_patterns=["linear1"],
         )
+
+
+def test_runtime_boundary_hooks_delegate_to_preallocated_loader():
+    loader = _RecordingPreallocatedLoader()
+    manager = OffloadManager("runtime-boundaries")
+    manager._compiled = SimpleNamespace(active=True)
+    manager._tensor_manager = _takeover_tensor_manager("strategy")
+    manager._tensor_manager.tensor_layer_loader = loader
+
+    assert manager._tensor_manager.sync_prev_onload() is None
+    assert manager._tensor_manager.join_after_forward() is None
+    assert manager.sync_prev_onload() is None
+    assert manager.join_after_forward() is None
+
+    assert loader.boundary_calls == [
+        "sync_prev_onload",
+        "join_after_forward",
+        "sync_prev_onload",
+        "join_after_forward",
+    ]
+
+
+@pytest.mark.parametrize("compiled_active", [False, True], ids=["eager", "compiled"])
+@pytest.mark.parametrize("loader", [None, object()], ids=["missing", "wrong-type"])
+def test_runtime_boundary_hooks_are_noops_without_preallocated_loader(compiled_active, loader):
+    manager = OffloadManager("runtime-boundary-noop")
+    manager._compiled = SimpleNamespace(active=compiled_active)
+    manager._tensor_manager = _takeover_tensor_manager("strategy")
+    manager._tensor_manager.tensor_layer_loader = loader
+
+    assert manager._tensor_manager.sync_prev_onload() is None
+    assert manager._tensor_manager.join_after_forward() is None
+    assert manager.sync_prev_onload() is None
+    assert manager.join_after_forward() is None
+
+
+def test_runtime_boundary_hooks_are_noops_without_tensor_manager():
+    manager = OffloadManager("runtime-boundaries-without-manager")
+
+    assert manager.sync_prev_onload() is None
+    assert manager.join_after_forward() is None
 
 
 class TestOffloadManagerSaveProfile:
@@ -731,7 +796,12 @@ class TestOffloadFromState:
         result = flextensor.offload_from_state(model, state, config=config, name="adopted")
 
         mock_get_om.assert_called_once_with("adopted")
-        manager.offload_from_state.assert_called_once_with(model, state, config=config)
+        manager.offload_from_state.assert_called_once_with(
+            model,
+            state,
+            config=config,
+            allow_strategy_replan=True,
+        )
         assert result is final_model
 
     def test_manager_runs_takeover_in_order_and_rejects_a_second_active_call(self):
@@ -763,6 +833,15 @@ class TestOffloadFromState:
         manager._offload_modules = MagicMock(side_effect=lambda *_: events.append("patch"))
         manager._exclude_modules = MagicMock(side_effect=lambda *_: events.append("exclude"))
         manager._check_no_modules_patched = MagicMock()
+        resolve_activation = manager._compiled.resolve_activation
+        manager._compiled.resolve_activation = MagicMock(
+            side_effect=lambda *args: (events.append("resolve"), resolve_activation(*args))[1]
+        )
+        manager._compiled.arm_non_destructive_first_loader = MagicMock(side_effect=lambda: events.append("arm"))
+        manager._install_compiled_forwards = MagicMock(side_effect=lambda: events.append("install-compiled"))
+        manager._compiled.on_enter_inference = MagicMock(side_effect=lambda: events.append("enter-compiled"))
+        init = manager.init
+        manager.init = MagicMock(side_effect=lambda *args, **kwargs: (events.append("init"), init(*args, **kwargs))[1])
 
         with patch(
             "flextensor.offload_manager.dump_to_directory",
@@ -774,6 +853,9 @@ class TestOffloadFromState:
         assert result.__subject__ is final_model
         assert result.offload_manager is manager
         assert events == [
+            "resolve",
+            "init",
+            "arm",
             "plan",
             "execute",
             "restore",
@@ -783,6 +865,8 @@ class TestOffloadFromState:
             "finalize",
             "set_model",
             "publish",
+            "install-compiled",
+            "enter-compiled",
             "dump",
         ]
         dump.assert_called_once_with("instrumentation", extra={"memory_transfer_stats": {1024: 0.5}})
@@ -795,7 +879,7 @@ class TestOffloadFromState:
             manager.offload_from_state(model, state, config=config)
         tensor_manager.plan_state_adoption.assert_called_once()
 
-    def test_external_compile_config_installs_the_adopted_loader(self):
+    def test_external_compile_without_strategy_replan_installs_the_adopted_loader(self):
         model = SimpleModel()
         state = _state_for_model(model)
         plan = StateTransitionPlan(migrations=(), pinning_groups=(), peak_host_bytes=0, peak_gpu_bytes=0)
@@ -816,9 +900,12 @@ class TestOffloadFromState:
                     external_compile=True,
                     transfer_mode="allocation_block_transfer",
                 ),
+                allow_strategy_replan=False,
             )
 
             assert manager._compiled.active
+            assert not manager.compiled_replan_active
+            tensor_manager.arm_non_destructive_first_loader.assert_not_called()
             assert custom_ops.get_active_loader(manager.compiled_offload_manager_id) is loader
         finally:
             manager.release()
@@ -861,6 +948,65 @@ class TestOffloadFromState:
             manager.offload_from_state(model, _state_for_model(model))
 
         tensor_manager.plan_state_adoption.assert_not_called()
+
+    def test_takeover_init_failure_tears_down_resolved_compiled_activation(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        manager = OffloadManager("compiled-init-failure")
+        manager._compiled.resolve_activation = MagicMock(return_value=True)
+        manager._compiled.teardown = MagicMock()
+        manager.init = MagicMock(side_effect=RuntimeError("init failed"))
+        config = OffloadConfig(
+            external_compile=True,
+            transfer_mode="allocation_block_transfer",
+            pinned_memory=False,
+        )
+
+        with pytest.raises(RuntimeError, match="init failed"):
+            manager.offload_from_state(model, state, config=config)
+
+        manager._compiled.resolve_activation.assert_called_once_with(config, None)
+        manager._compiled.teardown.assert_called_once_with()
+
+    def test_init_failure_cleans_partially_initialized_tensor_manager_before_retry(self):
+        tensor_manager = MagicMock()
+        tensor_manager.set_skip_discovery.side_effect = RuntimeError("skip-discovery failed")
+        manager = OffloadManager("partial-init-failure")
+        config = OffloadConfig(pinned_memory=False)
+
+        with patch("flextensor.tensor_manager.TensorManager", return_value=tensor_manager) as tensor_manager_cls:
+            with pytest.raises(RuntimeError, match="skip-discovery failed"):
+                manager.init(config)
+
+            tensor_manager.shutdown.assert_called_once_with()
+            assert manager._tensor_manager is None
+
+            tensor_manager.set_skip_discovery.side_effect = None
+            manager.init(config)
+
+        assert tensor_manager_cls.call_count == 2
+        assert manager._tensor_manager is tensor_manager
+
+    def test_takeover_failure_after_activation_tears_down_compiled_state(self):
+        model = SimpleModel()
+        state = _state_for_model(model)
+        tensor_manager = MagicMock()
+        tensor_manager.plan_state_adoption.side_effect = RuntimeError("plan failed")
+        manager = OffloadManager("compiled-plan-failure")
+        manager._tensor_manager = tensor_manager
+        manager._compiled.resolve_activation = MagicMock(return_value=True)
+        manager._compiled.teardown = MagicMock()
+        config = OffloadConfig(
+            external_compile=True,
+            transfer_mode="allocation_block_transfer",
+            pinned_memory=False,
+        )
+
+        with pytest.raises(RuntimeError, match="plan failed"):
+            manager.offload_from_state(model, state, config=config)
+
+        manager._compiled.resolve_activation.assert_called_once_with(config, None)
+        manager._compiled.teardown.assert_called_once_with()
 
     def test_postmigration_failure_restores_owned_parameter_data_and_closes_manager(self):
         model = SimpleModel()

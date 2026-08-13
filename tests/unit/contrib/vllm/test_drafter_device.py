@@ -147,19 +147,19 @@ class TestLoadModelOrdering:
 
     ``ensure_drafter_on_device`` must run before ``flextensor.offload()`` so
     that identity-shared drafter submodules are GPU-resident when FT
-    installs forward patches. This test reads ``worker.py`` via AST so it
+    installs forward patches. This test reads ``_legacy_worker.py`` via AST so it
     runs without vLLM or a GPU.
     """
 
     def _load_model_ast(self) -> ast.FunctionDef:
-        worker_path = Path(__file__).parents[4] / "src" / "flextensor" / "contrib" / "vllm" / "worker.py"
+        worker_path = Path(__file__).parents[4] / "src" / "flextensor" / "contrib" / "vllm" / "_legacy_worker.py"
         tree = ast.parse(worker_path.read_text())
         for node in ast.walk(tree):
             if isinstance(node, ast.ClassDef) and node.name == "FlexTensorOffloadWorker":
                 for item in node.body:
                     if isinstance(item, ast.FunctionDef) and item.name == "load_model":
                         return item
-        pytest.fail("FlexTensorOffloadWorker.load_model not found in worker.py")
+        pytest.fail("FlexTensorOffloadWorker.load_model not found in _legacy_worker.py")
 
     def test_ensure_drafter_on_device_called_before_flextensor_offload(self) -> None:
         load_model = self._load_model_ast()

@@ -178,6 +178,7 @@ def test_replan_raises_after_loader_release_when_build_fails() -> None:
 def _make_load_mode_manager(*, armed: bool) -> tuple[TensorManager, MagicMock]:
     """Minimal TM for ``prepare_infer_load_mode`` release/snapshot contracts."""
     tm = TensorManager.__new__(TensorManager)
+    tm.enable_diagnostics = False
     tm._first_loader_non_destructive = armed
     tm._replan_source_data = {}
     weight = torch.nn.Parameter(torch.full((2,), 1.5), requires_grad=False)

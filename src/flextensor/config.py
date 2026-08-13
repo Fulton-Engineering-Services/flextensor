@@ -24,7 +24,7 @@ from typing_extensions import Self
 from typing_extensions import deprecated as _deprecated
 
 from flextensor.host_pinning import PinnedMemoryMode
-from flextensor.strategy import Strategy
+from flextensor.strategy import AdaptiveStrategy, Strategy
 from flextensor.utils import CLASS_PATTERN_PREFIX, NAME_PATTERN_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,8 @@ _REGISTERED_ENV_VARS: set[str] = set()
 ProfileMode = Literal["torch_function", "getter", "view"]
 OffloadTimingMode = Literal["off", "eager", "cuda_graph"]
 PiecewisePrefetchMode = Literal["off", "warn", "error"]
+BLOCK_TRANSFER_MODES = frozenset({"allocation_block_transfer", "raw_block_transfer"})
+OFFLOAD_TRANSFER_MODES = frozenset({"strategy", *BLOCK_TRANSFER_MODES})
 
 # Bidirectional deprecated ↔ canonical field pairs. Used by model_copy()
 # to mirror updates so that Pydantic v2's validator-bypass doesn't desync
@@ -540,7 +542,7 @@ class OffloadConfig(BaseModel):
         manager is built. ``TensorManager`` performs additional checks for
         internal flags (e.g. ``_use_trace_tensor``) that aren't expressible on
         ``OffloadConfig``."""
-        block_loaders = ("allocation_block_transfer", "raw_block_transfer")
+        block_loaders = BLOCK_TRANSFER_MODES
         if self.profile_mode == "torch_function" and self.transfer_mode in block_loaders:
             raise ValueError(
                 f"profile_mode='torch_function' is incompatible with "
@@ -662,6 +664,18 @@ class OffloadConfig(BaseModel):
         """
         warnings.warn(_ALL_WARMUP_ITERS_MSG, DeprecationWarning, stacklevel=2)
         return self.pre_inference_iters
+
+
+def resolve_load_strategy(config: OffloadConfig) -> Strategy:
+    """Return the explicit strategy or a fresh adaptive default."""
+    if config.load_strategy is not None:
+        return config.load_strategy
+    return AdaptiveStrategy(
+        scale=config.transfer_budget_scale,
+        loader_type=config.transfer_mode,
+        n_blocks=config.num_blocks,
+        min_blocks=config.min_blocks,
+    )
 
 
 def _resolve_union_field_type(annotation: object) -> type:

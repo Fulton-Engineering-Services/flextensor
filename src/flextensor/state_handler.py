@@ -15,7 +15,13 @@ import torch
 
 from flextensor.collectors import LayerStatistics, TensorStatistics
 from flextensor.compiler_utils import find_torch_compile_wrapper, is_compiling, is_torch_compiled_module
-from flextensor.model_state_capture import _inspect_storage, _storage_id_from_key, capture_model_state
+from flextensor.config import OFFLOAD_TRANSFER_MODES
+from flextensor.model_state_capture import (
+    LiveStorageKey,
+    _storage_id_from_key,
+    capture_model_state,
+    inspect_tensor_storage,
+)
 from flextensor.state_transition import ModelPlacementState, StateTransitionPlan, StorageMigration
 from flextensor.tensor_processors import (
     DisableRequiresGradTensorProcessor,
@@ -27,9 +33,9 @@ from flextensor.utils import atomic_write_json, get_tensor_data, set_tensor_data
 logger = logging.getLogger(__name__)
 
 
-def _get_live_storage_key(name: str, tensor: torch.Tensor) -> tuple[str, int, int]:
-    storage_key, nbytes, _pinned = _inspect_storage(name, tensor)
-    return storage_key[0], storage_key[1], nbytes
+def _get_live_storage_key(name: str, tensor: torch.Tensor) -> tuple[LiveStorageKey, int]:
+    inspection = inspect_tensor_storage(name, tensor)
+    return inspection.key, inspection.nbytes
 
 
 def _copy_storage_to_device(source_bytes: torch.Tensor, destination_device: str) -> torch.Tensor:
@@ -156,7 +162,7 @@ class TensorManagerState:
         def mismatch(detail: str) -> ValueError:
             return ValueError(f"Saved state mismatch: {detail}. Re-profile the model.")
 
-        if self.loader_type not in {"strategy", "allocation_block_transfer", "raw_block_transfer"}:
+        if self.loader_type not in OFFLOAD_TRANSFER_MODES:
             raise ValueError(f"Unknown loader type: {self.loader_type}")
         inventory_names = list(self.tensor_id_to_name_map.values())
         duplicate_names = sorted(name for name, count in Counter(inventory_names).items() if count > 1)
@@ -666,15 +672,15 @@ class TensorManagerStateHandler:
         ]
         named_tensors = dict(named_items)
 
-        tensors_by_storage: dict[tuple[str, int, int], list[torch.Tensor]] = {}
-        storage_key_by_id: dict[str, tuple[str, int, int]] = {}
+        tensors_by_storage: dict[tuple[LiveStorageKey, int], list[torch.Tensor]] = {}
+        storage_key_by_id: dict[str, tuple[LiveStorageKey, int]] = {}
         for tensor in compute_reachable_tensor_map(model).values():
             key = _get_live_storage_key("<reachable tensor>", tensor)
             tensors_by_storage.setdefault(key, []).append(tensor)
-            storage_key_by_id.setdefault(_storage_id_from_key((key[0], key[1])), key)
+            storage_key_by_id.setdefault(_storage_id_from_key(key[0]), key)
 
-        storage_names: dict[tuple[str, int, int], tuple[str, ...]] = {}
-        storage_key_by_name: dict[str, tuple[str, int, int]] = {}
+        storage_names: dict[tuple[LiveStorageKey, int], tuple[str, ...]] = {}
+        storage_key_by_name: dict[str, tuple[LiveStorageKey, int]] = {}
         for name, tensor in named_items:
             key = _get_live_storage_key(name, tensor)
             storage_key_by_name[name] = key
@@ -682,7 +688,7 @@ class TensorManagerStateHandler:
 
         migrations_by_names: dict[frozenset[str], StorageMigration] = {}
         migration_name_owners: dict[str, tuple[str, ...]] = {}
-        migration_storage_owners: dict[tuple[str, int, int], tuple[str, ...]] = {}
+        migration_storage_owners: dict[tuple[LiveStorageKey, int], tuple[str, ...]] = {}
         resolved_migrations: list[tuple[StorageMigration, list[torch.Tensor]]] = []
         for migration in plan.migrations:
             if len(set(migration.names)) != len(migration.names):
@@ -724,17 +730,17 @@ class TensorManagerStateHandler:
                     f"{migration_storage_owners[key]} and {migration.names}"
                 )
             migration_storage_owners[key] = migration.names
-            if key[0] != migration.source_device:
+            if str(key[0].device) != migration.source_device:
                 raise ValueError(
                     f"State adoption execution plan source changed for {migration.names}: "
-                    f"expected={migration.source_device}, current={key[0]}"
+                    f"expected={migration.source_device}, current={key[0].device}"
                 )
-            if key[2] != migration.nbytes:
+            if key[1] != migration.nbytes:
                 raise ValueError(
                     f"State adoption execution plan nbytes changed for {migration.names}: "
-                    f"expected={migration.nbytes}, current={key[2]}"
+                    f"expected={migration.nbytes}, current={key[1]}"
                 )
-            live_storage_id = _storage_id_from_key((key[0], key[1]))
+            live_storage_id = _storage_id_from_key(key[0])
             if live_storage_id != migration.storage_id:
                 raise ValueError(
                     f"State adoption execution plan storage changed for {migration.names}: "
@@ -792,7 +798,7 @@ class TensorManagerStateHandler:
             if pinning_migration is not None:
                 if pinning_migration.destination_device != "cpu":
                     raise ValueError(f"State adoption execution plan pins final-GPU tensor group: {names}")
-            elif key[0] != "cpu":
+            elif key[0].device.type != "cpu":
                 raise ValueError(f"State adoption execution plan pins stationary non-CPU tensor group: {names}")
             tensors = tensors_by_storage.get(key)
             if not tensors:
@@ -817,10 +823,11 @@ class TensorManagerStateHandler:
             try:
                 display_name = migration.names[0] if migration.names else f"<storage:{migration.storage_id}>"
                 source_key = _get_live_storage_key(display_name, tensors[0])
-                if source_key[0] != migration.source_device or source_key[2] != migration.nbytes:
+                if str(source_key[0].device) != migration.source_device or source_key[1] != migration.nbytes:
                     raise ValueError(
                         f"Planned source changed for {migration.names}: expected="
-                        f"({migration.source_device}, {migration.nbytes}), current=({source_key[0]}, {source_key[2]})"
+                        f"({migration.source_device}, {migration.nbytes}), "
+                        f"current=({source_key[0].device}, {source_key[1]})"
                     )
                 source_bytes = torch.empty(0, dtype=torch.uint8, device=migration.source_device)
                 source_bytes.set_(tensors[0].untyped_storage(), 0, (migration.nbytes,), (1,))
@@ -870,10 +877,10 @@ class TensorManagerStateHandler:
         for names, tensors in resolved_pinning:
             try:
                 source_key = _get_live_storage_key(names[0], tensors[0])
-                if source_key[0] != "cpu":
+                if source_key[0].device.type != "cpu":
                     raise ValueError(f"Planned host-pinning group is no longer on CPU: {names}")
                 source_bytes = torch.empty(0, dtype=torch.uint8, device="cpu")
-                source_bytes.set_(tensors[0].untyped_storage(), 0, (source_key[2],), (1,))
+                source_bytes.set_(tensors[0].untyped_storage(), 0, (source_key[1],), (1,))
                 pinned_bytes = self.tensor_manager.host_pinner.pin(source_bytes)
                 pinned_key = _get_live_storage_key("<pinned storage>", pinned_bytes)
                 if pinned_key != source_key:
@@ -1237,8 +1244,13 @@ class TensorManagerStateHandler:
         """
         with pathlib.Path(file_path).open() as f:
             loaded_state = json.load(f)
+        if not isinstance(loaded_state, dict):
+            raise ValueError("Saved state must be a JSON object")
 
-        return TensorManagerState.from_dict(loaded_state)
+        try:
+            return TensorManagerState.from_dict(loaded_state)
+        except AttributeError as exc:
+            raise ValueError("Saved state contains malformed nested data") from exc
 
     @staticmethod
     def save_state_to_bytes(state: TensorManagerState) -> bytes:

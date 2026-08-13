@@ -31,7 +31,10 @@ if TYPE_CHECKING:
 DEFAULT_VLLM_PORT = 8000
 FLEXTENSOR_OFFLOAD_WORKER_CLS = "flextensor.contrib.vllm.worker.FlexTensorOffloadWorker"
 FLEXTENSOR_SNAPSHOT_WORKER_CLS = "flextensor.contrib.vllm.snapshot.FlexTensorSnapshotWorker"
-FLEXTENSOR_WORKER_CLASSES = {FLEXTENSOR_OFFLOAD_WORKER_CLS, FLEXTENSOR_SNAPSHOT_WORKER_CLS}
+FLEXTENSOR_WORKER_CLASSES = {
+    FLEXTENSOR_OFFLOAD_WORKER_CLS,
+    FLEXTENSOR_SNAPSHOT_WORKER_CLS,
+}
 
 
 @dataclass
@@ -48,8 +51,10 @@ class MemoryProfilingMetrics:
     non_torch_forward_increase_memory_gib: float | None = None
     weights_memory_gib: float | None = None
     available_kv_cache_memory_gib: float | None = None
+    whole_model_budget_bytes: int | None = None
+    managed_gpu_resident_bytes: int | None = None
 
-    def to_dict(self) -> dict[str, float | None]:
+    def to_dict(self) -> dict[str, float | int | None]:
         """Convert metrics to dictionary for JSON serialization."""
         return {
             "initial_free_memory_gib": self.initial_free_memory_gib,
@@ -62,6 +67,8 @@ class MemoryProfilingMetrics:
             "non_torch_forward_increase_memory_gib": self.non_torch_forward_increase_memory_gib,
             "weights_memory_gib": self.weights_memory_gib,
             "available_kv_cache_memory_gib": self.available_kv_cache_memory_gib,
+            "whole_model_budget_bytes": self.whole_model_budget_bytes,
+            "managed_gpu_resident_bytes": self.managed_gpu_resident_bytes,
         }
 
 
@@ -158,6 +165,32 @@ def _set_cli_arg(cli_args: tuple[str, ...], option: str, value: str) -> tuple[st
     return tuple(args)
 
 
+def resolve_hf_reasoning_parser(model_name: str, filename: str) -> str:
+    """Download a model-provided vLLM reasoning parser and return its local path."""
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo_id=model_name, filename=filename)
+
+
+def with_hf_reasoning_parser(
+    case: VllmOffloadSmokeCase,
+    *,
+    filename: str,
+    parser_name: str,
+) -> VllmOffloadSmokeCase:
+    parser_path = resolve_hf_reasoning_parser(case.model_name, filename)
+    return replace(
+        case,
+        cli_args=(
+            *case.cli_args,
+            "--reasoning-parser-plugin",
+            str(parser_path),
+            "--reasoning-parser",
+            parser_name,
+        ),
+    )
+
+
 def _cli_arg_value(cli_args: tuple[str, ...], option: str) -> str | None:
     for index, arg in enumerate(cli_args):
         if arg == option:
@@ -228,6 +261,15 @@ def parse_memory_profiling_logs(log_lines: list[str]) -> MemoryProfilingMetrics:
     if match:
         metrics.available_kv_cache_memory_gib = float(match.group(1))
 
+    budget_pattern = (
+        r"FlexTensor v2 GPU budget resolved: "
+        r"whole_model_budget_bytes=(\d+) managed_gpu_resident_bytes=(\d+)"
+    )
+    match = re.search(budget_pattern, log_text)
+    if match:
+        metrics.whole_model_budget_bytes = int(match.group(1))
+        metrics.managed_gpu_resident_bytes = int(match.group(2))
+
     return metrics
 
 
@@ -244,6 +286,7 @@ def run_vllm_server_test(
     process = None
     log_lines: list[str] = []
     offload_enabled = case_uses_flextensor_offload(case)
+    worker_cls = _cli_arg_value(case.cli_args, "--worker-cls")
     offload_status = "with offloading" if offload_enabled else "without offloading (baseline)"
     result_metrics: dict = {
         "model_name": case.model_name,
@@ -308,6 +351,10 @@ def run_vllm_server_test(
         assert case.model_name in model_ids, f"Model {case.model_name} not found in {model_ids}"
 
         usage = chat_response.get("usage", {})
+        completion_tokens = usage.get("completion_tokens")
+        assert isinstance(completion_tokens, int) and completion_tokens > 0, (
+            f"completion_tokens must be positive, got {completion_tokens!r}"
+        )
         correctness_metrics = {
             "expected_substrings": list(correctness.expected_substrings),
             "request_latency_seconds": request_latency,
@@ -344,13 +391,25 @@ def run_vllm_server_test(
                 log_text = "\n".join(log_lines)
                 offload_config_found = "FlexTensor offloading enabled with config" in log_text
                 offload_applied_found = "FlexTensor offloading applied" in log_text
+                v2_takeover_found = "FlexTensor vLLM integration v2 state takeover complete" in log_text
 
-                if offload_enabled:
+                worker_selection = dict(server_case.extra_env_vars).get("FT_VLLM_USE_V2_WORKER", "1")
+                if offload_enabled and worker_cls == FLEXTENSOR_OFFLOAD_WORKER_CLS:
+                    if worker_selection == "0":
+                        assert offload_config_found, "FlexTensor legacy offloading config not found"
+                        assert offload_applied_found, "FlexTensor legacy offloading applied message not found"
+                        assert not v2_takeover_found, "Unexpected v2 state takeover for legacy worker"
+                    else:
+                        assert v2_takeover_found, "FlexTensor v2 state takeover message not found"
+                        assert not offload_config_found, "Unexpected legacy config marker for v2 worker"
+                        assert not offload_applied_found, "Unexpected legacy applied marker for v2 worker"
+                elif offload_enabled and worker_cls == FLEXTENSOR_SNAPSHOT_WORKER_CLS:
                     assert offload_config_found, "FlexTensor offloading config not found in logs"
                     assert offload_applied_found, "FlexTensor offloading applied message not found"
                 else:
                     assert not offload_config_found, "Unexpected offloading config in baseline"
                     assert not offload_applied_found, "Unexpected offloading applied in baseline"
+                    assert not v2_takeover_found, "Unexpected v2 state takeover in baseline"
 
     memory_metrics = parse_memory_profiling_logs(log_lines)
 
@@ -369,7 +428,7 @@ def run_vllm_server_test(
         runtime_gpu=query_runtime_gpu_backend_metadata(),
     )
 
-    if offload_enabled and success:
+    if offload_enabled and success and worker_cls == FLEXTENSOR_SNAPSHOT_WORKER_CLS:
         transfer_validation = validate_latest_memory_transfer_stats_for_current_bus(instrumentation_dir)
         print(f"\n{offload_status} - Memory transfer validation:")
         print(
@@ -393,8 +452,9 @@ def _validated_chat_response_content(chat_response: dict[str, Any]) -> str:
     assert "choices" in chat_response, "No choices in chat response"
     assert len(chat_response["choices"]) > 0, "Empty choices in chat response"
     assert "message" in chat_response["choices"][0], "No message in chat choice"
-    content = chat_response["choices"][0]["message"].get("content")
-    assert isinstance(content, str) and content, "No text content in chat choice"
+    message = chat_response["choices"][0]["message"]
+    content = message.get("content")
+    assert isinstance(content, str) and content, f"No text content in chat response: {chat_response!r}"
     return content
 
 
@@ -628,6 +688,7 @@ def make_chat_request(
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
+        "return_token_ids": True,
     }
     if seed is not None:
         payload["seed"] = seed

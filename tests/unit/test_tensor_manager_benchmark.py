@@ -757,7 +757,7 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_auto_enables_on_gap_layers(
         self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
@@ -784,7 +784,7 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_no_auto_enable_without_transfer_gaps(
         self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
@@ -810,7 +810,7 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_no_auto_enable_without_gap_layers(
         self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:
@@ -837,7 +837,7 @@ class TestAutoEnableRearrangeTransfers:
     @patch.object(TensorManager, "_benchmark_tensor_statistics", return_value={})
     @patch("flextensor.tensor_manager.compute_layer_statistics")
     @patch("flextensor.tensor_manager.IterativeLayerStatisticsFilter")
-    @patch("flextensor.tensor_manager.report_profiling_quality")
+    @patch("flextensor.tensor_manager.report_profiling_quality", return_value=None)
     def test_already_enabled_skips_auto_detection(
         self, _report_quality, _filter, mock_compute_stats, _bench, _mem, _budget, _remove, mock_has_gaps, _loader
     ) -> None:

@@ -45,7 +45,7 @@ else:
 logger = logging.getLogger(__name__)
 
 try:
-    from flextensor.contrib.vllm.worker import FlexTensorOffloadWorker
+    from flextensor.contrib.vllm._legacy_worker import FlexTensorOffloadWorker
 except (ModuleNotFoundError, ImportError):
     FlexTensorOffloadWorker = None  # type: ignore[assignment,misc]
 

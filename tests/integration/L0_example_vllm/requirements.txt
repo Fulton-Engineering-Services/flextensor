@@ -3,5 +3,5 @@
 # Integration test requirements for L0_example_vllm
 # These are in addition to the example's own requirements (installed via install.sh)
 # Keep this vLLM floor in sync with examples/vllm/requirements.txt.
-vllm>=0.19.0
+vllm>=0.25.1
 requests~=2.32

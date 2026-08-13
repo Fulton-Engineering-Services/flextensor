@@ -2,11 +2,40 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import json
+from dataclasses import FrozenInstanceError
 
 import pytest
 import torch
 
-from flextensor.model_state_capture import capture_model_state
+from flextensor import model_state_capture
+from flextensor.model_state_capture import LiveStorageKey, capture_model_state
+
+
+def test_live_storage_key_is_nominal_frozen_and_hashable() -> None:
+    key = LiveStorageKey(device=torch.device("cpu"), storage_impl_id=17)
+
+    assert key == LiveStorageKey(device=torch.device("cpu"), storage_impl_id=17)
+    assert key != (torch.device("cpu"), 17)
+    assert {key: "storage"}[LiveStorageKey(device=torch.device("cpu"), storage_impl_id=17)] == "storage"
+    with pytest.raises(FrozenInstanceError):
+        key.device = torch.device("cuda:0")  # type: ignore[misc]
+    assert not hasattr(key, "__dict__")
+
+
+def test_inspect_tensor_storage_returns_named_storage_details() -> None:
+    tensor = torch.ones(3)
+
+    inspection = model_state_capture.inspect_tensor_storage("tensor", tensor)
+
+    assert inspection.key == LiveStorageKey(
+        device=torch.device("cpu"),
+        storage_impl_id=tensor.untyped_storage()._cdata,
+    )
+    assert not hasattr(inspection, "__dict__")
+    assert inspection.key.device == tensor.device
+    assert inspection.key.storage_impl_id == tensor.untyped_storage()._cdata
+    assert inspection.nbytes == tensor.untyped_storage().nbytes()
+    assert not inspection.pinned
 
 
 def test_capture_preserves_names_views_buffers_and_reachable_tensors() -> None:

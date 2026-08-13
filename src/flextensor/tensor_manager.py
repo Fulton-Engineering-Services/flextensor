@@ -22,7 +22,7 @@ from flextensor.collectors import (
     LayerStatistics,
     TensorStatistics,
 )
-from flextensor.config import OffloadTimingMode, PiecewisePrefetchMode, ProfileMode
+from flextensor.config import BLOCK_TRANSFER_MODES, OffloadTimingMode, PiecewisePrefetchMode, ProfileMode
 from flextensor.gpu_budget import (
     CUDAMemorySnapshot,
     reserve_strategy_invisible_gpu_budget,
@@ -31,11 +31,16 @@ from flextensor.gpu_budget import (
 from flextensor.helpers import ProfilingSuspender, TrapNestingGuard, format_tensor_id_hint
 from flextensor.host_pinning import HostPinner, HostPinRegistry, PinnedMemoryMode, make_host_pinner
 from flextensor.instrumentation import instrumentable
-from flextensor.layer_statistics_analyzer import report_profiling_quality
+from flextensor.layer_statistics_analyzer import (
+    LayerStatisticsAnalyzer,
+    format_effective_layer_duration_table,
+    report_profiling_quality,
+)
 from flextensor.loaders import (
     AllocationBlockController,
     PreallocatedBatchTransferTensorLoader,
     PreallocatedBatchTransferTensorLoaderReordered,
+    PreallocatedLoader,
     RawBlockController,
     TensorLayerLoader,
     TensorStrategyLoader,
@@ -1213,6 +1218,48 @@ class TensorManager:
             msg = f"Unknown loader type: {self.loader_type}"
             raise ValueError(msg)
 
+    def _runtime_preallocated_loader(self) -> PreallocatedLoader | None:
+        loader = self.tensor_layer_loader
+        return loader if isinstance(loader, PreallocatedLoader) else None
+
+    def sync_prev_onload(self) -> None:
+        loader = self._runtime_preallocated_loader()
+        if loader is not None:
+            loader.sync_prev_onload()
+
+    def join_after_forward(self) -> None:
+        loader = self._runtime_preallocated_loader()
+        if loader is not None:
+            loader.join_after_forward()
+
+    def _log_inference_diagnostics(
+        self,
+        block_data: BlockStrategyData | None,
+        *,
+        duration_analyzer: LayerStatisticsAnalyzer | None = None,
+    ) -> None:
+        """Emit the inference duration, transfer, and block tables together."""
+        if not self.enable_diagnostics:
+            return
+
+        duration_table = (
+            duration_analyzer.format_statistics_table()
+            if duration_analyzer is not None
+            else format_effective_layer_duration_table(self.stats)
+        )
+        get_diagnostics_logger().info("Layer duration statistics:\n%s", duration_table)
+        if self.memory_transfer_stats:
+            get_diagnostics_logger().info(
+                "Memory transfer statistics:\n%s",
+                format_memory_transfer_table(self.memory_transfer_stats),
+            )
+        log_block_table(
+            self.stats,
+            self.load_strategy,
+            block_data,
+            type(self.tensor_manager_load_strategy).__name__,
+        )
+
     def prepare_infer_load_mode(self):
         """Prepare inference mode from saved state.
 
@@ -1233,8 +1280,19 @@ class TensorManager:
         """
         self.load_strategy = self.tensor_manager_state.load_strategy
         self.stats = self.tensor_manager_state.stats
-
+        self.memory_transfer_stats = extract_memory_transfers_from_layer_stats(self.stats)
         loader_data = self.tensor_manager_state.to_loader_input_data()
+        block_data = None
+        if self.enable_diagnostics and self.loader_type in BLOCK_TRANSFER_MODES:
+            block_data = BlockStrategyData(
+                label_to_size_map=loader_data.label_to_size_map,
+                allocation_ordered=loader_data.allocation_ordered,
+                block_sizes=loader_data.block_sizes,
+                label_to_block_id=loader_data.label_to_block_id,
+                transfer_to_compute_map=loader_data.transfer_to_compute_map,
+            )
+        self._log_inference_diagnostics(block_data)
+
         # Match prepare_infer_mode: destructive by default; keep sources when a
         # post-compile replan may rebuild the loader from compiled timings.
         release_tensor_memory = not self._first_loader_non_destructive
@@ -1559,7 +1617,7 @@ class TensorManager:
         # to the driver.
         self._teardown_profile_block_controller()
 
-        report_profiling_quality(self.layer_statistics_collector, self.enable_diagnostics)
+        duration_analyzer = report_profiling_quality(self.layer_statistics_collector)
         self._report_cross_layer_access()
 
         self.layer_stats = self.layer_statistics_collector.get_layer_stats()
@@ -1590,19 +1648,15 @@ class TensorManager:
 
         self.tensor_statistics_map = self._benchmark_tensor_statistics()
         self.stats = compute_layer_statistics(self.layer_stats, self.tensor_statistics_map)
-        memory_stats = self._get_memory_transfer_stats()
-        self.memory_transfer_stats = memory_stats
-
-        if self.enable_diagnostics and memory_stats:
-            get_diagnostics_logger().info(
-                "Memory transfer statistics:\n%s",
-                format_memory_transfer_table(memory_stats),
-            )
+        self.memory_transfer_stats = self._get_memory_transfer_stats()
 
         # Default: destructive first build. Re-plan arms ``_first_loader_non_destructive``
         # so weights stay intact for the post-compile rebuild.
         release_tensor_memory = not self._first_loader_non_destructive
-        self._compute_strategy_and_build_loader(release_tensor_memory=release_tensor_memory)
+        self._compute_strategy_and_build_loader(
+            release_tensor_memory=release_tensor_memory,
+            duration_analyzer=duration_analyzer,
+        )
 
         if self._first_loader_non_destructive:
             # Snapshot original ``.data`` before ``prepare_final_model`` repoints
@@ -1611,7 +1665,12 @@ class TensorManager:
             # One-shot: later rebuilds / re-offloads must not inherit this arm.
             self._first_loader_non_destructive = False
 
-    def _compute_strategy_and_build_loader(self, *, release_tensor_memory: bool = True) -> None:
+    def _compute_strategy_and_build_loader(
+        self,
+        *,
+        release_tensor_memory: bool = True,
+        duration_analyzer: LayerStatisticsAnalyzer | None = None,
+    ) -> None:
         """Compute the load strategy from ``self.stats`` and build the inference loader.
 
         Shared by :meth:`prepare_infer_mode` (first build) and
@@ -1665,9 +1724,7 @@ class TensorManager:
                 self.rearrange_transfers = True
                 logger.info("Auto-enabled rearrange_transfers: detected permanent gap layers")
 
-        if self.enable_diagnostics:
-            strategy_name = type(self.tensor_manager_load_strategy).__name__
-            log_block_table(self.stats, load_strategy, self.block_data, strategy_name)
+        self._log_inference_diagnostics(self.block_data, duration_analyzer=duration_analyzer)
 
         # Create LoaderInputData from fresh computation
         if self.loader_type == "strategy":

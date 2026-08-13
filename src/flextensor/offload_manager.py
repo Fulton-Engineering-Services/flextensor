@@ -30,7 +30,7 @@ from flextensor.compiler_utils import (
     find_torch_compile_wrapper,
     is_torch_compiled_module,
 )
-from flextensor.config import OffloadConfig
+from flextensor.config import OffloadConfig, resolve_load_strategy
 from flextensor.helpers import NoOpTensorManager
 from flextensor.instrumentation import dump_to_directory, get_registry
 from flextensor.offload_timing import (
@@ -39,7 +39,6 @@ from flextensor.offload_timing import (
     format_offload_timing_table,
 )
 from flextensor.state_handler import TensorManagerState  # noqa: TC001 — beartype resolves annotations at runtime
-from flextensor.strategy import AdaptiveStrategy
 from flextensor.tensor_discovery import (
     has_offload_modules,
     has_patched_ancestor,
@@ -266,6 +265,8 @@ class TensorManagerProtocol(Protocol):
     def get_gpu_memory_usage(self) -> GPUMemoryUsage: ...
     def get_memory_transfer_stats(self) -> dict[int, float] | None: ...
     def collect_offload_timing(self) -> OffloadTimingReport | None: ...
+    def sync_prev_onload(self) -> None: ...
+    def join_after_forward(self) -> None: ...
     def trap(self, name: str) -> Any: ...
     def is_profiling_suspended(self) -> bool: ...
     def clear_profiling_durations(self) -> None: ...
@@ -726,6 +727,14 @@ class OffloadManager:
         """
         return self._tensor_manager
 
+    def sync_prev_onload(self) -> None:
+        if self._tensor_manager is not None:
+            self._tensor_manager.sync_prev_onload()
+
+    def join_after_forward(self) -> None:
+        if self._tensor_manager is not None:
+            self._tensor_manager.join_after_forward()
+
     def get_gpu_memory_usage(self) -> GPUMemoryUsage:
         """Get GPU memory usage by FlexTensor in inference mode.
 
@@ -866,15 +875,7 @@ class OffloadManager:
 
         device_gpu = torch.device(f"cuda:{self.config.gpu_device}")
 
-        if self.config.load_strategy is not None:
-            tensor_manager_load_strategy = self.config.load_strategy
-        else:
-            tensor_manager_load_strategy = AdaptiveStrategy(
-                scale=self.config.transfer_budget_scale,
-                loader_type=self.config.transfer_mode,
-                n_blocks=self.config.num_blocks,
-                min_blocks=self.config.min_blocks,
-            )
+        tensor_manager_load_strategy = resolve_load_strategy(self.config)
 
         if not self.config.enabled:
             benchmark_cls = PreloadToDevice
@@ -1219,6 +1220,38 @@ class OffloadManager:
             )
             return False
         return True
+
+    def reset_offload_timing_sampling(self) -> None:
+        """Reset durable timings and close the integration-owned sample window."""
+        self.reset_offload_timing()
+        collector = self._offload_timing_collector()
+        if collector is not None:
+            collector.set_measure_window(False)
+
+    def begin_offload_timing_sample(self) -> None:
+        """Open the durable sink for one selected outer inference call."""
+        collector = self._offload_timing_collector()
+        if collector is not None:
+            collector.set_measure_window(True)
+
+    def finish_offload_timing_sample(self, *, replay_generation: int | None) -> bool:
+        """Publish one selected eager or captured pass, then close its sink."""
+        collector = self._offload_timing_collector()
+        if collector is None:
+            return False
+        try:
+            if replay_generation is None:
+                return collector.flush_pending_eager_pass(preserve_replay_state=True)
+            collector.arm_replay_measure()
+            return collector.finalize_replay_pass(replay_generation=replay_generation)
+        finally:
+            collector.set_measure_window(False)
+
+    def cancel_offload_timing_sample(self) -> None:
+        """Close a selected sample window without publishing it."""
+        collector = self._offload_timing_collector()
+        if collector is not None:
+            collector.set_measure_window(False)
 
     def _fail_manual_update_replan(self, exc: BaseException) -> None:
         """Abort an in-flight CUDA-graph measure replan (strategy unchanged)."""
@@ -1621,14 +1654,28 @@ class OffloadManager:
         if config is not None:
             self.set_config(config)
         if self._tensor_manager is None:
-            self._initialize_tensor_manager()
+            try:
+                self._initialize_tensor_manager()
+            except Exception:
+                tensor_manager = self._tensor_manager
+                if tensor_manager is not None:
+                    try:
+                        tensor_manager.shutdown()
+                    except Exception:
+                        self._cleanup_blocked = True
+                        LOGGER.exception("TensorManager cleanup failed after initialization error")
+                    else:
+                        self._tensor_manager = None
+                raise
 
     @_error_boundary
-    def offload_from_state(
+    def offload_from_state(  # noqa: C901 - takeover is one transactional lifecycle.
         self,
         model: nn.Module,
         state: TensorManagerState,
         config: OffloadConfig | None = None,
+        *,
+        allow_strategy_replan: bool = True,
     ) -> nn.Module:
         """Adopt a saved state and return the offloaded model proxy.
 
@@ -1645,13 +1692,22 @@ class OffloadManager:
 
         self._manual_update_state = False
         effective_config = config if config is not None else self.config
-        self._compiled.resolve_activation(effective_config, None)
-        self.init(config)
+        activation_resolved = False
+        try:
+            self._compiled.resolve_activation(effective_config, None)
+            if not allow_strategy_replan:
+                self._compiled.replan_active = False
+            activation_resolved = True
+            self.init(config)
+        except Exception:
+            if activation_resolved:
+                self._compiled.teardown()
+            raise
         if self._tensor_manager is None:
             raise RuntimeError("Tensor manager initialization failed")
-        self._compiled.arm_non_destructive_first_loader()
 
         try:
+            self._compiled.arm_non_destructive_first_loader()
             plan = self._tensor_manager.plan_state_adoption(model, state)
         except Exception:
             self._cleanup_failed_state_takeover(model, [])
@@ -2427,6 +2483,8 @@ def offload_from_state(
     state: TensorManagerState,
     config: OffloadConfig | None = None,
     name: str = DEFAULT_MANAGER_NAME,
+    *,
+    allow_strategy_replan: bool = True,
 ) -> nn.Module:
     """Adopt an in-memory tensor-manager state and enter inference.
 
@@ -2443,11 +2501,17 @@ def offload_from_state(
         state: Validated state to adopt.
         config: Offload configuration. Uses the manager's current configuration when omitted.
         name: Offload manager name.
+        allow_strategy_replan: Preserve source weights for a later compiled-timing replan.
 
     Returns:
         An inference-ready proxy for ``model``.
     """
-    return get_offload_manager(name).offload_from_state(model, state, config=config)
+    return get_offload_manager(name).offload_from_state(
+        model,
+        state,
+        config=config,
+        allow_strategy_replan=allow_strategy_replan,
+    )
 
 
 def offload_from_profile(

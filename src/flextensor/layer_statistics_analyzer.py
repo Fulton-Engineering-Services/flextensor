@@ -11,8 +11,7 @@ import logging
 import numpy as np
 from pydantic import BaseModel, ConfigDict, computed_field
 
-from flextensor._logging import get_diagnostics_logger
-from flextensor.collectors import IterativeLayerStatisticsCollector
+from flextensor.collectors import IterativeLayerStatisticsCollector, LayerStatistics
 from flextensor.instrumentation.decorator import instrumentable
 
 LOGGER = logging.getLogger(__name__)
@@ -183,6 +182,23 @@ class LayerStatisticsAnalyzer:
         return is_consistent
 
 
+def format_effective_layer_duration_table(layer_stats: list[LayerStatistics]) -> str:
+    """Format effective saved compute durations without implying raw samples exist."""
+    header = "=" * 64
+    lines = [
+        header,
+        "Layer Duration Statistics (ms)",
+        header,
+        f"{'Layer':<48} {'Compute':>12}",
+        "-" * 64,
+    ]
+    for stats in layer_stats:
+        label = stats.label[:46] + ".." if len(stats.label) > 48 else stats.label
+        lines.append(f"{label:<48} {stats.duration:>12.3f}")
+    lines.append(header)
+    return "\n".join(lines)
+
+
 class UntimedTrapsReport:
     """Diagnostic: traps with tensor IDs recorded but no duration samples.
 
@@ -211,40 +227,28 @@ class UntimedTrapsReport:
 
 def report_profiling_quality(
     layer_statistics_collector: IterativeLayerStatisticsCollector,
-    enable_diagnostics: bool,
-) -> None:
+) -> LayerStatisticsAnalyzer:
     """Surface profiling-quality signals after collection completes.
-
-    Two independent emissions, each with its own contract:
 
     * Untimed-trap report — emitted at WARNING on this module's logger
       whenever any label has tensor IDs but no duration samples. Such
       labels are silently dropped from strategy input, so users need
-      to know which layers were excluded regardless of whether
-      ``enable_diagnostics`` is on.
-    * Per-layer duration statistics table — emitted at WARNING on the
-      diagnostics logger only when ``enable_diagnostics`` is set *and*
-      :meth:`LayerStatisticsAnalyzer.check_measurement_consistency`
-      flagged a problem. The table's columns (min/max/avg/std/CV/count)
-      exist to troubleshoot variability and low-sample warnings; on
-      consistent runs the strategy table's median is sufficient and
-      the detailed table would be noise.
+      to know which layers were excluded.
 
     The per-issue warnings emitted by ``check_measurement_consistency``
     itself (low samples, high CV) fire from this module unconditionally
     as part of the consistency check.
 
+    Returns the analyzer so ``TensorManager`` can emit all inference
+    diagnostics together after the effective strategy has been computed.
+
     Anchored by ``tests/unit/test_tensor_manager_diagnostics_emission.py``.
     """
     analyzer = LayerStatisticsAnalyzer(layer_statistics_collector)
-    is_consistent = analyzer.check_measurement_consistency()
+    analyzer.check_measurement_consistency()
 
     untimed_traps = UntimedTrapsReport(layer_statistics_collector)
     if not untimed_traps.is_empty():
         LOGGER.warning("%s", untimed_traps.format())
 
-    if enable_diagnostics and not is_consistent:
-        get_diagnostics_logger().warning(
-            "Layer duration statistics:\n%s",
-            analyzer.format_statistics_table(),
-        )
+    return analyzer

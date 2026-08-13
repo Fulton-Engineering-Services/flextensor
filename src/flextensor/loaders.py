@@ -1298,6 +1298,14 @@ class PreallocatedLoader(Loader):
         Prepare the loader for transfers or computation.
         """
 
+    def sync_prev_onload(self) -> None:
+        """Make the current compute stream wait for prior transfer work."""
+        raise NotImplementedError
+
+    def join_after_forward(self) -> None:
+        """Join transfer work at an integration-defined forward boundary."""
+        raise NotImplementedError
+
     def shutdown(self) -> None:
         """
         Release resources and clean up allocations.
@@ -1369,6 +1377,11 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
 
         self.preload_transfers = find_transfers_for_preload(self.transfer_to_compute_map, layer_stats)
         self.prepare()
+
+    @_compiler_disable
+    def sync_prev_onload(self) -> None:
+        """Make the current compute stream wait for prior transfer work."""
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
 
     @_compiler_disable
     def preload(self) -> None:
@@ -1486,9 +1499,10 @@ class PreallocatedBatchTransferTensorLoader(PreallocatedLoader):
         if label == self.last_layer_label:
             from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
 
-            self.last_iteration_event = self.transfer_stream.record_event()
-            torch.cuda.current_stream().wait_event(self.last_iteration_event)
-            self._has_pending_transfer_work = False
+            if self._has_pending_transfer_work:
+                self.last_iteration_event = self.transfer_stream.record_event()
+                torch.cuda.current_stream().wait_event(self.last_iteration_event)
+                self._has_pending_transfer_work = False
 
             # Clear maps even if strict policy raises (same contract as
             # join_after_forward) so capture-session handles never leak.
@@ -1599,6 +1613,11 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
 
         self.preload_transfers = find_transfers_for_preload(self.transfer_to_compute_map, layer_stats)
         self.prepare()
+
+    @_compiler_disable
+    def sync_prev_onload(self) -> None:
+        """Make the current compute stream wait for prior transfer work."""
+        torch.cuda.current_stream().wait_stream(self.transfer_stream)
 
     @_compiler_disable
     def preload(self) -> None:
@@ -1721,9 +1740,10 @@ class PreallocatedBatchTransferTensorLoaderReordered(PreallocatedLoader):
         if label == self.last_layer_label:
             from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicyError
 
-            last_event = self.transfer_stream.record_event()
-            torch.cuda.current_stream().wait_event(last_event)
-            self._has_pending_transfer_work = False
+            if self._has_pending_transfer_work:
+                last_event = self.transfer_stream.record_event()
+                torch.cuda.current_stream().wait_event(last_event)
+                self._has_pending_transfer_work = False
 
             # Clear maps even if strict policy raises (same contract as
             # join_after_forward) so capture-session handles never leak.

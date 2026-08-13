@@ -20,7 +20,7 @@ from flextensor.compiled_offload import (
     build_profile_compile_forward,
     bump_dynamo_limits_for_compiled_offload,
 )
-from flextensor.config import OffloadConfig
+from flextensor.config import BLOCK_TRANSFER_MODES, OffloadConfig
 from flextensor.tensor_discovery import is_offload_patched_module
 
 LOGGER = logging.getLogger(__name__)
@@ -42,8 +42,6 @@ PROFILE_COMPILE_WARMUP_FORWARDS = 3
 # Compiled offload drives ``pre_compute/post_compute`` custom ops through a
 # :class:`~flextensor.loaders.PreallocatedLoader`. Strategy transfer mode is
 # incompatible (it builds :class:`~flextensor.loaders.TensorStrategyLoader`).
-_COMPILED_OFFLOAD_TRANSFER_MODES = frozenset({"allocation_block_transfer", "raw_block_transfer"})
-
 _NEXT_MANAGER_ID = 0
 _MANAGER_ID_LOCK = threading.Lock()
 
@@ -191,7 +189,7 @@ class CompiledOffload:
     @staticmethod
     def _require_compiled_transfer_mode(effective_config: OffloadConfig) -> None:
         """Reject transfer modes that cannot back ``install_active_loader``."""
-        if effective_config.transfer_mode in _COMPILED_OFFLOAD_TRANSFER_MODES:
+        if effective_config.transfer_mode in BLOCK_TRANSFER_MODES:
             return
         raise ValueError(
             "compiled offload requires a block transfer_mode "

@@ -19,7 +19,7 @@ TIMEOUT=${TIMEOUT:-3600}
 echo "Running vLLM example integration tests with timeout ${TIMEOUT}s..."
 
 # Build pytest command with optional marker filter
-PYTEST_ARGS=(-v -rA -s --tb=short --maxfail=3 --durations=10)
+PYTEST_ARGS=(-v -rA -s --tb=short --maxfail=3 --durations=0)
 if [ -n "${PYTEST_MARKER:-}" ]; then
   echo "Filtering tests with marker: $PYTEST_MARKER"
   PYTEST_ARGS+=(-m "$PYTEST_MARKER")
