@@ -432,14 +432,20 @@ class TestNvmeOffloadCudaGraph:
     @pytest.mark.xfail(
         strict=False,
         reason=(
-            "CUDA graph replay with POSIX NVMe backend is not fully supported: "
+            "CUDA graph replay with POSIX NVMe backend is not supported: "
             "os.pread is CPU-side and not captured in the graph, so on replay "
             "the shared pinned buffer contains stale data from the last "
             "capture-time read. cuFile (GDS) would work because it writes "
-            "directly to GPU memory (capturable), but GDS is not available on "
-            "GB10 unified memory. Graph capture itself succeeds (see "
-            "test_nvme_graph_capture_succeeds) — only the replay correctness "
-            "is affected when using the POSIX fallback."
+            "directly to GPU memory (capturable), but GDS is fundamentally "
+            "unsupported on GB10 unified memory — cuFileHandleRegister fails "
+            "with CU_FILE_IO_NOT_SUPPORTED (rc=5008) regardless of cuFile "
+            "version (tested 1.15.1 and 1.18.1), nvidia-fs load state, or "
+            "cuFileSetParameterBool flags (FORCE_COMPAT_MODE, "
+            "SKIP_TOPOLOGY_DETECTION, USE_PCIP2PDMA). The error is a "
+            "platform architecture limitation: no PCIe P2P path exists from "
+            "the NVMe controller to the GPU's unified memory. Graph capture "
+            "itself succeeds (see test_nvme_graph_capture_succeeds) — only "
+            "the replay correctness is affected when using the POSIX fallback."
         ),
     )
     def test_nvme_graph_replay_matches_eager(self, device: torch.device, tmp_path: Path) -> None:

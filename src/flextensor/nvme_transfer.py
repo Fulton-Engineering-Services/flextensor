@@ -43,6 +43,8 @@ __all__ = [
 
 _CUFILE_LIB_PATHS = [
     "/usr/local/cuda/lib64/libcufile.so",
+    "/usr/local/cuda-13.3/lib64/libcufile.so",
+    "/usr/local/cuda-13.2/lib64/libcufile.so",
     "/usr/local/cuda-13.0/lib64/libcufile.so",
     "/usr/lib/aarch64-linux-gnu/libcufile.so",
 ]
@@ -277,6 +279,20 @@ class CuFileBackend:
     * The ``nvidia-fs`` kernel module loaded (``modprobe nvidia-fs``).
     * ``libcufile.so`` available on the library path.
     * 4K-aligned file offsets, GPU buffer addresses, and read sizes.
+    * A GPU with a PCIe BAR accessible for GDS P2P DMA (not unified-memory
+      SoCs like GB10, where the GPU and CPU share the same physical DRAM and
+      no PCIe P2P path exists between the NVMe controller and GPU memory).
+
+    .. note::
+
+        **GB10 limitation**: cuFile/GDS does not work on GB10 (Grace-Blackwell)
+        unified memory. ``cuFileHandleRegister`` fails with ``CU_FILE_IO_NOT_SUPPORTED``
+        (rc=5008) regardless of cuFile library version (tested 1.15.1 and 1.18.1),
+        ``nvidia-fs`` load state, or ``cuFileSetParameterBool`` flags
+        (``FORCE_COMPAT_MODE``, ``SKIP_TOPOLOGY_DETECTION``, ``USE_PCIP2PDMA``).
+        The error is a fundamental platform limitation — no PCIe P2P path exists
+        from the NVMe controller to the GPU's unified memory. The
+        :class:`PosixBackend` is the correct and only viable backend on GB10.
     """
 
     def __init__(self, alignment: int = 4096) -> None:
@@ -306,16 +322,29 @@ class CuFileBackend:
     def _preflight_check(self) -> None:
         """Verify cuFileHandleRegister works by registering a temp file.
 
-        On platforms where the GPU model is not supported for GDS (e.g. GB10
-        unified memory), ``cuFileDriverOpen`` succeeds but
-        ``cuFileHandleRegister`` fails with rc=5008. This pre-flight detects
-        that and raises ``RuntimeError`` so :func:`make_nvme_backend` falls
-        back to :class:`PosixBackend`.
+        Opens a temporary file with ``O_DIRECT`` (matching :meth:`open_file`)
+        and calls ``cuFileHandleRegister``. On platforms where the GPU model
+        is not supported for GDS (e.g. GB10 unified memory),
+        ``cuFileDriverOpen`` succeeds but ``cuFileHandleRegister`` fails with
+        ``CU_FILE_IO_NOT_SUPPORTED`` (rc=5008). This pre-flight detects that
+        and raises ``RuntimeError`` so :func:`make_nvme_backend` falls back
+        to :class:`PosixBackend`.
+
+        The file is opened with ``O_DIRECT`` because cuFile requires it by
+        default (the compat-mode relaxation of this requirement was added in
+        cuFile 1.17+ and is not available on all platforms).
         """
         import ctypes
         import tempfile
 
-        fd, tmp_path = tempfile.mkstemp(prefix="cufile_preflight_", suffix=".bin")
+        tmp_dir = Path(tempfile.gettempdir())
+        tmp_path = str(tmp_dir / f"cufile_preflight_{os.getpid()}.bin")
+        o_direct = getattr(os, "O_DIRECT", 0)
+        flags = os.O_RDWR | os.O_CREAT | o_direct
+        try:
+            fd = os.open(tmp_path, flags, 0o644)
+        except OSError:
+            fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             os.ftruncate(fd, self.alignment)
             handle = ctypes.c_void_p(None)
