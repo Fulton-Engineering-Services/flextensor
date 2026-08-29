@@ -2248,11 +2248,18 @@ class TensorManager:
     def _restore_block_loader_tensor_data(self) -> None:
         controller = getattr(self.tensor_layer_loader, "allocation_controller", None)
         if isinstance(controller, AllocationBlockController):
-            views_by_label = {label: block.views for label, block in controller.block_map_cpu.items()}
+            # Skip labels whose CPU blocks were evicted to NVMe (block is None).
+            views_by_label = {
+                label: block.views
+                for label, block in controller.block_map_cpu.items()
+                if block is not None
+            }
         elif isinstance(controller, RawBlockController):
+            # Skip labels whose CPU blocks were evicted to NVMe (block is None).
             views_by_label = {
                 label: controller.reconstruct_original_shapes(block, controller.block_meta_map[label])
                 for label, block in controller.block_map_cpu.items()
+                if block is not None
             }
         else:
             return
