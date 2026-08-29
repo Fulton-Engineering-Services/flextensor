@@ -638,3 +638,155 @@ All fields in `gpu_memory` and `host_memory` are in bytes. Divide by `1024 ** 3`
 
 !!! note "Multi-rank deployments"
     In tensor-parallel deployments, each rank writes its own file. The filename includes `rank` and `device` to distinguish them.
+
+---
+
+## Troubleshoot NVMe Disk Offload
+
+**Problem**: NVMe disk offload is enabled (`nvme_offload_enabled=True`) but weights are not being read from NVMe, the cuFile backend falls back to POSIX unexpectedly, or CUDA graph replay produces incorrect results.
+
+### Verify the NVMe transfer backend
+
+Check which backend `make_nvme_backend()` selected by inspecting the log output
+during `offload()`. A `WARNING` log indicates a fallback from cuFile to POSIX:
+
+```text
+nvme_transfer_mode='cufile' requested but nvidia-fs is not loaded
+(/proc/driver/nvidia-fs/version not found). Falling back to 'posix'.
+```
+
+Or:
+
+```text
+CuFileBackend initialization failed (...). Falling back to 'posix'.
+```
+
+### Step 1: Check `nvidia-fs` kernel module (cuFile only)
+
+cuFile (GDS) requires the `nvidia-fs` kernel module. Verify it is loaded:
+
+```bash
+ls /proc/driver/nvidia-fs/version     # exists when nvidia-fs is loaded
+cat /proc/driver/nvidia-fs/version     # prints the GDS version
+lsmod | grep nvidia_fs                 # alternative check
+```
+
+If not loaded, load it (requires root):
+
+```bash
+sudo modprobe nvidia-fs
+```
+
+If the module is not available, install the NVIDIA GPU Direct Storage driver
+package, or use `nvme_transfer_mode="posix"` to skip cuFile entirely.
+
+### Step 2: Check `libcufile.so` availability
+
+`CuFileBackend` searches for `libcufile.so` in standard CUDA library paths
+(`/usr/local/cuda/lib64/`, `/usr/lib/aarch64-linux-gnu/`, etc.) and via
+`LD_LIBRARY_PATH` using `ctypes.util.find_library("cufile")`. Verify it exists:
+
+```bash
+find /usr -name 'libcufile.so' 2>/dev/null
+# or
+ldconfig -p | grep cufile
+```
+
+If not found, install the CUDA `libcufile` package (part of the CUDA toolkit,
+typically in the `cuda-libraries-*` package group), or use
+`nvme_transfer_mode="posix"`.
+
+### Step 3: Check GPU model supports GDS P2P
+
+Even with `nvidia-fs` loaded and `libcufile.so` present, `CuFileBackend` runs a
+pre-flight check in `__init__` that registers a temporary file with
+`cuFileHandleRegister`. On GPUs that do not support GDS P2P DMA (e.g., GB10
+unified memory), the pre-flight fails with `CU_FILE_IO_NOT_SUPPORTED` (rc=5008).
+
+This is a **platform architecture limitation**, not a software bug — no PCIe
+P2P path exists from the NVMe controller to the GPU's unified memory on GB10.
+The auto-fallback to `PosixBackend` is the correct behavior. To suppress the
+warning, set `nvme_transfer_mode="posix"` explicitly:
+
+```python
+config = OffloadConfig(
+    nvme_offload_enabled=True,
+    nvme_offload_path="/mnt/nvme/weights",
+    nvme_transfer_mode="posix",  # skip cuFile on GB10 / unified-memory SoCs
+)
+```
+
+### Step 4: Check filesystem supports `O_DIRECT`
+
+Both `CuFileBackend` and `PosixBackend` open files with `O_DIRECT` (cuFile
+requires it; POSIX prefers it for alignment-aligned I/O). Some filesystems
+(tmpfs, some NFS configurations) do not support `O_DIRECT`:
+
+- `PosixBackend.open_file()` falls back to buffered I/O (`O_RDWR | O_CREAT`)
+  when `O_DIRECT` is not supported — no error, but read performance may be
+  lower without direct I/O.
+- `CuFileBackend.open_file()` does **not** fall back — `cuFileHandleRegister`
+  fails if the filesystem does not support `O_DIRECT`. This triggers the
+  auto-fallback to `PosixBackend`.
+
+Verify the target filesystem supports `O_DIRECT`:
+
+```bash
+# Test O_DIRECT on the NVMe path
+python3 -c "
+import os
+path = '/mnt/nvme/flextensor_weights/test_direct.bin'
+fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_DIRECT, 0o644)
+os.close(fd); os.unlink(path)
+print('O_DIRECT supported')
+"
+```
+
+### Step 5: Check disk space for `blocks.bin`
+
+The NVMe block file (`{nvme_offload_path}/blocks.bin`) grows to the sum of all
+alignment-padded weight blocks. For large models, this can be substantial.
+Ensure the NVMe filesystem has sufficient free space:
+
+```bash
+df -h /mnt/nvme/flextensor_weights
+```
+
+The file is created during block controller construction (at the
+PROFILING→INFERENCE transition) and deleted when the block controller shuts
+down (`shutdown()` calls `close_file()`). If the process crashes, the file
+may be left behind — clean it up manually.
+
+### Step 6: CUDA graph replay with POSIX NVMe backend
+
+If you observe incorrect results when replaying a CUDA graph captured with
+NVMe-backed offload, this is a known limitation of the `PosixBackend`: `os.pread`
+is a CPU-side operation that is **not** captured in the CUDA graph. On replay,
+the pinned staging buffer contains stale data from the last capture-time read,
+so `copy_()` transfers stale data to the GPU block view.
+
+```text
+# xfail: CUDA graph replay with POSIX NVMe backend produces stale data
+# cuFile (GDS) would work (writes directly to GPU memory — capturable),
+# but cuFile is fundamentally unsupported on GB10 unified memory.
+```
+
+**Mitigation**: use eager inference (no graph capture) with NVMe offload on
+GB10. Graph **capture** succeeds (the capture-time read populates the buffer
+correctly), but **replay** correctness is not guaranteed with the POSIX backend.
+This is documented as an `xfail` in the integration test suite
+(`test_nvme_graph_replay_matches_eager`).
+
+### Step 7: Verify config validation passes
+
+`nvme_offload_enabled=True` requires:
+
+- A block `transfer_mode` (`allocation_block_transfer` or `raw_block_transfer`).
+  `transfer_mode="strategy"` is rejected at construction with `ValueError`.
+- `nvme_offload_path` to be set (not `None`). Construction raises `ValueError`
+  when `nvme_offload_enabled=True` and `nvme_offload_path` is `None`.
+- `nvme_alignment_bytes >= 512` (the minimum for NVMe sector alignment).
+
+If the config constructs successfully, the validation passed. If you see a
+`ValidationError` from pydantic, check the error message for the specific
+constraint that failed.

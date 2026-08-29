@@ -143,6 +143,73 @@ directory when switching between decode and prefill measurements.
 
 ---
 
+## NVMe Disk Offload
+
+Use this configuration when both GPU memory and host RAM are constrained — for
+example, running a large model on a GB10 Grace-Blackwell system where the GPU
+and CPU share unified DRAM. NVMe disk offload evicts cold weights to a local
+NVMe SSD, freeing host memory while keeping weights accessible for on-demand
+GPU reads.
+
+```python
+from flextensor import OffloadConfig, offload
+
+config = OffloadConfig(
+    nvme_offload_enabled=True,
+    nvme_offload_path="/mnt/nvme/flextensor_weights",
+    nvme_transfer_mode="cufile",           # GDS direct-to-GPU; auto-falls back to POSIX
+    transfer_mode="allocation_block_transfer",  # required — NVMe needs a block loader
+)
+
+model = offload(model, config=config)
+```
+
+Key choices:
+
+- `nvme_offload_enabled=True` activates the NVMe eviction path. During block
+  controller construction, all packed weight blocks are written to a single
+  file (`{nvme_offload_path}/blocks.bin`) at alignment-aligned offsets, then the
+  pinned CPU blocks are freed. During inference, `schedule_transfer()` reads from
+  the NVMe file instead of copying from CPU memory.
+- `nvme_offload_path` must point to a writable directory on a local NVMe
+  filesystem (not NFS). Files are opened with `O_DIRECT` for cuFile; the POSIX
+  backend also prefers `O_DIRECT` but falls back to buffered I/O when the
+  filesystem does not support it.
+- `nvme_transfer_mode="cufile"` selects GPU Direct Storage (`cuFileRead`) for
+  direct NVMe→GPU DMA. When `nvidia-fs` is not loaded, `libcufile.so` is
+  unavailable, or the GPU model does not support GDS P2P, FlexTensor logs a
+  `WARNING` and falls back to `PosixBackend` automatically. Set
+  `nvme_transfer_mode="posix"` to use the `pread`+`copy_` path explicitly.
+- A block `transfer_mode` (`allocation_block_transfer` or `raw_block_transfer`)
+  is required. NVMe backing is implemented by the block controllers, which the
+  `strategy` loader does not use. Config construction raises `ValueError` if
+  `nvme_offload_enabled=True` is combined with `transfer_mode="strategy"`.
+
+!!! note "GB10 (Grace-Blackwell) unified memory"
+    On GB10, cuFile/GDS is fundamentally unsupported — `cuFileHandleRegister`
+    fails with `CU_FILE_IO_NOT_SUPPORTED` (rc=5008) because no PCIe P2P path
+    exists from the NVMe controller to the GPU's unified memory. The auto-fallback
+    to `PosixBackend` handles this transparently. On GB10, `PosixBackend` is
+    the only viable backend: `pread` into pinned CPU memory, then `copy_` to the
+    GPU block view. Since the pinned CPU buffer shares the same physical DRAM as
+    the GPU on unified-memory systems, the `copy_` is near-zero-cost.
+
+    Set `nvme_transfer_mode="posix"` explicitly to suppress the fallback
+    warning.
+
+!!! warning "CUDA graph replay with POSIX NVMe backend"
+    CUDA graph capture succeeds with NVMe-backed offload, but **graph replay
+    correctness is not guaranteed with the POSIX backend**. `os.pread` is a
+    CPU-side operation not captured in the CUDA graph, so on replay the shared
+    pinned staging buffer contains stale data from the last capture-time read.
+    cuFile (GDS) would work because it writes directly to GPU memory (capturable),
+    but cuFile is unavailable on GB10. Use eager inference (no graph capture) or
+    avoid graph replay with NVMe offload on GB10. See
+    [Troubleshooting](troubleshooting.md#troubleshoot-nvme-disk-offload) for
+    details.
+
+---
+
 ## Measure transfer overlap during inference
 
 Use this when you want per-trap **transfer / compute / wait** timings while serving — without rebuilding the offload strategy.

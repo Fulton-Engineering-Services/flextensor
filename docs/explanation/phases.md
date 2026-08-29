@@ -212,6 +212,22 @@ FlexTensor supports different transfer strategies internally:
 | `allocation_block_transfer` | Pre-allocated GPU blocks with batch transfers |
 | `raw_block_transfer` | Direct memory management for maximum efficiency |
 
+#### NVMe Eviction
+
+When [NVMe disk offload](../explanation/configuration.md#nvme-disk-offload) is
+enabled (`nvme_offload_enabled=True`), the block controllers
+(`RawBlockController` / `AllocationBlockController`) write all packed weight
+blocks to a single NVMe file (`{nvme_offload_path}/blocks.bin`) at
+alignment-aligned offsets during construction, then free the pinned CPU blocks.
+During inference, `schedule_transfer()` reads from the NVMe file via cuFile
+(GDS) or POSIX `pread` instead of copying from CPU memory. This reduces host
+memory usage to near-zero for offloaded weights — only the GPU blocks and the
+NVMe file remain.
+
+See [Configuration — NVMe Disk Offload](configuration.md#nvme-disk-offload) for
+requirements, platform limitations (GB10 unified memory), and the cuFile vs
+POSIX trade-off.
+
 ### Why It Matters
 
 The inference phase is where the performance gains are realized. By using the learned statistics and optimized strategies, FlexTensor achieves:

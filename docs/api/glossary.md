@@ -260,6 +260,74 @@ transfers via DMA (Direct Memory Access). Controlled by
 
 ---
 
+## NVMe Disk Offload
+
+### NVMe Disk Offload
+
+A feature that evicts cold weights from CPU RAM to a local NVMe SSD and reads
+them back to GPU memory on demand during inference, reducing host memory
+pressure when both GPU and CPU RAM are constrained. Configured via
+`OffloadConfig.nvme_offload_enabled` and `OffloadConfig.nvme_offload_path`.
+Requires a block [transfer mode](#transfer-mode) (`allocation_block_transfer`
+or `raw_block_transfer`); the `strategy` loader does not support NVMe backing.
+
+See: [Configuration — NVMe Disk Offload](../explanation/configuration.md#nvme-disk-offload)
+
+### cuFile (GDS)
+
+GPU Direct Storage: reads directly from NVMe storage into GPU memory via
+`cuFileRead` without staging through CPU buffers. Requires the `nvidia-fs`
+kernel module loaded, `libcufile.so` available, and a GPU with a PCIe BAR
+accessible for GDS P2P DMA. **Not supported on GB10 (Grace-Blackwell) unified
+memory** — `cuFileHandleRegister` fails with `CU_FILE_IO_NOT_SUPPORTED`
+(rc=5008) because no PCIe P2P path exists from the NVMe controller to the
+GPU's unified memory. Implemented by
+[`CuFileBackend`][flextensor.nvme_transfer.CuFileBackend].
+
+### POSIX Backend
+
+The fallback [NVMe disk offload](#nvme-disk-offload) transfer backend using
+`pread` into pinned CPU memory, then `copy_` to the GPU block view. No kernel
+modules or CUDA libraries required; works everywhere as a universal fallback.
+The only viable backend on GB10 unified memory. Implemented by
+[`PosixBackend`][flextensor.nvme_transfer.PosixBackend].
+
+### NVMe Block File
+
+The single file (`{nvme_offload_path}/blocks.bin`) that stores all packed
+weight blocks at alignment-aligned offsets during [NVMe eviction](#nvme-eviction).
+Created during block controller construction; freed on shutdown.
+
+### NVMe Eviction
+
+The construction-time step where [block controllers](#memory-block) write all
+packed weight blocks to the [NVMe block file](#nvme-block-file) at
+alignment-aligned offsets and then free the pinned CPU copies, leaving only
+the GPU blocks and the NVMe file. During inference, `schedule_transfer()` reads
+from the NVMe file via cuFile (GDS) or POSIX `pread` instead of copying from
+CPU memory.
+
+### NvmeBlockRef
+
+Metadata for a weight block stored on NVMe, tracking the file path, byte
+offset, logical (unpadded) size, and aligned (padded) size. Returned by
+`NvmeTransferBackend.write_block()` and consumed by `read_block()` during
+inference. See
+[`NvmeBlockRef`][flextensor.nvme_transfer.NvmeBlockRef].
+
+### NVMe Transfer Backend
+
+A protocol (`NvmeTransferBackend`) implementing the NVMe read/write interface
+used by the block controllers. Two implementations are provided:
+[`CuFileBackend`][flextensor.nvme_transfer.CuFileBackend] (GDS direct-to-GPU)
+and [`PosixBackend`][flextensor.nvme_transfer.PosixBackend] (universal
+fallback). The factory function
+[`make_nvme_backend()`][flextensor.nvme_transfer.make_nvme_backend] selects the
+appropriate backend based on `nvme_transfer_mode` and falls back to
+`PosixBackend` when cuFile is unavailable.
+
+---
+
 ## Profiles and Persistence
 
 ### Offload Profile

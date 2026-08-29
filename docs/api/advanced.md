@@ -69,3 +69,26 @@ for when to switch modes.
         - NoOpHostPinner
         - is_available
         - make_host_pinner
+
+## NVMe Transfer Backends
+
+Lower-level [NVMe disk offload](../explanation/configuration.md#nvme-disk-offload)
+transfer backends used by the block controllers when `nvme_offload_enabled=True`.
+`NvmeTransferBackend` is a `Protocol` (runtime-checkable) defining the
+read/write interface; `CuFileBackend` and `PosixBackend` are the two
+implementations. `make_nvme_backend()` is the factory that selects the backend
+based on `nvme_transfer_mode` and falls back to `PosixBackend` when cuFile is
+unavailable. See
+[Troubleshooting](../how-to/troubleshooting.md#troubleshoot-nvme-disk-offload)
+for platform limitations (GB10 unified memory, `O_DIRECT` support, CUDA graph
+replay).
+
+::: flextensor.nvme_transfer
+    options:
+      members:
+        - NvmeTransferBackend
+        - PosixBackend
+        - CuFileBackend
+        - NvmeBlockRef
+        - make_nvme_backend
+        - is_nvidia_fs_available

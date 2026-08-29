@@ -323,6 +323,97 @@ detection rather than a hard wall-clock timeout.
 These options can also be set via `FT_SHM_ENABLED`, `FT_SHM_NAMESPACE`, and
 `FT_SHM_WAIT_TIMEOUT` environment variables.
 
+### NVMe Disk Offload
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `nvme_offload_enabled` | bool | `False` | Enable NVMe disk offload — evict cold weights to a local NVMe SSD and read them back to GPU memory on demand via cuFile (GDS) or POSIX `pread`. Requires a block `transfer_mode` (`allocation_block_transfer` or `raw_block_transfer`); the `strategy` loader does not support NVMe backing. |
+| `nvme_offload_path` | str \| None | `None` | Base directory for NVMe weight block files. Must be on a local NVMe filesystem (not NFS/network storage) for cuFile direct-to-GPU reads. Files are created with `O_DIRECT`. Required when `nvme_offload_enabled=True`. |
+| `nvme_transfer_mode` | `"cufile"` \| `"posix"` | `"cufile"` | Transfer mechanism for NVMe reads. `"cufile"` uses GPU Direct Storage (`cuFileRead`) for direct NVMe→GPU reads; `"posix"` uses `pread` into pinned CPU memory then `copy_` to GPU. cuFile auto-falls back to POSIX when `nvidia-fs` is not loaded or the GPU model does not support GDS P2P. |
+| `nvme_alignment_bytes` | int | `4096` | File/device alignment for cuFile I/O in bytes (minimum 512). cuFile requires file offsets, buffer addresses, and read sizes to be aligned to this value. Weight blocks are padded to this boundary on write; the true logical size is tracked in block metadata. |
+
+NVMe disk offload evicts cold weights from CPU RAM to a local NVMe SSD during
+block controller construction and reads them back to GPU memory on demand during
+inference. This reduces host memory pressure to near-zero for offloaded weights —
+only the GPU blocks and the NVMe file remain, not the pinned CPU staging buffers.
+
+```python
+from flextensor import OffloadConfig, offload
+
+config = OffloadConfig(
+    nvme_offload_enabled=True,
+    nvme_offload_path="/mnt/nvme/flextensor_weights",
+    nvme_transfer_mode="cufile",  # or "posix" for the universal fallback
+    transfer_mode="allocation_block_transfer",  # required — NVMe needs a block loader
+)
+
+model = offload(model, config=config)
+```
+
+These options can also be set via environment variables:
+
+```bash
+export FT_NVME_OFFLOAD_ENABLED=1
+export FT_NVME_OFFLOAD_PATH=/mnt/nvme/flextensor_weights
+export FT_NVME_TRANSFER_MODE=cufile   # or "posix"
+export FT_NVME_ALIGNMENT_BYTES=4096   # default; minimum 512
+```
+
+#### cuFile (GDS) vs POSIX
+
+FlexTensor supports two NVMe transfer backends:
+
+| Backend | Mechanism | Requirements | Best for |
+|---------|-----------|--------------|----------|
+| `CuFileBackend` | `cuFileRead` — direct NVMe→GPU DMA | `nvidia-fs` kernel module loaded, `libcufile.so` available, GPU with PCIe BAR accessible for GDS P2P DMA, `O_DIRECT`-capable filesystem | Discrete GPUs with dedicated PCIe NVMe controllers |
+| `PosixBackend` | `pread` into pinned CPU memory, then `copy_` to GPU | None (universal fallback) | Any system; the only viable backend on unified-memory SoCs (GB10) |
+
+When `nvme_transfer_mode="cufile"` is requested but `nvidia-fs` is not loaded or `libcufile.so` cannot be initialized, FlexTensor logs a `WARNING` and falls back to `PosixBackend` automatically. The factory function `make_nvme_backend()` never raises — it always returns a usable backend.
+
+A pre-flight check inside `CuFileBackend.__init__` registers a temporary file with `cuFileHandleRegister` to verify that the GPU model supports GDS P2P DMA. If the pre-flight fails (e.g., on GB10 unified memory), `RuntimeError` is raised and `make_nvme_backend()` catches it and falls back to `PosixBackend`.
+
+!!! warning "GB10 (Grace-Blackwell) unified memory limitation"
+    cuFile/GDS does not work on GB10 unified memory. `cuFileHandleRegister` fails with
+    `CU_FILE_IO_NOT_SUPPORTED` (rc=5008) regardless of cuFile library version (tested
+    1.15.1 and 1.18.1), `nvidia-fs` load state, or `cuFileSetParameterBool` flags
+    (`FORCE_COMPAT_MODE`, `SKIP_TOPOLOGY_DETECTION`, `USE_PCIP2PDMA`). The error is a
+    fundamental platform limitation — no PCIe P2P path exists from the NVMe controller
+    to the GPU's unified memory. `PosixBackend` is the correct and only viable backend
+    on GB10. The auto-fallback handles this transparently; set
+    `nvme_transfer_mode="posix"` explicitly to suppress the warning.
+
+#### Requirements and Constraints
+
+- **Block `transfer_mode` required**: `nvme_offload_enabled=True` with
+  `transfer_mode="strategy"` is rejected at config construction time with
+  `ValueError`. NVMe backing is implemented by the block controllers
+  (`RawBlockController` / `AllocationBlockController`), which the `strategy`
+  loader does not use.
+- **`nvme_offload_path` required**: when `nvme_offload_enabled=True`, the path
+  must be set to a writable directory on a local NVMe filesystem. Construction
+  raises `ValueError` if the path is `None`.
+- **Local filesystem**: `nvme_offload_path` must be on a local filesystem (not
+  NFS or network storage) for cuFile `O_DIRECT` reads to work. The `PosixBackend`
+  also prefers `O_DIRECT` but falls back to buffered I/O when the filesystem does
+  not support it (e.g., tmpfs).
+- **One-shot**: the NVMe fields are consumed when the `TensorManager` is first
+  constructed (during the first `offload()` call). A later `set_config` with
+  different NVMe values emits a `UserWarning`; call `release()` and re-`offload()`
+  to apply them.
+
+#### What Happens Internally
+
+During block controller construction (at the PROFILING→INFERENCE transition):
+
+1. **Pack**: all weights for each label are packed into a contiguous `uint8` CPU block at alignment-aligned offsets.
+2. **Evict**: each CPU block is written to a single file (`{nvme_offload_path}/blocks.bin`) at its aligned offset via `write_block()`. The logical (unpadded) and aligned (padded) sizes are recorded in an [`NvmeBlockRef`][flextensor.nvme_transfer.NvmeBlockRef].
+3. **Free CPU blocks**: after all blocks are written, the pinned CPU blocks are freed — only the GPU blocks and the NVMe file remain.
+
+During inference, `schedule_transfer()` reads from the NVMe file via `read_block()` instead of copying from the CPU block:
+
+- **cuFile**: `cuFileRead(handle, gpu_ptr, aligned_nbytes, offset)` — direct DMA from NVMe to the GPU block view's memory.
+- **POSIX**: `pread(fd, aligned_nbytes, offset)` into a pinned CPU staging buffer, then `copy_()` to the GPU block view. On GB10 unified memory, the pinned CPU buffer shares the same physical DRAM as the GPU, so the `copy_` is near-zero-cost.
+
 ### Profiling Configuration
 
 | Option | Type | Default | Description |

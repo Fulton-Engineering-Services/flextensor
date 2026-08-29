@@ -5,6 +5,7 @@
 
 *[assignment strategy]: Algorithm that maps weights to memory blocks for pipelined transfer (e.g., StrictRoundRobinAssignment).
 *[auto trap]: Synonym for forward patching — FlexTensor automatically wraps matched modules' forward methods.
+*[cuFile (GDS)]: GPU Direct Storage — reads directly from NVMe into GPU memory via cuFileRead. Requires nvidia-fs + libcufile.so. Not supported on GB10 unified memory.
 *[direct mode]: Trap implementation that routes parameter access through materialized tensors instead of intercepting every PyTorch operation at dispatch time. Lower overhead than indirect mode.
 *[forward patching]: The mechanism where offload() replaces a module's forward method with a wrapper that manages weight transfers. Also called "auto trap."
 *[gap trap]: A trap whose module contains no offloadable weights. Gap traps extend the transfer window for neighboring traps.
@@ -18,8 +19,14 @@
 *[memory mode]: Strategy mode activated by setting max_gpu_mem_fraction to a float — keeps peak GPU usage within a budget.
 *[include pattern]: A glob-style string in OffloadConfig.include_patterns that selects which modules or parameters to include for offloading.
 *[module execution]: The forward pass of the nn.Module wrapped by a trap — excludes the weight loading and release managed by the trap itself.
+*[NVMe disk offload]: Feature that evicts cold weights from CPU RAM to a local NVMe SSD and reads them back to GPU memory via cuFile (GDS) or POSIX pread. Configured via OffloadConfig.nvme_offload_enabled / nvme_offload_path. Requires a block transfer_mode.
+*[NVMe block file]: The single file (blocks.bin) storing all weight blocks at alignment-aligned offsets during NVMe eviction.
+*[NVMe eviction]: Construction-time step where block controllers write weight blocks to the NVMe block file and free CPU-pinned copies, leaving only NVMe + GPU blocks.
+*[NVMe transfer backend]: Protocol implementing the NVMe read/write interface used by block controllers. Two implementations: CuFileBackend (GDS) and PosixBackend (universal fallback). Factory: make_nvme_backend().
+*[NvmeBlockRef]: Metadata for a weight block on NVMe — tracks file path, offset, logical (unpadded) and aligned (padded) sizes.
 *[offload profile]: Serialized result of discovery and profiling (parameter maps, timing, strategy) that can be saved and reloaded to skip those phases.
 *[offloading strategy]: Algorithm that decides which weights to keep on GPU vs. move to CPU (e.g., KnapsackStrategy, GreedyStrategy, AdaptiveStrategy).
+*[POSIX backend]: Fallback NVMe transfer backend using pread into pinned CPU memory then copy_ to GPU. No kernel modules required. The only viable backend on GB10 unified memory.
 *[profiling phase]: Second active phase — measures per-trap execution timing using CUDA events across profiling_iters iterations. "Profiling" is the process; the offload profile is the artifact.
 *[release strategy]: Algorithm that decides when to free GPU memory after a trap finishes executing its module.
 *[tensor]: In FlexTensor context, a PyTorch tensor (usually a model parameter or buffer) that can be offloaded between GPU and CPU memory.

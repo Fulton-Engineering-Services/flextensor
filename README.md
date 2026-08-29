@@ -19,6 +19,7 @@ FlexTensor is a tensor offloading and management library for PyTorch that enable
 - **Profile Persistence**: Save and load offloading profiles for faster startup
 - **Lazy Model Initialization**: Load models from saved profiles with optimized weight loading
 - **Shared Memory**: Optional shared memory subsystem for cross-process tensor coordination
+- **NVMe Disk Offload**: Evict cold weights to a local NVMe SSD with cuFile (GDS) direct-to-GPU reads or POSIX `pread` fallback, reducing host memory pressure when both GPU and CPU RAM are constrained
 
 ## Documentation
 
