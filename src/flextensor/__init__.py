@@ -27,6 +27,7 @@ from flextensor.benchmark_tensor_mode import BenchmarkReplace, PreloadToDevice, 
 from flextensor.config import OffloadConfig, load_config, load_config_from_env, load_config_from_file
 from flextensor.host_pinning import PinnedMemoryMode
 from flextensor.lazy_model_init import load_model_from_profile
+from flextensor.nvme_transfer import NvmeTransferBackend
 from flextensor.offload_manager import (
     DEFAULT_MANAGER_NAME,
     OffloadManager,
@@ -90,6 +91,7 @@ __all__ = [  # noqa: RUF022
     "load_config",
     "load_config_from_env",
     "load_config_from_file",
+    "NvmeTransferBackend",
     "offload",
     "offload_block",
     "offload_from_profile",

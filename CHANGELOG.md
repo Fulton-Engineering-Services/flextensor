@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- NVMe disk offload via cuFile (GDS): evict cold weights to a local NVMe SSD
+  with direct GPU-memory reads. Enable with
+  `OffloadConfig(nvme_offload_enabled=True, nvme_offload_path="/path/to/nvme")`.
+  Requires a block `transfer_mode` (`allocation_block_transfer` or
+  `raw_block_transfer`). Falls back to POSIX `pread`+`copy_` when the
+  `nvidia-fs` kernel module is not loaded or `libcufile.so` is unavailable.
+
 ## [0.4.0] — 2026-08-17
 
 ### Added

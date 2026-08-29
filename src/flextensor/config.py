@@ -32,6 +32,7 @@ _REGISTERED_ENV_VARS: set[str] = set()
 ProfileMode = Literal["torch_function", "getter", "view"]
 OffloadTimingMode = Literal["off", "eager", "cuda_graph"]
 PiecewisePrefetchMode = Literal["off", "warn", "error"]
+NvmeTransferMode = Literal["cufile", "posix"]
 BLOCK_TRANSFER_MODES = frozenset({"allocation_block_transfer", "raw_block_transfer"})
 OFFLOAD_TRANSFER_MODES = frozenset({"strategy", *BLOCK_TRANSFER_MODES})
 
@@ -292,6 +293,53 @@ class OffloadConfig(BaseModel):
     ``release()`` and re-``offload()`` to apply it.
     """
 
+    nvme_offload_enabled: bool = Field(default=False)
+    """Enable NVMe disk offload: evict cold weights to a local NVMe SSD and read
+    them back to GPU memory on demand via cuFile (GDS) or POSIX pread.
+
+    Requires a block ``transfer_mode`` (``allocation_block_transfer`` or
+    ``raw_block_transfer``); the ``strategy`` loader does not support NVMe
+    backing. Set ``nvme_offload_path`` to a directory on a local NVMe filesystem.
+
+    Can also be set via the ``FT_NVME_OFFLOAD_ENABLED`` env var.
+
+    One-shot: consumed when the ``TensorManager`` is first constructed (first
+    ``offload()``). A later ``set_config`` with a different value warns; call
+    ``release()`` and re-``offload()`` to apply it.
+    """
+
+    nvme_offload_path: str | None = Field(default=None)
+    """Base directory for NVMe weight block files.
+
+    Must be on a local NVMe filesystem (not NFS/network storage) for cuFile
+    direct-to-GPU reads to work. Files are created with ``O_DIRECT``.
+
+    Can also be set via the ``FT_NVME_OFFLOAD_PATH`` env var.
+    """
+
+    nvme_transfer_mode: NvmeTransferMode = Field(default="cufile")
+    """Transfer mechanism for NVMe reads.
+
+    * ``"cufile"`` — GPU Direct Storage: reads directly from NVMe into GPU
+      memory via ``cuFileRead``. Requires the ``nvidia-fs`` kernel module
+      loaded (``modprobe nvidia-fs``) and ``libcufile.so`` available.
+    * ``"posix"`` — ``pread`` into pinned CPU memory, then ``copy_`` to GPU.
+      No kernel module required; works everywhere as a fallback.
+
+    Can also be set via the ``FT_NVME_TRANSFER_MODE`` env var.
+    """
+
+    nvme_alignment_bytes: int = Field(default=4096, ge=512)
+    """File/device alignment for cuFile I/O.
+
+    cuFile requires file offsets, buffer addresses, and read sizes to be
+    aligned to this value (4096 for standard NVMe). Weight blocks are padded
+    to this boundary on write; the true logical size is tracked in block
+    metadata.
+
+    Can also be set via the ``FT_NVME_ALIGNMENT_BYTES`` env var.
+    """
+
     include_patterns: list[str] = Field(default_factory=lambda: ["*"])
     """Module or parameter patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
@@ -492,6 +540,18 @@ class OffloadConfig(BaseModel):
                 f"transfer_mode={self.transfer_mode!r}. Inference timing is recorded "
                 f"by PreallocatedLoader enter/exit hooks, which "
                 f"transfer_mode='strategy' does not install."
+            )
+        if self.nvme_offload_enabled and self.transfer_mode not in block_loaders:
+            raise ValueError(
+                f"nvme_offload_enabled=True requires a block transfer_mode "
+                f"(allocation_block_transfer or raw_block_transfer); got "
+                f"transfer_mode={self.transfer_mode!r}. NVMe backing is implemented "
+                f"by the block controllers, which transfer_mode='strategy' does not use."
+            )
+        if self.nvme_offload_enabled and self.nvme_offload_path is None:
+            raise ValueError(
+                "nvme_offload_enabled=True requires nvme_offload_path to be set "
+                "to a directory on a local NVMe filesystem."
             )
         return self
 

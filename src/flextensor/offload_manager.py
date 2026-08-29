@@ -307,6 +307,10 @@ _TENSOR_MANAGER_ONESHOT_FIELDS: tuple[str, ...] = (
     "max_gpu_mem_fraction",
     "min_blocks",
     "num_blocks",
+    "nvme_offload_enabled",
+    "nvme_offload_path",
+    "nvme_transfer_mode",
+    "nvme_alignment_bytes",
     "piecewise_prefetch",
     "pinned_memory",
     "pinned_memory_mode",
@@ -853,6 +857,10 @@ class OffloadManager:
                 profile_mode=self.config.profile_mode,
                 _offload_timing=self.config.offload_timing,
                 _piecewise_prefetch=self.config.piecewise_prefetch,
+                _nvme_offload_enabled=self.config.nvme_offload_enabled,
+                _nvme_offload_path=self.config.nvme_offload_path,
+                _nvme_transfer_mode=self.config.nvme_transfer_mode,
+                _nvme_alignment_bytes=self.config.nvme_alignment_bytes,
             )
             self._tensor_manager.set_skip_discovery(self.config.skip_discovery)
 

@@ -5,6 +5,7 @@ import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -15,6 +16,7 @@ from flextensor.compiler_utils import is_compiling as _is_compiling
 from flextensor.helpers import format_tensor_id_hint
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
+from flextensor.nvme_transfer import NvmeBlockRef  # noqa: TC001 — used as runtime type annotation
 from flextensor.offload_timing import OffloadTimingCollector
 from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicy
 from flextensor.strategy_operations import find_transfers_for_preload
@@ -896,6 +898,8 @@ class RawBlockController:
         *,
         host_pinner: HostPinner,
         release_tensor_memory: bool = True,
+        nvme_backend=None,
+        nvme_offload_path: str | None = None,
     ):
         self.block_map_cpu = {}
         self.block_map_cpu_sizes = {}
@@ -909,6 +913,13 @@ class RawBlockController:
         # re-plan's first (non-destructive) build must pass False so originals
         # survive for the subsequent destructive rebuild.
         self.release_tensor_memory = release_tensor_memory
+        # NVMe disk offload: when enabled, weight blocks are written to NVMe
+        # files after construction and the CPU blocks are freed. During
+        # inference, schedule_transfer reads from NVMe instead of CPU block.
+        self.nvme_backend = nvme_backend
+        self.nvme_offload_path = nvme_offload_path
+        self.nvme_block_map: dict[str, NvmeBlockRef] = {}
+        self.nvme_file_fd: int | None = None
 
         # Process each layer: allocate block, copy tensors, release tensors
         # This interleaved approach reduces peak memory compared to allocating all blocks upfront
@@ -957,6 +968,43 @@ class RawBlockController:
             self.gpu_block_view_map[label] = gpu_block_view
 
         self.prepare_tensor_id_to_view_mapping()
+
+        # NVMe eviction: write CPU blocks to NVMe file, then free CPU blocks.
+        if self.nvme_backend is not None and self.nvme_offload_path is not None:
+            self._evict_to_nvme()
+
+    def _evict_to_nvme(self) -> None:
+        """Write each label's CPU block to a single NVMe file and free CPU blocks.
+
+        All labels are written to one file (``{nvme_offload_path}/blocks.bin``)
+        at 4K-aligned offsets. After writing, the pinned CPU blocks are freed to
+        reclaim host memory — only the GPU blocks and NVMe file remain.
+        """
+        file_path = str(Path(self.nvme_offload_path) / "blocks.bin")
+        self.nvme_file_fd = self.nvme_backend.open_file(file_path)
+        alignment = self.nvme_backend.alignment
+
+        offset = 0
+        for label in list(self.block_map_cpu.keys()):
+            cpu_block = self.block_map_cpu[label]
+            block_ref = self.nvme_backend.write_block(self.nvme_file_fd, cpu_block, offset)
+            block_ref.file_path = file_path
+            self.nvme_block_map[label] = block_ref
+            offset = block_ref.file_offset + block_ref.aligned_nbytes
+
+        # Free CPU blocks — only NVMe + GPU blocks remain.
+        for label in list(self.block_map_cpu.keys()):
+            self.block_map_cpu[label] = None
+            self.block_map_cpu_sizes[label] = self.nvme_block_map[label].logical_nbytes
+
+        LOGGER.info(
+            "RawBlockController: NVMe eviction complete — %d block(s) written to %s "
+            "(%d bytes, aligned to %d).",
+            len(self.nvme_block_map),
+            file_path,
+            offset,
+            alignment,
+        )
 
     def prepare_tensor_id_to_view_mapping(self):
         self.label_to_tensor_views_map = {}
@@ -1041,12 +1089,25 @@ class RawBlockController:
         return self.tensor_id_to_view_map
 
     def schedule_transfer(self, label, non_blocking=True):
-        cpu_block = self.block_map_cpu[label]
         gpu_block_view = self.gpu_block_view_map[label]
-        gpu_block_view.copy_(cpu_block, non_blocking=non_blocking)
+        if self.nvme_backend is not None and label in self.nvme_block_map:
+            block_ref = self.nvme_block_map[label]
+            self.nvme_backend.read_block(
+                self.nvme_file_fd,
+                gpu_block_view,
+                block_ref.file_offset,
+                block_ref.logical_nbytes,
+            )
+        else:
+            cpu_block = self.block_map_cpu[label]
+            gpu_block_view.copy_(cpu_block, non_blocking=non_blocking)
 
     def shutdown(self) -> None:
         """Release any resources associated with this controller."""
+        if self.nvme_file_fd is not None and self.nvme_backend is not None:
+            self.nvme_backend.close_file(self.nvme_file_fd)
+            self.nvme_file_fd = None
+        self.nvme_block_map.clear()
         self.block_map_cpu.clear()
         self.block_map_cpu_sizes.clear()
         self.block_map_gpu.clear()
@@ -1095,6 +1156,8 @@ class AllocationBlockController:
         *,
         host_pinner: HostPinner,
         release_tensor_memory: bool = True,
+        nvme_backend=None,
+        nvme_offload_path: str | None = None,
     ) -> None:
         self.block_map_cpu = {}  # label to cpu block
         self.label_to_cpu_tensor_id_map = {}
@@ -1115,6 +1178,13 @@ class AllocationBlockController:
         # from those timings and a second (destructive) controller is built from
         # ``tensors_map`` afterwards, so the source weights must survive this build.
         self.release_tensor_memory = release_tensor_memory
+        # NVMe disk offload: when enabled, weight blocks are written to NVMe
+        # files after construction and the CPU blocks are freed. During
+        # inference, schedule_transfer reads from NVMe instead of CPU block.
+        self.nvme_backend = nvme_backend
+        self.nvme_offload_path = nvme_offload_path
+        self.nvme_block_map: dict[str, NvmeBlockRef] = {}
+        self.nvme_file_fd: int | None = None
 
         for index, (_block_id, layers) in enumerate(allocation_ordered.items()):
             shm_prefix = None
@@ -1158,6 +1228,41 @@ class AllocationBlockController:
             self.gpu_block_view_map[label] = gpu_block_view
 
         self.prepare_tensor_id_to_view_mapping()
+
+        # NVMe eviction: write CPU blocks to NVMe file, then free CPU blocks.
+        if self.nvme_backend is not None and self.nvme_offload_path is not None:
+            self._evict_to_nvme()
+
+    def _evict_to_nvme(self) -> None:
+        """Write each label's CPU block to a single NVMe file and free CPU blocks.
+
+        All labels are written to one file (``{nvme_offload_path}/blocks.bin``)
+        at alignment-aligned offsets. After writing, the CPU blocks are freed to
+        reclaim host memory — only the GPU blocks and NVMe file remain.
+        """
+        file_path = str(Path(self.nvme_offload_path) / "blocks.bin")
+        self.nvme_file_fd = self.nvme_backend.open_file(file_path)
+
+        offset = 0
+        for label, cpu_block in list(self.block_map_cpu.items()):
+            block_bytes = cpu_block.block.view(torch.uint8).flatten()
+            block_ref = self.nvme_backend.write_block(self.nvme_file_fd, block_bytes, offset)
+            block_ref.file_path = file_path
+            self.nvme_block_map[label] = block_ref
+            offset = block_ref.file_offset + block_ref.aligned_nbytes
+
+        # Free CPU blocks — only NVMe + GPU blocks remain.
+        for label in list(self.block_map_cpu.keys()):
+            self.block_map_cpu[label].release()
+            self.block_map_cpu[label] = None
+
+        LOGGER.info(
+            "AllocationBlockController: NVMe eviction complete — %d block(s) written to %s "
+            "(%d bytes).",
+            len(self.nvme_block_map),
+            file_path,
+            offset,
+        )
 
     def _add_tensors(
         self,
@@ -1226,13 +1331,27 @@ class AllocationBlockController:
         return self.tensor_id_to_view_map
 
     def schedule_transfer(self, label, non_blocking=True):
-        cpu_block = self.block_map_cpu[label]
         gpu_block_view = self.gpu_block_view_map[label]
-        cpu_block.copy_to(gpu_block_view, non_blocking=non_blocking)
+        if self.nvme_backend is not None and label in self.nvme_block_map:
+            block_ref = self.nvme_block_map[label]
+            self.nvme_backend.read_block(
+                self.nvme_file_fd,
+                gpu_block_view,
+                block_ref.file_offset,
+                block_ref.logical_nbytes,
+            )
+        else:
+            cpu_block = self.block_map_cpu[label]
+            cpu_block.copy_to(gpu_block_view, non_blocking=non_blocking)
 
     def shutdown(self) -> None:
+        if self.nvme_file_fd is not None and self.nvme_backend is not None:
+            self.nvme_backend.close_file(self.nvme_file_fd)
+            self.nvme_file_fd = None
+        self.nvme_block_map.clear()
         for block in self.block_map_cpu.values():
-            block.release()
+            if block is not None:
+                block.release()
         self.block_map_cpu.clear()
         self.block_map_gpu.clear()
         self.label_to_gpu_block.clear()

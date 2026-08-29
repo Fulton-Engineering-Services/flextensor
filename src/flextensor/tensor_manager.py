@@ -410,6 +410,10 @@ class TensorManager:
         _piecewise_prefetch: PiecewisePrefetchMode = "warn",
         _offload_timing_log_every: int = OFFLOAD_TIMING_LOG_EVERY,
         _offload_timing_measure_max_passes: int = OFFLOAD_TIMING_MEASURE_MAX_PASSES,
+        _nvme_offload_enabled: bool = False,
+        _nvme_offload_path: str | None = None,
+        _nvme_transfer_mode: str = "cufile",
+        _nvme_alignment_bytes: int = 4096,
     ) -> None:
         """
         Initialize TensorManager with configurable tensor loading strategy.
@@ -493,6 +497,15 @@ class TensorManager:
             _offload_timing_measure_max_passes: Internal — max finalized passes in
                 the durable measure store (ring buffer).
                 (default: :data:`~flextensor.offload_timing.OFFLOAD_TIMING_MEASURE_MAX_PASSES`)
+            _nvme_offload_enabled: Internal — when True, evict cold weights to NVMe
+                disk files and read them back via cuFile/posix during inference.
+                (default: False)
+            _nvme_offload_path: Internal — base directory for NVMe weight files.
+                Required when ``_nvme_offload_enabled`` is True.
+            _nvme_transfer_mode: Internal — ``"cufile"`` for GDS direct-to-GPU,
+                ``"posix"`` for pread+copy fallback. (default: ``"cufile"``)
+            _nvme_alignment_bytes: Internal — alignment for cuFile I/O.
+                (default: 4096)
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
@@ -529,6 +542,14 @@ class TensorManager:
         self.piecewise_prefetch: PiecewisePrefetchMode = _piecewise_prefetch
         self.enable_piecewise_prefetch_check = _piecewise_prefetch != "off"
         self.strict_piecewise_prefetch = _piecewise_prefetch == "error"
+        # NVMe disk offload — when enabled, block controllers evict cold weights
+        # to NVMe files during construction and read them back via cuFile/posix
+        # during inference (replacing the pinned CPU block copy path).
+        self.nvme_offload_enabled = _nvme_offload_enabled
+        self.nvme_offload_path = _nvme_offload_path
+        self.nvme_transfer_mode = _nvme_transfer_mode
+        self.nvme_alignment_bytes = _nvme_alignment_bytes
+        self._nvme_backend = None
         # Durable offload-timing measure store (replan / collect). Fed by the
         # loader's OffloadTimingCollector via on_pass; independent of the
         # collector's rolling log window. Capped ring buffer — see
@@ -1398,6 +1419,8 @@ class TensorManager:
             label_to_block_id,
             host_pinner=self.host_pinner,
             release_tensor_memory=release_tensor_memory,
+            nvme_backend=self._make_nvme_backend(),
+            nvme_offload_path=self.nvme_offload_path,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -1457,6 +1480,20 @@ class TensorManager:
         if not self.enable_piecewise_prefetch_check:
             return PiecewisePrefetchPolicy(enabled=False)
         return PiecewisePrefetchPolicy(enabled=True, strict=self.strict_piecewise_prefetch)
+
+    def _make_nvme_backend(self):
+        """Return an NVMe transfer backend, or None when NVMe offload is disabled."""
+        if not self.nvme_offload_enabled:
+            return None
+        if self._nvme_backend is not None:
+            return self._nvme_backend
+        from flextensor.nvme_transfer import make_nvme_backend
+
+        self._nvme_backend = make_nvme_backend(
+            self.nvme_transfer_mode,
+            alignment=self.nvme_alignment_bytes,
+        )
+        return self._nvme_backend
 
     def _make_shm_block_name_fn(self) -> Callable[[int], str] | None:
         """Build a block-naming function from the SHM namespace, if available."""
@@ -1521,6 +1558,8 @@ class TensorManager:
             block_name_fn=block_name_fn,
             host_pinner=self.host_pinner,
             release_tensor_memory=release_tensor_memory,
+            nvme_backend=self._make_nvme_backend(),
+            nvme_offload_path=self.nvme_offload_path,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
