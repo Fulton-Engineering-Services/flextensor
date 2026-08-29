@@ -414,6 +414,7 @@ class TensorManager:
         _nvme_offload_path: str | None = None,
         _nvme_transfer_mode: str = "cufile",
         _nvme_alignment_bytes: int = 4096,
+        _unified_memory: bool = False,
     ) -> None:
         """
         Initialize TensorManager with configurable tensor loading strategy.
@@ -506,6 +507,11 @@ class TensorManager:
                 ``"posix"`` for pread+copy fallback. (default: ``"cufile"``)
             _nvme_alignment_bytes: Internal — alignment for cuFile I/O.
                 (default: 4096)
+            _unified_memory: Internal — when True, optimise for unified-memory
+                SoCs (e.g. GB10). Skips CPU staging in the bootstrap offloader
+                and uses direct GPU→NVMe writes in the block controller, avoiding
+                ``device="cpu"`` allocations that would double peak memory on
+                unified memory. (default: False)
         """
         if remove_layers_operations is None:
             remove_layers_operations = []
@@ -549,6 +555,7 @@ class TensorManager:
         self.nvme_offload_path = _nvme_offload_path
         self.nvme_transfer_mode = _nvme_transfer_mode
         self.nvme_alignment_bytes = _nvme_alignment_bytes
+        self.unified_memory = _unified_memory
         self._nvme_backend = None
         # Durable offload-timing measure store (replan / collect). Fed by the
         # loader's OffloadTimingCollector via on_pass; independent of the
@@ -1421,6 +1428,7 @@ class TensorManager:
             release_tensor_memory=release_tensor_memory,
             nvme_backend=self._make_nvme_backend(),
             nvme_offload_path=self.nvme_offload_path,
+            unified_memory=self.unified_memory,
         )
 
         self.tensor_layer_loader = tensor_loader_class(
@@ -1492,6 +1500,7 @@ class TensorManager:
         self._nvme_backend = make_nvme_backend(
             self.nvme_transfer_mode,
             alignment=self.nvme_alignment_bytes,
+            use_odirect=not self.unified_memory,
         )
         return self._nvme_backend
 
@@ -1560,6 +1569,7 @@ class TensorManager:
             release_tensor_memory=release_tensor_memory,
             nvme_backend=self._make_nvme_backend(),
             nvme_offload_path=self.nvme_offload_path,
+            unified_memory=self.unified_memory,
         )
 
         self.tensor_layer_loader = tensor_loader_class(

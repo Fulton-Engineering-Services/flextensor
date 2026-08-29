@@ -144,25 +144,33 @@ class PosixBackend:
     fallback.
     """
 
-    def __init__(self, alignment: int = 4096) -> None:
+    def __init__(self, alignment: int = 4096, *, use_odirect: bool = True) -> None:
         """Initialize the POSIX backend.
 
         Args:
             alignment: File and read-size alignment in bytes (default 4096).
                 Data smaller than this is padded on write; reads are rounded
                 up to the next multiple.
+            use_odirect: When True (default), open files with ``O_DIRECT``.
+                Set False for unified-memory platforms where GPU tensor
+                pointers may not meet ``O_DIRECT`` alignment requirements —
+                writes go through the page cache instead. Reads still work
+                correctly; the kernel evicts page-cache pages under memory
+                pressure.
         """
         self.alignment = alignment
+        self.use_odirect = use_odirect
         self._pinned_buf: torch.Tensor | None = None
         self._pinned_buf_size: int = 0
         self._libc = None
         self._libc_pread = None
 
     def open_file(self, file_path: str) -> int:
-        """Open a file for read/write, preferring ``O_DIRECT`` when available.
+        """Open a file for read/write, preferring ``O_DIRECT`` when enabled.
 
-        Falls back to buffered I/O (``O_RDWR | O_CREAT``) when the filesystem
-        does not support ``O_DIRECT`` (e.g. tmpfs).
+        Falls back to buffered I/O (``O_RDWR | O_CREAT``) when ``O_DIRECT``
+        is disabled (``use_odirect=False``) or the filesystem does not support
+        it (e.g. tmpfs).
 
         Args:
             file_path: Path to the NVMe block file.
@@ -170,6 +178,8 @@ class PosixBackend:
         Returns:
             Operating-system file descriptor.
         """
+        if not self.use_odirect:
+            return os.open(file_path, os.O_RDWR | os.O_CREAT, 0o600)
         o_direct = getattr(os, "O_DIRECT", 0)
         flags = os.O_RDWR | os.O_CREAT | o_direct
         try:
@@ -189,33 +199,46 @@ class PosixBackend:
     def write_block(self, fd: int, data: torch.Tensor, offset: int) -> NvmeBlockRef:
         """Write a uint8 block to the file, padding to alignment.
 
+        On unified-memory platforms (e.g. GB10), GPU tensors are accepted:
+        the GPU pointer is host-accessible, so ``os.pwrite`` reads directly
+        from the GPU tensor's physical memory without a CPU-side copy.
+
         Args:
             fd: File descriptor from :meth:`open_file`.
-            data: Contiguous CPU tensor (will be reinterpreted as uint8).
-                GPU tensors are rejected with ``ValueError``.
+            data: Contiguous CPU or GPU tensor (will be reinterpreted as uint8).
+                GPU tensors require unified memory (host-accessible GPU pointers).
             offset: Byte offset within the file (must be alignment-aligned).
 
         Returns:
             :class:`NvmeBlockRef` with the logical and aligned sizes.
 
         Raises:
-            ValueError: If ``data`` is not on CPU.
+            ValueError: If ``data`` is on a non-host-accessible GPU device
+                (i.e. not unified memory).
             OSError: If the write is short (fewer bytes written than expected).
         """
-        if data.device.type != "cpu":
-            raise ValueError(f"PosixBackend.write_block expects a CPU tensor; got {data.device}")
         logical_nbytes = data.numel() * data.element_size()
         aligned_nbytes = _align_up(logical_nbytes, self.alignment)
 
-        data_bytes = data.contiguous().view(torch.uint8).flatten()
-        if aligned_nbytes > logical_nbytes:
-            padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
-            padded[:logical_nbytes] = data_bytes
-            buf = padded.numpy()
+        if data.device.type == "cuda":
+            torch.cuda.synchronize()
+            data_bytes = data.contiguous().view(torch.uint8).flatten()
+            if aligned_nbytes > logical_nbytes:
+                padded = torch.zeros(aligned_nbytes, dtype=torch.uint8, device=data.device)
+                padded[:logical_nbytes] = data_bytes
+                data_bytes = padded
+            buf = self._ctypes_buffer_from_tensor(data_bytes)
         else:
-            buf = data_bytes.numpy()
+            data_bytes = data.contiguous().view(torch.uint8).flatten()
+            if aligned_nbytes > logical_nbytes:
+                padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
+                padded[:logical_nbytes] = data_bytes
+                buf = padded.numpy()
+            else:
+                buf = data_bytes.numpy()
+            buf = memoryview(buf)
 
-        written = os.pwrite(fd, memoryview(buf), offset)
+        written = os.pwrite(fd, buf, offset)
         if written != aligned_nbytes:
             raise OSError(f"Short write: expected {aligned_nbytes}, wrote {written}")
 
@@ -225,6 +248,26 @@ class PosixBackend:
             logical_nbytes=logical_nbytes,
             aligned_nbytes=aligned_nbytes,
         )
+
+    @staticmethod
+    def _ctypes_buffer_from_tensor(tensor: torch.Tensor):
+        """Create a ctypes buffer view from a GPU tensor's data pointer.
+
+        On unified-memory platforms (GB10), GPU memory is host-accessible —
+        the physical address returned by ``data_ptr()`` can be read directly
+        by ``os.pwrite`` without a CPU-side copy.
+
+        Args:
+            tensor: A contiguous uint8 tensor on ``cuda`` (unified memory).
+
+        Returns:
+            A ctypes buffer object suitable for ``os.pwrite``.
+        """
+        import ctypes
+
+        ptr = tensor.data_ptr()
+        nbytes = tensor.numel() * tensor.element_size()
+        return (ctypes.c_char * nbytes).from_address(ptr)
 
     def _ensure_pinned_buf(self, nbytes: int) -> torch.Tensor:
         """Get or grow a pinned CPU buffer for staging reads.
@@ -590,6 +633,8 @@ class CuFileBackend:
 def make_nvme_backend(
     mode: NvmeTransferMode,
     alignment: int = 4096,
+    *,
+    use_odirect: bool = True,
 ) -> NvmeTransferBackend:
     """Create an NVMe transfer backend from the configured mode.
 
@@ -601,6 +646,9 @@ def make_nvme_backend(
     Args:
         mode: ``"cufile"`` for GDS direct-to-GPU, ``"posix"`` for pread+copy.
         alignment: File/device alignment (default 4096 for standard NVMe).
+        use_odirect: When False, open files without ``O_DIRECT`` (for
+            unified-memory platforms where GPU pointers may not meet
+            ``O_DIRECT`` alignment requirements).
 
     Returns:
         A :class:`NvmeTransferBackend` instance.
@@ -613,7 +661,7 @@ def make_nvme_backend(
                 "to enable cuFile (GDS) direct-to-GPU reads.",
                 _NVIDIA_FS_VERSION_PATH,
             )
-            return PosixBackend(alignment=alignment)
+            return PosixBackend(alignment=alignment, use_odirect=use_odirect)
 
         try:
             return CuFileBackend(alignment=alignment)
@@ -622,6 +670,6 @@ def make_nvme_backend(
                 "CuFileBackend initialization failed (%s). Falling back to 'posix'.",
                 exc,
             )
-            return PosixBackend(alignment=alignment)
+            return PosixBackend(alignment=alignment, use_odirect=use_odirect)
 
-    return PosixBackend(alignment=alignment)
+    return PosixBackend(alignment=alignment, use_odirect=use_odirect)

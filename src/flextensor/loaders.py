@@ -17,13 +17,13 @@ from flextensor.compiler_utils import is_compiling as _is_compiling
 from flextensor.helpers import format_tensor_id_hint
 from flextensor.host_pinning import HostPinner
 from flextensor.instrumentation import instrumentable
-from flextensor.nvme_transfer import NvmeBlockRef  # noqa: TC001 — used as runtime type annotation
+from flextensor.nvme_transfer import NvmeBlockRef, _align_up  # noqa: TC001 — used as runtime type annotation
 from flextensor.offload_timing import OffloadTimingCollector
 from flextensor.piecewise_prefetch_policy import PiecewisePrefetchPolicy
 from flextensor.strategy_operations import find_transfers_for_preload
 
 from .collectors import IterativeLayerStatistics, LayerStatistics, TensorStatistics
-from .utils import clear_and_delete_tensor, delete_tensor, is_dense_layout
+from .utils import clear_and_delete_tensor, delete_tensor, is_dense_layout, _compute_packed_byte_layout, _DEFAULT_PACKED_TENSOR_ALIGNMENT_BYTES
 
 LOGGER = logging.getLogger(__name__)
 
@@ -901,6 +901,7 @@ class RawBlockController:
         release_tensor_memory: bool = True,
         nvme_backend=None,
         nvme_offload_path: str | None = None,
+        unified_memory: bool = False,
     ):
         self.block_map_cpu = {}
         self.block_map_cpu_sizes = {}
@@ -1159,6 +1160,7 @@ class AllocationBlockController:
         release_tensor_memory: bool = True,
         nvme_backend=None,
         nvme_offload_path: str | None = None,
+        unified_memory: bool = False,
     ) -> None:
         self.block_map_cpu = {}  # label to cpu block
         self.label_to_cpu_tensor_id_map = {}
@@ -1172,20 +1174,21 @@ class AllocationBlockController:
         self.shm_block_name_map = shm_block_name_map or {}
         self._block_name_fn = block_name_fn or (lambda index: f"ft_{os.getpid()}_{index}")
         self.host_pinner = host_pinner
-        # When True (inference default), each source weight in ``tensors_map`` is
-        # freed right after being copied into its pinned CPU block, to keep peak
-        # host memory low. A profiling-phase controller built to measure the
-        # *compiled* per-layer timings must pass False: the strategy is recomputed
-        # from those timings and a second (destructive) controller is built from
-        # ``tensors_map`` afterwards, so the source weights must survive this build.
         self.release_tensor_memory = release_tensor_memory
-        # NVMe disk offload: when enabled, weight blocks are written to NVMe
-        # files after construction and the CPU blocks are freed. During
-        # inference, schedule_transfer reads from NVMe instead of CPU block.
         self.nvme_backend = nvme_backend
         self.nvme_offload_path = nvme_offload_path
         self.nvme_block_map: dict[str, NvmeBlockRef] = {}
         self.nvme_file_fd: int | None = None
+        self.unified_memory = unified_memory
+
+        if self.unified_memory and self.nvme_backend is not None and self.nvme_offload_path is not None:
+            self._construct_unified_memory(
+                allocation_ordered,
+                tensors_map,
+                strategy_map,
+                label_to_block_id,
+            )
+            return
 
         for index, (_block_id, layers) in enumerate(allocation_ordered.items()):
             shm_prefix = None
@@ -1233,6 +1236,178 @@ class AllocationBlockController:
         # NVMe eviction: write CPU blocks to NVMe file, then free CPU blocks.
         if self.nvme_backend is not None and self.nvme_offload_path is not None:
             self._evict_to_nvme()
+
+    def _construct_unified_memory(
+        self,
+        allocation_ordered: dict[int, list[str]],
+        tensors_map: Mapping[int, torch.Tensor],
+        strategy_map: dict[str, list[TensorStatistics]],
+        label_to_block_id: dict[str, int],
+    ) -> None:
+        """Construct the block controller for unified-memory platforms (e.g. GB10).
+
+        On unified memory, ``device="cpu"`` and ``device="cuda"`` share the same
+        physical DRAM. The standard path allocates CPU blocks via the OS
+        allocator, which cannot reuse the CUDA allocator's cached freed blocks —
+        causing OOM when weights already occupy most of the pool.
+
+        This path writes each label's GPU tensors directly to NVMe via
+        ``os.pwrite`` with a ctypes buffer view from the GPU pointer
+        (host-accessible on unified memory), freeing each tensor after the
+        write and calling ``torch.cuda.empty_cache`` to return freed blocks
+        to the OS. No ``device="cpu"`` allocations are made during eviction.
+
+        After all labels in an allocation group are evicted, the GPU "hot"
+        block is allocated from the freed memory. The view mapping is the same
+        as the standard path — the only difference is the data source (NVMe
+        instead of a CPU block).
+        """
+        import ctypes
+
+        file_path = str(Path(self.nvme_offload_path) / f"blocks_{uuid.uuid4().hex}.bin")
+        self.nvme_file_fd = self.nvme_backend.open_file(file_path)
+        nvme_alignment = self.nvme_backend.alignment
+
+        self.label_to_tensor_views_map = {}
+        self.gpu_block_view_map = {}
+        self.label_to_cpu_tensor_id_map = {}
+
+        file_offset = 0
+
+        for _block_id, layers in allocation_ordered.items():
+            # Phase 1: Write each label's tensors to NVMe, freeing GPU memory.
+            label_layouts: dict[str, tuple[list[int], int, list[tuple]]] = {}
+            label_tensor_ids: dict[str, list[int]] = {}
+
+            for label in layers:
+                strategy = strategy_map.get(label, [])
+                if len(strategy) == 0:
+                    label_layouts[label] = ([], 0, [])
+                    label_tensor_ids[label] = []
+                    continue
+
+                unique_tensor_ids: set[int] = set()
+                tensors_list: list[torch.Tensor] = []
+                tensor_ids_list: list[int] = []
+                for tensor_info in strategy:
+                    tid = tensor_info.tensor_id
+                    if tid in unique_tensor_ids:
+                        continue
+                    unique_tensor_ids.add(tid)
+                    tensors_list.append(tensors_map[tid])
+                    tensor_ids_list.append(tid)
+
+                tensor_byte_sizes = [t.element_size() * t.numel() for t in tensors_list]
+                tensor_offsets, total_packed = _compute_packed_byte_layout(
+                    tensor_byte_sizes, nvme_alignment
+                )
+
+                tensor_meta = [
+                    (t.shape, t.dtype, t.stride() if is_dense_layout(t) else None, t.element_size() * t.numel())
+                    for t in tensors_list
+                ]
+                label_layouts[label] = (tensor_offsets, total_packed, tensor_meta)
+                label_tensor_ids[label] = tensor_ids_list
+
+                for tensor, t_offset in zip(tensors_list, tensor_offsets):
+                    if tensor.device.type == "cuda":
+                        torch.cuda.synchronize()
+                    if tensor.is_contiguous():
+                        byte_view = tensor.view(torch.uint8).flatten()
+                    elif is_dense_layout(tensor):
+                        off_bytes = tensor.storage_offset() * tensor.element_size()
+                        byte_view = torch.empty(0, dtype=torch.uint8, device=tensor.device)
+                        byte_view.set_(
+                            tensor.untyped_storage(), off_bytes,
+                            (tensor.numel() * tensor.element_size(),),
+                        )
+                    else:
+                        byte_view = tensor.contiguous().view(torch.uint8).flatten()
+
+                    nbytes = byte_view.numel() * byte_view.element_size()
+                    aligned = _align_up(nbytes, nvme_alignment)
+                    if aligned > nbytes:
+                        padded = torch.zeros(aligned, dtype=torch.uint8, device=tensor.device)
+                        padded[:nbytes] = byte_view
+                        byte_view = padded
+
+                    ptr = byte_view.data_ptr()
+                    buf = (ctypes.c_char * aligned).from_address(ptr)
+                    written = os.pwrite(self.nvme_file_fd, buf, file_offset + t_offset)
+                    if written != aligned:
+                        raise OSError(
+                            f"Short NVMe write for label={label}: expected {aligned}, wrote {written}"
+                        )
+
+                    if self.release_tensor_memory:
+                        tensor.data = torch.empty(0, device=tensor.device, dtype=tensor.dtype)
+
+                logical_nbytes = total_packed
+                aligned_nbytes = _align_up(logical_nbytes, nvme_alignment)
+                self.nvme_block_map[label] = NvmeBlockRef(
+                    file_path=file_path,
+                    file_offset=file_offset,
+                    logical_nbytes=logical_nbytes,
+                    aligned_nbytes=aligned_nbytes,
+                )
+                file_offset += aligned_nbytes
+
+                torch.cuda.empty_cache()
+
+            # Phase 2: Allocate GPU block and create views.
+            max_packed = max((total for _, total, _ in label_layouts.values()), default=0)
+            if max_packed > 0:
+                gpu_block = torch.zeros(max_packed, dtype=torch.uint8, device=self.device_gpu)
+            else:
+                gpu_block = torch.zeros(1, dtype=torch.uint8, device=self.device_gpu)
+
+            for label in layers:
+                offsets, total_packed, tensor_meta = label_layouts[label]
+                tensor_ids = label_tensor_ids[label]
+
+                tensor_views: list[torch.Tensor] = []
+                for (shape, dtype, stride, _nbytes), t_offset in zip(tensor_meta, offsets):
+                    view = self._view_from_gpu_block(gpu_block, dtype, shape, t_offset, stride)
+                    tensor_views.append(view)
+
+                self.label_to_tensor_views_map[label] = tensor_views
+                self.label_to_cpu_tensor_id_map[label] = tensor_ids
+
+                block_view = gpu_block[:total_packed] if total_packed > 0 else gpu_block[:0]
+                self.gpu_block_view_map[label] = block_view
+                block_id = label_to_block_id[label]
+                self.block_map_gpu[block_id] = block_view
+                self.label_to_gpu_block[label] = gpu_block
+
+        self.prepare_tensor_id_to_view_mapping()
+
+        LOGGER.info(
+            "AllocationBlockController: unified-memory NVMe eviction complete — "
+            "%d label(s) written to %s (%d bytes). GPU hot blocks allocated.",
+            len(self.nvme_block_map),
+            file_path,
+            file_offset,
+        )
+
+    @staticmethod
+    def _view_from_gpu_block(
+        gpu_block: torch.Tensor,
+        dtype: torch.dtype,
+        shape: torch.Size,
+        offset_bytes: int,
+        stride: tuple[int, ...] | None,
+    ) -> torch.Tensor:
+        """Create a typed view from a uint8 GPU block at the given byte offset."""
+        ust = gpu_block.untyped_storage()
+        t = torch.empty(0, dtype=dtype, device=gpu_block.device)
+        elem_size = t.element_size()
+        if offset_bytes % elem_size != 0:
+            raise ValueError(
+                f"offset_bytes ({offset_bytes}) must be a multiple of dtype element size {elem_size}"
+            )
+        storage_offset_elems = offset_bytes // elem_size
+        t.set_(ust, storage_offset_elems, shape, stride)
+        return t
 
     def _evict_to_nvme(self) -> None:
         """Write each label's CPU block to a single NVMe file and free CPU blocks.

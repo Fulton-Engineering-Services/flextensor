@@ -243,7 +243,7 @@ class FlexTensorOffloadWorker(Worker):
         _validate_native_offloader(previous)
         manager_active = False
         try:
-            bootstrap_offloader = VllmBootstrapOffloader()
+            bootstrap_offloader = VllmBootstrapOffloader(unified_memory=offload_config.unified_memory)
             set_offloader(bootstrap_offloader)
             super().load_model()
 

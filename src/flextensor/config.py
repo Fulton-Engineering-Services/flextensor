@@ -340,6 +340,36 @@ class OffloadConfig(BaseModel):
     Can also be set via the ``FT_NVME_ALIGNMENT_BYTES`` env var.
     """
 
+    unified_memory: bool = Field(default=False)
+    """Optimise for unified-memory SoCs (e.g. GB10 Grace-Blackwell).
+
+    On unified memory, ``device="cpu"`` and ``device="cuda"`` share the same
+    physical DRAM. The default bootstrap and block-controller paths stage
+    weights through ``device="cpu"`` allocations, which on unified memory
+    consumes from the same pool as the GPU — doubling peak memory and
+    causing OOM during loading when weights already occupy most of the pool.
+
+    When ``True``:
+
+    * The vLLM bootstrap offloader skips CPU staging — weights stay on GPU
+      after ``load_model`` (same as without FlexTensor).
+    * The block controllers write GPU tensors directly to NVMe via
+      ``os.pwrite`` with a ``ctypes`` buffer view from the GPU pointer (which
+      is host-accessible on unified memory), freeing each tensor after the
+      write and calling ``torch.cuda.empty_cache`` to return freed blocks to
+      the OS. No ``device="cpu"`` allocations are made during eviction.
+
+    This eliminates the doubled-memory peak that makes the standard path
+    incompatible with GB10 and allows ``gpu_memory_utilization`` to be set
+    well below the weight-footprint threshold.
+
+    Can also be set via the ``FT_UNIFIED_MEMORY`` env var.
+
+    One-shot: consumed when the ``TensorManager`` is first constructed (first
+    ``offload()``). A later ``set_config`` with a different value warns; call
+    ``release()`` and re-``offload()`` to apply it.
+    """
+
     include_patterns: list[str] = Field(default_factory=lambda: ["*"])
     """Module or parameter patterns to include for offloading (supports ``*`` and ``?`` wildcards).
 
@@ -552,6 +582,13 @@ class OffloadConfig(BaseModel):
             raise ValueError(
                 "nvme_offload_enabled=True requires nvme_offload_path to be set "
                 "to a directory on a local NVMe filesystem."
+            )
+        if self.unified_memory and self.transfer_mode not in block_loaders:
+            raise ValueError(
+                f"unified_memory=True requires a block transfer_mode "
+                f"(allocation_block_transfer or raw_block_transfer); got "
+                f"transfer_mode={self.transfer_mode!r}. The unified-memory "
+                f"eviction path is implemented by the block controllers."
             )
         return self
 

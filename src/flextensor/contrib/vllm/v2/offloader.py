@@ -106,8 +106,9 @@ def _storage_aliases_by_key(
 
 
 class VllmBootstrapOffloader(_VllmBaseOffloader):
-    def __init__(self) -> None:
+    def __init__(self, *, unified_memory: bool = False) -> None:
         super().__init__()
+        self._unified_memory = unified_memory
         self._wrap_call_index = 0
         self._live_units: list[tuple[int, int, nn.Module]] = []
         self._staged_parameter_ids: set[int] = set()
@@ -128,8 +129,13 @@ class VllmBootstrapOffloader(_VllmBaseOffloader):
         for module_index, module in enumerate(modules_generator):
             coordinate = (wrap_call_index, module_index)
             self._live_units.append((*coordinate, module))
-            # one completed unit must fit on GPU; stream parameters inside a unit only if measurements require it.
-            self._stage_concrete_parameters_on_cpu(module)
+            if not self._unified_memory:
+                # On discrete GPUs, stage each module's parameters to CPU
+                # during loading so GPU storage is freed for reuse by the next
+                # module. On unified memory (GB10), CPU = GPU pool — staging
+                # would double peak memory. Skip it; weights stay on GPU
+                # and the block controller evicts directly to NVMe.
+                self._stage_concrete_parameters_on_cpu(module)
             self._install_supported_deferred_callbacks(module, coordinate)
             modules.append(module)
             self.last_coordinate = coordinate

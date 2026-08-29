@@ -318,6 +318,7 @@ _TENSOR_MANAGER_ONESHOT_FIELDS: tuple[str, ...] = (
     "shm_enabled",
     "transfer_budget_scale",
     "transfer_mode",
+    "unified_memory",
     "offload_timing",
 )
 
@@ -861,6 +862,7 @@ class OffloadManager:
                 _nvme_offload_path=self.config.nvme_offload_path,
                 _nvme_transfer_mode=self.config.nvme_transfer_mode,
                 _nvme_alignment_bytes=self.config.nvme_alignment_bytes,
+                _unified_memory=self.config.unified_memory,
             )
             self._tensor_manager.set_skip_discovery(self.config.skip_discovery)
 
