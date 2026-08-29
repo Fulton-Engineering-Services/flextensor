@@ -100,7 +100,7 @@ def make_nvme_offload_config(
     nvme_dir.mkdir(parents=True, exist_ok=True)
 
     config = config.model_copy(
-        updates={
+        update={
             "nvme_offload_enabled": True,
             "nvme_offload_path": str(nvme_dir),
             "nvme_transfer_mode": nvme_transfer_mode,

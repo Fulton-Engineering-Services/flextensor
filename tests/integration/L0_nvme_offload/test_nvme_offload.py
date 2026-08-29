@@ -153,11 +153,17 @@ class TestNvmeBackendGpuRoundtrip:
         backend.read_block(fd, buf2, ref2.file_offset, ref2.logical_nbytes)
         backend.read_block(fd, buf3, ref3.file_offset, ref3.logical_nbytes)
 
-        assert torch.equal(buf1[: ref1.logical_nbytes].view(torch.float32).reshape(500), data1)
-        assert torch.equal(buf2[: ref2.logical_nbytes].view(torch.int64).reshape(300), data2)
+        assert torch.equal(
+            buf1[: ref1.logical_nbytes].view(torch.float32).reshape(500),
+            data1.to(device),
+        )
+        assert torch.equal(
+            buf2[: ref2.logical_nbytes].view(torch.int64).reshape(300),
+            data2.to(device),
+        )
         assert torch.equal(
             buf3[: ref3.logical_nbytes].view(torch.float16).reshape(200),
-            data3,
+            data3.to(device),
         )
 
         backend.close_file(fd)
@@ -180,7 +186,7 @@ class TestNvmeBackendGpuRoundtrip:
         gpu_buf = torch.zeros(ref.aligned_nbytes, dtype=torch.uint8, device=device)
         backend.read_block(fd, gpu_buf, ref.file_offset, ref.logical_nbytes)
         result = gpu_buf[: ref.logical_nbytes].view(torch.float32).reshape(25)
-        assert torch.equal(result, data)
+        assert torch.equal(result, data.to(device))
 
         backend.close_file(fd)
         backend.close()
