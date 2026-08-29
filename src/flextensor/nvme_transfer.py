@@ -281,7 +281,7 @@ class CuFileBackend:
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_size_t,
-            ctypes.c_off_t,
+            ctypes.c_int64,
         ]
         read_fn.restype = ctypes.c_ssize_t
 
@@ -290,7 +290,7 @@ class CuFileBackend:
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_size_t,
-            ctypes.c_off_t,
+            ctypes.c_int64,
         ]
         write_fn.restype = ctypes.c_ssize_t
 
