@@ -1,13 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unit tests for NVMe transfer backends (PosixBackend, alignment, fallback)."""
+"""Unit tests for NVMe transfer backends.
 
+Exercises ``_align_up``, :class:`PosixBackend` roundtrips, the
+``nvidia-fs`` probe, the :func:`make_nvme_backend` factory fallback
+logic, and :class:`NvmeBlockRef` dataclass fields. No GPU is required
+for POSIX and alignment tests; the GPU-tensor-rejection test requires
+CUDA and is skipped otherwise.
+"""
 
-import pathlib
+from pathlib import Path
 
 import pytest
 import torch
+from pytest import MonkeyPatch
 
 from flextensor.nvme_transfer import (
     NvmeBlockRef,
@@ -19,18 +26,24 @@ from flextensor.nvme_transfer import (
 
 
 class TestAlignUp:
+    """Tests for the ``_align_up`` alignment helper."""
+
     def test_exact_multiple(self) -> None:
+        """A size already aligned must return unchanged."""
         assert _align_up(4096, 4096) == 4096
 
     def test_round_up(self) -> None:
+        """Non-aligned sizes must round up to the next alignment boundary."""
         assert _align_up(1, 4096) == 4096
         assert _align_up(4097, 4096) == 8192
         assert _align_up(8191, 4096) == 8192
 
     def test_zero(self) -> None:
+        """Zero must remain zero (no padding for empty blocks)."""
         assert _align_up(0, 4096) == 0
 
     def test_small_alignment(self) -> None:
+        """Alignment must work with non-4096 values (e.g. 512-byte sectors)."""
         assert _align_up(5, 512) == 512
         assert _align_up(512, 512) == 512
 
@@ -38,7 +51,8 @@ class TestAlignUp:
 class TestPosixBackend:
     """Tests for the POSIX fallback backend (no GPU or kernel module required)."""
 
-    def test_write_read_roundtrip(self, tmp_path) -> None:
+    def test_write_read_roundtrip(self, tmp_path: Path) -> None:
+        """A single block written to NVMe must read back with identical bytes."""
         backend = PosixBackend(alignment=4096)
         file_path = str(tmp_path / "test_block.bin")
         fd = backend.open_file(file_path)
@@ -61,7 +75,8 @@ class TestPosixBackend:
         backend.close_file(fd)
         backend.close()
 
-    def test_multiple_blocks_in_one_file(self, tmp_path) -> None:
+    def test_multiple_blocks_in_one_file(self, tmp_path: Path) -> None:
+        """Multiple blocks at sequential aligned offsets must roundtrip independently."""
         backend = PosixBackend(alignment=4096)
         file_path = str(tmp_path / "multi_block.bin")
         fd = backend.open_file(file_path)
@@ -89,7 +104,8 @@ class TestPosixBackend:
         backend.close_file(fd)
         backend.close()
 
-    def test_alignment_padding(self, tmp_path) -> None:
+    def test_alignment_padding(self, tmp_path: Path) -> None:
+        """Sub-alignment data must be padded to the alignment boundary on disk."""
         backend = PosixBackend(alignment=4096)
         file_path = str(tmp_path / "aligned.bin")
         fd = backend.open_file(file_path)
@@ -103,14 +119,15 @@ class TestPosixBackend:
         assert ref.aligned_nbytes == 4096
 
         # File should be at least 4096 bytes.
-        file_size = pathlib.Path(file_path).stat().st_size
+        file_size = Path(file_path).stat().st_size
         assert file_size >= 4096
 
         backend.close_file(fd)
         backend.close()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to create a GPU tensor")
-    def test_rejects_gpu_tensor_on_write(self, tmp_path) -> None:
+    def test_rejects_gpu_tensor_on_write(self, tmp_path: Path) -> None:
+        """``write_block`` must reject GPU tensors with a ``ValueError``."""
         backend = PosixBackend(alignment=4096)
         file_path = str(tmp_path / "reject.bin")
         fd = backend.open_file(file_path)
@@ -124,18 +141,28 @@ class TestPosixBackend:
 
 
 class TestNvidiaFsProbe:
+    """Tests for the ``nvidia-fs`` kernel module probe."""
+
     def test_probe_returns_bool(self) -> None:
+        """``is_nvidia_fs_available`` must return a boolean (not raise)."""
         result = is_nvidia_fs_available()
         assert isinstance(result, bool)
 
 
 class TestMakeNvmeBackend:
+    """Tests for the ``make_nvme_backend`` factory and fallback logic."""
+
     def test_posix_mode_returns_posix_backend(self) -> None:
+        """Explicit ``'posix'`` mode must always return a :class:`PosixBackend`."""
         backend = make_nvme_backend("posix", alignment=4096)
         assert isinstance(backend, PosixBackend)
         backend.close()
 
-    def test_cufile_falls_back_to_posix_without_nvidia_fs(self, monkeypatch) -> None:
+    def test_cufile_falls_back_to_posix_without_nvidia_fs(
+        self,
+        monkeypatch: MonkeyPatch,
+    ) -> None:
+        """``'cufile'`` mode must fall back to POSIX when ``nvidia-fs`` is absent."""
         monkeypatch.setattr("flextensor.nvme_transfer.is_nvidia_fs_available", lambda: False)
         backend = make_nvme_backend("cufile", alignment=4096)
         assert isinstance(backend, PosixBackend)
@@ -143,7 +170,10 @@ class TestMakeNvmeBackend:
 
 
 class TestNvmeBlockRef:
+    """Tests for the :class:`NvmeBlockRef` dataclass field storage."""
+
     def test_fields(self) -> None:
+        """All constructor arguments must be stored as attributes."""
         ref = NvmeBlockRef(
             file_path="/mnt/nvme/test.bin",
             file_offset=4096,

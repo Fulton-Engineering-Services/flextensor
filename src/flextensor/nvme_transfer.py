@@ -26,7 +26,9 @@ from typing import Any, Protocol, runtime_checkable
 
 import torch
 
-from flextensor.config import NvmeTransferMode  # noqa: TC001 — beartype resolves at runtime
+from flextensor.config import (
+    NvmeTransferMode,  # ruff: ignore[typing-only-first-party-import] — beartype resolves at runtime
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,11 +143,29 @@ class PosixBackend:
     """
 
     def __init__(self, alignment: int = 4096) -> None:
+        """Initialize the POSIX backend.
+
+        Args:
+            alignment: File and read-size alignment in bytes (default 4096).
+                Data smaller than this is padded on write; reads are rounded
+                up to the next multiple.
+        """
         self.alignment = alignment
         self._pinned_buf: torch.Tensor | None = None
         self._pinned_buf_size: int = 0
 
     def open_file(self, file_path: str) -> int:
+        """Open a file for read/write, preferring ``O_DIRECT`` when available.
+
+        Falls back to buffered I/O (``O_RDWR | O_CREAT``) when the filesystem
+        does not support ``O_DIRECT`` (e.g. tmpfs).
+
+        Args:
+            file_path: Path to the NVMe block file.
+
+        Returns:
+            Operating-system file descriptor.
+        """
         o_direct = getattr(os, "O_DIRECT", 0)
         flags = os.O_RDWR | os.O_CREAT | o_direct
         try:
@@ -155,10 +175,29 @@ class PosixBackend:
         return fd
 
     def close_file(self, fd: int) -> None:
+        """Close an open file descriptor.
+
+        Args:
+            fd: File descriptor returned by :meth:`open_file`.
+        """
         os.close(fd)
 
     def write_block(self, fd: int, data: torch.Tensor, offset: int) -> NvmeBlockRef:
-        """Write a uint8 block to the file, padding to alignment."""
+        """Write a uint8 block to the file, padding to alignment.
+
+        Args:
+            fd: File descriptor from :meth:`open_file`.
+            data: Contiguous CPU tensor (will be reinterpreted as uint8).
+                GPU tensors are rejected with ``ValueError``.
+            offset: Byte offset within the file (must be alignment-aligned).
+
+        Returns:
+            :class:`NvmeBlockRef` with the logical and aligned sizes.
+
+        Raises:
+            ValueError: If ``data`` is not on CPU.
+            OSError: If the write is short (fewer bytes written than expected).
+        """
         if data.device.type != "cpu":
             raise ValueError(f"PosixBackend.write_block expects a CPU tensor; got {data.device}")
         logical_nbytes = data.numel() * data.element_size()
@@ -198,7 +237,20 @@ class PosixBackend:
         return self._pinned_buf
 
     def read_block(self, fd: int, gpu_buf: torch.Tensor, offset: int, nbytes: int) -> None:
-        """Read from NVMe into pinned CPU, then copy to GPU buffer."""
+        """Read from NVMe into pinned CPU memory, then copy to GPU buffer.
+
+        The read is staged through a pinned CPU buffer (grown on demand) and
+        then copied to ``gpu_buf`` via ``copy_`` with ``non_blocking=True``.
+
+        Args:
+            fd: File descriptor from :meth:`open_file`.
+            gpu_buf: GPU tensor (uint8 or reinterpretable view) to read into.
+            offset: Byte offset within the file (must be alignment-aligned).
+            nbytes: Number of bytes to read (rounded up to alignment).
+
+        Raises:
+            OSError: If the read is short (fewer bytes read than expected).
+        """
         aligned_nbytes = _align_up(nbytes, self.alignment)
         pinned = self._ensure_pinned_buf(aligned_nbytes)
 
@@ -228,6 +280,22 @@ class CuFileBackend:
     """
 
     def __init__(self, alignment: int = 4096) -> None:
+        """Initialize the cuFile (GDS) backend.
+
+        Loads ``libcufile.so`` via ctypes, opens the cuFile driver, and runs
+        a pre-flight check (registering a temporary file) to verify that
+        GDS P2P is supported on this GPU. On GB10 unified memory, the pre-flight
+        fails and :class:`RuntimeError` is raised so :func:`make_nvme_backend`
+        falls back to :class:`PosixBackend`.
+
+        Args:
+            alignment: File, buffer, and read-size alignment in bytes (default
+                4096). cuFile requires 4K-aligned offsets and buffer addresses.
+
+        Raises:
+            RuntimeError: If ``libcufile.so`` is not found, ``cuFileDriverOpen``
+                fails, or the pre-flight check fails (GPU model not supported).
+        """
         self.alignment = alignment
         self._cufile: Any = None
         self._lib: Any = None
@@ -262,10 +330,8 @@ class CuFileBackend:
             self._cufile["cuFileHandleDeregister"](ctypes.c_void_p(handle.value))
         finally:
             os.close(fd)
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            with contextlib.suppress(OSError):
+                Path(tmp_path).unlink()
 
     def _init_cufile(self) -> None:
         """Lazy-load libcufile via ctypes and call cuFileDriverInit."""
@@ -368,7 +434,11 @@ class CuFileBackend:
         return fd
 
     def close_file(self, fd: int) -> None:
-        """Deregister the cuFile handle and close the file descriptor."""
+        """Deregister the cuFile handle and close the file descriptor.
+
+        Args:
+            fd: File descriptor returned by :meth:`open_file`.
+        """
         import ctypes
 
         handle = self._handles.pop(fd, None)
@@ -377,7 +447,21 @@ class CuFileBackend:
         os.close(fd)
 
     def write_block(self, fd: int, data: torch.Tensor, offset: int) -> NvmeBlockRef:
-        """Write a uint8 block to NVMe via cuFile (CPU pointer source)."""
+        """Write a uint8 block to NVMe via cuFile (CPU pointer source).
+
+        Args:
+            fd: File descriptor from :meth:`open_file`.
+            data: Contiguous CPU tensor (will be reinterpreted as uint8).
+                GPU tensors are rejected with ``ValueError``.
+            offset: Byte offset within the file (must be alignment-aligned).
+
+        Returns:
+            :class:`NvmeBlockRef` with the logical and aligned sizes.
+
+        Raises:
+            ValueError: If ``data`` is not on CPU.
+            OSError: If ``cuFileWrite`` returns an error or a short write.
+        """
         if data.device.type != "cpu":
             raise ValueError(f"CuFileBackend.write_block expects a CPU tensor; got {data.device}")
         logical_nbytes = data.numel() * data.element_size()
@@ -411,7 +495,20 @@ class CuFileBackend:
         )
 
     def read_block(self, fd: int, gpu_buf: torch.Tensor, offset: int, nbytes: int) -> None:
-        """Read directly from NVMe into GPU memory via cuFileRead."""
+        """Read directly from NVMe into GPU memory via ``cuFileRead``.
+
+        No CPU staging buffer is used — the DMA goes directly into the GPU
+        buffer's memory (or unified DRAM on GB10).
+
+        Args:
+            fd: File descriptor from :meth:`open_file`.
+            gpu_buf: GPU tensor (uint8 or reinterpretable view) to read into.
+            offset: Byte offset within the file (must be alignment-aligned).
+            nbytes: Number of bytes to read (rounded up to alignment).
+
+        Raises:
+            OSError: If ``cuFileRead`` returns an error or a short read.
+        """
         aligned_nbytes = _align_up(nbytes, self.alignment)
         gpu_ptr = gpu_buf.view(torch.uint8).flatten().data_ptr()
 
@@ -428,7 +525,15 @@ class CuFileBackend:
             raise OSError(f"Short cuFile read: expected {aligned_nbytes}, got {read}")
 
     def close(self) -> None:
+        """Release cuFile driver resources.
+
+        ``cuFileDriverClose`` failures are suppressed because this is an
+        isolation point during shutdown — a failed close must not propagate
+        and mask the original exception that triggered cleanup.
+        """
         if self._cufile is not None:
+            # Isolation point per Google Style Guide §2.4: suppress cleanup
+            # errors so they do not mask the original exception.
             try:
                 self._cufile["cuFileDriverClose"]()
             except Exception:
