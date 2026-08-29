@@ -231,7 +231,41 @@ class CuFileBackend:
         self.alignment = alignment
         self._cufile: Any = None
         self._lib: Any = None
+        self._handles: dict[int, Any] = {}
         self._init_cufile()
+        self._preflight_check()
+
+    def _preflight_check(self) -> None:
+        """Verify cuFileHandleRegister works by registering a temp file.
+
+        On platforms where the GPU model is not supported for GDS (e.g. GB10
+        unified memory), ``cuFileDriverOpen`` succeeds but
+        ``cuFileHandleRegister`` fails with rc=5008. This pre-flight detects
+        that and raises ``RuntimeError`` so :func:`make_nvme_backend` falls
+        back to :class:`PosixBackend`.
+        """
+        import ctypes
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(prefix="cufile_preflight_", suffix=".bin")
+        try:
+            os.ftruncate(fd, self.alignment)
+            handle = ctypes.c_void_p(None)
+            c_fd = ctypes.c_int(fd)
+            rc = self._cufile["cuFileHandleRegister"](ctypes.byref(handle), ctypes.byref(c_fd))
+            if rc != 0:
+                raise RuntimeError(
+                    f"cuFileHandleRegister pre-flight failed with rc={rc}. The GPU "
+                    f"may not support GDS P2P DMA (e.g. GB10 unified memory). "
+                    f"Use nvme_transfer_mode='posix' for NVMe reads via pread."
+                )
+            self._cufile["cuFileHandleDeregister"](ctypes.c_void_p(handle.value))
+        finally:
+            os.close(fd)
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def _init_cufile(self) -> None:
         """Lazy-load libcufile via ctypes and call cuFileDriverInit."""
