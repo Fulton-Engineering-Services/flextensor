@@ -167,13 +167,14 @@ def assert_nvme_files_exist(nvme_dir: Path) -> None:
     """Assert that NVMe weight block files were written to ``nvme_dir``.
 
     Args:
-        nvme_dir: Directory expected to contain ``blocks.bin``.
+        nvme_dir: Directory expected to contain ``blocks_*.bin``.
 
     Raises:
-        AssertionError: If ``blocks.bin`` does not exist or is empty.
+        AssertionError: If no ``blocks_*.bin`` file exists or the first match is empty.
     """
-    blocks_file = nvme_dir / "blocks.bin"
-    assert blocks_file.exists(), f"NVMe block file not found: {blocks_file}"
+    candidates = sorted(nvme_dir.glob("blocks_*.bin"))
+    assert candidates, f"NVMe block file not found in: {nvme_dir}"
+    blocks_file = candidates[0]
     assert blocks_file.stat().st_size > 0, f"NVMe block file is empty: {blocks_file}"
 
 
