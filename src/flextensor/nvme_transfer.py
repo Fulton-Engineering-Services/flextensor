@@ -155,6 +155,8 @@ class PosixBackend:
         self.alignment = alignment
         self._pinned_buf: torch.Tensor | None = None
         self._pinned_buf_size: int = 0
+        self._libc = None
+        self._libc_pread = None
 
     def open_file(self, file_path: str) -> int:
         """Open a file for read/write, preferring ``O_DIRECT`` when available.
@@ -171,9 +173,9 @@ class PosixBackend:
         o_direct = getattr(os, "O_DIRECT", 0)
         flags = os.O_RDWR | os.O_CREAT | o_direct
         try:
-            fd = os.open(file_path, flags, 0o644)
+            fd = os.open(file_path, flags, 0o600)
         except OSError:
-            fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o644)
+            fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o600)
         return fd
 
     def close_file(self, fd: int) -> None:
@@ -256,17 +258,24 @@ class PosixBackend:
         """
         import ctypes
 
+        if self._libc is None:
+            self._libc = ctypes.CDLL(None)
+            self._libc_pread = self._libc.pread
+            self._libc_pread.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int64]
+            self._libc_pread.restype = ctypes.c_ssize_t
+
         aligned_nbytes = _align_up(nbytes, self.alignment)
         pinned = self._ensure_pinned_buf(aligned_nbytes)
 
-        buf_view = pinned[:aligned_nbytes]
-        buf_bytes = os.pread(fd, aligned_nbytes, offset)
-        if len(buf_bytes) != aligned_nbytes:
-            raise OSError(f"Short read: expected {aligned_nbytes}, got {len(buf_bytes)}")
-        ctypes.memmove(pinned.data_ptr(), buf_bytes, aligned_nbytes)
+        pinned_ptr = pinned.data_ptr()
+        read = self._libc_pread(fd, pinned_ptr, aligned_nbytes, offset)
+        if read < 0:
+            raise OSError(f"pread failed with errno {-read}")
+        if read != aligned_nbytes:
+            raise OSError(f"Short read: expected {aligned_nbytes}, got {read}")
 
         gpu_view = gpu_buf.view(torch.uint8).flatten()[:nbytes]
-        gpu_view.copy_(buf_view[:nbytes], non_blocking=True)
+        gpu_view.copy_(pinned[:nbytes], non_blocking=True)
 
     def close(self) -> None:
         self._pinned_buf = None
@@ -345,9 +354,9 @@ class CuFileBackend:
         o_direct = getattr(os, "O_DIRECT", 0)
         flags = os.O_RDWR | os.O_CREAT | o_direct
         try:
-            fd = os.open(tmp_path, flags, 0o644)
+            fd = os.open(tmp_path, flags, 0o600)
         except OSError:
-            fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT, 0o644)
+            fd = os.open(tmp_path, os.O_RDWR | os.O_CREAT, 0o600)
         try:
             os.ftruncate(fd, self.alignment)
             handle = ctypes.c_void_p(None)
@@ -414,6 +423,7 @@ class CuFileBackend:
             ctypes.c_void_p,
             ctypes.c_size_t,
             ctypes.c_int64,
+            ctypes.c_int64,
         ]
         read_fn.restype = ctypes.c_ssize_t
 
@@ -422,6 +432,7 @@ class CuFileBackend:
             ctypes.c_void_p,
             ctypes.c_void_p,
             ctypes.c_size_t,
+            ctypes.c_int64,
             ctypes.c_int64,
         ]
         write_fn.restype = ctypes.c_ssize_t
@@ -444,9 +455,9 @@ class CuFileBackend:
         o_direct = getattr(os, "O_DIRECT", 0)
         flags = os.O_RDWR | os.O_CREAT | o_direct
         try:
-            fd = os.open(file_path, flags, 0o644)
+            fd = os.open(file_path, flags, 0o600)
         except OSError:
-            fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o644)
+            fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o600)
 
         handle = ctypes.c_void_p(None)
         c_fd = ctypes.c_int(fd)
@@ -513,6 +524,7 @@ class CuFileBackend:
             src_ptr,
             aligned_nbytes,
             offset,
+            0,
         )
         if written < 0:
             raise OSError(f"cuFileWrite failed with rc={written}")
@@ -550,6 +562,7 @@ class CuFileBackend:
             gpu_ptr,
             aligned_nbytes,
             offset,
+            0,
         )
         if read < 0:
             raise OSError(f"cuFileRead failed with rc={read}")

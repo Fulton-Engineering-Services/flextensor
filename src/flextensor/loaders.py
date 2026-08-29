@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import logging
 import os
+import uuid
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
@@ -976,11 +977,11 @@ class RawBlockController:
     def _evict_to_nvme(self) -> None:
         """Write each label's CPU block to a single NVMe file and free CPU blocks.
 
-        All labels are written to one file (``{nvme_offload_path}/blocks.bin``)
+        All labels are written to one file (``{nvme_offload_path}/blocks_<uuid>.bin``)
         at 4K-aligned offsets. After writing, the pinned CPU blocks are freed to
         reclaim host memory — only the GPU blocks and NVMe file remain.
         """
-        file_path = str(Path(self.nvme_offload_path) / "blocks.bin")
+        file_path = str(Path(self.nvme_offload_path) / f"blocks_{uuid.uuid4().hex}.bin")
         self.nvme_file_fd = self.nvme_backend.open_file(file_path)
         alignment = self.nvme_backend.alignment
 
@@ -1236,11 +1237,11 @@ class AllocationBlockController:
     def _evict_to_nvme(self) -> None:
         """Write each label's CPU block to a single NVMe file and free CPU blocks.
 
-        All labels are written to one file (``{nvme_offload_path}/blocks.bin``)
+        All labels are written to one file (``{nvme_offload_path}/blocks_<uuid>.bin``)
         at alignment-aligned offsets. After writing, the CPU blocks are freed to
         reclaim host memory — only the GPU blocks and NVMe file remain.
         """
-        file_path = str(Path(self.nvme_offload_path) / "blocks.bin")
+        file_path = str(Path(self.nvme_offload_path) / f"blocks_{uuid.uuid4().hex}.bin")
         self.nvme_file_fd = self.nvme_backend.open_file(file_path)
 
         offset = 0
