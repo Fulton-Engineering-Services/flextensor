@@ -247,6 +247,9 @@ def _block_restore_case() -> tuple[
     controller.label_to_tensor_views_map = {}
     controller.label_to_cpu_tensor_id_map = {"layer": [id(parameter)]}
     controller.tensor_id_to_view_map = {id(parameter): runtime_view}
+    controller.nvme_file_fd = None
+    controller.nvme_backend = None
+    controller.nvme_block_map = {}
     manager.tensors_map = {id(parameter): parameter}
     manager.tensor_layer_loader = MagicMock(
         allocation_controller=controller,

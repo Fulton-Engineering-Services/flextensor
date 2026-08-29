@@ -70,7 +70,7 @@ def _install_bootstrap_fakes(  # noqa: C901
     class BootstrapOffloader:
         last_coordinate = (0, 1)
 
-        def __init__(self) -> None:
+        def __init__(self, *, unified_memory: bool = False) -> None:
             fail_construction("bootstrap-constructor")
             worker_module._test_bootstrap = self
 

@@ -86,6 +86,52 @@ def test_bootstrap_stages_each_unit_before_requesting_the_next(bootstrap_module,
     assert offloader.last_coordinate == (0, 1)
 
 
+def test_bootstrap_unified_memory_skips_cpu_staging(bootstrap_module, monkeypatch) -> None:
+    """``unified_memory=True`` must skip ``_stage_concrete_parameters_on_cpu`` entirely.
+
+    On unified memory (GB10), CPU and GPU share the same physical DRAM pool.
+    Staging to CPU would double peak memory. The offloader must be a
+    pass-through: modules are yielded without any CPU staging.
+    """
+    first = _module_with_tensor("weight")
+    second = _module_with_tensor("weight")
+    staged: list[int] = []
+
+    monkeypatch.setattr(
+        bootstrap_module,
+        "_stage_parameter_storage_on_cpu",
+        lambda parameter, staged_storages: staged.append(id(parameter)),
+    )
+    offloader = bootstrap_module.VllmBootstrapOffloader(unified_memory=True)
+
+    modules_list = [first, second]
+    result = offloader.wrap_modules(iter(modules_list))
+
+    assert result == modules_list
+    assert staged == []
+    assert offloader.last_coordinate == (0, 1)
+    assert offloader._unified_memory is True
+
+
+def test_bootstrap_unified_memory_preserves_weights_on_gpu(bootstrap_module, monkeypatch) -> None:
+    """``unified_memory=True`` must not move weights off their original device.
+
+    With staging skipped, weight parameters retain their original storage
+    (no clone-to-CPU). This is the key behavioural difference: on unified
+    memory, weights stay on GPU after ``load_model``.
+    """
+    weight = nn.Parameter(torch.ones(2, 2))
+    unit = nn.Module()
+    unit.weight = weight
+    original_storage = weight.untyped_storage()
+
+    offloader = bootstrap_module.VllmBootstrapOffloader(unified_memory=True)
+    offloader.wrap_modules(iter([unit]))
+
+    assert unit.weight.untyped_storage()._cdata == original_storage._cdata
+    torch.testing.assert_close(unit.weight, torch.ones(2, 2))
+
+
 def test_bootstrap_does_not_stage_buffers_meta_or_unsupported_layouts(bootstrap_module, monkeypatch) -> None:
     unit = nn.Module()
     unit.weight = nn.Parameter(torch.ones(2, 2))

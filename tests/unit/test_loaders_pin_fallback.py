@@ -225,6 +225,9 @@ def test_block_controller_shutdown_drops_owned_storage_maps(controller_type):
     controller.label_to_tensor_views_map = {"layer": [torch.ones(1)]}
     controller.label_to_cpu_tensor_id_map = {"layer": [1]}
     controller.tensor_id_to_view_map = {1: torch.ones(1)}
+    controller.nvme_file_fd = None
+    controller.nvme_backend = None
+    controller.nvme_block_map = {}
     if controller_type is RawBlockController:
         controller.block_map_cpu_sizes = {"layer": 4}
         controller.block_meta_map = {"layer": []}

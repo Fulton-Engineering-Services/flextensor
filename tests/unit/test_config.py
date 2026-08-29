@@ -111,6 +111,7 @@ class TestOffloadConfig:
         assert config.min_blocks == 4
         assert config.max_gpu_mem_fraction is None
         assert config.external_compile is False
+        assert config.unified_memory is False
 
     def test_max_gpu_mem_fraction_default(self):
         """Default max_gpu_mem_fraction is None for latency-first mode."""
@@ -962,6 +963,19 @@ class TestLoadConfigFromEnv:
         os.environ["FT_EXTERNAL_COMPILE"] = "1"
         config = load_config_from_env()
         assert config.external_compile is True
+
+    def test_unified_memory_from_env(self):
+        """FT_UNIFIED_MEMORY is picked up from the environment."""
+        os.environ["FT_UNIFIED_MEMORY"] = "1"
+        os.environ["FT_TRANSFER_MODE"] = "allocation_block_transfer"
+        config = load_config_from_env()
+        assert config.unified_memory is True
+
+    def test_unified_memory_false_from_env(self):
+        """FT_UNIFIED_MEMORY=0 must set unified_memory to False."""
+        os.environ["FT_UNIFIED_MEMORY"] = "0"
+        config = load_config_from_env()
+        assert config.unified_memory is False
 
 
 class TestLoadConfigFromFile:
