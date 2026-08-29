@@ -2283,11 +2283,6 @@ class TensorManager:
                     controller.tensor_id_to_view_map[tensor_id].untyped_storage()._cdata  # noqa: SLF001
                 )
                 if current_storage == loader_storage:
-                    # Regular CPU blocks are ordinary tensor storage. Rebinding
-                    # transfers ownership to the model, so controller teardown
-                    # can drop its references without a second full weight copy.
-                    # SHM blocks are explicitly unmapped by ``block.release()``
-                    # and therefore still need independent storage.
                     cpu_block = controller.block_map_cpu[label]
                     requires_copy = (
                         isinstance(controller, AllocationBlockController) and cpu_block.shm_block is not None
@@ -2296,6 +2291,20 @@ class TensorManager:
                         source_view.clone(memory_format=torch.preserve_format) if requires_copy else source_view
                     )
                     set_tensor_data(tensor, restored_data)
+
+        # For NVMe-evicted labels (block_map_cpu[label] is None), rebind
+        # parameters to empty CPU storage so they do not alias GPU blocks
+        # that will be freed by the loader shutdown below.
+        nvme_labels = {label for label, block in controller.block_map_cpu.items() if block is None}
+        for label in nvme_labels:
+            if label not in controller.label_to_cpu_tensor_id_map:
+                continue
+            for tensor_id in controller.label_to_cpu_tensor_id_map[label]:
+                tensor = self.tensors_map.get(tensor_id)
+                if tensor is None:
+                    continue
+                dt = tensor.dtype
+                set_tensor_data(tensor, torch.empty(0, dtype=dt, device="cpu"))
 
     def shutdown(self) -> None:  # noqa: C901
         class_restore_error: Exception | None = None
@@ -2322,6 +2331,13 @@ class TensorManager:
             raise
         except Exception as error:
             teardown_error = error
+        try:
+            if self._nvme_backend is not None:
+                self._nvme_backend.close()
+        except Exception:
+            if teardown_error is None:
+                raise
+            logger.exception("nvme_backend.close() raised during shutdown")
         try:
             self.host_pinner.release_all()
         except Exception:

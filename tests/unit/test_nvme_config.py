@@ -112,6 +112,8 @@ class TestNvmeConfigValidation:
         config = OffloadConfig(
             unified_memory=True,
             transfer_mode="allocation_block_transfer",
+            nvme_offload_enabled=True,
+            nvme_offload_path="/mnt/nvme/ft",
         )
         assert config.unified_memory is True
 
@@ -120,6 +122,8 @@ class TestNvmeConfigValidation:
         config = OffloadConfig(
             unified_memory=True,
             transfer_mode="raw_block_transfer",
+            nvme_offload_enabled=True,
+            nvme_offload_path="/mnt/nvme/ft",
         )
         assert config.unified_memory is True
 
@@ -158,5 +162,7 @@ class TestNvmeConfigEnvVars:
 
         monkeypatch.setenv("FT_UNIFIED_MEMORY", "1")
         monkeypatch.setenv("FT_TRANSFER_MODE", "allocation_block_transfer")
+        monkeypatch.setenv("FT_NVME_OFFLOAD_ENABLED", "1")
+        monkeypatch.setenv("FT_NVME_OFFLOAD_PATH", "/mnt/nvme/ft")
         config = load_config_from_env()
         assert config.unified_memory is True

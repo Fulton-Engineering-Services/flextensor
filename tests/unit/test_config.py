@@ -968,6 +968,8 @@ class TestLoadConfigFromEnv:
         """FT_UNIFIED_MEMORY is picked up from the environment."""
         os.environ["FT_UNIFIED_MEMORY"] = "1"
         os.environ["FT_TRANSFER_MODE"] = "allocation_block_transfer"
+        os.environ["FT_NVME_OFFLOAD_ENABLED"] = "1"
+        os.environ["FT_NVME_OFFLOAD_PATH"] = "/mnt/nvme/ft"
         config = load_config_from_env()
         assert config.unified_memory is True
 

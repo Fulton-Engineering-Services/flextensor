@@ -17,6 +17,7 @@ inference (replacing the CPU→GPU ``copy_`` path).
 
 from __future__ import annotations
 
+import ctypes
 import contextlib
 import logging
 import os
@@ -50,6 +51,12 @@ _CUFILE_LIB_PATHS = [
 ]
 
 _NVIDIA_FS_VERSION_PATH = "/proc/driver/nvidia-fs/version"
+
+_CU_FILE_HANDLE_TYPE_OPAQUE_FD = 1
+
+
+class _CUfileDescr(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("handle", ctypes.c_int)]
 
 
 def is_nvidia_fs_available() -> bool:
@@ -229,14 +236,17 @@ class PosixBackend:
             # physical pages under a CPU virtual address.
             data = data.cpu()
 
-        data_bytes = data.contiguous().view(torch.uint8).flatten()
+        data_bytes = data.contiguous().view(torch.uint8).flatten().numpy()
         if aligned_nbytes > logical_nbytes:
-            padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
-            padded[:logical_nbytes] = data_bytes
-            buf = padded.numpy()
+            import mmap
+            aligned_buf = mmap.mmap(-1, aligned_nbytes)
+            aligned_buf[:logical_nbytes] = data_bytes.tobytes()
+            buf = memoryview(aligned_buf)
         else:
-            buf = data_bytes.numpy()
-        buf = memoryview(buf)
+            import mmap
+            aligned_buf = mmap.mmap(-1, aligned_nbytes)
+            aligned_buf[:aligned_nbytes] = data_bytes.tobytes()
+            buf = memoryview(aligned_buf)
 
         written = os.pwrite(fd, buf, offset)
         if written != aligned_nbytes:
@@ -317,7 +327,8 @@ class PosixBackend:
         pinned_ptr = pinned.data_ptr()
         read = self._libc_pread(fd, pinned_ptr, aligned_nbytes, offset)
         if read < 0:
-            raise OSError(f"pread failed with errno {-read}")
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err))
         if read != aligned_nbytes:
             raise OSError(f"Short read: expected {aligned_nbytes}, got {read}")
 
@@ -407,8 +418,8 @@ class CuFileBackend:
         try:
             os.ftruncate(fd, self.alignment)
             handle = ctypes.c_void_p(None)
-            c_fd = ctypes.c_int(fd)
-            rc = self._cufile["cuFileHandleRegister"](ctypes.byref(handle), ctypes.byref(c_fd))
+            descr = _CUfileDescr(_CU_FILE_HANDLE_TYPE_OPAQUE_FD, fd)
+            rc = self._cufile["cuFileHandleRegister"](ctypes.byref(handle), ctypes.byref(descr))
             if rc != 0:
                 raise RuntimeError(
                     f"cuFileHandleRegister pre-flight failed with rc={rc}. The GPU "
@@ -487,7 +498,7 @@ class CuFileBackend:
         register_fn = self._cufile["cuFileHandleRegister"]
         register_fn.argtypes = [
             ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(_CUfileDescr),
         ]
         register_fn.restype = ctypes.c_int
 
@@ -507,8 +518,8 @@ class CuFileBackend:
             fd = os.open(file_path, os.O_RDWR | os.O_CREAT, 0o600)
 
         handle = ctypes.c_void_p(None)
-        c_fd = ctypes.c_int(fd)
-        rc = self._cufile["cuFileHandleRegister"](ctypes.byref(handle), ctypes.byref(c_fd))
+        descr = _CUfileDescr(_CU_FILE_HANDLE_TYPE_OPAQUE_FD, fd)
+        rc = self._cufile["cuFileHandleRegister"](ctypes.byref(handle), ctypes.byref(descr))
         if rc != 0:
             os.close(fd)
             raise RuntimeError(
@@ -557,13 +568,19 @@ class CuFileBackend:
         logical_nbytes = data.numel() * data.element_size()
         aligned_nbytes = _align_up(logical_nbytes, self.alignment)
 
+        import mmap
+
         data_bytes = data.contiguous().view(torch.uint8).flatten()
         if aligned_nbytes > logical_nbytes:
-            padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
-            padded[:logical_nbytes] = data_bytes
-            src_ptr = padded.data_ptr()
+            padded_buf = mmap.mmap(-1, aligned_nbytes)
+            padded_buf[:logical_nbytes] = data_bytes.numpy().tobytes()
+            src_ptr = ctypes.addressof(ctypes.c_char.from_buffer(padded_buf))
         else:
             src_ptr = data_bytes.data_ptr()
+            if src_ptr % self.alignment != 0:
+                aligned_buf = mmap.mmap(-1, aligned_nbytes)
+                aligned_buf[:logical_nbytes] = data_bytes.numpy().tobytes()
+                src_ptr = ctypes.addressof(ctypes.c_char.from_buffer(aligned_buf))
 
         handle = self._handles[fd]
         written = self._cufile["cuFileWrite"](
@@ -601,7 +618,14 @@ class CuFileBackend:
             OSError: If ``cuFileRead`` returns an error or a short read.
         """
         aligned_nbytes = _align_up(nbytes, self.alignment)
-        gpu_ptr = gpu_buf.view(torch.uint8).flatten().data_ptr()
+        gpu_view = gpu_buf.view(torch.uint8).flatten()
+        gpu_ptr = gpu_view.data_ptr()
+        if gpu_ptr % self.alignment != 0:
+            raise ValueError(
+                f"CuFileBackend.read_block: GPU buffer pointer {hex(gpu_ptr)} is not "
+                f"{self.alignment}-byte aligned. Ensure GPU blocks are allocated with "
+                f"alignment padding."
+            )
 
         handle = self._handles[fd]
         read = self._cufile["cuFileRead"](

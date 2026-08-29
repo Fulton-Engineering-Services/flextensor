@@ -903,6 +903,14 @@ class RawBlockController:
         nvme_offload_path: str | None = None,
         unified_memory: bool = False,
     ):
+        if unified_memory and nvme_backend is not None:
+            raise ValueError(
+                "RawBlockController does not support unified_memory=True. "
+                "Use transfer_mode='allocation_block_transfer' instead. "
+                "RawBlockController always allocates pinned CPU blocks first, "
+                "which on unified memory (GB10) doubles peak DRAM usage and "
+                "can cause OOM before NVMe eviction."
+            )
         self.block_map_cpu = {}
         self.block_map_cpu_sizes = {}
         self.block_map_gpu = {}
@@ -1285,6 +1293,12 @@ class AllocationBlockController:
                 if len(strategy) == 0:
                     label_layouts[label] = ([], 0, [])
                     label_tensor_ids[label] = []
+                    self.nvme_block_map[label] = NvmeBlockRef(
+                        file_path=file_path,
+                        file_offset=file_offset,
+                        logical_nbytes=0,
+                        aligned_nbytes=0,
+                    )
                     continue
 
                 unique_tensor_ids: set[int] = set()
@@ -1311,8 +1325,6 @@ class AllocationBlockController:
                 label_tensor_ids[label] = tensor_ids_list
 
                 for tensor, t_offset in zip(tensors_list, tensor_offsets):
-                    if tensor.device.type == "cuda":
-                        torch.cuda.synchronize()
                     if tensor.is_contiguous():
                         byte_view = tensor.view(torch.uint8).flatten()
                     elif is_dense_layout(tensor):
@@ -1363,6 +1375,7 @@ class AllocationBlockController:
                 )
                 file_offset += aligned_nbytes
 
+            if self.device_gpu.type == "cuda":
                 torch.cuda.empty_cache()
 
             # Phase 2: Allocate GPU block and create views.
@@ -1521,13 +1534,14 @@ class AllocationBlockController:
         gpu_block_view = self.gpu_block_view_map[label]
         if self.nvme_backend is not None and label in self.nvme_block_map:
             block_ref = self.nvme_block_map[label]
-            self.nvme_backend.read_block(
-                self.nvme_file_fd,
-                gpu_block_view,
-                block_ref.file_offset,
-                block_ref.logical_nbytes,
-            )
-        else:
+            if block_ref.logical_nbytes > 0:
+                self.nvme_backend.read_block(
+                    self.nvme_file_fd,
+                    gpu_block_view,
+                    block_ref.file_offset,
+                    block_ref.logical_nbytes,
+                )
+        elif label in self.block_map_cpu:
             cpu_block = self.block_map_cpu[label]
             cpu_block.copy_to(gpu_block_view, non_blocking=non_blocking)
 

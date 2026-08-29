@@ -590,6 +590,17 @@ class OffloadConfig(BaseModel):
                 f"transfer_mode={self.transfer_mode!r}. The unified-memory "
                 f"eviction path is implemented by the block controllers."
             )
+        if self.unified_memory and not self.nvme_offload_enabled:
+            raise ValueError(
+                "unified_memory=True requires nvme_offload_enabled=True. "
+                "The unified-memory eviction path writes weights directly "
+                "to NVMe to avoid double-allocation in unified DRAM."
+            )
+        if self.unified_memory and self.nvme_offload_path is None:
+            raise ValueError(
+                "unified_memory=True requires nvme_offload_path to be set "
+                "to a directory on a local NVMe filesystem."
+            )
         return self
 
     def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:

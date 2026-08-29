@@ -324,9 +324,10 @@ class TestUnifiedMemoryEdgeCases:
             label_to_block_id={label: 0, empty_label: 0},
         )
 
-        # Empty label should have an empty view list and no NVMe block.
+        # Empty label should have an empty view list and a zero-byte NVMe block.
         assert controller.label_to_tensor_views_map[empty_label] == []
-        assert empty_label not in controller.nvme_block_map
+        assert empty_label in controller.nvme_block_map
+        assert controller.nvme_block_map[empty_label].logical_nbytes == 0
 
         # Non-empty label should work.
         assert label in controller.nvme_block_map

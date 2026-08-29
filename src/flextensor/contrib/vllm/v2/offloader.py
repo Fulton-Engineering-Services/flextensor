@@ -254,7 +254,8 @@ class VllmBootstrapOffloader(_VllmBaseOffloader):
             raise VllmFlexTensorV2Error(
                 f"online quantization final parameters missing or meta: coordinate={coordinate} names={meta_names}"
             )
-        self._stage_concrete_parameters_on_cpu(unit)
+        if not self._unified_memory:
+            self._stage_concrete_parameters_on_cpu(unit)
         LOGGER.info(
             "online quantization placement complete: coordinate=%s final_bytes=%d",
             coordinate,
