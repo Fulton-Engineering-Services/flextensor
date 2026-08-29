@@ -199,22 +199,23 @@ class PosixBackend:
     def write_block(self, fd: int, data: torch.Tensor, offset: int) -> NvmeBlockRef:
         """Write a uint8 block to the file, padding to alignment.
 
-        On unified-memory platforms (e.g. GB10), GPU tensors are accepted:
-        the GPU pointer is host-accessible, so ``os.pwrite`` reads directly
-        from the GPU tensor's physical memory without a CPU-side copy.
+        GPU tensors are accepted: the data is staged to CPU via ``.cpu()``
+        before writing. On unified-memory platforms (GB10), CPU and GPU share
+        the same physical DRAM via C2C, but have separate virtual address
+        spaces — ``data_ptr()`` returns a GPU virtual address that is not
+        mapped in the CPU's page table, so ``os.pwrite`` cannot read from it
+        directly. ``.cpu()`` copies through the C2C bridge to a CPU-mapped
+        buffer (same physical pages, different virtual address).
 
         Args:
             fd: File descriptor from :meth:`open_file`.
             data: Contiguous CPU or GPU tensor (will be reinterpreted as uint8).
-                GPU tensors require unified memory (host-accessible GPU pointers).
             offset: Byte offset within the file (must be alignment-aligned).
 
         Returns:
             :class:`NvmeBlockRef` with the logical and aligned sizes.
 
         Raises:
-            ValueError: If ``data`` is on a non-host-accessible GPU device
-                (i.e. not unified memory).
             OSError: If the write is short (fewer bytes written than expected).
         """
         logical_nbytes = data.numel() * data.element_size()
@@ -222,21 +223,20 @@ class PosixBackend:
 
         if data.device.type == "cuda":
             torch.cuda.synchronize()
-            data_bytes = data.contiguous().view(torch.uint8).flatten()
-            if aligned_nbytes > logical_nbytes:
-                padded = torch.zeros(aligned_nbytes, dtype=torch.uint8, device=data.device)
-                padded[:logical_nbytes] = data_bytes
-                data_bytes = padded
-            buf = self._ctypes_buffer_from_tensor(data_bytes)
+            # GPU virtual addresses are not in the CPU's page table, even on
+            # unified memory (C2C). Stage through .cpu() to get a host-accessible
+            # buffer — on GB10 this copies through the C2C bridge to the same
+            # physical pages under a CPU virtual address.
+            data = data.cpu()
+
+        data_bytes = data.contiguous().view(torch.uint8).flatten()
+        if aligned_nbytes > logical_nbytes:
+            padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
+            padded[:logical_nbytes] = data_bytes
+            buf = padded.numpy()
         else:
-            data_bytes = data.contiguous().view(torch.uint8).flatten()
-            if aligned_nbytes > logical_nbytes:
-                padded = torch.zeros(aligned_nbytes, dtype=torch.uint8)
-                padded[:logical_nbytes] = data_bytes
-                buf = padded.numpy()
-            else:
-                buf = data_bytes.numpy()
-            buf = memoryview(buf)
+            buf = data_bytes.numpy()
+        buf = memoryview(buf)
 
         written = os.pwrite(fd, buf, offset)
         if written != aligned_nbytes:
@@ -251,17 +251,21 @@ class PosixBackend:
 
     @staticmethod
     def _ctypes_buffer_from_tensor(tensor: torch.Tensor):
-        """Create a ctypes buffer view from a GPU tensor's data pointer.
+        """Create a ctypes buffer view from a tensor's data pointer.
 
-        On unified-memory platforms (GB10), GPU memory is host-accessible —
-        the physical address returned by ``data_ptr()`` can be read directly
-        by ``os.pwrite`` without a CPU-side copy.
+        .. deprecated::
+            This method creates a ctypes buffer directly from ``data_ptr()``,
+            but on GB10 unified memory, GPU virtual addresses are not mapped
+            in the CPU's page table — ``os.pwrite`` fails with ``EFAULT``.
+            ``write_block`` now stages GPU tensors through ``.cpu()`` instead.
+            Retained for potential future use on platforms where GPU memory
+            is truly host-accessible via the CPU virtual address space.
 
         Args:
-            tensor: A contiguous uint8 tensor on ``cuda`` (unified memory).
+            tensor: A contiguous uint8 tensor.
 
         Returns:
-            A ctypes buffer object suitable for ``os.pwrite``.
+            A ctypes buffer object.
         """
         import ctypes
 

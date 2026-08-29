@@ -1251,19 +1251,20 @@ class AllocationBlockController:
         allocator, which cannot reuse the CUDA allocator's cached freed blocks —
         causing OOM when weights already occupy most of the pool.
 
-        This path writes each label's GPU tensors directly to NVMe via
-        ``os.pwrite`` with a ctypes buffer view from the GPU pointer
-        (host-accessible on unified memory), freeing each tensor after the
-        write and calling ``torch.cuda.empty_cache`` to return freed blocks
-        to the OS. No ``device="cpu"`` allocations are made during eviction.
+        This path writes each label's tensors to NVMe via ``os.pwrite``,
+        staging GPU tensors through ``.cpu()`` first (GPU virtual addresses
+        are not in the CPU's page table, even on unified memory — ``.cpu()``
+        copies through the C2C bridge to the same physical pages under a CPU
+        virtual address). Each tensor is freed after the write and
+        ``torch.cuda.empty_cache`` is called to return freed blocks to the OS.
+        The per-tensor CPU staging copy is short-lived (freed immediately after
+        the write), so peak memory is ~1 tensor extra, not 2x all weights.
 
         After all labels in an allocation group are evicted, the GPU "hot"
         block is allocated from the freed memory. The view mapping is the same
         as the standard path — the only difference is the data source (NVMe
         instead of a CPU block).
         """
-        import ctypes
-
         file_path = str(Path(self.nvme_offload_path) / f"blocks_{uuid.uuid4().hex}.bin")
         self.nvme_file_fd = self.nvme_backend.open_file(file_path)
         nvme_alignment = self.nvme_backend.alignment
@@ -1331,9 +1332,19 @@ class AllocationBlockController:
                         padded[:nbytes] = byte_view
                         byte_view = padded
 
-                    ptr = byte_view.data_ptr()
-                    buf = (ctypes.c_char * aligned).from_address(ptr)
-                    written = os.pwrite(self.nvme_file_fd, buf, file_offset + t_offset)
+                    # Stage to CPU for os.pwrite — GPU virtual addresses are
+                    # not in the CPU's page table, even on unified memory (C2C).
+                    # On GB10, .cpu() copies through the C2C bridge to the same
+                    # physical pages under a CPU virtual address. The CPU copy
+                    # is freed when byte_view goes out of scope after the write.
+                    if byte_view.device.type == "cuda":
+                        byte_view = byte_view.cpu()
+
+                    written = os.pwrite(
+                        self.nvme_file_fd,
+                        memoryview(byte_view.numpy()),
+                        file_offset + t_offset,
+                    )
                     if written != aligned:
                         raise OSError(
                             f"Short NVMe write for label={label}: expected {aligned}, wrote {written}"

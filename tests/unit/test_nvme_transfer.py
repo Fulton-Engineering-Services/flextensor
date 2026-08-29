@@ -127,20 +127,6 @@ class TestPosixBackend:
         backend.close()
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA to create a GPU tensor")
-    @pytest.mark.xfail(
-        strict=False,
-        reason=(
-            "os.pwrite with a ctypes buffer from GPU data_ptr() fails with EFAULT "
-            "(Errno 14, Bad address) on GB10. The GPU virtual address returned by "
-            "data_ptr() is not in the CPU's address space — even on unified memory "
-            "(C2C), the CPU and GPU have separate virtual address spaces. The "
-            "ctypes buffer is created but os.pwrite cannot read from it. This "
-            "affects both PosixBackend.write_block and the _construct_unified_memory "
-            "path in AllocationBlockController. Fix: use cudaMemcpyDeviceToHost to "
-            "stage GPU data to a CPU buffer before os.pwrite, or use cuFile (GDS) "
-            "which writes directly from GPU memory (but GDS is unsupported on GB10)."
-        ),
-    )
     def test_writes_gpu_tensor_and_roundtrips(self, tmp_path: Path) -> None:
         """``write_block`` must accept GPU tensors and roundtrip data correctly.
 
