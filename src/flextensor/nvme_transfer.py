@@ -213,7 +213,7 @@ class PosixBackend:
         else:
             buf = data_bytes.numpy()
 
-        written = os.pwrite(fd, buf.tobytes(), offset)
+        written = os.pwrite(fd, memoryview(buf), offset)
         if written != aligned_nbytes:
             raise OSError(f"Short write: expected {aligned_nbytes}, wrote {written}")
 
@@ -241,8 +241,9 @@ class PosixBackend:
     def read_block(self, fd: int, gpu_buf: torch.Tensor, offset: int, nbytes: int) -> None:
         """Read from NVMe into pinned CPU memory, then copy to GPU buffer.
 
-        The read is staged through a pinned CPU buffer (grown on demand) and
-        then copied to ``gpu_buf`` via ``copy_`` with ``non_blocking=True``.
+        The read is staged through a pinned CPU buffer (grown on demand).
+        On unified-memory platforms (e.g. GB10) the ``copy_`` from pinned
+        to GPU is near-zero-cost because both share the same physical DRAM.
 
         Args:
             fd: File descriptor from :meth:`open_file`.
@@ -253,6 +254,8 @@ class PosixBackend:
         Raises:
             OSError: If the read is short (fewer bytes read than expected).
         """
+        import ctypes
+
         aligned_nbytes = _align_up(nbytes, self.alignment)
         pinned = self._ensure_pinned_buf(aligned_nbytes)
 
@@ -260,7 +263,7 @@ class PosixBackend:
         buf_bytes = os.pread(fd, aligned_nbytes, offset)
         if len(buf_bytes) != aligned_nbytes:
             raise OSError(f"Short read: expected {aligned_nbytes}, got {len(buf_bytes)}")
-        buf_view.copy_(torch.frombuffer(buf_bytes, dtype=torch.uint8))
+        ctypes.memmove(pinned.data_ptr(), buf_bytes, aligned_nbytes)
 
         gpu_view = gpu_buf.view(torch.uint8).flatten()[:nbytes]
         gpu_view.copy_(buf_view[:nbytes], non_blocking=True)
