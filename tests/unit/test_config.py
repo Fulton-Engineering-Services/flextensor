@@ -245,8 +245,26 @@ class TestOffloadConfig:
         assert config.min_blocks == 3
 
     def test_profile_mode_default(self):
-        """Default profile_mode is 'view' to match TensorManager."""
+        """Default profile_mode is 'view' to match TensorManager.
+
+        WARNING: 'view' is read-only — it reads a pre-existing profile. On
+        first deploy with a new model architecture (e.g. Glm5Next), no
+        profile exists, so FlexTensor uses "conservative statistics" and
+        evicts nothing. This caused the production OOM where all 44 GiB
+        weights stayed on GPU. The deployment entrypoint must set
+        FT_PROFILE_MODE=getter for first-deploy scenarios.
+        """
         assert OffloadConfig().profile_mode == "view"
+
+    def test_profile_mode_getter_accepted(self):
+        """profile_mode='getter' is accepted — the production fix for OOM.
+
+        getter mode profiles layer sizes live by intercepting __getattribute__
+        during initialization, generating a profile on first boot when no
+        pre-existing profile exists.
+        """
+        config = OffloadConfig(profile_mode="getter")
+        assert config.profile_mode == "getter"
 
     def test_profile_mode_view_with_block_loader(self):
         """profile_mode='view' is accepted with the default block-transfer loader."""
@@ -688,6 +706,18 @@ class TestLoadConfigFromEnv:
         os.environ["FT_PROFILE_MODE"] = "view"
         config = load_config_from_env()
         assert config.profile_mode == "view"
+
+    def test_load_profile_mode_getter_from_env(self):
+        """FT_PROFILE_MODE=getter is picked up from the environment.
+
+        This is the production fix: the dynamo-serve-entrypoint.sh must
+        set FT_PROFILE_MODE=getter so FlexTensor profiles on first boot
+        instead of defaulting to read-only 'view' (which evicts nothing
+        when no profile file exists, causing OOM).
+        """
+        os.environ["FT_PROFILE_MODE"] = "getter"
+        config = load_config_from_env()
+        assert config.profile_mode == "getter"
 
     def test_load_profile_mode_from_env_rejects_invalid(self):
         """Invalid FT_PROFILE_MODE values must surface as a ValidationError.
